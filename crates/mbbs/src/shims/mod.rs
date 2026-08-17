@@ -1001,6 +1001,14 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (GALGSBL, "btueba", gsbl::btueba, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
         (GALGSBL, "chiinp", gsbl::chiinp, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
         (GALGSBL, "chious", gsbl::chious, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
+        // Task 6: btumon2, btumds2 and btumks2 -- channel monitoring. The
+        // state is on Gsbl, not Channel: btumds2()/btumks2(kyschr) take no
+        // channel argument, so there is one monitor slot for the whole
+        // host. Only the suffixed trio is served -- the corpus imports no
+        // unsuffixed btumon/btumds/btumks, and neither is implemented here.
+        (GALGSBL, "btumon2", gsbl::btumon2, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
+        (GALGSBL, "btumds2", gsbl::btumds2, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
+        (GALGSBL, "btumks2", gsbl::btumks2, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
         // Allocation. `alcblok`/`ptrblok`/`freblok` are NOT here -- the two
         // vendor branches have structurally different headers, so they are
         // ABI-concrete in both native tables below.

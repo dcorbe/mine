@@ -39,6 +39,10 @@ use crate::chan::{Chan, Terms};
 const INPSIZ: usize = 1024;
 const OUTSIZ: usize = 8192;
 
+/// `btumon2`/`btumds2`'s monitor buffer cap (guide `btumds2` page 128).
+/// Oldest bytes drop on overflow -- see [`Gsbl::monitor`].
+const MONITOR_CAP: usize = 2047;
+
 /// [`Channel::transmit`]'s scanner state for CSI (`ESC` `[` ... final byte),
 /// carried on [`Channel`] rather than kept local to one call for the same
 /// reason `column` and `supplied_lf` are: a sequence can straddle two
@@ -366,6 +370,32 @@ pub struct Gsbl {
     /// main loop's -- the original kept its own cursor and handed out the
     /// result.
     next: u16,
+
+    /// `btumon2` -- the channel being monitored, if any (guide page 128).
+    ///
+    /// On [`Gsbl`] rather than [`Channel`] because the prototypes say so:
+    /// `btumds2()` and `btumks2(kyschr)` take no channel argument, so there
+    /// is exactly one monitored channel for the whole host, and the `2`
+    /// suffix names a second monitor *slot* (the guide calls it "a clone ...
+    /// for emulating a second channel"), not a second argument. Only this
+    /// suffixed trio is implemented -- the corpus imports no unsuffixed
+    /// `btumon`/`btumds`/`btumks`, and this host has no second slot to share
+    /// with them.
+    ///
+    /// The guide also requires the monitored channel be "a non-hardware
+    /// channel" (page 127, `btumon` DESCRIPTION). Every channel this host
+    /// has is one -- there is no modem, Xecom, Hayes, X.25 or LAN board here
+    /// at all -- so the restriction is satisfied trivially and there is no
+    /// check to write for it.
+    pub(crate) monitored: Option<Chan>,
+
+    /// `btumds2`'s buffer -- characters transmitted to [`Gsbl::monitored`],
+    /// capped at [`MONITOR_CAP`] (the guide's 2047). Oldest bytes are
+    /// dropped on overflow: the guide's own remedy for a full buffer is to
+    /// call `btumds2()` "often enough" to keep up, which makes an overflow
+    /// the caller's failure to drain, not a condition this buffer should
+    /// propagate the way [`Channel::status`] propagates [`Gsbl::OVRFLW`].
+    pub(crate) monitor_out: VecDeque<u8>,
 }
 
 impl Gsbl {
@@ -375,6 +405,8 @@ impl Gsbl {
             terms,
             channels: (0..terms.count()).map(|_| Channel::default()).collect(),
             next: 0,
+            monitored: None,
+            monitor_out: VecDeque::new(),
         }
     }
 
@@ -652,6 +684,7 @@ impl Gsbl {
     /// `btuxmt` -- ASCII output, word-wrapped at the `btutsw` width.
     pub fn transmit(&mut self, chan: Chan, bytes: &[u8]) {
         self.channel_mut(chan).transmit(bytes);
+        self.monitor(chan, bytes);
     }
 
     /// `btuxct` -- binary output, exactly as given.
@@ -666,6 +699,33 @@ impl Gsbl {
             return;
         }
         c.output.extend(bytes.iter().copied());
+        self.monitor(chan, bytes);
+    }
+
+    /// Copy bytes just transmitted to `chan` into [`Gsbl::monitor_out`], if
+    /// `chan` is the one [`Gsbl::monitored`] names.
+    ///
+    /// Called from [`Gsbl::transmit`] and [`Gsbl::transmit_raw`] -- the two
+    /// places bytes reach a channel -- with the bytes each was **handed by
+    /// its caller**, before [`Channel::transmit`]'s word-wrap and CRLF
+    /// expansion. The guide calls `btumds2` the next character waiting in the output buffer; a monitor showing the sysop what the module *sent* is
+    /// more useful than one reproducing wrap artefacts it never chose. **What
+    /// would reveal this wrong:** a sysop watching a monitored session and
+    /// seeing no line breaks where the user's own terminal shows them,
+    /// because a wrap break exists only inside [`Channel::output`], after
+    /// wrapping, and this copies before that step.
+    ///
+    /// Oldest bytes drop once [`MONITOR_CAP`] is exceeded -- see
+    /// [`Gsbl::monitor_out`]'s own doc comment for why that is the guide's
+    /// own remedy rather than an invented policy.
+    fn monitor(&mut self, chan: Chan, bytes: &[u8]) {
+        if self.monitored != Some(chan) {
+            return;
+        }
+        self.monitor_out.extend(bytes.iter().copied());
+        while self.monitor_out.len() > MONITOR_CAP {
+            self.monitor_out.pop_front();
+        }
     }
 }
 

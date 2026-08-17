@@ -1336,6 +1336,79 @@ pub fn chious<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
+/// `int btumon2(int chan)` -- start/stop monitoring a channel (guide page
+/// 128: "a clone of `btumon()`, for emulating a second channel").
+///
+/// `-1` disables monitoring and is answered `0`, **not** [`OUT_OF_RANGE`]:
+/// the guide's own SYNOPSIS lists `chan` as "channel number (-1 to disable
+/// monitoring)", a defined value, not a caller error. Handled ahead of
+/// [`on_channel`] for exactly that reason -- `Terms::chan(-1)` would refuse
+/// it the same way it refuses every other negative number, and folding the
+/// two together would answer the wrong one of the guide's two documented
+/// outcomes.
+///
+/// Every other value goes through [`on_channel`] like the rest of this
+/// file; a channel that is neither a valid number nor `-1` answers
+/// [`OUT_OF_RANGE`]. See [`crate::gsbl::Gsbl::monitored`]'s own doc comment
+/// for why the guide's "must be a non-hardware channel" restriction needs no
+/// check here.
+pub fn btumon2<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    if chan == -1 {
+        host.gsbl_mut().monitored = None;
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.monitored = Some(chan);
+    }) {
+        Some(()) => abi::Ret::Int(A::Int::from(0u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int btumds2(void)` -- the next buffered output character transmitted to
+/// the channel [`btumon2`] selected, or `0` once the monitor buffer is
+/// empty (guide page 128, a clone of `btumds()`).
+///
+/// Takes no channel argument, unlike every other routine in this file --
+/// the prototype has none, because the monitored channel is
+/// [`crate::gsbl::Gsbl::monitored`], global to the host rather than a
+/// per-caller value. There is accordingly no [`on_channel`] bound check to
+/// make: the channel was already validated, if any, by the [`btumon2`] call
+/// that set it.
+pub fn btumds2<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let byte = host.gsbl_mut().monitor_out.pop_front().unwrap_or(0);
+    Ok(abi::Ret::Int(A::Int::from(u16::from(byte))))
+}
+
+/// `void btumks2(char kyschr)` -- simulate a keystroke on the monitored
+/// channel (guide page 128, a clone of `btumks()`).
+///
+/// Guide: does nothing unless `btumon2()` has been called, and was last called with a channel other than -1 -- exactly [`crate::gsbl::Gsbl::monitored`] being
+/// `None`, checked directly rather than through [`on_channel`] for the same
+/// reason [`btumds2`] skips it: there is no channel argument to bound-check
+/// here at all.
+///
+/// Delivered through [`crate::gsbl::Gsbl::push_input`], the same door a
+/// byte off the socket or [`chiinp`] uses, so a simulated keystroke gets the
+/// identical cooking pipeline (translate table, backspace, CR, `maxinl`) a
+/// real one would. Pushing straight into `Channel::input` instead would
+/// bypass all of that -- the same wrong shortcut [`chiinp`]'s own doc
+/// comment already rules out for the same reason.
+///
+/// `kyschr` is read with [`u8_arg`], for the same reason as [`chiinp`]'s
+/// `c`: `CHAR` in the prototype, and this host has no wider use for it.
+pub fn btumks2<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let Some(c) = u8_arg::<A>(call.int()) else {
+        host.note("btumks2: character argument does not fit a byte".to_string());
+        return Ok(abi::Ret::Void);
+    };
+    if let Some(chan) = host.gsbl().monitored {
+        host.gsbl_mut().push_input(chan, &[c]);
+    }
+    Ok(abi::Ret::Void)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2457,5 +2530,122 @@ mod tests {
         let s = f.text("hello");
         f.invoke(chious, &[0, s.offset, s.selector]).expect("void");
         assert_eq!(f.host.gsbl_mut().drain_output(console), b"hello".to_vec());
+    }
+
+    // # Task 6: btumon2, btumds2 and btumks2 -- channel monitoring
+    //
+    // No sibling to copy: unlike every other routine in this file,
+    // btumon/btumds/btumks are not implemented either, so these tests are
+    // the only thing standing between a mistake here and HVSXROAD, the
+    // corpus's sole importer.
+
+    #[test]
+    fn btumon2_then_btumds2_drains_what_was_transmitted_to_the_monitored_channel() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        assert_eq!(f.invoke(btumon2, &[0]).expect("btumon2"), Ret::U16(0));
+        f.host.gsbl_mut().transmit(console, b"hi");
+
+        assert_eq!(f.invoke(btumds2, &[]).expect("btumds2"), Ret::U16(u16::from(b'h')));
+        assert_eq!(f.invoke(btumds2, &[]).expect("btumds2"), Ret::U16(u16::from(b'i')));
+        // Guide `btumds2`: 0 means the monitor buffer is empty.
+        assert_eq!(f.invoke(btumds2, &[]).expect("btumds2"), Ret::U16(0));
+    }
+
+    #[test]
+    fn btumon2_minus_one_disables_monitoring() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        assert_eq!(f.invoke(btumon2, &[0]).expect("btumon2"), Ret::U16(0));
+        assert_eq!(
+            f.invoke(btumon2, &[(-1i16) as u16]).expect("btumon2"),
+            Ret::U16(0),
+            "-1 disables, it is not out of range"
+        );
+        f.host.gsbl_mut().transmit(console, b"hi");
+        assert_eq!(
+            f.invoke(btumds2, &[]).expect("btumds2"),
+            Ret::U16(0),
+            "nothing is monitored"
+        );
+    }
+
+    #[test]
+    fn btumon2_out_of_range_channel_answers_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(
+            f.invoke(btumon2, &[past]).expect("btumon2"),
+            Ret::U16(OUT_OF_RANGE),
+            "a channel that is neither valid nor -1 is refused"
+        );
+    }
+
+    #[test]
+    fn btumks2_is_inert_while_nothing_is_monitored() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        // Guide, `btumks2`: does nothing unless btumon2() has been called, and was last called with a channel other than -1.
+        f.invoke(btumks2, &[u16::from(b'x')]).expect("void");
+        // Assert on `line`, not `input`. A default channel is cooked, so a
+        // simulated keystroke lands in `line` (`gsbl.rs`'s `Channel::take`,
+        // step 9); `input` is raw-mode only and is empty here whether or not
+        // the routine did anything -- `assert!(input.is_empty())` would
+        // pass vacuously, the exact shape of a test that cannot fail.
+        assert!(f.host.gsbl().channel(console).line.is_empty());
+    }
+
+    #[test]
+    fn btumks2_reaches_the_monitored_channel() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        assert_eq!(f.invoke(btumon2, &[0]).expect("btumon2"), Ret::U16(0));
+        f.invoke(btumks2, &[u16::from(b'x')]).expect("void");
+        assert_eq!(f.host.gsbl().channel(console).line, b"x".to_vec());
+    }
+
+    #[test]
+    fn the_monitor_buffer_does_not_grow_without_bound() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        assert_eq!(f.invoke(btumon2, &[0]).expect("btumon2"), Ret::U16(0));
+        for _ in 0..100 {
+            f.host.gsbl_mut().transmit(console, &[b'x'; 100]);
+            f.host.gsbl_mut().channel_mut(console).output.clear();
+        }
+        assert!(
+            f.host.gsbl().monitor_out.len() <= 2047,
+            "guide `btumds2` caps it at 2047"
+        );
+    }
+
+    /// Two channels, only one monitored -- the discriminating test for
+    /// `Gsbl::monitor`'s `self.monitored != Some(chan)` guard. A mutation
+    /// that copies for *any* channel once monitoring is merely active
+    /// (rather than checking which channel) would pass every test above,
+    /// which only ever transmits to the one channel being monitored.
+    #[test]
+    fn btumon2_ignores_bytes_transmitted_to_a_different_channel() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let console = f.console();
+        let one = f.host.gsbl().terms().chan(1).expect("channel 1");
+        assert_eq!(f.invoke(btumon2, &[1]).expect("btumon2"), Ret::U16(0));
+
+        f.host.gsbl_mut().transmit(console, b"no");
+        f.host.gsbl_mut().transmit(one, b"yes");
+
+        assert_eq!(f.invoke(btumds2, &[]).expect("btumds2"), Ret::U16(u16::from(b'y')));
+    }
+
+    /// `Gsbl::transmit_raw` is the other of the "two places bytes reach a
+    /// channel" `Gsbl::monitor`'s own doc comment names -- unexercised by
+    /// every test above, all of which go through `Gsbl::transmit`.
+    #[test]
+    fn btumds2_also_drains_what_transmit_raw_sends() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        assert_eq!(f.invoke(btumon2, &[0]).expect("btumon2"), Ret::U16(0));
+        f.host.gsbl_mut().transmit_raw(console, b"Q");
+        assert_eq!(f.invoke(btumds2, &[]).expect("btumds2"), Ret::U16(u16::from(b'Q')));
     }
 }
