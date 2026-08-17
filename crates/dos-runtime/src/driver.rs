@@ -110,6 +110,66 @@ pub trait Driver {
     }
 }
 
+/// A literal string of keystrokes, handed over one at a time.
+///
+/// **Why this exists when `--keys` already works for the DOS guest.** That path
+/// feeds `Keyboard`, the BIOS keystroke buffer, and the guest reads it with
+/// `int 16h`. The Win32 host has no BIOS and no such buffer: `_getch` *is* its
+/// only input, so the same command-line switch needs a [`Driver`] behind it
+/// there. Making it one keeps the Win32 side to a single input path -- the
+/// thing the console plan was explicit about -- rather than growing a private
+/// key queue inside `win32`.
+///
+/// Every byte is a `Key::Char`. Extended keys have no spelling in a literal
+/// string; a caller who needs an arrow key wants [`Script`], which has names
+/// for them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Keys {
+    keys: Vec<u8>,
+    at: usize,
+}
+
+impl Keys {
+    pub fn new(text: &str) -> Self {
+        Self {
+            keys: text.as_bytes().to_vec(),
+            at: 0,
+        }
+    }
+
+    /// How many keystrokes are still unread.
+    pub fn remaining(&self) -> usize {
+        self.keys.len().saturating_sub(self.at)
+    }
+}
+
+impl Driver for Keys {
+    fn next_key(&mut self, _screen: &Screen) -> Option<Key> {
+        let key = self.keys.get(self.at).copied()?;
+        self.at += 1;
+        Some(Key::Char(key))
+    }
+
+    /// The same key a blocking read would get.
+    ///
+    /// A poll and a blocking read draw from one queue on purpose: a program
+    /// that asks `kbhit` and then `getch` must get the key it was just promised,
+    /// and one that only ever polls must still make progress. `kbhit`'s own
+    /// non-consuming contract is kept by the *caller*, which peeks -- see
+    /// `win32::crt`'s `_kbhit` arm.
+    fn poll_key(&mut self, screen: &Screen) -> Option<Key> {
+        self.next_key(screen)
+    }
+
+    fn finished(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    fn ending(&self) -> String {
+        format!("{} keystrokes left unread", self.remaining())
+    }
+}
+
 /// One line of a script.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
@@ -342,5 +402,52 @@ mod tests {
         // `char:` disambiguates one that collides with a name.
         assert_eq!(Key::parse("char:f"), Some(Key::Char(b'f')));
         assert_eq!(Key::parse("f1"), Some(Key::Ext(0x3b)));
+    }
+}
+
+#[cfg(test)]
+mod keys_tests {
+    use super::*;
+
+    fn blank() -> Screen {
+        Screen {
+            grid: crate::screen::Cells::blank(80, 25),
+            cursor: (0, 0),
+            cursor_visible: true,
+        }
+    }
+
+    /// Keys come out in the order they were written, once each.
+    #[test]
+    fn a_literal_string_is_handed_over_one_key_at_a_time() {
+        let mut k = Keys::new("Hi\r");
+        let s = blank();
+        assert_eq!(k.next_key(&s), Some(Key::Char(b'H')));
+        assert_eq!(k.next_key(&s), Some(Key::Char(b'i')));
+        assert!(!k.finished(), "one left");
+        assert_eq!(k.next_key(&s), Some(Key::Char(b'\r')));
+        assert_eq!(k.next_key(&s), None);
+        assert!(k.finished());
+    }
+
+    /// A poll and a blocking read draw from one queue: a program that asks
+    /// `kbhit` and then `getch` must get the key it was promised.
+    #[test]
+    fn a_poll_and_a_blocking_read_share_the_queue() {
+        let mut k = Keys::new("AB");
+        let s = blank();
+        assert_eq!(k.poll_key(&s), Some(Key::Char(b'A')));
+        assert_eq!(k.next_key(&s), Some(Key::Char(b'B')));
+        assert_eq!(k.poll_key(&s), None);
+    }
+
+    /// An empty string is a driver with nothing to say, not a driver that
+    /// blocks.
+    #[test]
+    fn an_empty_string_is_finished_immediately() {
+        let mut k = Keys::new("");
+        assert!(k.finished());
+        assert_eq!(k.next_key(&blank()), None);
+        assert_eq!(k.remaining(), 0);
     }
 }

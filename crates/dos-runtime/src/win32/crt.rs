@@ -383,6 +383,37 @@ pub fn dispatch(
             process.exit(3);
             Some(Answer::cdecl(0))
         }
+        // void clreol(void)
+        //
+        // conio, and the first of that group this program has ever been
+        // measured calling. `_getch`, `_kbhit` and the rest stay unwritten:
+        // they are linked and still never reached, and the discipline that
+        // left this one alone until now is what makes its arrival meaningful.
+        //
+        // Takes nothing and returns nothing, so it cleans nothing and its
+        // value is never read.
+        "_clreol" => {
+            process.console.clreol();
+            Some(Answer::cdecl(0))
+        }
+        // int getch(void)
+        //
+        // Blocks for a key and does not echo it. With no driver -- a batch run
+        // -- there is nothing to wait for and nothing will ever arrive, so this
+        // answers `\r` rather than blocking or looping: a "press any key"
+        // prompt is satisfied and the program moves on. Blocking would hang a
+        // run that has no keyboard, and looping on a poll would burn the call
+        // budget on a question that can never be answered differently.
+        "_getch" => Some(Answer::cdecl(u32::from(
+            process.next_key().unwrap_or(b'\r'),
+        ))),
+        // int kbhit(void)
+        //
+        // Non-zero if a key is waiting, and **it must not consume one** -- see
+        // `Process::pending_key`. False with no driver, which is the honest
+        // answer for a run with no keyboard and keeps a polling loop from
+        // believing input is arriving.
+        "_kbhit" => Some(Answer::cdecl(u32::from(process.key_waiting()))),
         // void *memset(void *dest, int c, size_t n)
         "_memset" => {
             let dest = machine.arg_u32(mem.stack(), 0);
@@ -663,7 +694,7 @@ mod tests {
     fn unreached_symbols_are_declined_rather_than_answered() {
         let mut l = loaded();
         let mut p = Process::new("C:\\WCCMMUTL.EXE", &[]);
-        for symbol in ["_longjmp", "_strtok", "_clreol", "_getch", "_fnsplit"] {
+        for symbol in ["_longjmp", "_strtok", "_fnsplit", "__fullpath", "_flushall"] {
             assert!(
                 dispatch(&mut p, &mut l.machine, &mut l.mem, symbol).is_none(),
                 "{symbol} is unreached and must stay diagnosable"

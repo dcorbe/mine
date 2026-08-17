@@ -302,7 +302,14 @@ pub fn format_of(file: &[u8]) -> Format {
 /// today ends by naming the next symbol to implement. That is the useful
 /// output, and printing it is the whole reason this front door exists before
 /// the program can complete.
-fn run_pe32(path: &str, data: &[u8], tail: &str, root_dir: &str) -> io::Result<()> {
+fn run_pe32(
+    path: &str,
+    data: &[u8],
+    tail: &str,
+    root_dir: &str,
+    keys: &str,
+    script_path: Option<&str>,
+) -> io::Result<()> {
     let mut loaded = win32::load::load(data)?;
     // `Machine`'s own default per-entry-point watchdog is five wall-clock
     // seconds (`mbbs_machine::m32::DEFAULT_BUDGET`), sized for the kind of
@@ -345,6 +352,22 @@ fn run_pe32(path: &str, data: &[u8], tail: &str, root_dir: &str) -> io::Result<(
         root.into(),
         std::path::PathBuf::from(root_dir),
     )));
+
+    // The same two switches the real-mode guest is driven by, behind the same
+    // `Driver` trait. A PE32 program has no BIOS keystroke buffer, so `--keys`
+    // reaches it as a `Keys` driver rather than through `Keyboard` -- one input
+    // path on this side, which is what `_getch` reads. A script wins over
+    // literal keys, as it does for the DOS path, because a script is the more
+    // specific instruction.
+    process.keys = match script_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)?;
+            Some(Box::new(Script::parse(&text).map_err(io::Error::other)?)
+                as Box<dyn dos_runtime::driver::Driver>)
+        }
+        None if !keys.is_empty() => Some(Box::new(dos_runtime::driver::Keys::new(keys))),
+        None => None,
+    };
 
     let outcome = win32::process::run(&mut loaded, &mut process, PE_CALL_BUDGET)?;
     println!("--- {outcome:?} ---");
@@ -463,7 +486,9 @@ fn main() -> io::Result<()> {
     // One front door, two runtimes. Everything below this point is the
     // real-mode path and is unchanged; a PE32 leaves here instead.
     match format_of(&data) {
-        Format::Pe32 => return run_pe32(&path, &data, &tail, &root_dir),
+        Format::Pe32 => {
+            return run_pe32(&path, &data, &tail, &root_dir, &keys, script_path.as_deref());
+        }
         Format::Unsupported => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

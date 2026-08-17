@@ -199,6 +199,23 @@ pub struct Process {
     /// reference to the loaded image. One copy, made once, at the point where
     /// both are in scope.
     pub exports: Vec<(String, u32)>,
+    /// Where `_getch` and `_kbhit` get their keystrokes.
+    ///
+    /// The *same* [`Driver`](crate::driver::Driver) the real-mode guest is
+    /// driven by, so `--keys` and `--script` mean the same thing for a PE32
+    /// program as for a DOS one. `None` is a program with no keyboard: every
+    /// read reports nothing rather than blocking, which is what a batch run
+    /// needs and what every test that does not care about input gets for free.
+    pub keys: Option<Box<dyn crate::driver::Driver>>,
+    /// One keystroke `_kbhit` has looked at but `_getch` has not taken.
+    ///
+    /// **`kbhit` must not consume.** It reports whether a key is waiting; a
+    /// host that drew one from the driver and dropped it turns every "press any
+    /// key to continue" into a swallowed keystroke and the prompt never
+    /// clears. A `Driver` has no peek, so the peek is built here: `_kbhit`
+    /// draws at most one key and parks it, and `_getch` takes the parked one
+    /// before asking for another.
+    pending_key: Option<u8>,
     /// `(caption, text)` of every `MessageBoxA` the program tried to show.
     ///
     /// There is no desktop here, so the box cannot appear -- but the text is
@@ -249,6 +266,24 @@ pub struct Process {
     /// implemented" and "implemented, but this call cannot be honoured" stay
     /// distinguishable.
     pub unwind_gap: Option<String>,
+}
+
+/// A [`Key`](crate::driver::Key) as `getch` reports it.
+///
+/// **An extended key is two reads, and this returns the first.** DOS conio
+/// signals a function or arrow key by answering `0` and making the *next*
+/// `getch` return the scan code. Collapsing an `Ext` to its bare scan code
+/// would hand the program a plain character it never pressed -- `Ext(0x48)`,
+/// the up arrow, would read as `H`.
+///
+/// The second read is not yet modelled, because nothing measured has pressed
+/// one: this program's only conio use is a "press any key" prompt. When one is
+/// measured, the parked scan code belongs beside `pending_key`.
+fn key_byte(key: crate::driver::Key) -> u8 {
+    match key {
+        crate::driver::Key::Char(b) => b,
+        crate::driver::Key::Ext(_) => 0,
+    }
 }
 
 /// One `ReportEventA` call: the program's own diagnostic.
@@ -319,6 +354,8 @@ impl Process {
             events: Vec::new(),
             exports: Vec::new(),
             messages: Vec::new(),
+            keys: None,
+            pending_key: None,
             objects: Vec::new(),
             btrieve: ::btrieve::Btrieve::default(),
             btrieve_heap: btrieve::Win32Heap::default(),
@@ -381,6 +418,50 @@ impl Process {
             }
             _ => false,
         }
+    }
+
+    /// The console as a [`Screen`](crate::screen::Screen), for a `Driver`.
+    ///
+    /// A `Driver` decides what to type by *looking* -- `Script`'s `expect`
+    /// steps read the screen -- so it has to be handed one. `Screen` is the
+    /// real-mode guest's own type, built there by sampling `B800:0000`; here
+    /// the host owns the cells outright, so the same structure is assembled
+    /// directly instead. That is the whole reason `Screen`'s fields are public
+    /// and its snapshot constructor is not the only way in.
+    pub fn screen(&self) -> crate::screen::Screen {
+        let (col, row) = self.console.cursor();
+        let (_, visible) = self.console.cursor_info();
+        crate::screen::Screen {
+            grid: self.console.cells().clone(),
+            cursor: (
+                u8::try_from(row).unwrap_or(u8::MAX),
+                u8::try_from(col).unwrap_or(u8::MAX),
+            ),
+            cursor_visible: visible,
+        }
+    }
+
+    /// Is a keystroke waiting? Does **not** consume it.
+    pub fn key_waiting(&mut self) -> bool {
+        if self.pending_key.is_some() {
+            return true;
+        }
+        let screen = self.screen();
+        let Some(driver) = self.keys.as_mut() else {
+            return false;
+        };
+        self.pending_key = driver.poll_key(&screen).map(key_byte);
+        self.pending_key.is_some()
+    }
+
+    /// Take the next keystroke, or `None` when there is no more input.
+    pub fn next_key(&mut self) -> Option<u8> {
+        if let Some(key) = self.pending_key.take() {
+            return Some(key);
+        }
+        let screen = self.screen();
+        let driver = self.keys.as_mut()?;
+        driver.next_key(&screen).map(key_byte)
     }
 
     /// Record an exit code. [`run`] stops as soon as one is set, which is what
@@ -711,10 +792,27 @@ mod tests {
     /// What remains is implementing `RtlUnwind`, which is what the register
     /// API exists for.
     ///
-    /// The program reaches it because it throws: `WCCMMUD.MCV` does not exist
-    /// (only the uncompiled `WCCMMUD.MSG` does), so it reports the failure,
-    /// writes a full `GALCAT.OUT` crash dump, and unwinds. Supplying the whole
-    /// 73-file fixture does not change this -- it was measured both ways.
+    /// The program reaches it because it throws: this test's root has no
+    /// `WCCMMUD.MCV`, so it reports the failure, writes a full `GALCAT.OUT`
+    /// crash dump, and unwinds.
+    ///
+    /// **This comment used to end "supplying the whole 73-file fixture does not
+    /// change this -- it was measured both ways", and that sentence cost a
+    /// session.** Both measurements were true and both were taken before a
+    /// `.MCV` could be compiled at all, so the pair read as exhaustive while
+    /// the one configuration that mattered had never been tried. The third
+    /// measurement:
+    ///
+    /// | root | stops at |
+    /// |---|---|
+    /// | empty (this test) | `__Return_unwind` |
+    /// | full 73-file board, no `.MCV` | `__Return_unwind` |
+    /// | **full board + compiled `.MCV`** | **past the C runtime entirely** |
+    ///
+    /// So the unwind is not on this program's ordinary path; it is what a
+    /// missing message catalogue produces. **Two negative measurements can
+    /// still be missing the third**, and a doc comment that lists them reads as
+    /// a proof when it is a sample.
     ///
     /// One thing this route confirmed is worth keeping: `CreateFileA` was both
     /// the survey's first *mis-cleaned* call and this runner's stopping point
@@ -922,6 +1020,53 @@ mod tests {
             screen.contains("Updating Rooms"),
             "expected \"Updating Rooms\" somewhere on the console; got:\n{screen}"
         );
+    }
+
+    /// **`kbhit` peeks and `getch` consumes.** A host that let `kbhit` draw and
+    /// drop a key turns every "press any key to continue" into a swallowed
+    /// keystroke, and the prompt never clears.
+    #[test]
+    fn kbhit_peeks_and_getch_consumes() {
+        let mut p = Process::new("X.EXE", &[]);
+        p.keys = Some(Box::new(crate::driver::Keys::new("AB")));
+
+        assert!(p.key_waiting());
+        assert!(p.key_waiting(), "peeking twice does not consume");
+        assert_eq!(p.next_key(), Some(b'A'), "and getch gets the peeked key");
+        assert_eq!(p.next_key(), Some(b'B'));
+        assert!(!p.key_waiting(), "the queue is empty");
+        assert_eq!(p.next_key(), None);
+    }
+
+    /// A process with no driver has no keyboard: nothing is waiting, and
+    /// nothing ever arrives. It must not block or invent input.
+    #[test]
+    fn a_process_with_no_driver_reports_no_input() {
+        let mut p = Process::new("X.EXE", &[]);
+        assert!(!p.key_waiting());
+        assert_eq!(p.next_key(), None);
+    }
+
+    /// A `Driver` decides what to type by looking at the screen, so the one it
+    /// is handed must be the console the program has actually drawn on.
+    #[test]
+    fn the_screen_a_driver_sees_is_the_console_the_program_drew() {
+        let mut p = Process::new("X.EXE", &[]);
+        p.console.write_output_character(0, 2, b"Database Recovery");
+        p.console.set_cursor(5, 2);
+
+        let screen = p.screen();
+        assert!(screen.contains("Database Recovery"));
+        assert_eq!(screen.cursor, (2, 5), "Screen orders it (row, col)");
+    }
+
+    /// An extended key reads as zero rather than as its scan code, because a
+    /// bare scan code is a character the user never pressed -- the up arrow's
+    /// `0x48` would arrive as `H`.
+    #[test]
+    fn an_extended_key_does_not_arrive_as_a_character() {
+        assert_eq!(key_byte(crate::driver::Key::Char(b'A')), b'A');
+        assert_eq!(key_byte(crate::driver::Key::Ext(0x48)), 0, "not b'H'");
     }
 
     /// `ExitProcess` must end the run and carry its code out, not merely

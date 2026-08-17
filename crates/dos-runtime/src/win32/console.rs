@@ -119,6 +119,41 @@ impl Console {
         true
     }
 
+    /// `clreol` -- blank from the cursor to the end of *its* line.
+    ///
+    /// Three boundaries, and getting any of them wrong is invisible on a screen
+    /// that happens to be full:
+    ///
+    /// - it starts **at** the cursor, not at the start of the line, so text to
+    ///   the left survives;
+    /// - it stops at the end of that line, so the rows below survive -- this is
+    ///   the one place in this module where the buffer is *not* treated as one
+    ///   linear run, because `clreol` is a line operation and `Console::index`'s
+    ///   wrap-onto-the-next-row rule is exactly wrong for it;
+    /// - it writes spaces rather than NULs, because the program reads its own
+    ///   screen back and a NUL is not what a cleared cell holds.
+    ///
+    /// Attributes are left alone. Borland's `clreol` clears to the *current*
+    /// text attribute, and this host has no separate notion of one to apply --
+    /// `SetConsoleTextAttribute` tracks it, but a cell's colour only changes
+    /// when something writes an attribute to it. Blanking the characters and
+    /// leaving the colours is what the program will read back either way.
+    pub fn clreol(&mut self) {
+        let (col, row) = self.cursor;
+        let cols = u16::try_from(self.grid.cols).unwrap_or(u16::MAX);
+        if col >= cols {
+            return;
+        }
+        let Some(start) = self.index(col, row) else {
+            return;
+        };
+        let to_end = usize::from(cols - col);
+        let n = to_end.min(self.grid.cells.len() - start);
+        for cell in &mut self.grid.cells[start..start + n] {
+            cell.ch = b' ';
+        }
+    }
+
     /// `CONSOLE_CURSOR_INFO`: `(dwSize, bVisible)`.
     pub fn cursor_info(&self) -> (u32, bool) {
         (self.cursor_size, self.cursor_visible)
@@ -792,6 +827,60 @@ mod win32_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `clreol` clears from the cursor to the end of **its** line and nothing
+    /// else -- not the whole line, and not the following ones.
+    ///
+    /// The buffer is one linear run everywhere else in this module, which is
+    /// exactly the rule that would be wrong here: a `clreol` that used
+    /// `write_output_character`'s wrap would blank the rest of the screen.
+    #[test]
+    fn clreol_clears_only_to_the_end_of_the_line() {
+        let mut c = Console::new(10, 2);
+        c.write_output_character(0, 0, b"ABCDEFGHIJ");
+        c.write_output_character(0, 1, b"KEEPKEEPKE");
+        c.set_cursor(4, 0);
+        c.clreol();
+        assert_eq!(c.read_output_character(0, 0, 10), b"ABCD      ");
+        assert_eq!(
+            c.read_output_character(0, 1, 10),
+            b"KEEPKEEPKE",
+            "the row below must survive"
+        );
+    }
+
+    /// At column zero it clears the whole line; past the last column it does
+    /// nothing. Both are boundaries a loop written with `<=` gets wrong.
+    #[test]
+    fn clreol_at_the_edges() {
+        let mut c = Console::new(10, 2);
+        c.write_output_character(0, 0, b"ABCDEFGHIJ");
+        c.write_output_character(0, 1, b"KEEPKEEPKE");
+        c.set_cursor(0, 0);
+        c.clreol();
+        assert_eq!(c.read_output_character(0, 0, 10), b"          ");
+        assert_eq!(c.read_output_character(0, 1, 10), b"KEEPKEEPKE");
+
+        c.set_cursor(10, 1);
+        c.clreol();
+        assert_eq!(
+            c.read_output_character(0, 1, 10),
+            b"KEEPKEEPKE",
+            "a cursor past the last column clears nothing"
+        );
+    }
+
+    /// Characters go, colours stay. The program reads both back separately.
+    #[test]
+    fn clreol_leaves_the_attributes_alone() {
+        let mut c = Console::new(10, 1);
+        c.write_output_character(0, 0, b"ABCDEFGHIJ");
+        c.write_output_attribute(0, 0, &[0x4e; 10]);
+        c.set_cursor(2, 0);
+        c.clreol();
+        assert_eq!(c.read_output_character(0, 0, 10), b"AB        ");
+        assert_eq!(c.read_output_attribute(0, 0, 10), &[0x4e; 10]);
+    }
 
     /// The program reads its own screen back (`ReadConsoleOutputCharacterA` is
     /// in its import table), so the buffer is real state, not a write-only
