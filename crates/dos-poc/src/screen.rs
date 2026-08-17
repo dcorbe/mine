@@ -8,7 +8,7 @@
 //! by *colour*, so text alone cannot say where the highlight bar is -- which is
 //! exactly what a script needs to know before it presses Enter.
 
-use crate::guest::{DosGuest, DosPtr};
+use crate::guest::{Guest, Ptr};
 
 /// One character cell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,7 +38,7 @@ pub struct Screen {
 
 impl Screen {
     /// Read the whole screen out of the guest's text buffer.
-    pub fn snapshot<G: DosGuest>(
+    pub fn snapshot<G: Guest>(
         g: &G,
         cols: usize,
         rows: usize,
@@ -47,7 +47,7 @@ impl Screen {
     ) -> Self {
         let mut cells = Vec::with_capacity(cols * rows);
         for row in 0..rows {
-            let at = DosPtr::new(0xb800, (row * cols * 2) as u16);
+            let at = Ptr::new(0xb800, (row * cols * 2) as u16);
             match g.read(at, cols * 2) {
                 Ok(bytes) => cells.extend(bytes.chunks_exact(2).map(|c| Cell {
                     ch: c[0],

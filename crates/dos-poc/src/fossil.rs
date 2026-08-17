@@ -41,7 +41,7 @@
 //! the word with the line bits in the low byte and a door reads carrier-detect
 //! as data-ready and hangs up on a caller who is still there.
 
-use crate::guest::{DosFault, DosGuest, DosPtr};
+use crate::guest::{Fault, Guest, Ptr};
 use crate::uart::Uart;
 
 /// What `AH=04` must answer. A door that does not see this reports the driver
@@ -168,10 +168,10 @@ fn status(uart: &Uart) -> u16 {
 
 /// Answer one `int 14h`.
 pub fn dispatch(
-    guest: &mut impl DosGuest,
+    guest: &mut impl Guest,
     uart: &mut Uart,
     info: &Info,
-) -> Result<Serviced, DosFault> {
+) -> Result<Serviced, Fault> {
     let mut regs = guest.regs();
     let func = regs.ah();
     let mut serviced = Serviced::Done;
@@ -294,7 +294,7 @@ pub fn dispatch(
                 }
             }
             if !buf.is_empty() {
-                guest.write(DosPtr::new(regs.es, regs.di), &buf)?;
+                guest.write(Ptr::new(regs.es, regs.di), &buf)?;
             }
             regs.ax = u16::try_from(buf.len()).unwrap_or(u16::MAX);
             if buf.is_empty() {
@@ -306,7 +306,7 @@ pub fn dispatch(
         0x19 => {
             let want = usize::from(regs.cx);
             if want > 0 {
-                let at = DosPtr::new(regs.es, regs.di);
+                let at = Ptr::new(regs.es, regs.di);
                 let bytes = guest.read(at, want)?.to_vec();
                 for b in &bytes {
                     uart.send(*b);
@@ -320,7 +320,7 @@ pub fn dispatch(
             let all = info_bytes(uart, info);
             let n = usize::from(regs.cx).min(all.len());
             if n > 0 {
-                guest.write(DosPtr::new(regs.es, regs.di), &all[..n])?;
+                guest.write(Ptr::new(regs.es, regs.di), &all[..n])?;
             }
             regs.ax = u16::try_from(n).unwrap_or(0);
         }
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn a_block_write_sends_every_byte_and_reports_the_count() {
         let (mut g, mut u) = setup();
-        let at = DosPtr::new(0x2000, 0x10);
+        let at = Ptr::new(0x2000, 0x10);
         g.write(at, b"block!").unwrap();
         let mut r = g.regs();
         r.ax = 0x1900;
@@ -472,7 +472,7 @@ mod tests {
         for b in b"xy" {
             u.receive(*b);
         }
-        let at = DosPtr::new(0x2000, 0x40);
+        let at = Ptr::new(0x2000, 0x40);
         let mut r = g.regs();
         r.ax = 0x1800;
         r.cx = 16; // asks for more than is there
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn driver_info_is_nineteen_bytes_and_honours_a_short_buffer() {
         let (mut g, mut u) = setup();
-        let at = DosPtr::new(0x3000, 0);
+        let at = Ptr::new(0x3000, 0);
         let mut r = g.regs();
         r.ax = 0x1b00;
         r.cx = 19;

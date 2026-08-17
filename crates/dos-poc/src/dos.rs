@@ -6,7 +6,7 @@
 //! changing a line.
 
 use crate::files::{self, Files};
-use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs, Flag};
+use crate::guest::{Fault, Guest, Ptr, Regs, Flag};
 
 /// DOS error codes, as returned in AX with CF set.
 pub const ERR_INVALID_FUNCTION: u16 = 0x01;
@@ -25,7 +25,7 @@ pub enum Outcome {
     /// read whatever happened to be there; reporting it instead turns silent
     /// corruption into a stop, which is the trade this project makes
     /// everywhere else.
-    Fault(DosFault),
+    Fault(Fault),
 }
 
 /// The DOS kernel's state. Small here on purpose -- this is a proof of
@@ -54,7 +54,7 @@ pub struct DosState {
     pub psp_seg: Option<u16>,
     /// The Disk Transfer Address, `DS:DX` as last set by `AH=1Ah`. `None`
     /// until the program calls it; see [`dta`] for what stands in until then.
-    pub dta: Option<DosPtr>,
+    pub dta: Option<Ptr>,
 }
 
 impl Default for DosState {
@@ -72,14 +72,14 @@ impl Default for DosState {
 }
 
 /// Finish a successful call: registers back, carry clear.
-fn ok<G: DosGuest>(g: &mut G, regs: DosRegs) -> Outcome {
+fn ok<G: Guest>(g: &mut G, regs: Regs) -> Outcome {
     g.set_regs(regs);
     g.set_flag(Flag::Carry, false);
     Outcome::Continue
 }
 
 /// Finish a failed call the way DOS does: CF set, code in AX.
-fn fail<G: DosGuest>(g: &mut G, mut regs: DosRegs, code: u16) -> Outcome {
+fn fail<G: Guest>(g: &mut G, mut regs: Regs, code: u16) -> Outcome {
     regs.ax = code;
     g.set_regs(regs);
     g.set_flag(Flag::Carry, true);
@@ -132,7 +132,7 @@ fn local_time() -> Now {
 }
 
 /// Read an ASCIIZ path argument, bounded by DOS's own 128-byte path limit.
-fn path_at<G: DosGuest>(g: &G, at: DosPtr) -> Result<Vec<u8>, DosFault> {
+fn path_at<G: Guest>(g: &G, at: Ptr) -> Result<Vec<u8>, Fault> {
     g.read_until(at, 0, 128).map(<[u8]>::to_vec)
 }
 
@@ -146,9 +146,9 @@ fn path_at<G: DosGuest>(g: &G, at: DosPtr) -> Result<Vec<u8>, DosFault> {
 /// inherit this real-mode default by silently falling through this function
 /// -- it will simply have no `psp_seg` to fall back to, and `dta` will
 /// correctly report `None` rather than fabricate an address.
-fn dta(dos: &DosState) -> Option<DosPtr> {
+fn dta(dos: &DosState) -> Option<Ptr> {
     dos.dta
-        .or_else(|| dos.psp_seg.map(|seg| DosPtr::new(seg, 0x80)))
+        .or_else(|| dos.psp_seg.map(|seg| Ptr::new(seg, 0x80)))
 }
 
 /// Assemble the 43-byte record `AH=4Eh`/`4Fh` write to the DTA.
@@ -180,7 +180,7 @@ fn find_record(entry: &files::FindEntry) -> [u8; 43] {
 }
 
 /// Service one `int 21h`.
-pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
+pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
     let mut regs = g.regs();
     match regs.ah() {
         // 02h -- display character in DL.
@@ -232,7 +232,7 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
         // (A protected-mode edge has no IVT and would have to model one; not
         // every DOS call is as mode-agnostic as the file services.)
         0x25 => {
-            let at = DosPtr::new(0, u16::from(regs.al()) * 4);
+            let at = Ptr::new(0, u16::from(regs.al()) * 4);
             let mut entry = [0u8; 4];
             entry[0..2].copy_from_slice(&regs.dx.to_le_bytes());
             entry[2..4].copy_from_slice(&regs.ds.to_le_bytes());
@@ -244,7 +244,7 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
 
         // 35h -- get interrupt vector AL, answered in ES:BX.
         0x35 => {
-            let at = DosPtr::new(0, u16::from(regs.al()) * 4);
+            let at = Ptr::new(0, u16::from(regs.al()) * 4);
             let entry = match g.read(at, 4) {
                 Ok(b) => [b[0], b[1], b[2], b[3]],
                 Err(f) => return Outcome::Fault(f),
@@ -436,7 +436,7 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
                 Ok(p) => p,
                 Err(f) => return Outcome::Fault(f),
             };
-            let to = match path_at(g, DosPtr::new(regs.es, regs.di)) {
+            let to = match path_at(g, Ptr::new(regs.es, regs.di)) {
                 Ok(p) => p,
                 Err(f) => return Outcome::Fault(f),
             };
@@ -539,15 +539,15 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guest::DosPtr;
+    use crate::guest::Ptr;
     use crate::testguest::TestGuest;
 
     /// A guest with `text` placed at a known address, and DS:DX pointing at it.
     fn with_string(text: &[u8]) -> (TestGuest, DosState) {
         let mut g = TestGuest::new(64 * 1024);
-        let at = DosPtr::new(0x100, 0x20);
+        let at = Ptr::new(0x100, 0x20);
         g.poke(at, text);
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.ds = at.seg;
         regs.dx = at.off;
         g.call_with(regs);
@@ -577,7 +577,7 @@ mod tests {
         // The guest is all zeroes past the string, so a naive implementation
         // would happily emit 64 KiB of NULs instead of stopping.
         match dispatch(&mut g, &mut dos) {
-            Outcome::Fault(DosFault::Unterminated { term, .. }) => assert_eq!(term, b'$'),
+            Outcome::Fault(Fault::Unterminated { term, .. }) => assert_eq!(term, b'$'),
             other => panic!("expected an Unterminated fault, got {other:?}"),
         }
         assert!(dos.out.is_empty(), "nothing is emitted on a fault");
@@ -590,7 +590,7 @@ mod tests {
             drive: 3,
             ..DosState::default()
         };
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x19);
         g.call_with(regs);
 
@@ -607,7 +607,7 @@ mod tests {
             drives: 7,
             ..DosState::default()
         };
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x0e);
         regs.dx = 4;
         g.call_with(regs);
@@ -625,7 +625,7 @@ mod tests {
             version: (6, 22),
             ..DosState::default()
         };
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x30);
         g.call_with(regs);
 
@@ -667,7 +667,7 @@ mod tests {
     fn an_unimplemented_call_fails_loudly_rather_than_succeeding_silently() {
         let mut g = TestGuest::new(4096);
         let mut dos = DosState::default();
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x5b);
         g.call_with(regs);
 
@@ -680,7 +680,7 @@ mod tests {
     fn terminate_carries_the_code_out_of_al() {
         let mut g = TestGuest::new(4096);
         let mut dos = DosState::default();
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.ax = 0x4c00 | 3;
         g.call_with(regs);
 
@@ -691,7 +691,7 @@ mod tests {
     fn a_pointer_past_the_end_of_memory_faults() {
         let mut g = TestGuest::new(4096);
         let mut dos = DosState::default();
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x40);
         regs.bx = 1;
         regs.cx = 16;
@@ -700,7 +700,7 @@ mod tests {
         g.call_with(regs);
 
         match dispatch(&mut g, &mut dos) {
-            Outcome::Fault(DosFault::OutOfBounds { .. }) => {}
+            Outcome::Fault(Fault::OutOfBounds { .. }) => {}
             other => panic!("expected OutOfBounds, got {other:?}"),
         }
     }
@@ -714,7 +714,7 @@ mod tests {
             psp_seg: Some(0x1234),
             ..DosState::default()
         };
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x62);
         g.call_with(regs);
 
@@ -727,7 +727,7 @@ mod tests {
     fn get_psp_without_a_loaded_program_fails_rather_than_inventing_a_segment() {
         let mut g = TestGuest::new(4096);
         let mut dos = DosState::default();
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x62);
         g.call_with(regs);
 
@@ -742,7 +742,7 @@ mod tests {
     fn set_dta_stores_the_far_pointer_from_ds_dx() {
         let mut g = TestGuest::new(4096);
         let mut dos = DosState::default();
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x1a);
         regs.ds = 0x2000;
         regs.dx = 0x0080;
@@ -750,7 +750,7 @@ mod tests {
 
         assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
         assert!(!g.carry());
-        assert_eq!(dos.dta, Some(DosPtr::new(0x2000, 0x0080)));
+        assert_eq!(dos.dta, Some(Ptr::new(0x2000, 0x0080)));
     }
 
     #[test]
@@ -759,7 +759,7 @@ mod tests {
             psp_seg: Some(0x1000),
             ..DosState::default()
         };
-        assert_eq!(dta(&dos), Some(DosPtr::new(0x1000, 0x80)));
+        assert_eq!(dta(&dos), Some(Ptr::new(0x1000, 0x80)));
     }
 
     #[test]
@@ -771,10 +771,10 @@ mod tests {
     fn an_explicit_dta_wins_over_the_psp_default() {
         let dos = DosState {
             psp_seg: Some(0x1000),
-            dta: Some(DosPtr::new(0x9999, 0x0001)),
+            dta: Some(Ptr::new(0x9999, 0x0001)),
             ..DosState::default()
         };
-        assert_eq!(dta(&dos), Some(DosPtr::new(0x9999, 0x0001)));
+        assert_eq!(dta(&dos), Some(Ptr::new(0x9999, 0x0001)));
     }
 
     // -- AH=4Eh/4Fh: find first/next, driven through dispatch end to end --
@@ -798,19 +798,19 @@ mod tests {
         std::fs::write(root.join("LORD.DAT"), vec![0u8; 10]).expect("seed");
 
         let mut g = TestGuest::new(64 * 1024);
-        let path_at = DosPtr::new(0x100, 0x20);
+        let path_at = Ptr::new(0x100, 0x20);
         g.poke(path_at, b"LORD.DAT\0");
-        let dta_at = DosPtr::new(0x100, 0x200);
+        let dta_at = Ptr::new(0x100, 0x200);
         // A guard byte just past the record, so a write one byte too long
         // would be caught rather than silently landing in unused memory.
-        g.poke(DosPtr::new(0x100, 0x200 + 43), &[0xaa]);
+        g.poke(Ptr::new(0x100, 0x200 + 43), &[0xaa]);
 
         let mut dos = DosState {
             files: Some(fs),
             dta: Some(dta_at),
             ..DosState::default()
         };
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x4e);
         regs.ds = path_at.seg;
         regs.dx = path_at.off;
@@ -828,7 +828,7 @@ mod tests {
         assert_eq!(&record[0x1e..0x1e + name_end], b"LORD.DAT", "name at offset 0x1e");
 
         assert_eq!(
-            g.peek(DosPtr::new(0x100, 0x200 + 43), 1),
+            g.peek(Ptr::new(0x100, 0x200 + 43), 1),
             &[0xaa],
             "the record is exactly 43 bytes, not one more"
         );
@@ -841,9 +841,9 @@ mod tests {
         std::fs::write(root.join("B.DAT"), vec![0u8; 2]).expect("seed");
 
         let mut g = TestGuest::new(64 * 1024);
-        let path_at = DosPtr::new(0x100, 0x20);
+        let path_at = Ptr::new(0x100, 0x20);
         g.poke(path_at, b"*.DAT\0");
-        let dta_at = DosPtr::new(0x100, 0x200);
+        let dta_at = Ptr::new(0x100, 0x200);
 
         let mut dos = DosState {
             files: Some(fs),
@@ -851,7 +851,7 @@ mod tests {
             ..DosState::default()
         };
 
-        let mut first_call = DosRegs::default();
+        let mut first_call = Regs::default();
         first_call.set_ah(0x4e);
         first_call.ds = path_at.seg;
         first_call.dx = path_at.off;
@@ -864,7 +864,7 @@ mod tests {
         };
         let first = name_of(&g);
 
-        let mut next_call = DosRegs::default();
+        let mut next_call = Regs::default();
         next_call.set_ah(0x4f);
         g.call_with(next_call);
         assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
@@ -873,7 +873,7 @@ mod tests {
         assert_eq!(first, b"A.DAT");
         assert_eq!(second, b"B.DAT");
 
-        let mut third_call = DosRegs::default();
+        let mut third_call = Regs::default();
         third_call.set_ah(0x4f);
         g.call_with(third_call);
         assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
@@ -889,7 +889,7 @@ mod tests {
             files: Some(fs),
             ..DosState::default()
         };
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x4e);
         g.call_with(regs);
 
@@ -905,7 +905,7 @@ mod tests {
             psp_seg: Some(0x1000), // so the DTA default resolves
             ..DosState::default()
         };
-        let mut regs = DosRegs::default();
+        let mut regs = Regs::default();
         regs.set_ah(0x4e);
         g.call_with(regs);
 

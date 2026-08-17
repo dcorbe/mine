@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs, Flag};
+use crate::guest::{Fault, Guest, Ptr, Regs, Flag};
 
 /// The port our trap stubs write to. Any unclaimed port works; the value is
 /// arbitrary and only has to agree with the stub bytes.
@@ -821,49 +821,49 @@ impl VmGuest {
     }
 
     /// Resolve a far pointer the way real mode does.
-    fn linear(&self, at: DosPtr) -> usize {
+    fn linear(&self, at: Ptr) -> usize {
         at.seg as usize * 16 + at.off as usize
     }
 
-    fn span(&self, at: DosPtr, len: usize) -> Result<(usize, usize), DosFault> {
+    fn span(&self, at: Ptr, len: usize) -> Result<(usize, usize), Fault> {
         let base = self.linear(at);
         let end = base
             .checked_add(len)
-            .ok_or(DosFault::OutOfBounds { at, len })?;
+            .ok_or(Fault::OutOfBounds { at, len })?;
         if end > self.mem_len {
-            return Err(DosFault::OutOfBounds { at, len });
+            return Err(Fault::OutOfBounds { at, len });
         }
         Ok((base, end))
     }
 }
 
-impl DosGuest for VmGuest {
-    fn read(&self, at: DosPtr, len: usize) -> Result<&[u8], DosFault> {
+impl Guest for VmGuest {
+    fn read(&self, at: Ptr, len: usize) -> Result<&[u8], Fault> {
         let (base, end) = self.span(at, len)?;
         Ok(&self.mem_ref()[base..end])
     }
 
-    fn read_until(&self, at: DosPtr, term: u8, max: usize) -> Result<&[u8], DosFault> {
+    fn read_until(&self, at: Ptr, term: u8, max: usize) -> Result<&[u8], Fault> {
         let base = self.linear(at);
         let mem = self.mem_ref();
         let tail = mem
             .get(base..)
-            .ok_or(DosFault::OutOfBounds { at, len: 0 })?;
+            .ok_or(Fault::OutOfBounds { at, len: 0 })?;
         let limit = max.min(tail.len());
         match tail[..limit].iter().position(|&b| b == term) {
             Some(n) => Ok(&tail[..n]),
-            None => Err(DosFault::Unterminated { at, term, max }),
+            None => Err(Fault::Unterminated { at, term, max }),
         }
     }
 
-    fn write(&mut self, at: DosPtr, bytes: &[u8]) -> Result<(), DosFault> {
+    fn write(&mut self, at: Ptr, bytes: &[u8]) -> Result<(), Fault> {
         let (base, end) = self.span(at, bytes.len())?;
         self.mem_mut()[base..end].copy_from_slice(bytes);
         Ok(())
     }
 
-    fn regs(&self) -> DosRegs {
-        DosRegs {
+    fn regs(&self) -> Regs {
+        Regs {
             ax: self.regs.rax as u16,
             bx: self.regs.rbx as u16,
             cx: self.regs.rcx as u16,
@@ -875,7 +875,7 @@ impl DosGuest for VmGuest {
         }
     }
 
-    fn set_regs(&mut self, regs: DosRegs) {
+    fn set_regs(&mut self, regs: Regs) {
         // Only the low 16 bits are the guest's; leave the rest of each 64-bit
         // register as the CPU left it.
         self.regs.rax = (self.regs.rax & !0xffff) | regs.ax as u64;

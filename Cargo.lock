@@ -247,9 +247,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dos"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "dos-poc"
 version = "0.1.0"
 dependencies = [
+ "dos",
  "libc",
 ]
 

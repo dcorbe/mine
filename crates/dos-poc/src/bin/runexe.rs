@@ -16,7 +16,7 @@ use dos_poc::bios::{
     Keyboard, Video, int10, int10_implemented, int15, int16, int16_implemented, missing,
 };
 use dos_poc::dos::{DosState, Outcome, dispatch, is_implemented};
-use dos_poc::guest::{DosGuest, DosPtr};
+use dos_poc::guest::{Guest, Ptr};
 use dos_poc::kvm::{Stop, VmGuest};
 use dos_poc::driver::{Driver, Script};
 use dos_poc::terminal::{RawStdin, Terminal};
@@ -603,7 +603,7 @@ fn main() -> io::Result<()> {
     let ruler: String = (0..80).map(|c| char::from(b'0' + c % 10)).collect();
     println!("    {ruler}");
     for row in 0..25u16 {
-        let at = DosPtr::new(0xb800, row * 160);
+        let at = Ptr::new(0xb800, row * 160);
         let line: String = match vm.read(at, 160) {
             Ok(cells) => cells
                 .chunks(2)

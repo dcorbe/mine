@@ -14,12 +14,12 @@
 /// `seg << 4` under real mode), so the disagreement stays on their side of the
 /// trait rather than leaking into every call that takes a pointer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DosPtr {
+pub struct Ptr {
     pub seg: u16,
     pub off: u16,
 }
 
-impl DosPtr {
+impl Ptr {
     pub fn new(seg: u16, off: u16) -> Self {
         Self { seg, off }
     }
@@ -33,7 +33,7 @@ impl DosPtr {
 /// x86-64 `struct sigcontext_64` carries no `ds`/`es` at all, and a handler
 /// has to recover them by reading its own live registers.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct DosRegs {
+pub struct Regs {
     pub ax: u16,
     pub bx: u16,
     pub cx: u16,
@@ -44,7 +44,7 @@ pub struct DosRegs {
     pub es: u16,
 }
 
-impl DosRegs {
+impl Regs {
     /// The function number. Every dispatch decision starts here.
     pub fn ah(&self) -> u8 {
         (self.ax >> 8) as u8
@@ -67,8 +67,8 @@ impl DosRegs {
     }
 
     /// `DS:DX` -- the argument convention of nearly every pointer-taking call.
-    pub fn ds_dx(&self) -> DosPtr {
-        DosPtr::new(self.ds, self.dx)
+    pub fn ds_dx(&self) -> Ptr {
+        Ptr::new(self.ds, self.dx)
     }
 }
 
@@ -79,34 +79,34 @@ impl DosRegs {
 /// read something else. Surfacing it is the point: a runtime crash beats
 /// undefined behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DosFault {
+pub enum Fault {
     /// The span starting at `at` leaves the address space.
-    OutOfBounds { at: DosPtr, len: usize },
+    OutOfBounds { at: Ptr, len: usize },
     /// A terminated string ran `max` bytes without its terminator.
-    Unterminated { at: DosPtr, term: u8, max: usize },
+    Unterminated { at: Ptr, term: u8, max: usize },
 }
 
 /// What a DOS call needs from whatever is executing the program.
-pub trait DosGuest {
+pub trait Guest {
     /// `len` bytes at `at`.
-    fn read(&self, at: DosPtr, len: usize) -> Result<&[u8], DosFault>;
+    fn read(&self, at: Ptr, len: usize) -> Result<&[u8], Fault>;
 
     /// Bytes from `at` up to but excluding the first `term`.
     ///
     /// One method rather than two because DOS terminates strings two different
     /// ways -- NUL for ASCIIZ paths, `$` for `AH=09` -- and the only thing that
     /// differs is the byte.
-    fn read_until(&self, at: DosPtr, term: u8, max: usize) -> Result<&[u8], DosFault>;
+    fn read_until(&self, at: Ptr, term: u8, max: usize) -> Result<&[u8], Fault>;
 
-    fn write(&mut self, at: DosPtr, bytes: &[u8]) -> Result<(), DosFault>;
+    fn write(&mut self, at: Ptr, bytes: &[u8]) -> Result<(), Fault>;
 
-    fn regs(&self) -> DosRegs;
+    fn regs(&self) -> Regs;
 
-    fn set_regs(&mut self, regs: DosRegs);
+    fn set_regs(&mut self, regs: Regs);
 
     /// Set a status flag the caller will read.
     ///
-    /// Separate from [`DosGuest::set_regs`] precisely because the two edges
+    /// Separate from [`Guest::set_regs`] precisely because the two edges
     /// write flags to different places: the live `EFLAGS` in a signal context,
     /// which `sigreturn` restores, versus the `FLAGS` image already pushed on
     /// the guest stack, which `iret` will pop. Writing to the live flags under

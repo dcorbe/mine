@@ -24,7 +24,7 @@ pub mod dos;
 pub mod driver;
 pub mod files;
 pub mod fossil;
-pub mod guest;
+pub use ::dos::guest;
 pub mod kvm;
 pub mod mz;
 pub mod screen;

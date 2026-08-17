@@ -11,10 +11,10 @@
 //! the program can scribble on it freely. Only the *queries* need answering.
 
 use crate::driver::Key;
-use crate::guest::{DosGuest, DosPtr, Flag};
+use crate::guest::{Guest, Ptr, Flag};
 
 /// Physical base of the colour text buffer.
-const TEXT_BASE: DosPtr = DosPtr {
+const TEXT_BASE: Ptr = Ptr {
     seg: 0xb800,
     off: 0,
 };
@@ -144,9 +144,9 @@ impl Video {
         }
     }
 
-    fn cell(&self, row: u8, col: u8) -> DosPtr {
+    fn cell(&self, row: u8, col: u8) -> Ptr {
         let index = (u16::from(row) * self.columns + u16::from(col)) * 2;
-        DosPtr::new(TEXT_BASE.seg, TEXT_BASE.off.wrapping_add(index))
+        Ptr::new(TEXT_BASE.seg, TEXT_BASE.off.wrapping_add(index))
     }
 }
 
@@ -159,8 +159,8 @@ impl Video {
     /// eighty columns by *zero* rows, so every line the program prints lands on
     /// top of the last one. That is not a rendering nicety; it is the
     /// difference between a legible screen and garbage.
-    pub fn install_bda<G: DosGuest>(&self, g: &mut G) {
-        let bda = |off: u16| DosPtr::new(0x0040, off);
+    pub fn install_bda<G: Guest>(&self, g: &mut G) {
+        let bda = |off: u16| Ptr::new(0x0040, off);
         let _ = g.write(bda(0x0010), &0x0021u16.to_le_bytes()); // equipment: 80x25 colour
         let _ = g.write(bda(0x0013), &640u16.to_le_bytes()); // KiB of memory
         let _ = g.write(bda(0x0049), &[self.mode]);
@@ -224,7 +224,7 @@ impl Keyboard {
 
 /// Service one `int 16h`. Returns false when the guest asked for a key and
 /// none is queued, which the caller should treat as "waiting for the user".
-pub fn int16<G: DosGuest>(g: &mut G, keys: &mut Keyboard) -> bool {
+pub fn int16<G: Guest>(g: &mut G, keys: &mut Keyboard) -> bool {
     let mut regs = g.regs();
     match regs.ah() {
         // 00h/10h -- wait for a keystroke: AL is the character, AH the scan code.
@@ -273,7 +273,7 @@ pub fn int16<G: DosGuest>(g: &mut G, keys: &mut Keyboard) -> bool {
 /// `lines == 0`, or more lines than the window is tall, means blank all of it
 /// -- which is the overwhelmingly common call, since that is `ClrScr`.
 #[allow(clippy::too_many_arguments)]
-fn scroll<G: DosGuest>(
+fn scroll<G: Guest>(
     g: &mut G,
     video: &Video,
     top: u8,
@@ -346,7 +346,7 @@ fn scancode(ch: u8) -> u8 {
 
 /// Service one `int 10h`. Unknown functions are a no-op, which is what a BIOS
 /// does with a function it does not have.
-pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
+pub fn int10<G: Guest>(g: &mut G, video: &mut Video) {
     let mut regs = g.regs();
     match regs.ah() {
         // 00h -- set video mode. A mode set restores the default cursor.
@@ -381,7 +381,7 @@ pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
                 video.cursor_row, video.cursor_col
             ));
             let page = usize::from(video.page).min(7);
-            let at = DosPtr::new(0x0040, 0x0050 + (page as u16) * 2);
+            let at = Ptr::new(0x0040, 0x0050 + (page as u16) * 2);
             let _ = g.write(at, &[video.cursor_col, video.cursor_row]);
         }
 
@@ -389,7 +389,7 @@ pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
         // program which moved the cursor by poking 0040:0050 sees its own value.
         0x03 => {
             let page = usize::from(video.page).min(7);
-            let at = DosPtr::new(0x0040, 0x0050 + (page as u16) * 2);
+            let at = Ptr::new(0x0040, 0x0050 + (page as u16) * 2);
             if let Ok(b) = g.read(at, 2) {
                 video.cursor_col = b[0];
                 video.cursor_row = b[1];
@@ -511,7 +511,7 @@ pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
 /// them instantly is what turns a keyboard poll loop into a 100%-of-a-core
 /// spin: the guest asks to be descheduled, we decline, and it asks again a
 /// microsecond later. Honouring them is the semantics, not a throttle.
-pub fn int15<G: DosGuest>(g: &mut G) -> Option<std::time::Duration> {
+pub fn int15<G: Guest>(g: &mut G) -> Option<std::time::Duration> {
     let regs = g.regs();
     match regs.ah() {
         // 10h -- release the current timeslice.
