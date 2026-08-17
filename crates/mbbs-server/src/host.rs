@@ -676,6 +676,13 @@ fn life<A: Abi>(
     //    be handed in.
     let mut machine = (boot.build)()?;
     let mut host = Host::<A>::new(&mut machine, boot.root.clone(), boot.terms)?;
+    // `MAJORBBS.C:999` -- the real `WGSERVER.EXE` opens its own generic data
+    // file and publishes `genbb` before any module initialises, and modules
+    // dereference that global without ever assigning it. A board is exactly the
+    // caller this belongs to: it is a startup step with a side effect on
+    // `boot.root`, which is why `Host::new` does not do it. See
+    // `Host::open_genbb` for the disassembled call site that made it necessary.
+    host.open_genbb(&mut machine);
     // Every life gets the SAME shared inventory `run` built -- see `Boot::survey`'s
     // own doc for why this cannot be a fresh `Inventory` per life: a `Host`
     // (and everything it owns) is rebuilt from scratch on every restart, and

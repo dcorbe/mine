@@ -162,7 +162,12 @@ pub fn fopen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
         // Not there, and the module asked to read it. `WCCMMUD.INI` is not
         // shipped -- it is something a sysop writes -- so this is the ordinary
         // case rather than the exceptional one.
-        None if mode.read => return Ok(abi::Ret::Ptr(null_ptr::<A>())),
+        None if mode.read => {
+            if super::traced() {
+                eprintln!("mbbs-trace: FOPEN {named} ({spelt}) -> MISSING, returning NULL");
+            }
+            return Ok(abi::Ret::Ptr(null_ptr::<A>()));
+        }
 
         // Not there, and the module asked to write it. That is a create.
         // `name` may now hold a subdirectory (`Host::dos_name` accepts one),
@@ -187,6 +192,9 @@ pub fn fopen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
         .streams
         .open_mem(call.mem(), &name, &path, mode)
         .map_err(|e| ShimError::Failed(format!("fopen({named}, {spelt}): {e}")))?;
+    if super::traced() {
+        eprintln!("mbbs-trace: FOPEN {named} ({spelt}) -> {cookie:?}");
+    }
     Ok(abi::Ret::Ptr(cookie))
 }
 

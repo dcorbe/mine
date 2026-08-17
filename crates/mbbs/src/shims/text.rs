@@ -218,7 +218,7 @@ pub fn prf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>
     // decides whether it is ever transmitted. A module that formats a message
     // and never sends it is otherwise indistinguishable from one that never
     // had anything to say -- which is exactly what a wedged move looks like.
-    if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
+    if super::traced() {
         eprintln!("mbbs-trace: PRF {:?}", String::from_utf8_lossy(&text));
     }
     append_mem(call.mem(), host, &text)?;

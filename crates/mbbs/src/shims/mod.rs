@@ -38,6 +38,25 @@ use crate::exports::{DOSCALLS, GALGSBL, GALME, GALMSG, MAJORBBS, PHAPI};
 use crate::globals::GLOBALS;
 use evidence::Evidence;
 
+/// Whether `MBBS_TRACE_SHIMS` is set, for the shims that print an *argument*
+/// rather than just their own name.
+///
+/// [`entry`] already logs every dispatch as `chan=… DLL!symbol`, which is
+/// enough to see the shape of a call sequence but not what it operated on. A
+/// handful of routines carry the one value that makes their line diagnostic --
+/// the filename a `dfaOpen` opened, the block pointer a `dfaSetBlk` was handed,
+/// the text a `prf` composed -- and they print it through this predicate.
+///
+/// That distinction is not cosmetic. A symbol-only trace shows fifteen
+/// identical `dfaopen` lines and a `dfasetblk`; it cannot show that the fifteen
+/// were fifteen *different* files, nor that the `dfasetblk` was handed a null,
+/// and those two facts together are what identified [`crate::Host::open_genbb`]'s
+/// missing global. The names are printed in capitals so a grep separates them
+/// from the per-dispatch lines.
+pub(crate) fn traced() -> bool {
+    std::env::var_os("MBBS_TRACE_SHIMS").is_some()
+}
+
 /// `KERNEL32.dll`'s own import-directory spelling -- measured byte-for-byte
 /// from `LUNATIX.DLL` (`archive/modules/dlls/ISVCWD__LUNWG53F/LUNATIX.DLL`):
 /// mixed case, with the `.dll` suffix, unlike `MAJORBBS`/`GALGSBL`'s bare

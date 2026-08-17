@@ -267,6 +267,9 @@ pub fn dfaOpen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
             .open(call.mem(), heap, &name, &path, geometry, maxlen)
             .map_err(|e| ShimError::Failed(format!("dfaOpen({name}): {e}")))?
     };
+    if super::traced() {
+        eprintln!("mbbs-trace: DFAOPEN {name} -> {block:?}");
+    }
 
     if let Some(dropped) = host.btrieve.dfa_set(block) {
         host.note(format!(
@@ -329,6 +332,9 @@ pub fn dfaClose<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::R
 /// behaviour, and a refusal beats a deferred one" reasoning.
 pub fn dfaSetBlk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let dfaptr = call.ptr();
+    if super::traced() {
+        eprintln!("mbbs-trace: DFASETBLK {dfaptr:?}");
+    }
     if dfaptr != Btrieve::<AbiMem<A>>::null() {
         host.btrieve.block(dfaptr).map_err(|e| ShimError::Failed(format!("dfaSetBlk: {e}")))?;
     }

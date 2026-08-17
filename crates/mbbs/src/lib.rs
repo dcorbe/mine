@@ -1731,6 +1731,138 @@ impl<A: Abi> Host<A> {
         Ok(host)
     }
 
+    /// Open the host's own generic data file and publish `genbb`.
+    ///
+    /// `MAJORBBS.C:999` -- `genbb=dfaOpen("wgsgen2.dat",GENSIZ,NULL)`, run once
+    /// as the real `WGSERVER.EXE` starts, long before any module is asked to
+    /// initialise. `MAJORBBS.H:548` exports the resulting `DFAFILE *` to every
+    /// module (`EXPWGSV(DFAFILE*) genbb`), and modules use it *without ever
+    /// assigning it* -- Galacticomm's own `GALNOTE.C:242`, `GALFIL.C:1161` and
+    /// the host's `BBSGEN.C:30` all just `dfaSetBlk(genbb)` and trust the host.
+    ///
+    /// # Why this is not optional
+    ///
+    /// Leaving it null is not a quiet gap. `WCCMMUD.DLL` (the 32-bit build)
+    /// reads the imported pointer and hands its *value* straight to
+    /// `dfaSetBlk`, disassembled at VA `0x40b0e3`:
+    ///
+    /// ```text
+    /// mov  eax, ds:0x49d560      ; the IAT slot for the host's `genbb`
+    /// push dword ptr [eax]       ; *genbb -- null, on a host that never set it
+    /// call dfaSetBlk
+    /// ...  dfaAcqLock -> today -> dfaInsertV
+    /// ```
+    ///
+    /// and `DFAAPI.C` gives `dfaInsertV` no `dfa == NULL` guard at all, so the
+    /// module's own init dies there. That block is MajorMUD's demo clock, the
+    /// same one `tests/wccmmud.rs`'s call-127 commentary works through for the
+    /// 16-bit build. There it is invisible -- `setbtv(NULL)` is guarded and
+    /// merely does nothing, so the module grants itself a fresh 14-day demo
+    /// every boot -- and here the identical host omission stops the board.
+    ///
+    /// # The file, and where it comes from
+    ///
+    /// `WGSGEN2.DAT` is the *host's* file, not a module's, so no module
+    /// distribution ships it and [`Host::btrieve_file`]'s usual `.VIR` install
+    /// has nothing to install from. This crate therefore carries its own virgin
+    /// copy (`data/WGSGEN2.VIR`) and lays it down when a board has neither.
+    ///
+    /// Those bytes were not invented here. They were built by genuine Pervasive
+    /// Btrieve 6.15 (`B_CREATE` through `tools/btrieve-oracle`, under Wine) from
+    /// Galacticomm's own create description
+    /// `re/wg33src/SRC/server/wgserver/WGSGEN2.BCR` -- `record=55 variable=y
+    /// key=2 page=4096`, two keys over three segments, every segment a
+    /// duplicate-permitting `zstring` collating through the `galcaps.alt`
+    /// alternate sequence -- and the engine's own `B_STAT` confirmed the result
+    /// before it was committed. Nothing here builds it, because
+    /// [`crate::btrieve::create`] refuses all three of variable-length records,
+    /// alternate collating sequences and a second duplicate-permitting key for
+    /// want of a measured create-time layout; borrowing the vendor engine's
+    /// answer is what those refusals are for.
+    ///
+    /// `GENSIZ` is `MAJORBBS.H:65`'s 8192, and it is the `maxlen` a caller
+    /// opens *with* -- the biggest record it intends to handle -- not the
+    /// file's own 55-byte `reclen`. Conflating the two is what produced the
+    /// earlier `reclen 8192` files under `target/`, which are wrong.
+    ///
+    /// # Why a board calls this and [`Host::new`] does not
+    ///
+    /// This lays a file down in [`Host::root`], and that directory is one the
+    /// *module* reads: `cntdir`, `fndnxt` and `tfsopn` all enumerate it, and a
+    /// module counting `*.*` counts whatever the host left there. Doing it from
+    /// the constructor therefore changes what every `Host` in the crate can see
+    /// of its own root, which is not a constructor's business -- it was tried,
+    /// and ten tests went red, every one of them a directory count rather than
+    /// anything to do with `genbb`.
+    ///
+    /// So it is the board's own startup step, called once from
+    /// `mbbs-server`'s `host.rs`, exactly where the real `WGSERVER.EXE` runs
+    /// `MAJORBBS.C:999`. A `Host` built for a test has no generic data file and
+    /// a null `genbb`, which is what it had before this existed.
+    ///
+    /// # Failure is noted, never fatal
+    ///
+    /// A board whose root cannot be written, or whose `WGSGEN2.DAT` this host
+    /// cannot parse, leaves `genbb` null and records why with [`Host::note`],
+    /// so the null is attributable rather than silent. It is not an error
+    /// return, because a board that cannot keep a demo clock is still a board
+    /// that can run -- what it must not be is a board that cannot say so.
+    pub fn open_genbb(&mut self, machine: &mut A::Cpu) {
+        /// `MAJORBBS.H:65` -- `#define GENSIZ 8192`, "max size of a generic
+        /// user dbase rec".
+        const GENSIZ: u16 = 8192;
+        const NAME: &str = "WGSGEN2.DAT";
+        static TEMPLATE: &[u8] = include_bytes!("../data/WGSGEN2.VIR");
+
+        // Written as the `.DAT` itself rather than as a `.VIR` for
+        // [`Host::btrieve_file`] to install: that convention belongs to the
+        // fifteen files a *module* distribution ships virgin, and a real
+        // Worldgroup install has no `WGSGEN2.VIR` at all. One file, under the
+        // name the host actually opens.
+        if self.find(NAME).is_none() {
+            let to = self.root.join(NAME);
+            if let Err(e) =
+                std::fs::create_dir_all(&self.root).and_then(|()| std::fs::write(&to, TEMPLATE))
+            {
+                self.note(format!(
+                    "genbb stays null: {} could not be written ({e}), so the host has no \
+                     generic data file and any module that does dfaSetBlk(genbb) will be \
+                     handed a null one",
+                    to.display()
+                ));
+                return;
+            }
+        }
+
+        let Some(path) = self.find(NAME) else {
+            self.note(format!("genbb stays null: no {NAME} under {}", self.root.display()));
+            return;
+        };
+        let geometry = match btrieve::Geometry::read(NAME, &path) {
+            Ok(geometry) => geometry,
+            Err(e) => {
+                self.note(format!("genbb stays null: {NAME} is not readable: {e}"));
+                return;
+            }
+        };
+
+        let opened = {
+            let Host { btrieve, heap, .. } = self;
+            btrieve.open(A::mem(machine), heap, NAME, &path, geometry, GENSIZ)
+        };
+        let block = match opened {
+            Ok(block) => block,
+            Err(why) => {
+                self.note(format!("genbb stays null: {NAME} would not open: {why}"));
+                return;
+            }
+        };
+
+        if let Err(e) = self.globals.write_mem(A::mem(machine), "genbb", &A::ptr_to_bytes(block)) {
+            self.note(format!("genbb was opened but could not be published: {e}"));
+        }
+    }
+
     /// The file a module named, with the directory it is allowed to name
     /// stripped off.
     ///
@@ -2862,7 +2994,7 @@ impl<A: Abi> Host<A> {
                     // Costs one `var_os` per dispatch when off. Read with the
                     // `KICK-FIRE` line in `prcrtk` and the `PRF` line in
                     // `shims::text::prf`, which share the same variable.
-                    if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
+                    if shims::traced() {
                         eprintln!("mbbs-trace: chan={chan:?} {from}!{symbol}");
                     }
                     (shim, cleans)
@@ -3263,9 +3395,7 @@ impl<A: Abi> Host<A> {
             // asking without the shim flood that answers it -- one idle
             // MajorMUD window is 137,211 shim lines, 96.5% of them `ptrtile`,
             // against a handful of kicks a second.
-            if std::env::var_os("MBBS_TRACE_SHIMS").is_some()
-                || std::env::var_os("MBBS_TRACE_KICKS").is_some()
-            {
+            if shims::traced() || std::env::var_os("MBBS_TRACE_KICKS").is_some() {
                 eprintln!("mbbs-trace: KICK-FIRE dstrou={:?}", kick.dstrou);
             }
             match self.run(machine, module, kick.dstrou, &[], None)? {
@@ -4901,7 +5031,7 @@ impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
 
 #[cfg(test)]
 mod tests {
-    use crate::abi::Wg16;
+    use crate::abi::{Abi, Wg16};
     use crate::testing::Fixture;
     use crate::users::Connection;
     use crate::{
@@ -4909,6 +5039,62 @@ mod tests {
         gsbl, stall_note, testing, users,
     };
     use mbbs_machine::m16::{FarPtr, Machine, Poison, Ret};
+
+    /// `genbb` is a *host* global. `MAJORBBS.C:999` fills it in with
+    /// `dfaOpen("wgsgen2.dat",GENSIZ,NULL)` and modules dereference it without
+    /// ever assigning it -- so a null one is not a quiet gap but the thing that
+    /// stopped `WCCMMUD.DLL`'s init at `dfaInsertV`, which `DFAAPI.C` does not
+    /// guard.
+    ///
+    /// This asserts the whole chain rather than just "the global is non-zero":
+    /// a pointer that does not resolve to an open file, or resolves to a file
+    /// of the wrong shape, would satisfy a null check and still hand the module
+    /// something useless. The 55-byte record length is the assertion that
+    /// actually discriminates -- it is `WGSGEN2.BCR`'s own `record=55`, and it
+    /// is *not* `GENSIZ`. Conflating the two is a real failure mode with real
+    /// artefacts: the `WGSGEN2.DAT` files this repo produced before this
+    /// existed carry `reclen 8192`, the open-time buffer size written into the
+    /// file as its record length.
+    #[test]
+    fn a_board_opens_its_own_generic_data_file_and_publishes_genbb() {
+        let root = testing::scratch("genbb-published");
+        let mut machine = Machine::new().expect("16-bit machine");
+        let mut host = Host::<Wg16>::new(&mut machine, root.clone(), Terms::new(1)).expect("host");
+
+        // Not the constructor's job -- see `Host::open_genbb`. Before the board
+        // takes its startup step there is no file and no pointer.
+        assert!(
+            !root.join("WGSGEN2.DAT").exists(),
+            "Host::new must not lay a file down in a module's own directory"
+        );
+
+        host.open_genbb(&mut machine);
+
+        assert!(
+            root.join("WGSGEN2.DAT").is_file(),
+            "the board seeds its own generic data file: {:?}",
+            host.notes()
+        );
+        let genbb = host
+            .globals()
+            .pointer_mem(Wg16::mem_ref(&machine), "genbb")
+            .expect("genbb is placed");
+        assert_ne!(
+            genbb,
+            crate::btrieve::Btrieve::<crate::btrieve::AbiMem<Wg16>>::null(),
+            "the module reads this pointer and passes its value straight to \
+             dfaSetBlk: {:?}",
+            host.notes()
+        );
+
+        let file = host.btrieve.block(genbb).expect("genbb names an open file");
+        assert_eq!(
+            file.geometry().reclen,
+            55,
+            "WGSGEN2.BCR says record=55; GENSIZ (8192) is the open-time buffer, \
+             not the file's record length"
+        );
+    }
 
     #[test]
     fn a_host_is_built_with_as_many_channels_as_it_is_asked_for() {
