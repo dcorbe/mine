@@ -1308,11 +1308,9 @@ pub fn chiinp<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         host.note(format!("chiinp: channel {chan}: character argument does not fit a byte"));
         return Ok(abi::Ret::Void);
     };
-    let Some(chan) = host.gsbl().terms().chan(chan) else {
+    if on_channel(host, chan, |g, chan| g.push_input(chan, &[c])).is_none() {
         host.note(format!("chiinp: channel {chan} is out of range; character dropped"));
-        return Ok(abi::Ret::Void);
-    };
-    host.gsbl_mut().push_input(chan, &[c]);
+    }
     Ok(abi::Ret::Void)
 }
 
@@ -2408,7 +2406,7 @@ mod tests {
         f.invoke(chiinp, &[0, b'q' as u16]).expect("void");
         // A DEFAULT CHANNEL IS COOKED, so the byte lands in `line`, not
         // `input`. `Channel::take` fills `input` only in raw mode
-        // (`gsbl.rs:732,734`); a cooked byte lands in `line` (`:790`) until a
+        // (`gsbl.rs:732,734`); a cooked byte lands in `line` (`:820`) until a
         // CR moves it to `ready` (`:797`). Asserting on `input` would assert
         // on a buffer this path never touches.
         assert_eq!(f.host.gsbl().channel(console).line, b"q".to_vec());
@@ -2428,6 +2426,27 @@ mod tests {
         assert_eq!(
             f.host.gsbl().channel(console).ready.front().map(Vec::as_slice),
             Some(&b"hi"[..])
+        );
+    }
+
+    /// Not merely "does not panic" -- `chiout_on_a_channel_out_of_range_...`
+    /// only proves that, which cannot tell a genuine refusal from a bound
+    /// check that silently fell through to some other channel. This checks
+    /// that channel zero -- a channel that DOES exist -- is left untouched
+    /// when the argument named one that does not, which is what
+    /// `on_channel`'s `?` actually buys `chiinp` now that it routes through
+    /// the shared helper instead of resolving the channel by hand.
+    #[test]
+    fn chiinp_on_a_channel_out_of_range_drops_the_character_without_stopping_the_machine() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let past = f.host.gsbl().terms().count();
+        f.invoke(chiinp, &[past, b'x' as u16])
+            .expect("void routines note and continue -- see chiout's own doc comment");
+        assert_eq!(
+            f.host.gsbl().channel(console).line,
+            Vec::<u8>::new(),
+            "an out-of-range channel must not fall through to channel zero"
         );
     }
 
