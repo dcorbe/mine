@@ -756,6 +756,97 @@ mod tests {
         );
     }
 
+    /// **Task 7's acceptance test.** `wccmmutl.exe -recover` against a full
+    /// copy of a real board -- not the two-file fixture every other test
+    /// here uses -- reaches genuine recovery stages a person would recognise
+    /// (`Deleting Active`, `Known Monsters`, `Updating Rooms`, painted onto
+    /// the Win32 console this host owns) before stopping on a real,
+    /// understood Btrieve status: op 3 (Update) on `WCCMP002.DAT` changes a
+    /// key that file declares non-modifiable, which genuine Btrieve answers
+    /// status 10 for and this engine already detects
+    /// (`Btrieve::unmodifiable_key_changed`, `lib.rs:1242`) -- `btrcall.rs`'s
+    /// `update` dispatch just has no typed path from that detection to a
+    /// status yet, so it surfaces as a `BtrieveGap` rather than a wrong
+    /// number. That is real, honest progress, not completion: this program
+    /// never reaches `ExitProcess`, so there is no process exit code to
+    /// assert, only the outcome the run actually stopped at.
+    ///
+    /// **`#[ignore]`d**, the same way `crates/btrieve/src/ops.rs`'s own
+    /// Wine-oracle tests are: this needs `/home/daniel/peepeebbs` (a real
+    /// board, outside the repo) and copies all ~218 MB of it into `tmp/`
+    /// before running, then burns real CPU walking it -- run explicitly with
+    /// `cargo test -p dos-runtime --lib win32::process::tests::wccmmutl_recover_reaches_a_real_board_frontier -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "copies and walks a real ~218 MB board; run explicitly"]
+    fn wccmmutl_recover_reaches_a_real_board_frontier() {
+        let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
+        let mut loaded = crate::win32::load::load(&file).expect("loads");
+        // Same watchdog `runexe`'s own PE32 path sets for exactly this
+        // program -- see that binary's `run_pe32` for the measurement
+        // (`-recover` genuinely burns the default five seconds of native
+        // CPU between two import calls while walking a real record file).
+        loaded.machine.set_budget(std::time::Duration::from_secs(120));
+        let mut p = Process::new("C:\\WCCMMUTL.EXE", &["-recover"]);
+
+        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
+            .join("win32-recover-acceptance");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("root dir");
+        let status = std::process::Command::new("cp")
+            .arg("-a")
+            .arg("/home/daniel/peepeebbs/.")
+            .arg(&dir)
+            .status()
+            .expect("cp runs");
+        assert!(status.success(), "copying the board failed");
+        // The board's own WCCMMUD.MSG compiles byte-identical to this
+        // checked-in fixture (verified when this test was written); reusing
+        // it avoids depending on `msgcomp` having been built first. See
+        // `with_a_catalogue_it_runs_past_the_unwind_into_the_c_runtime` for
+        // how to regenerate it if the board's own message file ever changes.
+        let mcv = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/WCCMMUD.MCV"
+        ));
+        std::fs::copy(&mcv, dir.join("WCCMMUD.MCV")).expect("the message catalogue");
+
+        let fd = std::fs::File::open(&dir).expect("root fd");
+        p.streams = crate::win32::stream::Streams::new(Some(dos::files::Files::new(
+            fd.into(),
+            dir.clone(),
+        )));
+
+        // 20,000,000, matching `runexe`'s own `PE_CALL_BUDGET` -- see that
+        // constant's doc comment for why 100,000 (this crate's other tests'
+        // usual scale) is not "generous" for a batch tool over real data.
+        let out = run(&mut loaded, &mut p, 20_000_000).expect("the machine runs");
+        assert_eq!(
+            out,
+            Outcome::BtrieveGap {
+                what: "updating: WCCMP002.DAT: key 0 does not declare itself modifiable, \
+                       and this update changes its value -- genuine Btrieve answers status \
+                       10 and writes nothing"
+                    .to_owned(),
+            },
+            "the measured frontier: real recovery progress through several stages, \
+             stopped by a real Btrieve status this engine detects but btrcall's \
+             update dispatch cannot yet report as a status rather than a gap"
+        );
+
+        // What it painted at the point it stopped -- each recovery stage
+        // repaints this line over the last, so only the final one ("Updating
+        // Rooms", `WCCMP002.DAT`) is still on screen; that it got there at
+        // all is what the Gap message above already establishes -- the
+        // program does not reach the Rooms pass without finishing Active and
+        // Monsters first.
+        let grid = p.console.cells();
+        let screen: String = (0..grid.rows).map(|r| grid.line(r)).collect();
+        assert!(
+            screen.contains("Updating Rooms"),
+            "expected \"Updating Rooms\" somewhere on the console; got:\n{screen}"
+        );
+    }
+
     /// `ExitProcess` must end the run and carry its code out, not merely
     /// return. A program that calls it and keeps running is worse than one
     /// that crashes, because the trace looks healthy.
