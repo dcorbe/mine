@@ -505,3 +505,28 @@ fn loading_a_module_does_not_invalidate_a_pointer_the_host_already_holds() {
     );
     assert_eq!(got, pattern, "the pointer's bytes must survive the load unchanged");
 }
+
+/// `genbb` (`MAJORBBS.C:999` -- `genbb=dfaOpen("wgsgen2.dat",GENSIZ,NULL)`)
+/// is a host global no module ever writes; `WCCMMUD.DLL`'s NT/PE32 build is
+/// the module that reads it unchecked and hands a null straight into
+/// `dfaSetBlk` -- see `crates/mbbs/src/lib.rs`'s `Host::open_genbb` for the
+/// full citation set. `Host::new` must leave it a real block under `Wg32`
+/// exactly as it does under `Wg16`
+/// (`crates/mbbs/src/globals.rs`'s own
+/// `genbb_is_a_real_block_pointer_before_any_module_runs`), so this is that
+/// same assertion's `Wg32` counterpart -- no module load or dispatch
+/// involved, just `Host::new` finishing.
+#[test]
+fn genbb_is_a_real_block_pointer_under_wg32_too() {
+    let mut cpu = machine_and_placeholder();
+    let host = Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), Terms::new(1))
+        .expect("host builds against the placeholder memory");
+
+    let genbb = host.globals().pointer_mem(&cpu.mem, "genbb").expect("genbb");
+    assert_ne!(
+        genbb,
+        Flat32Ptr(0),
+        "genbb must be a real block, not the null every module read before Host::open_genbb \
+         existed"
+    );
+}

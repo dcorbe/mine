@@ -52,8 +52,19 @@ const SIDSIZ: u16 = 5;
 const VERSIZ: u16 = 9;
 /// `UStructs.h:14` -- maximum size for user-id cross reference strings.
 const XRFSIZ: u16 = 15;
-/// `UStructs.h:10` -- user-id size, *including* the trailing zero.
-const UIDSIZ: u16 = 30;
+/// `UStructs.h:10` -- user-id size, *including* the trailing zero. Also
+/// `re/wg33src/INC/GCSP.H:27`'s own `UIDSIZ 30` -- the wg1 and wg33 archive
+/// trees agree on the value, so [`crate::Host::open_genbb`] reuses this
+/// constant rather than a second copy of it under a wg33 citation.
+pub(crate) const UIDSIZ: u16 = 30;
+/// `re/wg33src/INC/MAJORBBS.H:53` -- "maximum size for module names". Read
+/// only by [`crate::Host::open_genbb`], which has no other reason to live in
+/// this file -- see that method's own doc comment.
+pub(crate) const MNMSIZ: u16 = 25;
+/// `re/wg33src/INC/MAJORBBS.H:65` and `re/wg33src/VCPROJ/GCOMMLIB/MAJORBBS.H:51`
+/// agree byte for byte -- "max size of a generic user dbase rec". Read only
+/// by [`crate::Host::open_genbb`].
+pub(crate) const GENSIZ: u16 = 8192;
 
 /// A far pointer, as 16-bit C stores one: offset then selector. Four bytes
 /// under both ABIs ([`Abi::PTR_WIDTH`]), so it needs no [`Width`] of its own.
@@ -1116,6 +1127,30 @@ mod tests {
         let f = crate::testing::Fixture::new();
         assert_eq!(f.host.globals().word(&f.machine, "nterms").expect("nterms"), 1);
         assert_eq!(f.host.globals().word(&f.machine, "hichp1").expect("hichp1"), 1);
+    }
+
+    /// `MAJORBBS.C:999` -- `genbb=dfaOpen("wgsgen2.dat",GENSIZ,NULL)`. `genbb`
+    /// is a host global no module ever writes -- see `Host::open_genbb`'s own
+    /// doc comment for the full citation set. Before that method existed this
+    /// stayed the null it was born with, and `WCCMMUD.DLL`'s PE32 build reads
+    /// it unchecked and hands the null straight into `dfaSetBlk`
+    /// (`crates/mbbs/tests/wccmmud.rs:806-852` measures the identical shape
+    /// on the 16-bit module).
+    ///
+    /// `Fixture::new()` roots at `tests/data`, which already carries a
+    /// checked-in `WGSGEN2.DAT` -- see `Host::open_genbb`'s own doc comment
+    /// for why creating one on every one of this crate's ~900 `Fixture::new`
+    /// call sites would be the wrong thing for a boot-time open to do.
+    #[test]
+    fn genbb_is_a_real_block_pointer_before_any_module_runs() {
+        let f = crate::testing::Fixture::new();
+        let genbb = f.host.globals().pointer(&f.machine, "genbb").expect("genbb");
+        assert_ne!(
+            genbb,
+            crate::btrieve::Btrieve::<crate::abi::Wg16>::null(),
+            "genbb must be a real block, not the null every module read before \
+             Host::open_genbb existed"
+        );
     }
 
     /// `outbsz` is the print buffer's size, and the module reads it to size its

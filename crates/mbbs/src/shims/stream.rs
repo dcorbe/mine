@@ -1654,8 +1654,9 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_dir(&root).expect("the directory").count(),
-            1,
-            "and not a second file beside it"
+            2,
+            "LOG.LOG and nothing beside it under its own name -- the second entry is \
+             WGSGEN2.DAT, which Host::new creates in every fresh root (Host::open_genbb)"
         );
     }
 
@@ -2020,8 +2021,9 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_dir(&root).expect("the directory").count(),
-            1,
-            "and not a second file beside it"
+            2,
+            "WCCMMUD.LOG and nothing beside it under its own name -- the second entry is \
+             WGSGEN2.DAT, which Host::new creates in every fresh root (Host::open_genbb)"
         );
     }
 
@@ -2208,19 +2210,25 @@ mod tests {
 
     #[test]
     fn cntdir_sums_a_wildcard() {
+        // `directory()`'s own five files, plus `WGSGEN2.DAT`: `Host::new`
+        // creates it in every fresh root (`Host::open_genbb`), it is a real
+        // 24576-byte `.DAT` file, and it is exactly as visible to a wildcard
+        // scan as any file a module wrote there itself.
         let mut f = Fixture::rooted(directory("cntdir-wild"));
-        assert_eq!(counted(&mut f, "*.DAT"), (3, 3072, 3072));
+        assert_eq!(counted(&mut f, "*.DAT"), (4, 3072 + 24576, 3072 + 24576));
         assert_eq!(counted(&mut f, "*.MSG"), (2, 481, 481));
         assert_eq!(counted(&mut f, "SAMPLE.*"), (2, 1457, 1457));
-        assert_eq!(counted(&mut f, "*.*"), (5, 3553, 3553));
+        assert_eq!(counted(&mut f, "*.*"), (6, 3553 + 24576, 3553 + 24576));
     }
 
     #[test]
     fn cntdir_replaces_the_last_answer_rather_than_adding_to_it() {
         // Every recovered caller calls it and reads immediately. A host that
         // accumulated would be right the first time and wrong forever after.
+        // `*.DAT` is one file wider than `directory()`'s own three -- see
+        // `cntdir_sums_a_wildcard`'s own comment on `WGSGEN2.DAT`.
         let mut f = Fixture::rooted(directory("cntdir-again"));
-        assert_eq!(counted(&mut f, "*.DAT"), (3, 3072, 3072));
+        assert_eq!(counted(&mut f, "*.DAT"), (4, 3072 + 24576, 3072 + 24576));
         assert_eq!(counted(&mut f, "SAMPLE.DAT"), (1, 1024, 1024));
     }
 
@@ -2230,11 +2238,16 @@ mod tests {
         // names no `fnd1st` loop could ever have returned -- `tmp/` really does
         // hold `slumpos.json` and `control_run.out`. Counting them would report
         // files the module cannot open by the name it was given.
+        //
+        // `*.*` is one file wider than `directory()`'s own five -- see
+        // `cntdir_sums_a_wildcard`'s own comment on `WGSGEN2.DAT`, the sixth,
+        // which `Host::new` creates before this test ever writes its alien
+        // files.
         let at = directory("cntdir-alien");
         std::fs::write(at.join("slumpos.json"), b"0123456789").expect("written");
         std::fs::create_dir(at.join("SUBDIR.D")).expect("a subdirectory");
         let mut f = Fixture::rooted(at);
-        assert_eq!(counted(&mut f, "*.*"), (5, 3553, 3553));
+        assert_eq!(counted(&mut f, "*.*"), (6, 3553 + 24576, 3553 + 24576));
     }
 
     #[test]
@@ -2337,10 +2350,12 @@ mod tests {
 
     #[test]
     fn fndnxt_drains_the_remaining_matches_of_a_wildcard_scan_in_order() {
-        // `directory()` seeds SAMPLE.DAT, OTHER.DAT and EMPTY.DAT -- three
-        // matches for `*.DAT`, in the alphabetical order `fnd1st` sorts its
-        // matches into (this host has no on-disk directory order to match
-        // real DOS's FAT order with -- see `fnd1st`'s own doc comment).
+        // `directory()` seeds SAMPLE.DAT, OTHER.DAT and EMPTY.DAT, and
+        // `Host::new` creates a fourth, WGSGEN2.DAT, in every fresh root
+        // (`Host::open_genbb`) -- four matches for `*.DAT`, in the
+        // alphabetical order `fnd1st` sorts its matches into (this host has
+        // no on-disk directory order to match real DOS's FAT order with --
+        // see `fnd1st`'s own doc comment). `W` sorts last of the four.
         let mut f = Fixture::rooted(directory("fnd1st-several"));
         let blk = fndblk(&mut f);
 
@@ -2353,7 +2368,10 @@ mod tests {
         assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 1);
         assert_eq!(found_name(&f, blk), "SAMPLE.DAT");
 
-        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 0, "no more after the third");
+        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 1);
+        assert_eq!(found_name(&f, blk), "WGSGEN2.DAT");
+
+        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 0, "no more after the fourth");
     }
 
     #[test]

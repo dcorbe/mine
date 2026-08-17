@@ -1502,6 +1502,52 @@ impl<A: Abi> Default for FsdSession<A> {
     }
 }
 
+/// The shape [`Host::open_genbb`] creates `WGSGEN2.DAT` with, when a fresh
+/// board has none yet.
+///
+/// # The key is sourced, not guessed
+///
+/// `re/wg33src/INC/DFCAPI.H:63` -- `#define GDBDOFF (UIDSIZ+MNMSIZ)`,
+/// "offset for app-spec data in gen db" -- names the exact boundary between
+/// a generic-database record's key and everything past it: `UIDSIZ` (30)
+/// bytes of `userid` immediately followed by `MNMSIZ` (25) bytes of
+/// `modnam`, 55 bytes total. `re/wg33src/SRC/server/utils/wgsrpt/BBSGEN.C`'s
+/// own `getgen`/`setgen` -- the only two routines in the whole `wg33src`
+/// tree that touch `genbb` after `MAJORBBS.C:999` opens it -- confirm it
+/// independently: `getgen` zeroes a `struct bbsgen`, writes `userid` and
+/// `modnam` (`BBSGMX`, `"Main Executive"`) into it and nothing else, then
+/// calls `dfaAcqEQ(genbuf,genbuf,0)` -- key 0, positioned by exactly the 55
+/// bytes `GDBDOFF` names and nothing past them. One record per user per
+/// module is the entire point of a *generic* database (`MAJORBBS.H:550-554`:
+/// "generic user data records for main exec... add fields here, default to
+/// all-0's"), so the key is unique, not duplicate-permitting.
+///
+/// `kind: 0x0b` is `DFAST_ZSTRING`, the same extended type this crate's own
+/// [`btrieve::create`] tests already use for every other `CHAR[]` key
+/// (`WCCBANKS.VIR`'s name key among them) -- there is no shipped `wgsgen2.*`
+/// to measure the byte against directly, so this follows the one convention
+/// on hand for a field of this shape rather than inventing a second one.
+///
+/// `page_size` is `GENSIZ` itself (8192, already a multiple of 512): with no
+/// duplicate key the physical record is exactly `GENSIZ`, and `GENSIZ` is
+/// the smallest page that can hold a record that size at all.
+fn genbb_spec() -> btrieve::FileSpec {
+    btrieve::FileSpec {
+        record_length: globals::GENSIZ,
+        page_size: globals::GENSIZ,
+        keys: vec![btrieve::KeySpec {
+            segments: vec![btrieve::SegmentSpec {
+                offset: 0,
+                length: globals::UIDSIZ + globals::MNMSIZ,
+                kind: 0x0b, // DFAST_ZSTRING
+                descending: false,
+            }],
+            duplicates: false,
+            modifiable: false,
+        }],
+    }
+}
+
 /// Every method here works purely off the fields `Host<A>` already owns --
 /// field accessors, pointer arithmetic through [`Abi::ptr_offset`],
 /// bookkeeping vectors and maps -- and never needs a `Machine`. See the
@@ -1727,7 +1773,136 @@ impl<A: Abi> Host<A> {
         // `Clock::system()` is built inline in the literal above, so there is
         // no binding to read while it is being written.
         host.started = host.clock.epoch().unwrap_or(0);
+
+        // `MAJORBBS.C:999` -- `genbb=dfaOpen("wgsgen2.dat",GENSIZ,NULL)`, the
+        // last of this function's globals to get a real value. See
+        // `Host::open_genbb`'s own doc comment for why this cannot run any
+        // earlier than here (it needs `host.root`/`host.btrieve`/`host.heap`,
+        // none of which exist while `Globals::new` -- above, and *before*
+        // `host` itself -- is still building the module-memory image).
+        host.open_genbb(machine)?;
+
         Ok(host)
+    }
+
+    /// `MAJORBBS.C:999` -- `genbb=dfaOpen("wgsgen2.dat",GENSIZ,NULL)`.
+    ///
+    /// `genbb` (`MAJORBBS.H:547`, `EXPWGSV(DFAFILE*) genbb`, "generic user
+    /// data file btrieve file ptr") is a **host**-owned global -- one this
+    /// crate's `globals` table places (`globals.rs`'s own `g("genbb", PTR)`)
+    /// but that no module ever writes. Before this method existed the slot
+    /// stayed at the zero it was born with, and `WCCMMUD.DLL`'s PE32 build
+    /// reads it directly (`0x49d560 -> &genbb`) and hands whatever is there,
+    /// unread, into `dfaSetBlk` -- a null `genbb` is a null `dfa_current`,
+    /// and the very next `dfaInsertV` refuses with "no dfa file current"
+    /// (`crates/mbbs/tests/wccmmud.rs:806-852` measures the identical shape
+    /// on the 16-bit module, and rules out the vacation file and the
+    /// `setbtv` stack as the cause -- read that test before touching this
+    /// one).
+    ///
+    /// This cannot live in [`globals::Globals::new`] alongside `nterms`'s own
+    /// write: opening a Btrieve file needs `self.root` (where the file
+    /// lives), `self.btrieve` (the engine that opens it) and `self.heap`
+    /// (where the module-memory `dfablk` image is allocated), and none of
+    /// those exist yet while `Globals::new` is still building the raw
+    /// module-memory image `Host::new` has not yet wrapped in a `Host`. So
+    /// this runs last in `Host::new`, once `host` is a real value, rather
+    /// than "alongside" `nterms` in the literal sense.
+    ///
+    /// # `wgsgen2.dat` ships with Worldgroup, not with any module
+    ///
+    /// Every other Btrieve file this host opens is installed from a `.VIR`
+    /// template a module's own distribution ships (`Host::btrieve_file`).
+    /// `wgsgen2.dat` has no such template anywhere in this repository or in
+    /// any board directory -- it is Worldgroup's own generic-user-data file,
+    /// and the real host is what creates it, once, the first time a board
+    /// boots. So a missing file here is created rather than refused: see
+    /// [`genbb_spec`] for the shape.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be created (already exists and is not readable as
+    /// this shape, or the filesystem refuses the write), or cannot be opened
+    /// once it is there. Never a silent null `genbb` -- see this crate's own
+    /// house rule that a refusal beats a fabricated success, and see
+    /// `wccmmud.rs`'s own doc comment on why a null `genbb` is exactly the
+    /// bug this method exists to close, not a shape to reproduce quietly a
+    /// second time under a new name.
+    fn open_genbb(&mut self, machine: &mut A::Cpu) -> io::Result<()> {
+        const NAME: &str = "WGSGEN2.DAT";
+
+        let path = match self.find(NAME) {
+            Some(path) => path,
+            None => {
+                let path = self.root.join(NAME);
+                btrieve::create(&path, &genbb_spec())
+                    .map_err(|e| io::Error::other(format!("creating {NAME}: {e}")))?;
+                self.note(format!(
+                    "created {NAME} -- this board had no host generic-user-data file yet"
+                ));
+                path
+            }
+        };
+
+        let geometry = btrieve::Geometry::read(NAME, &path).map_err(io::Error::other)?;
+        let block = {
+            let Host { btrieve, heap, .. } = self;
+            btrieve
+                .open(A::mem(machine), heap, NAME, &path, geometry, globals::GENSIZ)
+                .map_err(|e| io::Error::other(format!("opening {NAME}: {e}")))?
+        };
+
+        // Deliberately **not** `self.btrieve.dfa_set(block)`, even though
+        // `DFAAPI.C:175` has `dfaOpen`'s own last line unconditionally
+        // `dfaSetBlk(dfa)`. That call is what makes the file *current* --
+        // `Btrieve::dfa_current`, a host-side field no module can read
+        // directly (see `shims::dfa`'s own module doc, "`dfa`/`dfastk` are
+        // never `bb`/`bbstk`") -- and the bug this method exists to close is
+        // upstream of that: `WCCMMUD.DLL`'s own code reads the *global*
+        // `genbb` and hands it to `dfaSetBlk` itself
+        // (`push *genbb; call dfaSetBlk`, this task's own disassembly). Once
+        // the write below makes that global a real pointer, the module's own
+        // `dfaSetBlk(genbb)` call makes it current correctly, on its own,
+        // exactly as it would on the real host -- there is nothing left for
+        // this method to pre-seed. Measured, not merely reasoned through:
+        // an earlier version of this method did call `dfa_set` here, to
+        // mirror `dfaOpen`'s own side effect, and it cost five otherwise-
+        // unrelated `shims::dfa` tests their shared "no dfa file current
+        // before any module runs" precondition for no gain this method's own
+        // contract needs.
+        self.globals.write_mem(A::mem(machine), "genbb", &A::ptr_to_bytes(block))?;
+        Ok(())
+    }
+
+    /// `MAJORBBS.C:5644` -- `dfaClose(genbb)`, [`Host::open_genbb`]'s mirror
+    /// at the other end of a board's life.
+    ///
+    /// Public, unlike `open_genbb`: `Host::new` is the one place `genbb` is
+    /// ever opened, so opening it can stay a construction detail, but
+    /// closing it is a caller's decision, made once, when a board's own
+    /// shutdown actually runs -- `crates/mbbs-server/src/host.rs`'s
+    /// `shut_down` is that place today, well after `Host::new` returns and
+    /// after the module sweep's own `finrou` calls (`MAJORBBS.C:5628-5646`:
+    /// the module sweep, then `clsmsg`/`dfaClose(mstbb)`/`dfaClose(xrfbb)`/
+    /// `dfaClose(genbb)`, in that order -- this host implements only
+    /// `genbb` of the four). `Host<A>` has no `Drop` of its own to fold this
+    /// into instead: a real board's shutdown is a deliberate act with its
+    /// own place in a sequence, not a value going out of scope.
+    ///
+    /// # Errors
+    ///
+    /// If `genbb` is somehow not a valid global (cannot happen --
+    /// `globals.rs` always places it), or if [`btrieve::Btrieve::close`]
+    /// itself refuses -- a dirty block whose reindex fails, or an
+    /// outstanding transaction pre-image; see that method's own doc comment
+    /// for both.
+    pub fn close_genbb(&mut self, machine: &mut A::Cpu) -> io::Result<()> {
+        let genbb = self.globals.pointer_mem(A::mem_ref(machine), "genbb")?;
+        let Host { btrieve, heap, .. } = self;
+        btrieve
+            .close(A::mem(machine), heap, genbb)
+            .map_err(|e| io::Error::other(format!("closing WGSGEN2.DAT: {e}")))?;
+        Ok(())
     }
 
     /// The file a module named, with the directory it is allowed to name
@@ -4908,6 +5083,52 @@ mod tests {
         gsbl, stall_note, testing, users,
     };
     use mbbs_machine::m16::{FarPtr, Machine, Poison, Ret};
+
+    /// `Host::open_genbb`'s create-when-absent half. `WGSGEN2.DAT` has no
+    /// `.VIR` template anywhere in this repository, unlike every module
+    /// Btrieve file `Host::btrieve_file` installs -- so a board that has
+    /// genuinely never run before has to have this host create the file
+    /// itself, not merely open one that happens to already be there.
+    /// `testing::scratch` hands back an empty directory, cleared on every
+    /// call, so nothing here can be finding the checked-in
+    /// `tests/data/WGSGEN2.DAT` by accident.
+    #[test]
+    fn genbb_is_created_when_the_board_has_never_run_before() {
+        let root = testing::scratch("genbb-creates-when-absent");
+        let path = root.join("WGSGEN2.DAT");
+        assert!(!path.exists(), "the scratch directory must start without one");
+
+        let mut machine = Machine::new().expect("16-bit machine");
+        let host = Host::<Wg16>::new(&mut machine, root, Terms::new(1)).expect("host");
+
+        assert!(path.exists(), "Host::new must create WGSGEN2.DAT when it finds none");
+        assert!(
+            host.notes().iter().any(|n| n.contains("WGSGEN2.DAT") && n.contains("created")),
+            "and say so: {:?}",
+            host.notes()
+        );
+    }
+
+    /// `Host::close_genbb`, `MAJORBBS.C:5644`'s `dfaClose(genbb)` -- the
+    /// mirror of the test just above and of
+    /// `globals::tests::genbb_is_a_real_block_pointer_before_any_module_runs`.
+    /// `Btrieve::len()` is a real count of what is open, not a re-read of
+    /// `genbb` itself, so this proves the close actually removed the block
+    /// rather than merely leaving the global's own bytes alone.
+    #[test]
+    fn close_genbb_closes_the_block_dfaclose_would() {
+        let root = testing::scratch("genbb-close");
+        let mut machine = Machine::new().expect("16-bit machine");
+        let mut host = Host::<Wg16>::new(&mut machine, root, Terms::new(1)).expect("host");
+        assert_eq!(host.btrieve().len(), 1, "genbb is the one file Host::new opened");
+
+        host.close_genbb(&mut machine).expect("closes");
+        assert_eq!(
+            host.btrieve().len(),
+            0,
+            "MAJORBBS.C:5644's dfaClose(genbb) leaves nothing open"
+        );
+    }
 
     #[test]
     fn a_host_is_built_with_as_many_channels_as_it_is_asked_for() {

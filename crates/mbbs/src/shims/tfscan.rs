@@ -860,8 +860,12 @@ mod tests {
         assert_eq!(tfsbuf(&f), "hello");
 
         // BBSMAINM.C:1014-1034's own shape: tfsopn called again while a scan
-        // is still running.
-        assert_eq!(word(tfsopn_(&mut f, "*.DAT").expect("tfsopn")), 1);
+        // is still running. A literal name, not `*.DAT` -- `Host::new` now
+        // creates `WGSGEN2.DAT` in every fresh scratch root
+        // (`Host::open_genbb`), which is a second, real `.DAT` file this
+        // wildcard would also match; `BETA.DAT` names the one file this test
+        // is actually about.
+        assert_eq!(word(tfsopn_(&mut f, "BETA.DAT").expect("tfsopn")), 1);
         assert_eq!(tfstate(&f), 1, "TFSBGN immediately after the second tfsopn");
 
         // If the old scan had merely been left running underneath, this

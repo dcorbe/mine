@@ -321,6 +321,51 @@ fn cleaning_zero_bytes_under_wg32_is_the_same_as_not_cleaning() {
     assert_eq!(moved, 8);
 }
 
+/// `Ret::<Wg32>::Ptr`'s own marshalling (`abi/wg32.rs`: `Ret::Ptr(p) =>
+/// mbbs_machine::m32::Ret::U32(p.0)`), constructed directly rather than
+/// observed through a shim's return value.
+///
+/// Before this test, every `Ret::<Wg32>` constructed anywhere under
+/// `crates/mbbs/tests/wg32_*.rs` was `Ret::Void`
+/// (`stack_delta_under`, above) -- `Ret::Ptr` itself was only ever exercised
+/// indirectly, through `wg32_round_trip.rs`'s `l2as` round trip returning
+/// `abi::Ret::Ptr` from inside a generic shim. That is real coverage of the
+/// marshalling arm, but never through a direct, isolated construction the
+/// way `stack_delta_under` already gives `Ret::Void` -- this closes that gap
+/// the same way: call the thunk, resume with a hand-built `Ret::Ptr`, and
+/// read `EAX` straight back with nothing else touching it in between.
+#[test]
+fn resume_with_ret_ptr_places_the_pointers_raw_value_in_eax() {
+    let mut cpu = cpu();
+    let thunk = cpu.machine.thunk_addr(0);
+    let mut mapping = mbbs_machine::m32::Mapping::new(4096).expect("a code mapping");
+    let base = mapping.base() as usize as u32;
+    let mut code = vec![0xB8];
+    code.extend(thunk.to_le_bytes()); // mov eax, thunk
+    code.extend([0xFF, 0xD0]); // call eax
+    code.push(0xC3); // ret -- nothing here touches EAX after the call returns
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+    let entry = mbbs_machine::m32::Flat32Ptr(base);
+
+    let exit = Wg32::call(&mut cpu, entry, &[]).expect("reaches the thunk");
+    assert!(matches!(exit, Exit::Call { index: 0 }), "must stop at thunk 0: {exit:?}");
+
+    const PTR: u32 = 0x0012_3456;
+    let exit = Wg32::resume(
+        &mut cpu,
+        Ret::<Wg32>::Ptr(mbbs_machine::m32::Flat32Ptr(PTR)),
+        mbbs::Cleans::Caller,
+    )
+    .expect("resumed");
+    match exit {
+        Exit::Returned { lo, hi } => {
+            assert_eq!(lo, PTR, "Ret::Ptr must marshal its raw value into EAX");
+            assert_eq!(hi, 0, "nothing sets EDX for a Ret::Ptr");
+        }
+        other => panic!("expected Exit::Returned, got {other:?}"),
+    }
+}
+
 /// Task 6, requirement 3 -- **the one that matters** (design §6). Both `Abi`
 /// implementations agree `PTR_WIDTH == LONG_WIDTH == 4`; a ptr/long confusion
 /// in generic code is invisible to either. Only `INT_WIDTH` (2 under `Wg16`,
