@@ -206,6 +206,10 @@ impl<G: crate::guest::Guest> crate::service::Service<G> for Dos {
             Outcome::Fault(f) => Serviced::Fault(f),
         }
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Service one `int 21h`.

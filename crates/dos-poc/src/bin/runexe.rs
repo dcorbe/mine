@@ -9,20 +9,22 @@
 //!
 //! Usage: `runexe <program.exe> [command tail]`
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
+use std::rc::Rc;
 
-use dos_poc::bios::{
-    Keyboard, Video, int10, int10_implemented, int15, int16, int16_implemented, missing,
-};
-use dos_poc::dos::{DosState, Outcome, dispatch, is_implemented};
+use dos::count::{Counters, Counting};
+use dos::service::{Serviced, Services};
+use dos_poc::bios::{Bios, Keyboard, Video, int16, int16_implemented, missing};
+use dos_poc::dos::is_implemented;
 use dos_poc::guest::{Guest, Ptr};
 use dos_poc::kvm::{Stop, VmGuest};
 use dos_poc::driver::{Driver, Script};
 use dos_poc::terminal::{RawStdin, Terminal};
 use dos_poc::uart::{COM1_BASE, IRQ4_VECTOR, Pic, Uart};
 use dos_poc::files::Files;
-use dos_poc::fossil;
+use dos_poc::fossil::Fossil;
 use dos_poc::mz::{self, MzImage};
 use dos_poc::screen::Screen;
 
@@ -199,22 +201,25 @@ fn main() -> io::Result<()> {
 
     // In door mode the guest talks to a caller rather than to our screen, and
     // which way it does that is the door's own configuration -- LORDCFG's
-    // "Fossil / Internal" switch. `Internal` programs the chip directly and is
-    // served by `serial`; `Regular Fossil` calls int 14h and is served by
-    // `fossil`, which moves bytes through the very same queues.
-    let mut serial = door.then(|| Uart::new(baud));
-    let fossil_info = fossil::Info::default();
+    // "Fossil / Internal" switch. `Internal` programs the chip directly,
+    // served by the port handlers below; `Regular Fossil` calls int 14h,
+    // served by the composed `Fossil`. Both have to be the *same* `Uart`:
+    // this is the one the host pump below reads stdin into and drains to
+    // stdout, and a `Fossil` given a private copy transmits into a queue
+    // nobody ever empties -- see `Fossil`'s own doc comment, which is where a
+    // live door test actually hung on that before this was shared.
+    let serial = door.then(|| Rc::new(RefCell::new(Uart::new(baud))));
     let mut pic = Pic::default();
     let _raw = door.then(RawStdin::enter).transpose()?;
     if door {
         println!("door mode: COM1 at {COM1_BASE:#06x}, IRQ4, baud {baud:?}\r");
     }
 
-    let mut dos = DosState::default();
-    dos.files = Some(Files::new(root.into(), std::path::PathBuf::from(&root_dir)));
+    let mut kernel = dos_poc::dos::Dos::default();
+    kernel.state.files = Some(Files::new(root.into(), std::path::PathBuf::from(&root_dir)));
     // The real segment the loader built this program's PSP at, so AH=62h
     // answers with the program's own PSP rather than failing outright.
-    dos.psp_seg = Some(at.psp_seg);
+    kernel.state.psp_seg = Some(at.psp_seg);
     let mut keyboard = Keyboard::default();
     keyboard.feed(&keys);
     let mut driver: Option<Box<dyn Driver>> = if interactive {
@@ -232,12 +237,41 @@ fn main() -> io::Result<()> {
             None => None,
         }
     };
-    let mut video = Video::default();
-    video.install_bda(&mut vm);
-    let mut order: Vec<u8> = Vec::new();
-    let mut seen: BTreeMap<u8, u32> = BTreeMap::new();
-    let mut missing_dos: BTreeMap<u8, u32> = BTreeMap::new();
-    let mut bios: BTreeMap<(u8, u8), u32> = BTreeMap::new();
+    // Shared, not owned outright by `Bios`: a text-mode program moves the
+    // cursor by writing CRTC ports directly far more often than it calls
+    // `int 10h AH=02`, and that port handling is not a `Service` -- it lives
+    // in this loop, below. Both have to mutate the one `Video` a settle's
+    // `Screen::snapshot` and the exit report's cursor-move log read, or half
+    // of every session's cursor moves would land in a copy nothing ever
+    // prints. See `Bios`'s own doc comment for the detail.
+    let video = Rc::new(RefCell::new(Video::default()));
+    video.borrow().install_bda(&mut vm);
+
+    let mut services: Services<VmGuest> = Services::new()
+        .with(Counting::new(kernel))
+        .with(Counting::new(Bios { video: Rc::clone(&video) }));
+    if let Some(uart) = &serial {
+        services = services.with(Counting::new(Fossil::new(Rc::clone(uart))));
+    }
+
+    // `int 16h` and a vector nothing claims are the two trap kinds that are
+    // deliberately not services (R17, R21) -- the composed decorators' own
+    // `calls()` cannot see either, so this is summed with them at report
+    // time rather than read from `Counting` alone.
+    let mut calls_outside_services = 0u32;
+    // Every trap handled, composed or not -- the cap check below needs this
+    // running total every iteration, which is cheap here and would not be if
+    // it meant re-summing every decorator's `calls()` on each of up to
+    // `max_calls` iterations. The exit report's own `{calls}` line is instead
+    // reconstructed once, after the loop, from the composed decorators plus
+    // `calls_outside_services` (R21) -- the two are expected to agree, but
+    // this one exists only to gate the loop, never to be printed.
+    let mut calls_seen = 0u32;
+    // BIOS-and-other-interrupt entries a service cannot record itself:
+    // `int 16h` (not a service, R17) and any vector nothing claims (recorded
+    // here, not swallowed, so a gap like `int 2Fh` still shows in the report
+    // the way it did before routing went through `Services`).
+    let mut bios_extra: BTreeMap<(u8, u8), u32> = BTreeMap::new();
     let mut vectors: Vec<String> = Vec::new();
     let mut settles = 0u32;
     // Set once the watchpoint has fired and we are stepping a bounded window.
@@ -251,7 +285,6 @@ fn main() -> io::Result<()> {
     // Calls a real machine services and we do not, named at the moment they
     // happen rather than inferred later from a screen that looks wrong.
     let mut gaps: BTreeMap<String, u32> = BTreeMap::new();
-    let mut calls = 0u32;
     // Where the wall clock goes. "Is the pause the program working, or us?" is
     // not answerable from a total; it needs the split.
     let mut in_guest = std::time::Duration::ZERO;
@@ -272,10 +305,11 @@ fn main() -> io::Result<()> {
         // by polling -- it burns thousands of calls just waiting for a turn.
         // A door serves a person, same as an interactive session: the cap is
         // for unattended probes only.
-        if !attended && calls >= max_calls {
+        if !attended && calls_seen >= max_calls {
             break format!("stopped after {max_calls} calls");
         }
-        if let Some(uart) = serial.as_mut() {
+        if let Some(uart) = &serial {
+            let mut uart = uart.borrow_mut();
             // Host -> guest: anything the far end has typed.
             let mut buf = [0u8; 256];
             let mut fds = libc::pollfd {
@@ -324,24 +358,15 @@ fn main() -> io::Result<()> {
             longest = (took, format!("{stop:?}"));
         }
         match stop {
-            Stop::Trap(0x10) => {
-                let ah = vm.regs().ah();
-                *bios.entry((0x10, ah)).or_insert(0) += 1;
-                calls += 1;
-                if !int10_implemented(ah)
-                    && let Some(what) = missing(0x10, ah)
-                {
-                    *gaps.entry(format!("int 10h AH={ah:02X}  {what}")).or_insert(0) += 1;
-                    if strict {
-                        break format!("unimplemented: int 10h AH={ah:02X} ({what})");
-                    }
-                }
-                int10(&mut vm, &mut video);
-            }
+            // Not composed (R17, and Task 6's design note): its `bool` drives
+            // a settle protocol -- screen snapshot, driver script, `settles`/
+            // `busiest` statistics, run termination -- that a `Service` has no
+            // way to express. Kept ahead of the general arm, verbatim.
             Stop::Trap(0x16) => {
                 let ah = vm.regs().ah();
-                *bios.entry((0x16, ah)).or_insert(0) += 1;
-                calls += 1;
+                *bios_extra.entry((0x16, ah)).or_insert(0) += 1;
+                calls_seen += 1;
+                calls_outside_services += 1;
                 if !int16_implemented(ah)
                     && let Some(what) = missing(0x16, ah)
                 {
@@ -358,13 +383,15 @@ fn main() -> io::Result<()> {
                         && let Some(script) = driver.as_mut()
                         && script.poll_due()
                     {
+                        let v = video.borrow();
                         let screen = Screen::snapshot(
                             &vm,
-                            video.columns as usize,
-                            video.rows as usize,
-                            (video.cursor_row, video.cursor_col),
-                            video.cursor_visible,
+                            v.columns as usize,
+                            v.rows as usize,
+                            (v.cursor_row, v.cursor_col),
+                            v.cursor_visible,
                         );
+                        drop(v);
                         match script.poll_key(&screen) {
                             Some(key) => keyboard.push_key(key),
                             // A driver with nothing left to say ends the run,
@@ -385,13 +412,15 @@ fn main() -> io::Result<()> {
                     let Some(script) = driver.as_mut() else {
                         break "waiting for a keystroke, none queued".to_string();
                     };
+                    let v = video.borrow();
                     let screen = Screen::snapshot(
                         &vm,
-                        video.columns as usize,
-                        video.rows as usize,
-                        (video.cursor_row, video.cursor_col),
-                        video.cursor_visible,
+                        v.columns as usize,
+                        v.rows as usize,
+                        (v.cursor_row, v.cursor_col),
+                        v.cursor_visible,
                     );
+                    drop(v);
                     if since_settle.0 > busiest.0 {
                         busiest = (since_settle.0, since_settle.1, since_settle.2.elapsed());
                     }
@@ -426,112 +455,110 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
-            Stop::Trap(0x15) => {
-                let ah = vm.regs().ah();
-                *bios.entry((0x15, ah)).or_insert(0) += 1;
-                calls += 1;
-                if let Some(nap) = int15(&mut vm) {
-                    let before = std::time::Instant::now();
-                    std::thread::sleep(nap);
-                    slept += before.elapsed();
+            Stop::Trap(vector) => {
+                // A report, not dispatch: which vectors the program hooks or
+                // saves via AH=25h/35h. Must run before the call is routed,
+                // since a service's registers on the way out are not the
+                // request any more.
+                if vector == 0x21 {
+                    let regs = vm.regs();
+                    let ah = regs.ah();
+                    if ah == 0x25 || ah == 0x35 {
+                        let verb = if ah == 0x25 { "hooks" } else { "saves" };
+                        vectors.push(format!("{verb} int {:02X}h", regs.al()));
+                    }
                 }
-            }
-            // A door configured for a FOSSIL driver rather than for the bare
-            // chip. Both reach the same queues, so this is a second doorway on
-            // the same transport and not a second transport.
-            Stop::Trap(0x14) => {
-                let ah = vm.regs().ah();
-                *bios.entry((0x14, ah)).or_insert(0) += 1;
-                calls += 1;
-                match serial.as_mut() {
-                    Some(uart) => match fossil::dispatch(&mut vm, uart, &fossil_info) {
-                        // A block transfer whose ES:DI does not name memory.
-                        // Same treatment as a bad pointer into a DOS call: stop
-                        // and say so, rather than move bytes somewhere else.
-                        Err(fault) => break format!("bad guest pointer in int 14h: {fault:?}"),
-                        Ok(fossil::Answer::Done) => {}
-                        Ok(fossil::Answer::Yield) => {
-                            // The door asked for input that has not arrived.
-                            // Sleeping hands the core back until the top of the
-                            // loop can pump the socket; returning immediately
-                            // turns a polling door into a spin.
+                // Every trap that reaches this arm is one DOS/BIOS call,
+                // whether or not anything claims its vector -- matching the
+                // old code's per-arm `calls += 1`, kept as one counter here
+                // since the branch it lands in no longer determines that.
+                calls_seen += 1;
+                match services.service(vector, &mut vm) {
+                    Some(Serviced::Continue) => {}
+                    Some(Serviced::Yield(d)) => {
+                        let before = std::time::Instant::now();
+                        std::thread::sleep(d);
+                        slept += before.elapsed();
+                    }
+                    Some(Serviced::Terminate(code)) => {
+                        break format!("exited with code {code}");
+                    }
+                    Some(Serviced::Fault(f)) => {
+                        break match vector {
+                            0x14 => format!("bad guest pointer in int 14h: {f:?}"),
+                            _ => format!("bad guest pointer: {f:?}"),
+                        };
+                    }
+                    // The service reports the *fact* that it does not model
+                    // this call; whether that is REPORTED is the runtime's
+                    // policy, and it differs per vector (Task 6's table):
+                    Some(Serviced::Unclaimed { vector, ah }) => {
+                        let note = match vector {
+                            // int 21h: always reported, no `missing()` filter.
+                            0x21 => Some(format!("int 21h AH={ah:02X}")),
+                            // int 14h (FOSSIL): always reported too, once a
+                            // FOSSIL driver is composed at all (door mode).
+                            0x14 => Some(format!("int 14h AH={ah:02X}  FOSSIL function")),
+                            // int 10h/16h: reported only when `missing()`
+                            // knows the function's name.
+                            0x10 | 0x16 => missing(vector, ah)
+                                .map(|what| format!("int {vector:02X}h AH={ah:02X}  {what}")),
+                            // Everything else: never reported here. Nothing
+                            // claims these vectors as a `Service` either, so
+                            // in practice this arm is unreachable -- a claimed
+                            // vector's `Unclaimed` always names 0x21, 0x14,
+                            // 0x10 or 0x16 above. Kept for the same reason the
+                            // `None` arm below is: silence, not a panic, is
+                            // the right answer to a policy question no vector
+                            // this router can compose actually asks.
+                            _ => None,
+                        };
+                        if let Some(note) = note {
+                            *gaps.entry(note.clone()).or_insert(0) += 1;
+                            if strict {
+                                break format!("unimplemented: {note}");
+                            }
+                        }
+                    }
+                    // Nothing claims this vector -- the same case the old
+                    // catch-all handled for anything that was not 0x10, 0x14,
+                    // 0x15, 0x16 or 0x21. Record it and let the stub's `iret`
+                    // return, which is wrong but keeps the program moving so
+                    // the next gap shows.
+                    None => {
+                        let ah = vm.regs().ah();
+                        *bios_extra.entry((vector, ah)).or_insert(0) += 1;
+                        calls_outside_services += 1;
+                        if vector == 0x2f && vm.regs().ax == 0x1680 {
                             let before = std::time::Instant::now();
                             std::thread::sleep(std::time::Duration::from_millis(1));
                             slept += before.elapsed();
                         }
-                        Ok(fossil::Answer::Unsupported(func)) => {
+                        if let Some(what) = missing(vector, ah) {
                             *gaps
-                                .entry(format!("int 14h AH={func:02X}  FOSSIL function"))
+                                .entry(format!("int {vector:02X}h AH={ah:02X}  {what}"))
                                 .or_insert(0) += 1;
                             if strict {
-                                break format!("unimplemented: int 14h AH={func:02X} (FOSSIL)");
+                                break format!("unimplemented: int {vector:02X}h AH={ah:02X} ({what})");
                             }
                         }
-                    },
-                    // No serial means no far end -- a local run. Say so rather
-                    // than answering as a driver that has nothing behind it.
-                    None => {
-                        *gaps
-                            .entry("int 14h  FOSSIL, but this run has no serial port".to_string())
-                            .or_insert(0) += 1;
-                        if strict {
-                            break "int 14h with no serial port: use --door".to_string();
-                        }
                     }
                 }
             }
-            Stop::Trap(vector) if vector != 0x21 => {
-                // Not DOS. Record it and let the stub's `iret` return, which
-                // is wrong but keeps the program moving so the next gap shows.
-                let ah = vm.regs().ah();
-                *bios.entry((vector, ah)).or_insert(0) += 1;
-                calls += 1;
-                if vector == 0x2f && vm.regs().ax == 0x1680 {
-                    let before = std::time::Instant::now();
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    slept += before.elapsed();
+            Stop::PortWrite { port, value } => match (&serial, port) {
+                (Some(uart), p) if (COM1_BASE..COM1_BASE + 8).contains(&p) => {
+                    uart.borrow_mut().write(p, value);
                 }
-                if let Some(what) = missing(vector, ah) {
-                    *gaps.entry(format!("int {vector:02X}h AH={ah:02X}  {what}")).or_insert(0) += 1;
-                    if strict {
-                        break format!("unimplemented: int {vector:02X}h AH={ah:02X} ({what})");
-                    }
-                }
-            }
-            Stop::Trap(_) => {
-                let ah = vm.regs().ah();
-                if ah == 0x25 || ah == 0x35 {
-                    let vec = vm.regs().al();
-                    let verb = if ah == 0x25 { "hooks" } else { "saves" };
-                    vectors.push(format!("{verb} int {vec:02X}h"));
-                }
-                calls += 1;
-                *seen.entry(ah).or_insert(0) += 1;
-                if !is_implemented(ah) {
-                    *missing_dos.entry(ah).or_insert(0) += 1;
-                    if strict {
-                        break format!("unimplemented: int 21h AH={ah:02X}");
-                    }
-                }
-                if order.len() < 40 {
-                    order.push(ah);
-                }
-                match dispatch(&mut vm, &mut dos) {
-                    Outcome::Continue => {}
-                    Outcome::Terminate(code) => break format!("exited with code {code}"),
-                    Outcome::Fault(f) => break format!("bad guest pointer: {f:?}"),
-                }
-            }
-            Stop::PortWrite { port, value } => match (&mut serial, port) {
-                (Some(uart), p) if (COM1_BASE..COM1_BASE + 8).contains(&p) => uart.write(p, value),
                 (_, 0x20 | 0x21) => pic.write(port, value),
-                _ => video.port_out(port, value),
+                _ => video.borrow_mut().port_out(port, value),
             },
             Stop::PortRead { port } => {
-                let value = match (&mut serial, port) {
-                    (Some(uart), p) if (COM1_BASE..COM1_BASE + 8).contains(&p) => uart.read(p),
+                let value = match (&serial, port) {
+                    (Some(uart), p) if (COM1_BASE..COM1_BASE + 8).contains(&p) => {
+                        uart.borrow_mut().read(p)
+                    }
                     (_, 0x20 | 0x21) => pic.read(port),
-                    _ => video.port_in(port),
+                    _ => video.borrow_mut().port_in(port),
                 };
                 vm.complete_port_read(value);
             }
@@ -590,13 +617,23 @@ fn main() -> io::Result<()> {
 
     drop(driver);
 
+    // From here on the report reads state back out of the composed services,
+    // which own it now that they have been composed (Step 4). `counters()` is
+    // enough for anything `Counting` tracks generically; `DosState`'s own
+    // fields (`files`, `out`) are not counting state, so reading them back
+    // needs the concrete type, via `as_any`.
+    let kernel_dos: Option<&dos_poc::dos::Dos> = services
+        .claiming(0x21)
+        .and_then(|s| s.as_any().downcast_ref::<Counting<dos_poc::dos::Dos>>())
+        .map(Counting::inner);
+
     // The program painted straight into the text buffer, which is just guest
     // memory -- so the screen can be read back out without the guest's help.
     // A ruler, and lines marked at their true end. Trimming trailing spaces
     // makes a correctly placed cursor look like it overshoots: the space it
     // sits past is invisible, so "one past the content" reads as "two past the
     // text". A dump that silently drops content is a dump that lies.
-    let screen_cursor = (video.cursor_row, video.cursor_col);
+    let screen_cursor = (video.borrow().cursor_row, video.borrow().cursor_col);
     println!("--- screen at B800:0000 ---");
     let ruler: String = (0..80).map(|c| char::from(b'0' + (c / 10) % 10)).collect();
     println!("    {ruler}");
@@ -639,14 +676,14 @@ fn main() -> io::Result<()> {
         }
     }
 
-    if !video.moves.is_empty() {
+    if !video.borrow().moves.is_empty() {
         println!("--- last cursor moves ---");
-        for m in &video.moves {
+        for m in &video.borrow().moves {
             println!("  {m}");
         }
     }
 
-    if let Some(files) = dos.files.as_ref() {
+    if let Some(files) = kernel_dos.and_then(|d| d.state.files.as_ref()) {
         if !files.ambiguous.is_empty() {
             println!("--- names the host cannot uniquely resolve ---");
             for note in &files.ambiguous {
@@ -674,10 +711,66 @@ fn main() -> io::Result<()> {
         }
     }
 
-    if !dos.out.is_empty() {
+    let dos_out = kernel_dos.map_or(&[][..], |d| d.state.out.as_slice());
+    if !dos_out.is_empty() {
         println!("--- program output ---");
-        println!("{}", String::from_utf8_lossy(&dos.out));
+        println!("{}", String::from_utf8_lossy(dos_out));
     }
+
+    // The counters a composed `Counting` decorator tracks (Step 4): `seen`,
+    // `order` and `unclaimed` are all keyed `(vector, ah)`, so the int 21h
+    // views the report used to get for free from a dedicated map are
+    // reconstructed here by filtering to `vector == 0x21` and re-keying by
+    // `ah` alone (R20) -- filtering that is a no-op in practice, since `Dos`
+    // only ever claims 0x21 and nothing else can route a call to it, but
+    // doing it explicitly is what keeps this report-building code honest
+    // about a decorator that is deliberately generic.
+    let kernel_counters = services.claiming(0x21).and_then(|s| s.counters());
+    let mut seen: BTreeMap<u8, u32> = BTreeMap::new();
+    let mut missing_dos: BTreeMap<u8, u32> = BTreeMap::new();
+    let mut order: Vec<u8> = Vec::new();
+    if let Some(c) = kernel_counters {
+        for (&(vector, ah), &n) in c.seen() {
+            if vector == 0x21 {
+                *seen.entry(ah).or_insert(0) += n;
+            }
+        }
+        for (&(vector, ah), &n) in c.unclaimed() {
+            if vector == 0x21 {
+                *missing_dos.entry(ah).or_insert(0) += n;
+            }
+        }
+        order = c
+            .order()
+            .iter()
+            .filter(|&&(vector, _)| vector == 0x21)
+            .map(|&(_, ah)| ah)
+            .collect();
+    }
+
+    // The BIOS-and-other-interrupts table: `bios_extra` (int 16h, and any
+    // vector nothing claims -- neither is a `Service`, R17/R21) merged with
+    // what the composed `Bios`/`Fossil` decorators recorded for the vectors
+    // they do claim. `Bios` claims both 0x10 and 0x15 through one instance,
+    // so `claiming(0x10)`'s `seen()` already carries both -- no separate
+    // lookup for 0x15 is needed.
+    let mut bios = bios_extra;
+    let bios_counters = services.claiming(0x10).and_then(|s| s.counters());
+    let fossil_counters = services.claiming(0x14).and_then(|s| s.counters());
+    for counters in [bios_counters, fossil_counters].into_iter().flatten() {
+        for (&key, &n) in counters.seen() {
+            *bios.entry(key).or_insert(0) += n;
+        }
+    }
+
+    // `calls` sums the composed decorators' own counts with
+    // `calls_outside_services` (int 16h, plus any vector nothing claims) --
+    // never `Counting::calls()` alone, which would silently undercount by
+    // exactly those two trap kinds (R21).
+    let calls = calls_outside_services
+        + kernel_counters.map_or(0, Counters::calls)
+        + bios_counters.map_or(0, Counters::calls)
+        + fossil_counters.map_or(0, Counters::calls);
 
     println!("--- {calls} DOS calls, {ending} ---");
     for value in &scan {

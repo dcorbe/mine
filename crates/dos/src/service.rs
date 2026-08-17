@@ -60,6 +60,30 @@ pub trait Service<G: Guest> {
 
     /// Service one interrupt. `vector` is always one of [`Service::claims`].
     fn service(&mut self, vector: u8, g: &mut G) -> Serviced;
+
+    /// A decorator's counters, for a report that needs to read what one
+    /// recorded. `None` for a service that is not a counting decorator.
+    ///
+    /// A default rather than a required method: most services do not decorate
+    /// anything, and a required method would force every one of them to write
+    /// `None` by hand.
+    fn counters(&self) -> Option<&dyn crate::count::Counters> {
+        None
+    }
+
+    /// This service as [`std::any::Any`], for a report that needs to read a
+    /// concrete service's own state back out after composition has erased its
+    /// type -- `Services` stores every service behind `Box<dyn Service<G>>`,
+    /// so `Counters` is not the only thing composition costs a caller access
+    /// to.
+    ///
+    /// Required, not defaulted: the coercion from `&self` to `&dyn Any` needs
+    /// `Self: Sized`, and a bound like that on a default method quietly drops
+    /// it from the vtable -- the method still "exists" but nothing reachable
+    /// through `&dyn Service<G>` can call it, which is precisely the case
+    /// this method exists to serve. Every implementor's body is the same one
+    /// line, `{ self }`.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// The composed set of services, and the routing that was previously written
@@ -128,6 +152,16 @@ impl<G: Guest> Services<G> {
         }
         Some(self.services[usize::from(index)].service(vector, g))
     }
+
+    /// The service claiming `vector`, for a caller that needs to read what a
+    /// decorator recorded. `None` if nothing claims it.
+    pub fn claiming(&self, vector: u8) -> Option<&dyn Service<G>> {
+        let index = self.route[usize::from(vector)];
+        if index == u8::MAX {
+            return None;
+        }
+        Some(self.services[usize::from(index)].as_ref())
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +225,7 @@ mod tests {
         fn service(&mut self, _v: u8, _g: &mut TestGuest) -> Serviced {
             Serviced::Terminate(self.1)
         }
+        fn as_any(&self) -> &dyn std::any::Any { self }
     }
 
     #[test]
@@ -202,6 +237,21 @@ mod tests {
 
         assert_eq!(s.service(0x21, &mut g), Some(Serviced::Terminate(1)));
         assert_eq!(s.service(0x16, &mut g), Some(Serviced::Terminate(2)));
+    }
+
+    #[test]
+    fn claiming_finds_the_service_and_as_any_downcasts_back_to_it() {
+        // A report needs to read a composed service's own state back out
+        // after `Services` has erased its concrete type behind `Box<dyn
+        // Service<G>>`. `claiming` finds the trait object; `as_any` is the
+        // only route back to the concrete type from there.
+        let s = Services::<TestGuest>::new().with(Fake(vec![0x21], 7));
+
+        let found = s.claiming(0x21).expect("0x21 is claimed");
+        let fake = found.as_any().downcast_ref::<Fake>().expect("it is a Fake");
+        assert_eq!(fake.1, 7);
+
+        assert!(s.claiming(0x14).is_none(), "an unclaimed vector finds nothing");
     }
 
     #[test]

@@ -16,6 +16,19 @@ use crate::service::{Service, Serviced};
 /// site means a long session cannot grow this without limit.
 const ORDER_LIMIT: usize = 40;
 
+/// What a decorator can tell a report, independent of what it decorates.
+///
+/// A separate trait from `Counting`'s own inherent methods because a report
+/// only ever holds a `&dyn Service<G>` (from [`crate::service::Services::claiming`]),
+/// and a trait object cannot expose a concrete type's inherent methods --
+/// only what a trait names.
+pub trait Counters {
+    fn calls(&self) -> u32;
+    fn order(&self) -> &[(u8, u8)];
+    fn seen(&self) -> &BTreeMap<(u8, u8), u32>;
+    fn unclaimed(&self) -> &BTreeMap<(u8, u8), u32>;
+}
+
 pub struct Counting<S> {
     inner: S,
     calls: u32,
@@ -35,28 +48,30 @@ impl<S> Counting<S> {
         }
     }
 
-    pub fn calls(&self) -> u32 {
-        self.calls
-    }
-
-    pub fn order(&self) -> &[(u8, u8)] {
-        &self.order
-    }
-
-    pub fn seen(&self) -> &BTreeMap<(u8, u8), u32> {
-        &self.seen
-    }
-
-    pub fn unclaimed(&self) -> &BTreeMap<(u8, u8), u32> {
-        &self.unclaimed
-    }
-
     pub fn inner(&self) -> &S {
         &self.inner
     }
 }
 
-impl<G: Guest, S: Service<G>> Service<G> for Counting<S> {
+impl<S> Counters for Counting<S> {
+    fn calls(&self) -> u32 {
+        self.calls
+    }
+
+    fn order(&self) -> &[(u8, u8)] {
+        &self.order
+    }
+
+    fn seen(&self) -> &BTreeMap<(u8, u8), u32> {
+        &self.seen
+    }
+
+    fn unclaimed(&self) -> &BTreeMap<(u8, u8), u32> {
+        &self.unclaimed
+    }
+}
+
+impl<G: Guest, S: Service<G> + 'static> Service<G> for Counting<S> {
     fn claims(&self) -> &[u8] {
         self.inner.claims()
     }
@@ -74,6 +89,14 @@ impl<G: Guest, S: Service<G>> Service<G> for Counting<S> {
             *self.unclaimed.entry((vector, ah)).or_insert(0) += 1;
         }
         verdict
+    }
+
+    fn counters(&self) -> Option<&dyn Counters> {
+        Some(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -94,6 +117,7 @@ mod tests {
                 Serviced::Continue
             }
         }
+        fn as_any(&self) -> &dyn std::any::Any { self }
     }
 
     fn call(c: &mut Counting<Echo>, g: &mut TestGuest, ah: u8) {
@@ -179,6 +203,7 @@ mod tests {
             g.set_regs(regs);
             Serviced::Continue
         }
+        fn as_any(&self) -> &dyn std::any::Any { self }
     }
 
     #[test]

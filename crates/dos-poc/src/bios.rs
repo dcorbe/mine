@@ -533,9 +533,25 @@ pub fn int15<G: Guest>(g: &mut G) -> Option<std::time::Duration> {
 /// driver script and the run statistics, none of which a `Service` has. So
 /// `int 16h` is not serviced here, and `Keyboard` stays where that protocol
 /// lives -- in the runtime's loop.
-#[derive(Default)]
+///
+/// `video` is shared (`Rc<RefCell<..>>`), not owned outright, because the
+/// runtime needs the *same* cursor state this service mutates: a text-mode
+/// program moves the cursor by writing CRTC ports directly far more often
+/// than it calls `int 10h AH=02` (see `port_out`'s doc comment), and the
+/// runtime's port handler is not part of this trait -- it lives in the
+/// caller's loop. Two independent `Video`s would each see only half the
+/// cursor moves, and the exit report's interleaved move log would silently
+/// drop every one this service made. A caller not sharing a clone of the
+/// same cell is a wiring bug, not a supported configuration -- there is
+/// nothing this type can do to enforce that from here.
 pub struct Bios {
-    pub video: Video,
+    pub video: std::rc::Rc<std::cell::RefCell<Video>>,
+}
+
+impl Default for Bios {
+    fn default() -> Self {
+        Self { video: std::rc::Rc::new(std::cell::RefCell::new(Video::default())) }
+    }
 }
 
 impl<G: Guest> dos::service::Service<G> for Bios {
@@ -555,7 +571,7 @@ impl<G: Guest> dos::service::Service<G> for Bios {
                 if !int10_implemented(ah) {
                     return Serviced::Unclaimed { vector, ah };
                 }
-                int10(g, &mut self.video);
+                int10(g, &mut self.video.borrow_mut());
                 Serviced::Continue
             }
             // `int15` returns Some(duration) for the two calls it models
@@ -569,6 +585,10 @@ impl<G: Guest> dos::service::Service<G> for Bios {
             },
             _ => Serviced::Unclaimed { vector, ah },
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

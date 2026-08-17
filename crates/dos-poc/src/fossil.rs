@@ -167,13 +167,28 @@ fn status(uart: &Uart) -> u16 {
 }
 
 /// The FOSSIL driver as a service.
+///
+/// `uart` is shared (`Rc<RefCell<..>>`), not owned outright, for the same
+/// reason `Bios::video` is: a door built for a FOSSIL driver (LORDCFG's
+/// "Regular Fossil" setting, as opposed to "Internal") sends every byte
+/// through `int 14h` and nothing else, but the bytes still have to cross the
+/// real socket -- and pumping the actual telnet connection (stdin/stdout,
+/// the IRQ4 window) is not a `Service`, it lives in the runtime's loop,
+/// alongside the *other* front-end this same queue serves ([`crate::uart`]'s
+/// direct port I/O, for "Internal"). A `Fossil` given its own private `Uart`
+/// answers `AH=04`'s signature check correctly and then transmits every
+/// subsequent byte into a queue the host pump never drains -- the door goes
+/// dark from the caller's side while the guest spins making `int 14h AH=01`
+/// calls into a void. Measured, not theoretical: composing a fresh
+/// `Uart::new(baud)` here is what a live door test hung on before this was a
+/// shared cell.
 pub struct Fossil {
-    pub uart: Uart,
+    pub uart: std::rc::Rc<std::cell::RefCell<Uart>>,
     pub info: Info,
 }
 
 impl Fossil {
-    pub fn new(uart: Uart) -> Self {
+    pub fn new(uart: std::rc::Rc<std::cell::RefCell<Uart>>) -> Self {
         Self { uart, info: Info::default() }
     }
 }
@@ -187,12 +202,16 @@ impl<G: Guest> dos::service::Service<G> for Fossil {
         use dos::service::Serviced;
 
         let ah = g.regs().ah();
-        match dispatch(g, &mut self.uart, &self.info) {
+        match dispatch(g, &mut self.uart.borrow_mut(), &self.info) {
             Ok(Answer::Done) => Serviced::Continue,
             Ok(Answer::Yield) => Serviced::Yield(std::time::Duration::from_millis(1)),
             Ok(Answer::Unsupported(_)) => Serviced::Unclaimed { vector, ah },
             Err(f) => Serviced::Fault(f),
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -563,7 +582,7 @@ mod tests {
     fn fossil_claims_only_int_14h() {
         use dos::service::Service;
 
-        let f = Fossil::new(Uart::new(None));
+        let f = Fossil::new(std::rc::Rc::new(std::cell::RefCell::new(Uart::new(None))));
         assert_eq!(Service::<TestGuest>::claims(&f), &[0x14]);
     }
 
@@ -575,7 +594,7 @@ mod tests {
         use dos::service::{Service, Serviced};
         use dos::testguest::TestGuest;
 
-        let mut f = Fossil::new(Uart::new(None));
+        let mut f = Fossil::new(std::rc::Rc::new(std::cell::RefCell::new(Uart::new(None))));
         let mut g = TestGuest::new(64 * 1024);
         let mut regs = g.regs();
         regs.ax = 0x0200;
@@ -595,7 +614,7 @@ mod tests {
         use dos::service::{Service, Serviced};
         use dos::testguest::TestGuest;
 
-        let mut f = Fossil::new(Uart::new(None));
+        let mut f = Fossil::new(std::rc::Rc::new(std::cell::RefCell::new(Uart::new(None))));
         let mut g = TestGuest::new(64 * 1024);
         let mut regs = g.regs();
         regs.ax = 0x0300;
