@@ -645,12 +645,22 @@ mod tests {
     ///
     /// **`__Return_unwind` is a gate rather than a frontier**, and it is the one
     /// the phase plan predicted. It is Borland's C++ exception unwind: it
-    /// restores a saved register set and resumes at a stored address, and
-    /// `mbbs_machine::m32::Machine` has no register setters -- its only setter
-    /// is `set_budget`. That is the same wall the plan recorded for `_longjmp`,
-    /// reached from the exception path instead. Adding register setters is a
-    /// change in `mbbs-machine`, deliberately out of scope, and explicitly not
-    /// to be done speculatively.
+    /// restores a saved register set and resumes at a stored address.
+    ///
+    /// This used to say `mbbs_machine::m32::Machine` had no register setters
+    /// and that adding them was out of scope and not to be done
+    /// speculatively. **Half of that is now obsolete**: the machine has
+    /// [`mbbs_machine::m32::Regs`], a setter per register, and
+    /// `m32::Machine::jump`, the entry point that enters with exactly what
+    /// was set -- added deliberately, for API completeness, rather than
+    /// speculatively. `m16` has the same.
+    ///
+    /// What is still missing is the part that was never a setter: the layout
+    /// of the register block Borland's unwind reads. Nothing tracked
+    /// describes it -- see `docs/2026-08-16-phase3-4-handoff.md`'s note that
+    /// the sibling `jmp_buf` layout exists only in a gitignored Turbo C
+    /// header -- so wiring this symbol still needs a measurement, not more
+    /// machine surface.
     ///
     /// The program reaches it because it throws: `WCCMMUD.MCV` does not exist
     /// (only the uncompiled `WCCMMUD.MSG` does), so it reports the failure,
