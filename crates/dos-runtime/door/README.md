@@ -16,24 +16,48 @@ Both are supported and both move bytes through the same queues, so the choice
 changes nothing in this directory. Measured on a real session, `Regular Fossil`
 produced 1467 `AH=01` transmits and exactly 1467 bytes out.
 
-**Run the live board on `Internal`.** The two settings do not put the same
-bytes on the wire, because LORD renders differently for each: over the same
-screens it sent 6035 bytes on `Internal` against 3050 on `Regular Fossil`, with
-675 colour changes against 267 and 38 cursor-forwards against 120. `Internal`
-pads with real spaces carrying attributes; FOSSIL compresses with `ESC[nC`
-skips and leans on the terminal for the rest, which was the right trade at 2400
-baud and is the wrong one now.
+The two settings do not put the same bytes on the wire, because LORD renders
+differently for each: over the same screens it sent 6035 bytes on `Internal`
+against 3050 on `Regular Fossil`, with 675 colour changes against 267 and 38
+cursor-forwards against 120. `Internal` pads with real spaces carrying
+attributes; FOSSIL compresses with `ESC[nC` skips and leans on the terminal
+for the rest, which was the right trade at 2400 baud. That comparison is still
+true and still interesting; it just no longer settles the question by itself.
 
-The consequence is that FOSSIL output only lays out correctly on a terminal
-exactly 80 columns wide. LORD's own screen data assumes it -- around the
-`(F)lirt with Violet the Virgin` menu in `LORDTXT.DAT` there is an unbroken
-82-character run that is *meant* to wrap after column 80, and `ESC[nC` values
-up to 78 that only land where intended when the right margin clamps at 79. On
-a wider terminal neither happens and the screen is unreadable.
+It used to settle the question, because FOSSIL's compression only laid out
+correctly on a terminal exactly 80 columns wide. LORD's screen data assumes
+that width in two separate ways: some rows run past column 80 with no CR/LF,
+relying on the terminal to wrap them for free, and some `ESC[nC` (cursor
+forward) sequences rely on the terminal clamping at the right margin rather
+than naming their target column outright. Around the `(F)lirt with Violet the
+Virgin` menu in `LORDTXT.DAT` there was an unbroken 82-character run depending
+on the first of those -- on a wider terminal it never wraps, two rows collapse
+into one, and everything below shifts. That was the finding behind this
+document's old recommendation, **"run the live board on `Internal`."**
 
-That is a bug in LORD, not here, and it is deliberately not worked around: the
-transport does not rewrite a program's escape sequences. `Internal` does not
-have the problem, so the door uses it.
+**That cause was removed.** `d8f27ee` ("make LORD's art render the same at
+any terminal width") rewrapped `LORDTXT.DAT`, inserting a CR/LF at each of the
+68 places across `@#ARTHUR`, `@#CHANCE`, `@#TURGON`, `@#VIOLET`, `@#BT` and
+`@#FOOT` where an 80-column terminal used to wrap for free -- Violet's screen,
+the one that surfaced the bug, among them. On an 80-column terminal the output
+is byte-for-byte unchanged; on any other width the file now says what the
+terminal used to do for it, instead of leaving it to a wrap that no longer
+happens. The patched file is what the live board serves.
+
+The same commit deliberately left the second dependency, `ESC[nC` clamping,
+alone: three sites rely on it, against the 68 fixed. Pre-clamping them was
+tried and abandoned -- deleting a forward that was already at the margin also
+clears the terminal's pending-wrap flag, which moves the next character too,
+so the rewrite was not idempotent without also modelling pending-wrap
+semantics. Not worth it for three sites, so they are counted, reported, and
+left alone (`d8f27ee`'s commit message has the detail). If a screen ever looks
+subtly wrong near the right edge on a wide terminal, this is where to look
+first -- a known, narrow gap, not a guess.
+
+**Run the live board on `Regular Fossil`.** Nodes 1-4 already do. This is
+still a bug in LORD, not here, and it is still deliberately not worked around
+by rewriting a program's escape sequences on the wire -- `d8f27ee` fixed the
+data LORD ships, not the transport.
 
 If a door is set to a FOSSIL mode and the driver does not answer, the failure
 is not subtle -- LORD says `Fossil was not initialized properly! You should
