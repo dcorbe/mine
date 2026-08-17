@@ -255,7 +255,81 @@ fn run_pe32(path: &str, data: &[u8], tail: &str, root_dir: &str) -> io::Result<(
 
     let outcome = win32::process::run(&mut loaded, &mut process, PE_CALL_BUDGET)?;
     println!("--- {outcome:?} ---");
+    show_console(&process);
+    report_diagnostics(&process);
     Ok(())
+}
+
+/// Print what the program drew.
+///
+/// **Shaped like the real-mode path's own post-run dump, not like `Terminal`.**
+/// `Terminal` enters raw mode and repaints incrementally, which is right for
+/// driving an interactive guest and wrong for a batch run that has already
+/// finished -- it would take over the operator's terminal to show one final
+/// frame. The DOS side has exactly this distinction already: it drives through
+/// `Terminal` while running and then dumps `B800:0000` as plain text at the
+/// end. This is that same ending, for a console the host owns rather than one
+/// it samples out of guest memory.
+///
+/// Nothing is printed when the program drew nothing, so a run that fails before
+/// reaching the console does not emit an empty grid and imply it painted one.
+fn show_console(process: &win32::process::Process) {
+    let grid = process.console.cells();
+    if !anything_drawn(grid) {
+        return;
+    }
+
+    // The same ruler the real-mode dump prints, for the same reason: a column
+    // number is what makes a misplaced write obvious.
+    println!("--- console ({}x{}) ---", grid.cols, grid.rows);
+    let tens: String = (0..grid.cols).map(|c| char::from(b'0' + ((c / 10) % 10) as u8)).collect();
+    let ones: String = (0..grid.cols).map(|c| char::from(b'0' + (c % 10) as u8)).collect();
+    println!("    {tens}");
+    println!("    {ones}");
+    for row in 0..grid.rows {
+        let line = grid.line(row);
+        // Trailing spaces are trimmed for width, but the row number is kept
+        // even for a blank line: a gap in the numbering would read as a row
+        // that does not exist rather than one that is empty.
+        println!("{row:3} {}", line.trim_end());
+    }
+    let (col, cursor_row) = process.console.cursor();
+    let (size, visible) = process.console.cursor_info();
+    println!(
+        "cursor: row {cursor_row} col {col}, {} ({size}%)",
+        if visible { "visible" } else { "hidden" }
+    );
+}
+
+/// Whether the program put anything on screen.
+///
+/// A run that fails before reaching the console must not print an empty grid,
+/// because an 80x25 block of blanks with a ruler over it reads as "it painted
+/// this" rather than "it painted nothing".
+fn anything_drawn(grid: &dos_runtime::screen::Cells) -> bool {
+    (0..grid.rows).any(|r| !grid.line(r).trim().is_empty())
+}
+
+/// Print what the program *said* -- the diagnostics this host captured because
+/// there is nowhere on Linux to deliver them.
+///
+/// `ReportEventA` would reach the NT event log and `MessageBoxA` a desktop;
+/// neither exists here, and on the failure paths this family of utilities takes,
+/// the program's own words are the most informative thing it produces. Throwing
+/// them away to keep the output tidy would be discarding the answer.
+fn report_diagnostics(process: &win32::process::Process) {
+    for event in &process.events {
+        // `EVENTLOG_ERROR_TYPE` is 1, `WARNING` 2, `INFORMATION` 4. The raw
+        // value is printed alongside because this program passes values outside
+        // that set.
+        println!("event[{:#x}] {}", event.id, event.strings.join(" | "));
+    }
+    for (caption, text) in &process.messages {
+        println!("messagebox[{caption}] {text}");
+    }
+    if process.slept_calls > 0 {
+        println!("slept: {} calls (not actually waited)", process.slept_calls);
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -1094,6 +1168,25 @@ fn dropfile_baud(path: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// A blank console prints nothing. An 80x25 block of spaces under a ruler
+    /// reads as "the program drew this", which is the opposite of the truth.
+    #[test]
+    fn a_console_nothing_was_drawn_on_is_not_printed() {
+        use dos_runtime::screen::Cells;
+        assert!(!super::anything_drawn(&Cells::blank(80, 25)));
+
+        let mut grid = Cells::blank(80, 25);
+        grid.cells[3 * 80 + 10].ch = b'X';
+        assert!(super::anything_drawn(&grid), "one character counts");
+
+        // Spaces are not content, however many there are.
+        let mut spaces = Cells::blank(80, 25);
+        for c in &mut spaces.cells {
+            c.ch = b' ';
+        }
+        assert!(!super::anything_drawn(&spaces));
+    }
+
     use super::{Cli, Format, dropfile_baud, format_of};
     use clap::Parser;
 

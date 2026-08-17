@@ -699,6 +699,22 @@ mod tests {
             "GALCAT.OUT is {} bytes; a runaway memory-map walk makes it megabytes",
             dump.len()
         );
+
+        // **It drew the message on screen**, which is one assertion standing in
+        // for a whole chain: `GetLocalTime` filled a `SYSTEMTIME`, the format
+        // engine rendered it and the message, `WriteConsoleOutputCharacterA`
+        // marshalled a packed `COORD` and a count out-parameter, and the
+        // console buffer kept the cells. Any one of those being wrong shows up
+        // here as missing or misplaced text rather than as a passing unit test.
+        let text = p.console.cells().text();
+        assert!(
+            text.contains("CANNOT FIND"),
+            "the console should carry what the program drew:\n{text}"
+        );
+        assert!(
+            text.contains("-26 "),
+            "and the date it formatted through GetLocalTime:\n{text}"
+        );
     }
 
     /// `ExitProcess` must end the run and carry its code out, not merely
