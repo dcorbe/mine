@@ -7,3 +7,4 @@
 //! `docs/plans/2026-08-16-dos-border-design.md`.
 
 pub mod guest;
+pub mod files;
