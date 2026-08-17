@@ -589,12 +589,21 @@ pub(crate) fn apply_cpc(g: &mut Gsbl, chan: Chan, cpchar: u8) {
 }
 
 /// `int btuclo(int chan)` -- throw away output that has not gone out yet.
+///
+/// Resets `column` to zero -- the cursor is back at the left margin of a
+/// blank line -- and `wrapped` along with it, for the same reason every
+/// other `column`-resetting site does (`crate::gsbl::Channel::wrapped`'s own
+/// doc comment: "Reset wherever `column` is reset to zero"). Without it, a
+/// wrap that fired before this call would leave a soft CR on the discarded
+/// output's line still armed, degrading the *next* line's first soft CR to a
+/// SPACE it has not earned.
 pub fn btuclo<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
     Ok(match on_channel(host, chan, |g, chan| {
         let c = g.channel_mut(chan);
         c.output.clear();
         c.column = 0;
+        c.wrapped = false;
     }) {
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
@@ -1590,6 +1599,33 @@ mod tests {
             .expect("transmitted");
         f.invoke(btuclo, &[0]).expect("cleared");
         assert!(f.host.gsbl_mut().drain_output(console).is_empty());
+    }
+
+    /// `btuclo` resets `column` to zero -- the cursor is back at the left
+    /// margin -- and must reset `wrapped` along with it, the same as every
+    /// other site that zeroes `column`. Without that, a wrap from output
+    /// `btuclo` just discarded would leave the *next* line's first soft CR
+    /// wrongly degraded to a SPACE, on a line that has not itself wrapped.
+    #[test]
+    fn btuclo_clears_the_wrapped_flag_a_soft_cr_relied_on() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).width = 10;
+        f.invoke(btuscr, &[0, b'|' as u16]).expect("ok");
+
+        // Force a wrap, then throw the whole line away with btuclo rather
+        // than ending it with a real line break.
+        f.host.gsbl_mut().transmit(console, b"aaaaaaaaaaaa");
+        f.invoke(btuclo, &[0]).expect("cleared");
+
+        // The fresh line btuclo left behind has not itself wrapped: the soft
+        // CR must break it, not carry the space over from the discarded one.
+        f.host.gsbl_mut().transmit(console, b"ab|");
+        assert_eq!(
+            f.host.gsbl_mut().drain_output(console),
+            b"ab\r\n".to_vec(),
+            "btuclo must reset `wrapped`, or this soft CR wrongly degrades to a SPACE"
+        );
     }
 
     #[test]
