@@ -254,8 +254,29 @@ fn read_args(machine: &Machine, mem: &Memory) -> Result<Marshalled, String> {
 
     // `*dataLength` -- the caller's own `ULONG`, read before this call
     // overwrites it with how many bytes the engine actually used.
+    //
+    // **Only the low sixteen bits of this read are trustworthy.**
+    // `re/wg33src/SRC/api/gcommlib/DFAAPI.C:914,978` is the measured reason:
+    // `btvu`'s own record-length parameter, `rlen`, is declared `USHORT` --
+    // two bytes -- and its Win32 call site takes that two-byte local's
+    // address and casts it straight to `ULONG *` (`(ULONG*)&rlen`) before
+    // handing it to `BTRCALL`. Whatever this host resolves as the high
+    // sixteen bits is therefore not `dataLength` at all: it is two bytes of
+    // whatever sits next to `rlen` on the guest's own stack frame, which
+    // depends on stack layout this host has no reason to reproduce and the
+    // module never reads back as anything but the `USHORT` it declared.
+    // Measured at a real call site inside this run's own `-recover` pass
+    // (op 33, Step First): resolving all four bytes as the buffer length
+    // read `0x4101_0190` -- a plausible small record length, `0x0190`
+    // (400), sitting under an upper half that is address-shaped stack
+    // noise, the same signature `op`/`keyLength`/`ckeynum`'s own doc
+    // comments in this function already describe for the identical
+    // narrow-write-into-a-wide-slot shape.
     let datalen: u32 = match Flat32Ptr(datalen_at).resolve(mem, 4) {
-        Ok(bytes) => u32::from_le_bytes(bytes.try_into().expect("resolve returned 4 bytes")),
+        Ok(bytes) => {
+            let raw = u32::from_le_bytes(bytes.try_into().expect("resolve returned 4 bytes"));
+            u32::from(raw as u16)
+        }
         Err(e) => return Err(format!("data length at {datalen_at:#010x}: {e}")),
     };
 
@@ -264,7 +285,7 @@ fn read_args(machine: &Machine, mem: &Memory) -> Result<Marshalled, String> {
     } else {
         match Flat32Ptr(databuf_at).resolve(mem, datalen as usize) {
             Ok(bytes) => bytes.to_vec(),
-            Err(e) => return Err(format!("data buffer at {databuf_at:#010x}: {e}")),
+            Err(e) => return Err(format!("op {op_raw:#x}: data buffer at {databuf_at:#010x}, datalen {datalen}: {e}")),
         }
     };
 
@@ -544,5 +565,82 @@ mod tests {
         assert_eq!(args.keybuf, vec![KEYBUF_FILL; KEYBUF_LEN], "keyBuffer contents");
         assert_eq!(args.keylen, KEYLEN, "keyLength");
         assert_eq!(args.keynum, KEYNUM, "ckeynum");
+    }
+
+    /// `*dataLength` with garbage in its upper sixteen bits must still
+    /// resolve the data buffer at the real, small length -- not fail, and
+    /// not read millions of bytes.
+    ///
+    /// This is not a hypothetical: `re/wg33src/SRC/api/gcommlib/DFAAPI.C:914,
+    /// 978` casts the address of `btvu`'s own `USHORT rlen` parameter
+    /// straight to `ULONG *` before calling `BTRCALL`, so the real caller
+    /// hands this host four bytes where only the low two were ever meant to
+    /// be a length -- the top two are whatever sits next to `rlen` on the
+    /// guest's own stack frame. Measured live, inside this task's own
+    /// `-recover` run: op 33 (Step First) read `0x4101_0190` there before
+    /// this fix, where `0x0190` (400) is a plausible record length and
+    /// `0x4101` is address-shaped stack noise -- resolving the full 32-bit
+    /// value failed outright ("1090584976 bytes runs past the end of the
+    /// image"), which is what surfaced this.
+    #[test]
+    fn a_datalength_with_garbage_upper_bits_still_resolves_the_real_length() {
+        const DATABUF_FILL: u8 = 0xB2;
+        const REAL_LEN: u16 = 40;
+        // Address-shaped, the same kind of noise the module's own stack
+        // frame produced in the live measurement this test's doc comment
+        // cites -- chosen to be unmistakably wrong if it leaks into the
+        // resolved length.
+        const GARBAGE_UPPER: u32 = 0x4101_0000;
+
+        let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
+        let mut l = crate::win32::load::load(&file).expect("loads");
+
+        let posblk_at = l.mem.alloc(128).expect("posblk region").0;
+        Flat32Ptr(posblk_at)
+            .write(&mut l.mem, &[0u8; 128])
+            .expect("posblk region is writable");
+
+        let databuf_at = l.mem.alloc(usize::from(REAL_LEN)).expect("databuf region").0;
+        Flat32Ptr(databuf_at)
+            .write(&mut l.mem, &[DATABUF_FILL; REAL_LEN as usize])
+            .expect("databuf region is writable");
+
+        let datalen_at = l.mem.alloc(4).expect("datalen region").0;
+        Flat32Ptr(datalen_at)
+            .write(&mut l.mem, &(GARBAGE_UPPER | u32::from(REAL_LEN)).to_le_bytes())
+            .expect("datalen region is writable");
+
+        const SLOT: u16 = 451;
+        let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+        let base = code_mapping.base() as usize as u32;
+        let mut code = Vec::new();
+        let push_imm32 = |code: &mut Vec<u8>, v: u32| {
+            code.push(0x68);
+            code.extend_from_slice(&v.to_le_bytes());
+        };
+        push_imm32(&mut code, 0); // arg6: ckeynum
+        push_imm32(&mut code, 0); // arg5: keyLength (no key buffer offered)
+        push_imm32(&mut code, 0); // arg4: keyBuffer
+        push_imm32(&mut code, datalen_at); // arg3: dataLength
+        push_imm32(&mut code, databuf_at); // arg2: dataBuffer
+        push_imm32(&mut code, posblk_at); // arg1: posBlock
+        push_imm32(&mut code, 33); // arg0: operation (Step First)
+
+        let target = l.machine.thunk_addr(SLOT);
+        let next_ip = base + code.len() as u32 + 5;
+        code.push(0xe8); // call rel32
+        code.extend_from_slice(&target.wrapping_sub(next_ip).to_le_bytes());
+        code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let exit = l
+            .machine
+            .call_on(l.mem.stack_mut(), base, &[])
+            .expect("the hand-built frame traps into the armed thunk");
+        assert_eq!(exit, Exit::Call { index: SLOT });
+
+        let args = read_args(&l.machine, &l.mem)
+            .expect("the real length must resolve even with garbage above it");
+        assert_eq!(args.datalen, u32::from(REAL_LEN), "the garbage upper bits are gone");
+        assert_eq!(args.databuf, vec![DATABUF_FILL; REAL_LEN as usize]);
     }
 }
