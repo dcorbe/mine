@@ -22,12 +22,28 @@
 //! -- was invisible to both: the manifest check split on the literal
 //! `"[dependencies]"` and found nothing under a *different* header, and the
 //! source scan never walked `tests/` at all. Both guards now see the whole
-//! picture, and both stay allowlists: [`EXPECTED_DEV_DEPENDENCIES`] names
+//! picture, and both stay allowlists: [`expected_dev_dependencies`] names
 //! exactly what is permitted under `[dev-dependencies]`, and
 //! [`is_the_one_file_allowed_to_name_btrieve_oracle`] names exactly which
 //! file may say so in source. A second dev-dependency, or a second file
 //! naming `btrieve_oracle`, fails both guards rather than sliding through
 //! an empty split or an unwalked directory.
+//!
+//! # The empty split, closed
+//!
+//! That literal split stayed a hole even after the exception above was added,
+//! and it was recorded as a follow-up rather than fixed as a rider
+//! (`docs/2026-08-17-btrcall-facade-landed.md`, follow-up 1). It is closed
+//! here. Searching a manifest for the *substring* `"[dependencies]"` finds
+//! nothing in four ordinary Cargo spellings -- `[dependencies.libc]`,
+//! `[build-dependencies]`, `[target.'cfg(unix)'.dependencies]` and
+//! `[target.'cfg(unix)'.dependencies.libc]` -- and "no section found" and "the
+//! section is empty" were the same answer, so each of those forms declared a
+//! dependency the guard reported as an absence. [`declared_dependencies`]
+//! reads the section *header's path* instead, so how the table is spelled
+//! stops mattering. Each of those four forms was written into this crate's
+//! real `Cargo.toml` in turn, and each now fails the guard -- a check that has
+//! been watched failing, not merely watched passing.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -148,34 +164,191 @@ fn the_source_and_tests_use_only_the_allowed_dependencies() {
     assert!(offences.is_empty(), "the seam has leaked:\n{}", offences.join("\n"));
 }
 
-/// Splits `manifest` on `header` (a literal section marker like
-/// `"[dependencies]"`) and returns the trimmed text up to the next section
-/// header, or an empty string if `header` never appears. `"[dev-
-/// dependencies]"` never collides with a search for `"[dependencies]"`: the
-/// former's `[` is immediately followed by `dev-`, not `dependencies]`, so
-/// the two section markers do not overlap as substrings.
-fn section(manifest: &str, header: &str) -> String {
-    manifest
-        .split(header)
-        .nth(1)
-        .map(|rest| rest.split("\n[").next().unwrap_or("").trim().to_owned())
-        .unwrap_or_default()
+/// Which dependency table a section header names. Read off the header's
+/// *last* path segment rather than matched against one literal spelling --
+/// the previous guard searched the manifest for the substring
+/// `"[dependencies]"`, which four ordinary Cargo spellings do not contain:
+/// `[dependencies.libc]`, `[target.'cfg(unix)'.dependencies]`,
+/// `[target.'cfg(unix)'.dependencies.libc]` and `[build-dependencies]`. Each
+/// read as an absent section, i.e. as an empty one, i.e. as "no dependency
+/// here" -- the exact failure this guard exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DependencyKind {
+    /// `[dependencies]` -- must be empty; this crate is `std`-only.
+    Runtime,
+    /// `[dev-dependencies]` -- exactly [`expected_dev_dependencies`].
+    Dev,
+    /// `[build-dependencies]` -- must be empty. This crate has no build
+    /// script, so a build dependency is either dead weight or a dependency
+    /// smuggled in through the one table nobody thinks to look at.
+    Build,
 }
 
-/// The crate name on the left of each `name = ...` line in a dependencies
-/// section, ignoring blank lines. Good enough for this manifest, which never
-/// nests a table under `[dev-dependencies]`.
-fn crate_names(section: &str) -> BTreeSet<String> {
-    section
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
+impl DependencyKind {
+    fn from_segment(segment: &str) -> Option<Self> {
+        match segment {
+            "dependencies" => Some(Self::Runtime),
+            "dev-dependencies" => Some(Self::Dev),
+            "build-dependencies" => Some(Self::Build),
+            _ => None,
+        }
+    }
+}
+
+/// Splits a section header's path on `.`, honouring the quoting Cargo requires
+/// for `[target.'cfg(any(unix, windows))'.dependencies]`. An unquoted split
+/// would cut a `cfg(...)` predicate wherever it contains a dot -- and a
+/// predicate that mentions a version, a path or a feature name routinely does.
+/// The surrounding quotes are stripped so a segment compares equal to a plain
+/// name.
+fn header_segments(header: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for c in header.chars() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => current.push(c),
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '.') => segments.push(std::mem::take(&mut current)),
+            (None, _) => current.push(c),
+        }
+    }
+    segments.push(current);
+    segments.into_iter().map(|s| s.trim().to_owned()).collect()
+}
+
+/// What a section header means for the dependency census.
+#[derive(Debug, PartialEq, Eq)]
+enum Section {
+    /// A dependency table proper (`[dependencies]`,
+    /// `[target.'cfg(unix)'.dev-dependencies]`): every key in it names a
+    /// dependency.
+    KeysAreDependencies(DependencyKind),
+    /// The sub-table form (`[dependencies.libc]`): the *header* names the one
+    /// dependency and the keys inside it are that dependency's own fields --
+    /// `version`, `path`, `features` -- which are not dependency names and
+    /// must not be collected as if they were.
+    Names(DependencyKind, String),
+    /// `[package]`, `[lints]`, `[[bin]]`, anything else.
+    Irrelevant,
+}
+
+fn classify(header: &str) -> Section {
+    let segments = header_segments(header);
+    let Some(at) = segments.iter().position(|s| DependencyKind::from_segment(s).is_some()) else {
+        return Section::Irrelevant;
+    };
+    let kind = DependencyKind::from_segment(&segments[at]).expect("position found it");
+    match segments.get(at + 1) {
+        Some(name) => Section::Names(kind, name.clone()),
+        None => Section::KeysAreDependencies(kind),
+    }
+}
+
+/// Every dependency the manifest declares, paired with the table that declared
+/// it. Comment lines and blank lines are skipped; a dotted key (`libc.workspace
+/// = true`) contributes its first segment, and a quoted key its unquoted name.
+///
+/// Deliberately not a TOML parser. Where it cannot tell -- a value array split
+/// across lines inside a `[dependencies]` table, say -- it reports the
+/// continuation line as a dependency name rather than skipping it, so the
+/// guard fails loudly and someone reads the manifest. An allowlist that errs
+/// towards refusing is doing its job; one that errs towards accepting is the
+/// bug this whole file exists to stop.
+fn declared_dependencies(manifest: &str) -> BTreeSet<(DependencyKind, String)> {
+    let mut declared = BTreeSet::new();
+    let mut section = Section::Irrelevant;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // `[[bin]]` and friends are arrays of tables, never dependency
+        // tables, and their inner text (`[bin]`) must not be classified.
+        if trimmed.starts_with("[[") {
+            section = Section::Irrelevant;
+            continue;
+        }
+        if let Some(header) = trimmed.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            section = classify(header);
+            if let Section::Names(kind, name) = &section {
+                declared.insert((*kind, name.clone()));
             }
-            line.split('=').next().map(|n| n.trim().to_owned())
-        })
-        .collect()
+            continue;
+        }
+        if let Section::KeysAreDependencies(kind) = section {
+            let key = trimmed.split('=').next().unwrap_or("").trim();
+            let first = key.split('.').next().unwrap_or("").trim().trim_matches(['\'', '"']);
+            if !first.is_empty() {
+                declared.insert((kind, first.to_owned()));
+            }
+        }
+    }
+    declared
+}
+
+/// The names declared under one table, for the assertions below.
+fn names_of(declared: &BTreeSet<(DependencyKind, String)>, kind: DependencyKind) -> BTreeSet<String> {
+    declared.iter().filter(|(k, _)| *k == kind).map(|(_, n)| n.clone()).collect()
+}
+
+/// The four spellings the previous literal-substring guard read as an empty
+/// section. Each is ordinary Cargo, not a contrivance: `cargo add` writes the
+/// sub-table form whenever a dependency needs more than a version string.
+#[test]
+fn the_scanner_sees_a_dependency_however_the_manifest_spells_the_table() {
+    let cases: &[(&str, DependencyKind, &str)] = &[
+        ("[dependencies]\nlibc = \"0.2\"\n", DependencyKind::Runtime, "libc"),
+        ("[dependencies.libc]\nversion = \"0.2\"\n", DependencyKind::Runtime, "libc"),
+        ("[build-dependencies]\ncc = \"1\"\n", DependencyKind::Build, "cc"),
+        ("[dev-dependencies.tempfile]\nversion = \"3\"\n", DependencyKind::Dev, "tempfile"),
+        ("[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n", DependencyKind::Runtime, "libc"),
+        (
+            "[target.'cfg(unix)'.dependencies.libc]\nversion = \"0.2\"\n",
+            DependencyKind::Runtime,
+            "libc",
+        ),
+        ("[dependencies]\nlibc.workspace = true\n", DependencyKind::Runtime, "libc"),
+        ("[dependencies]\n\"libc\" = \"0.2\"\n", DependencyKind::Runtime, "libc"),
+    ];
+    for (manifest, kind, name) in cases {
+        let declared = declared_dependencies(manifest);
+        assert!(
+            declared.contains(&(*kind, (*name).to_owned())),
+            "the guard missed {name} in:\n{manifest}\nit saw {declared:?}"
+        );
+    }
+}
+
+/// The other half of the same guard: a dependency's own *fields* are not
+/// dependencies. Without this, `[dependencies.libc]`'s `version`/`features`
+/// keys would be collected as crate names and the guard would fail on a
+/// manifest that is perfectly fine -- an allowlist that cries wolf gets
+/// widened until it stops meaning anything.
+#[test]
+fn the_scanner_reads_no_dependency_where_there_is_none() {
+    let manifest = "\
+# a comment mentioning [dependencies] libc = \"0.2\"
+[package]
+name = \"btrieve\"
+
+[dependencies.libc]
+version = \"0.2\"
+features = [\"std\"]
+
+[[bin]]
+name = \"btrvdump\"
+
+[lints]
+workspace = true
+";
+    let declared = declared_dependencies(manifest);
+    assert_eq!(
+        declared,
+        [(DependencyKind::Runtime, "libc".to_owned())].into_iter().collect::<BTreeSet<_>>(),
+        "only libc is a dependency here"
+    );
 }
 
 #[test]
@@ -183,14 +356,16 @@ fn the_manifest_declares_no_runtime_dependencies_and_exactly_the_expected_dev_de
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("readable manifest");
+    let declared = declared_dependencies(&manifest);
 
-    let deps = section(&manifest, "[dependencies]");
+    let mut not_dev: Vec<_> = declared.iter().filter(|(k, _)| *k != DependencyKind::Dev).collect();
+    not_dev.sort();
     assert!(
-        deps.is_empty(),
-        "btrieve must depend on nothing but std at runtime; found under [dependencies]:\n{deps}"
+        not_dev.is_empty(),
+        "btrieve must depend on nothing but std to build and to run; found {not_dev:?}"
     );
 
-    let dev_deps = crate_names(&section(&manifest, "[dev-dependencies]"));
+    let dev_deps = names_of(&declared, DependencyKind::Dev);
     let expected = expected_dev_dependencies();
     assert_eq!(
         dev_deps, expected,
