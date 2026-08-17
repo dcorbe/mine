@@ -756,20 +756,37 @@ mod tests {
         );
     }
 
-    /// **Task 7's acceptance test.** `wccmmutl.exe -recover` against a full
+    /// **Task 7b's acceptance run.** `wccmmutl.exe -recover` against a full
     /// copy of a real board -- not the two-file fixture every other test
     /// here uses -- reaches genuine recovery stages a person would recognise
     /// (`Deleting Active`, `Known Monsters`, `Updating Rooms`, painted onto
-    /// the Win32 console this host owns) before stopping on a real,
-    /// understood Btrieve status: op 3 (Update) on `WCCMP002.DAT` changes a
-    /// key that file declares non-modifiable, which genuine Btrieve answers
-    /// status 10 for and this engine already detects
-    /// (`Btrieve::unmodifiable_key_changed`, `lib.rs:1242`) -- `btrcall.rs`'s
-    /// `update` dispatch just has no typed path from that detection to a
-    /// status yet, so it surfaces as a `BtrieveGap` rather than a wrong
-    /// number. That is real, honest progress, not completion: this program
-    /// never reaches `ExitProcess`, so there is no process exit code to
-    /// assert, only the outcome the run actually stopped at.
+    /// the Win32 console this host owns), then op 3 (Update) on
+    /// `WCCMP002.DAT` changes a key that file declares non-modifiable.
+    ///
+    /// **Task 7 measured this as an engine gap** (`Outcome::BtrieveGap`):
+    /// `Btrieve::unmodifiable_key_changed` (`lib.rs:1242`) already detected
+    /// it, but `btrcall.rs`'s `update` dispatch had no typed path from that
+    /// detection to a status, only a string inside a `BtvError`. **Task 7b
+    /// gave it one** (`Block::would_change_unmodifiable_key`, consulted
+    /// before `Block::update` runs), and the difference shows here: the
+    /// program itself now receives real Btrieve status 10, recognises it as
+    /// a genuine error rather than crashing on an unmodelled one, and prints
+    /// its own diagnostic -- `BTRIEVE UPDATE ERROR 10 ON FILE ".\WCCMP002.DAT"`
+    /// -- onto the console. That is the vendor's own error-reporting path
+    /// actually running, not this host inventing text.
+    ///
+    /// Having reported the error, the program throws a C++ exception to
+    /// unwind and abort the recovery pass, landing in
+    /// `cw3220mt.DLL!__Return_unwind` -- Borland's exception unwind, which
+    /// restores a saved register set and resumes at a stored address.
+    /// `mbbs_machine::m32::Machine` has no register setters for that (its
+    /// only setter is `set_budget`); adding them is a change in
+    /// `mbbs-machine`, out of this task's scope, and -- per
+    /// `with_a_catalogue_it_runs_past_the_unwind_into_the_c_runtime` and
+    /// `docs/2026-08-17-win32-crt-trace.md` -- explicitly not to be done
+    /// speculatively. This is the same wall those tests already named; this
+    /// run is the first time the *real* recovery path (not a synthetic
+    /// missing-file throw) reaches it.
     ///
     /// **`#[ignore]`d**, the same way `crates/btrieve/src/ops.rs`'s own
     /// Wine-oracle tests are: this needs `/home/daniel/peepeebbs` (a real
@@ -822,25 +839,26 @@ mod tests {
         let out = run(&mut loaded, &mut p, 20_000_000).expect("the machine runs");
         assert_eq!(
             out,
-            Outcome::BtrieveGap {
-                what: "updating: WCCMP002.DAT: key 0 does not declare itself modifiable, \
-                       and this update changes its value -- genuine Btrieve answers status \
-                       10 and writes nothing"
-                    .to_owned(),
+            Outcome::Unimplemented {
+                module: "cw3220mt.DLL".to_owned(),
+                symbol: "__Return_unwind".to_owned(),
             },
-            "the measured frontier: real recovery progress through several stages, \
-             stopped by a real Btrieve status this engine detects but btrcall's \
-             update dispatch cannot yet report as a status rather than a gap"
+            "the measured frontier: real recovery progress through several stages, a \
+             real Btrieve status 10 the program's own error handler reports and then \
+             unwinds from, landing on the register-setter wall this crate's own tests \
+             already name and are told not to fill speculatively"
         );
 
-        // What it painted at the point it stopped -- each recovery stage
-        // repaints this line over the last, so only the final one ("Updating
-        // Rooms", `WCCMP002.DAT`) is still on screen; that it got there at
-        // all is what the Gap message above already establishes -- the
-        // program does not reach the Rooms pass without finishing Active and
-        // Monsters first.
+        // What it painted at the point it stopped: the program's own
+        // diagnostic for the real status this host now hands it, still on
+        // screen underneath the "Updating Rooms" stage label the recovery
+        // pass was mid-way through when it threw.
         let grid = p.console.cells();
         let screen: String = (0..grid.rows).map(|r| grid.line(r)).collect();
+        assert!(
+            screen.contains(r#"BTRIEVE UPDATE ERROR 10 ON FILE ".\WCCMP002.DAT""#),
+            "expected the program's own status-10 diagnostic on the console; got:\n{screen}"
+        );
         assert!(
             screen.contains("Updating Rooms"),
             "expected \"Updating Rooms\" somewhere on the console; got:\n{screen}"
