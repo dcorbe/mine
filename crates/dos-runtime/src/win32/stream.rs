@@ -292,6 +292,21 @@ impl Streams {
         buf
     }
 
+    /// `fgetc(fp)` -- the next byte as an `int` in `0..=255`, or `EOF` (-1)
+    /// at end of file or on a `FILE *` this host never handed out.
+    ///
+    /// Delegates to [`Streams::read`] for one byte rather than duplicating
+    /// its end-of-file bookkeeping: `read`'s own `F_EOF` flag is exactly
+    /// what a program alternating `fgetc`/`feof` (a macro reading that same
+    /// flag straight out of the guest's `FILE`) needs set at the right
+    /// moment, and a second short-read path here could only disagree with it.
+    pub fn fgetc(&mut self, mem: &mut Memory, fp: u32) -> u32 {
+        match self.read(mem, fp, 1).first() {
+            Some(&byte) => u32::from(byte),
+            None => EOF,
+        }
+    }
+
     /// `fseek`/`ftell`'s shared seek. `whence` is C's 0/1/2, which is also what
     /// [`Files::seek`] takes.
     ///
@@ -610,6 +625,11 @@ pub fn dispatch(
             let items = if size == 0 { 0 } else { got / size };
             Some(Answer::cdecl(items as u32))
         }
+        // int fgetc(FILE *fp)
+        "_fgetc" => {
+            let fp = machine.arg_u32(mem.stack(), 0);
+            Some(Answer::cdecl(process.streams.fgetc(mem, fp)))
+        }
         // int vsprintf(char *buf, const char *fmt, va_list ap)
         //
         // A `va_list` on 32-bit cdecl is a bare pointer to the first variable
@@ -811,6 +831,46 @@ mod tests {
 
         assert_eq!(s.fclose(fp), 0);
         assert_eq!(s.fclose(fp), EOF, "closing it twice is an error");
+    }
+
+    /// `fgetc` walks a stream one byte at a time, as an unsigned `int` in
+    /// `0..=255` -- **not** a signed `i8`, which would turn a byte at or above
+    /// 0x80 into a negative value indistinguishable from `EOF` itself. The
+    /// last call past the final byte answers `EOF` and sets `F_EOF`, the same
+    /// flag `feof` reads and the same one a short [`Streams::read`] already
+    /// sets -- `fgetc` has no bookkeeping of its own to get out of step with
+    /// it.
+    #[test]
+    fn fgetc_walks_a_stream_one_byte_past_0x7f_then_answers_eof() {
+        let files = root_at("win32-fgetc");
+        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
+            .join("win32-fgetc");
+        std::fs::write(dir.join("BYTES.DAT"), [0x41, 0xff]).expect("fixture");
+
+        let mut l = loaded();
+        let mut s = Streams::new(Some(files));
+        let fp = s.fopen(&mut l.mem, b"BYTES.DAT", b"rb");
+        assert_ne!(fp, 0);
+
+        assert_eq!(s.fgetc(&mut l.mem, fp), 0x41, "first byte, ordinary ASCII");
+        assert_eq!(
+            s.fgetc(&mut l.mem, fp),
+            0xff,
+            "second byte: 255, not -1 -- a signed read would collide with EOF"
+        );
+        assert_eq!(s.fgetc(&mut l.mem, fp), EOF, "past the end of the file");
+
+        let raw = Flat32Ptr(fp).resolve(&l.mem, FILE_SIZE).expect("in memory");
+        let flags = u32::from_le_bytes(raw[FILE_FLAGS as usize..FILE_FLAGS as usize + 4].try_into().unwrap());
+        assert_ne!(flags & F_EOF, 0, "feof must see this");
+    }
+
+    /// A `FILE *` this host never handed out answers `EOF`, not a panic.
+    #[test]
+    fn fgetc_on_an_unknown_stream_is_eof_not_a_panic() {
+        let mut l = loaded();
+        let mut s = Streams::new(None);
+        assert_eq!(s.fgetc(&mut l.mem, 0x1234), EOF);
     }
 
     /// Two streams open at once must be distinguishable. A host keying its
