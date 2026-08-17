@@ -26,6 +26,30 @@ pub const ERR_INVALID_MEMORY_BLOCK: u16 = 0x09;
 /// same reason (`crates/dos-runtime/src/bin/runexe.rs`).
 const CONV_TOP: u16 = 0xa000;
 
+/// The smallest number of paragraphs any successful `AH=48h`/`4Ah` leaves a
+/// block owning, even when the caller asked for zero.
+///
+/// Real DOS accepts a zero-paragraph `48h` and does not refuse it, but it
+/// does not hand back a zero-footprint alias either: the returned segment is
+/// backed by nothing but that block's own one-paragraph MCB (Memory Control
+/// Block) header, which is real memory no other block can also start from.
+/// (The well-known trick for reading free memory *without* allocating is a
+/// deliberately oversized request -- `BX=0FFFFh` -- which is guaranteed to
+/// fail and report the largest block in `BX`; it is not `BX=0`, which DOS
+/// honours as a genuine, if minimal, allocation.)
+///
+/// This `Arena` has no separate header representation -- `allocated` maps a
+/// segment straight to the paragraphs a caller owns, with no per-block
+/// overhead modelled (see the struct's own doc comment). Without a floor,
+/// `alloc(0)` takes nothing from the free list, so the very next real
+/// allocation first-fits into the identical segment; two different callers
+/// then believe they each own it, and whichever frees first silently frees
+/// the other's live block out from under it. Reserving one paragraph here
+/// is the cheapest way to give a zero-size block the same non-aliasing
+/// property its real MCB header gives it, without modelling the header
+/// itself.
+const MIN_BLOCK: u16 = 1;
+
 /// Why a resize (`AH=4Ah`) failed.
 #[derive(Debug, PartialEq, Eq)]
 enum ResizeErr {
@@ -114,7 +138,12 @@ impl Arena {
     /// address order low to high (first-fit; see `AH=58h`'s doc comment for
     /// why nothing here honours a program's chosen strategy beyond accepting
     /// it). `Err` carries [`Arena::largest_free`], per `48h`'s own contract.
+    ///
+    /// `want` is floored to [`MIN_BLOCK`] before the search -- see that
+    /// constant's doc comment for why a zero-paragraph request still has to
+    /// consume real space.
     pub fn alloc(&mut self, want: u16) -> Result<u16, u16> {
+        let want = want.max(MIN_BLOCK);
         match self.free.iter().position(|&(_, size)| size >= want) {
             Some(i) => {
                 let (seg, size) = self.free[i];
@@ -142,8 +171,24 @@ impl Arena {
     /// Shrinking always succeeds and frees the tail; growing only succeeds
     /// in place, against whatever free block immediately follows the block
     /// (see [`ResizeErr::TooSmall`] for why relocation is not on offer).
+    ///
+    /// A shrink to zero is floored to [`MIN_BLOCK`] the same way `alloc`
+    /// floors `want` -- the caller (`ES` still names `seg`) keeps owning
+    /// that one paragraph instead of it going back on the free list, where
+    /// the next real allocation would first-fit into the exact segment the
+    /// caller still believes is theirs. Skipped when `old_size` is already
+    /// zero (the degenerate block a program with no free memory behind it
+    /// starts with, from [`Arena::new`]): flooring there would grow the
+    /// block without taking the paragraph from anywhere, so it is left at
+    /// zero and a genuine grow request has to go through the normal
+    /// adjacent-free-space check below like any other.
     fn resize(&mut self, seg: u16, new_size: u16) -> Result<(), ResizeErr> {
         let &old_size = self.allocated.get(&seg).ok_or(ResizeErr::NoSuchBlock)?;
+        let new_size = if new_size == 0 && old_size > 0 {
+            MIN_BLOCK
+        } else {
+            new_size
+        };
         if new_size <= old_size {
             self.allocated.insert(seg, new_size);
             self.release(seg + new_size, old_size - new_size);
@@ -648,6 +693,13 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
         // `find_record`'s doc comment already accepts, and nothing measured
         // interleaves the two calls.
         0x43 => {
+            // AL=1 (set) stores nothing and just succeeds -- see the doc
+            // comment above -- so it needs neither the path nor `dos.files`,
+            // and checking AL first means it can't fault on a pointer it
+            // never had to read.
+            if regs.al() == 1 {
+                return ok(g, regs);
+            }
             let path = match path_at(g, regs.ds_dx()) {
                 Ok(p) => p,
                 Err(f) => return Outcome::Fault(f),
@@ -655,9 +707,6 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
             let Some(files) = dos.files.as_mut() else {
                 return fail(g, regs, ERR_INVALID_FUNCTION);
             };
-            if regs.al() == 1 {
-                return ok(g, regs);
-            }
             match files.find_first(&path, files::ATTR_DIRECTORY) {
                 Ok(entry) => {
                     regs.cx = u16::from(entry.attr);
@@ -1385,6 +1434,69 @@ mod tests {
         assert_eq!(g.regs().bx, 0, "an empty arena has nothing to offer as a retry size");
     }
 
+    #[test]
+    fn zero_size_allocation_does_not_alias_a_later_real_allocation() {
+        // Reproduces the review finding verbatim: alloc(0) then alloc(0x20)
+        // both returning the identical segment, so freeing the phantom
+        // block frees memory a third caller still legitimately owns.
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x48, 0, 0, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry(), "a zero-paragraph request is a real, if minimal, allocation");
+        let phantom = g.regs().ax;
+
+        call_ah(&mut g, 0x48, 0, 0x20, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        let real = g.regs().ax;
+        assert_ne!(
+            phantom, real,
+            "a zero-size allocation must not alias the segment a later real one returns"
+        );
+
+        // Freeing the zero-size block must free only its own paragraph, not
+        // reach into the real block a different caller still owns.
+        call_ah(&mut g, 0x49, phantom, 0, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+
+        call_ah(&mut g, 0x48, 0, 0x10, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        let third = g.regs().ax;
+        assert!(
+            third >= real + 0x20 || third + 0x10 <= real,
+            "third allocation ({third:#06x}) must not overlap the still-live \
+             real block at {real:#06x}..+0x20"
+        );
+    }
+
+    #[test]
+    fn resize_down_to_zero_keeps_the_segment_from_aliasing_a_later_allocation() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x48, 0, 8, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        let seg = g.regs().ax;
+
+        call_ah(&mut g, 0x4a, seg, 0, 0); // shrink to zero paragraphs
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+
+        call_ah(&mut g, 0x48, 0, 8, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        let other = g.regs().ax;
+        assert_ne!(
+            seg, other,
+            "the block shrunk to zero still owns `seg` (ES still names it); \
+             a new allocation must not reuse the identical segment"
+        );
+    }
+
     // -- AH=58h/67h: allocation strategy and handle count, both no-ops that
     // must simply not fail. --
 
@@ -1473,6 +1585,25 @@ mod tests {
         let mut regs = Regs::default();
         regs.set_ah(0x43);
         regs.set_al(1);
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+    }
+
+    #[test]
+    fn set_file_attributes_needs_neither_a_filesystem_nor_a_valid_pointer() {
+        // AL=1 stores nothing (see the arm's own doc comment), so it must
+        // succeed even with no filesystem behind `dos` and a DS:DX that
+        // resolves outside the guest's memory -- proof that AL is checked
+        // before the path is ever read, not after.
+        let mut g = TestGuest::new(64);
+        let mut dos = DosState::default(); // files: None
+        let mut regs = Regs::default();
+        regs.set_ah(0x43);
+        regs.set_al(1);
+        regs.ds = 0xffff;
+        regs.dx = 0xffff; // linear address far past the 64-byte guest
         g.call_with(regs);
 
         assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);

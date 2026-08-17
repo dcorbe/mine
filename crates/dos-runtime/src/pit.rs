@@ -90,9 +90,17 @@ impl Pit {
                 self.ch0.pending = Some(value);
                 (value & 0xff) as u8
             }
-            // Channels 1 and 2: accepted so a program that merely selects
-            // them does not panic. Nothing measured so far reads them.
-            0x41 | 0x42 => 0,
+            // Channels 1 and 2: accepted (so a program that merely selects
+            // them does not panic) but not modelled -- nothing measured so
+            // far reads them. `runexe.rs` routes the whole `0x40..=0x43`
+            // range here, which took these two ports away from
+            // `video.port_in`'s catch-all; without this arm they would
+            // silently start answering `0` instead of that catch-all's
+            // documented "absent device reads `0xff`" (`crate::kvm`,
+            // `complete_port_read`'s doc comment) -- an unannounced
+            // departure this Pit should not introduce for channels it does
+            // not actually model.
+            0x41 | 0x42 => 0xff,
             _ => 0,
         }
     }
@@ -199,11 +207,15 @@ mod tests {
     }
 
     #[test]
-    fn an_unmodelled_channel_does_not_panic() {
+    fn an_unmodelled_channel_reads_as_the_absent_device_it_is() {
+        // Not `0` -- these ports were `video.port_in`'s absent-device `0xff`
+        // before `Pit` claimed the whole `0x40..=0x43` range, and claiming
+        // the range must not silently change what an unmodelled channel
+        // answers with.
         let mut pit = Pit::new();
         pit.write(0x43, 0b0111_0000); // channel 1, lo/hi access
-        let _ = pit.read(0x41);
+        assert_eq!(pit.read(0x41), 0xff);
         pit.write(0x43, 0b1011_0000); // channel 2, lo/hi access
-        let _ = pit.read(0x42);
+        assert_eq!(pit.read(0x42), 0xff);
     }
 }
