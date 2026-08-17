@@ -13,6 +13,7 @@
 
 pub mod advapi32;
 pub mod console;
+pub mod crt;
 pub mod kernel32;
 pub mod load;
 pub mod process;

@@ -54,6 +54,17 @@ impl Answer {
             cleans: args * 4,
         }
     }
+
+    /// A cdecl answer: the caller pops its own arguments, so this cleans
+    /// nothing.
+    ///
+    /// The whole C runtime is cdecl and the whole Win32 API is stdcall, so
+    /// which constructor a symbol uses is not a detail -- it is which of the two
+    /// worlds that symbol belongs to. See this module's doc comment for what a
+    /// wrong `cleans` does to the *next* call.
+    pub(crate) fn cdecl(value: u32) -> Self {
+        Self { value, cleans: 0 }
+    }
 }
 
 /// Answer a KERNEL32 import, or `None` for one still unimplemented.

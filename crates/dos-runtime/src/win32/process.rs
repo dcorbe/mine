@@ -18,6 +18,7 @@ use mbbs_machine::module::ImportSite;
 use mbbs_machine::ptr::ModulePtr;
 
 use crate::win32::advapi32;
+use crate::win32::crt;
 use crate::win32::kernel32::{self, Answer};
 use crate::win32::load::Loaded;
 
@@ -125,6 +126,14 @@ pub struct Process {
     /// that answers both the same way is choosing the program's behaviour for
     /// it by accident.
     pub last_error: u32,
+    /// The C runtime's `rand` state, which is per-process rather than global.
+    ///
+    /// Kept here and not in a `static` because two runs inside one test binary
+    /// would otherwise share a generator: the second would continue the first's
+    /// sequence, and a test that seeded and drew would pass or fail depending
+    /// on what ran before it. The same reasoning applies to every other piece
+    /// of C runtime state with a cursor in it.
+    pub random: crate::win32::crt::Random,
     /// Kernel objects this process has made, indexed by handle minus one.
     ///
     /// Handles are `1..=len` so that zero stays available as the NULL a failed
@@ -161,6 +170,7 @@ impl Process {
             command_line,
             exit_code: None,
             last_error: ERROR_SUCCESS,
+            random: crate::win32::crt::Random::default(),
             objects: Vec::new(),
         }
     }
@@ -252,6 +262,9 @@ pub fn dispatch(
     }
     if site.module.eq_ignore_ascii_case("ADVAPI32.dll") {
         return advapi32::dispatch(process, machine, mem, &symbol);
+    }
+    if site.module.eq_ignore_ascii_case("cw3220mt.DLL") {
+        return crt::dispatch(process, machine, mem, &symbol);
     }
     None
 }
@@ -422,6 +435,19 @@ mod tests {
     /// It stops here because the C runtime is Phase 3, not because anything
     /// went wrong. When that phase lands this assertion is expected to change;
     /// what it must never do is move *backwards*.
+    ///
+    /// **Phase 3, Task 2 moved it forward, and by exactly the predicted
+    /// amount.** `_time` and `_srand` are answered now, so the frontier is
+    /// `KERNEL32!CreateFileA` -- which is ordinal 12 of
+    /// `docs/2026-08-17-win32-crt-trace.md` §1, the first symbol past `_srand`
+    /// in the survey's list.
+    ///
+    /// That agreement is worth more than either measurement alone. The survey
+    /// answers unimplemented symbols with a lie and is only sound up to its
+    /// first mis-cleaned stdcall call, which is this very symbol; this runner
+    /// never lies and stops dead at it. Two instruments with different failure
+    /// modes naming the same boundary is what makes the trace's ordinals 0-11
+    /// evidence rather than an artefact of how the survey resumes.
     #[test]
     fn the_process_carries_main_as_far_as_the_c_runtime() {
         let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
@@ -431,8 +457,8 @@ mod tests {
         assert_eq!(
             out,
             Outcome::Unimplemented {
-                module: "cw3220mt.DLL".to_owned(),
-                symbol: "_time".to_owned(),
+                module: "KERNEL32.dll".to_owned(),
+                symbol: "CreateFileA".to_owned(),
             }
         );
     }
