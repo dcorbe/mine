@@ -269,6 +269,25 @@ impl Streams {
         }
     }
 
+    /// `fputc(c, fp)` -- the byte written back as an `int` in `0..=255` on
+    /// success, or `EOF` (-1) on a short write or a `FILE *` this host never
+    /// handed out.
+    ///
+    /// Delegates to [`Streams::write`] for the one byte rather than
+    /// duplicating its handle lookup -- the same reasoning [`Streams::fgetc`]
+    /// gives for delegating to `read`. Only the low byte of `c` is ever
+    /// written: C's `fputc` takes an `int` but the value is truncated to
+    /// `unsigned char`, the same narrowing every other byte-at-a-time path
+    /// in this module already does.
+    pub fn fputc(&mut self, fp: u32, c: u32) -> u32 {
+        let byte = c as u8;
+        if self.write(fp, &[byte]) == 1 {
+            u32::from(byte)
+        } else {
+            EOF
+        }
+    }
+
     /// Read up to `len` bytes from a stream.
     ///
     /// A short read is how end-of-file announces itself, so the caller is told
@@ -630,6 +649,12 @@ pub fn dispatch(
             let fp = machine.arg_u32(mem.stack(), 0);
             Some(Answer::cdecl(process.streams.fgetc(mem, fp)))
         }
+        // int fputc(int c, FILE *fp)
+        "_fputc" => {
+            let c = machine.arg_u32(mem.stack(), 0);
+            let fp = machine.arg_u32(mem.stack(), 1);
+            Some(Answer::cdecl(process.streams.fputc(fp, c)))
+        }
         // int vsprintf(char *buf, const char *fmt, va_list ap)
         //
         // A `va_list` on 32-bit cdecl is a bare pointer to the first variable
@@ -871,6 +896,39 @@ mod tests {
         let mut l = loaded();
         let mut s = Streams::new(None);
         assert_eq!(s.fgetc(&mut l.mem, 0x1234), EOF);
+    }
+
+    /// `fputc` writes one byte -- truncated from the `int` C passes down to
+    /// the `unsigned char` it actually is -- and hands the written byte back,
+    /// widened without sign extension. A byte at or above 0x80 must still
+    /// read back as itself, not as `EOF`.
+    #[test]
+    fn fputc_writes_one_truncated_byte_and_echoes_it_back() {
+        let files = root_at("win32-fputc");
+        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
+            .join("win32-fputc");
+
+        let mut l = loaded();
+        let mut s = Streams::new(Some(files));
+        let fp = s.fopen(&mut l.mem, b"OUT.DAT", b"wb");
+        assert_ne!(fp, 0);
+
+        assert_eq!(s.fputc(fp, 0x41), 0x41, "an ordinary byte");
+        // `int` carries garbage above the low byte the way every other
+        // narrow C argument on this ABI does -- only the low byte is ever
+        // meant to land on disk.
+        assert_eq!(s.fputc(fp, 0xdead_ff00 | 0xff), 0xff, "truncated, not EOF");
+        assert_eq!(s.fclose(fp), 0);
+
+        let written = std::fs::read(dir.join("OUT.DAT")).expect("the file landed");
+        assert_eq!(written, vec![0x41, 0xff], "both bytes, in order, on disk");
+    }
+
+    /// A `FILE *` this host never handed out answers `EOF`, not a panic.
+    #[test]
+    fn fputc_on_an_unknown_stream_is_eof_not_a_panic() {
+        let mut s = Streams::new(None);
+        assert_eq!(s.fputc(0x1234, 0x41), EOF);
     }
 
     /// Two streams open at once must be distinguishable. A host keying its
