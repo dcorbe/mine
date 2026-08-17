@@ -344,25 +344,36 @@ mod tests {
     /// zero. No amount of running the real program discriminates those
     /// reads; only a direct test of the marshalling can.
     ///
-    /// Each buffer gets its own fill byte (`databuf`/`keybuf` are even the
-    /// same length) so that a mixed-up read shows up as *wrong content* in
-    /// the assertions below, not as a resolve error that would only say
-    /// something failed without saying which read broke it.
+    /// Each buffer gets its own fill byte so that a mixed-up read shows up
+    /// as *wrong content* in the assertions below, not as a resolve error
+    /// that would only say something failed without saying which read broke
+    /// it. `datalen` and `keylen` are deliberately given **different**
+    /// numeric values (`40` and `17`) rather than sharing one -- a review
+    /// pass found that with both at `32`, a hypothetical swap between the
+    /// two field assignments in `read_args`'s `Ok(Marshalled { .. })` would
+    /// go numerically undetected (`args.datalen == 32` and `args.keylen as
+    /// u32 == 32` either way). That swap was applied by hand and confirmed
+    /// this test then fails (task report, "the datalen/keylen swap
+    /// mutation"); it is not left behind as its own test, because the
+    /// mutation is in `read_args`'s production code, not in a second
+    /// fixture worth maintaining.
     #[test]
     fn read_args_puts_each_of_the_seven_in_its_own_field() {
         const POSBLK_FILL: u8 = 0xA1;
         const DATABUF_FILL: u8 = 0xB2;
         const KEYBUF_FILL: u8 = 0xC3;
-        const BUF_LEN: usize = 32;
+        // Deliberately unequal to each other -- see this test's own doc
+        // comment -- and each still sized to match the buffer it describes,
+        // so resolving either does not run past what was actually filled.
+        const DATABUF_LEN: usize = 40;
+        const KEYBUF_LEN: usize = 17;
         // Upper sixteen bits are deliberately garbage, the same shape the
         // real call site produces (see `read_args`'s own comment on `op`):
         // this also proves the truncating cast, not just the argument's
         // position.
         const OP_PUSHED: u32 = 0xABCD_1234;
         const OP_EXPECTED: u16 = 0x1234;
-        // Matches `BUF_LEN` so a `databuf`/`keybuf` mixup still resolves
-        // (proving itself via content, not via a masking resolve failure).
-        const KEYLEN: u8 = 32;
+        const KEYLEN: u8 = 17; // == KEYBUF_LEN, so the key buffer resolves
         const KEYNUM: i8 = -5;
 
         let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
@@ -373,19 +384,19 @@ mod tests {
             .write(&mut l.mem, &[POSBLK_FILL; 128])
             .expect("posblk region is writable");
 
-        let databuf_at = l.mem.alloc(BUF_LEN).expect("databuf region").0;
+        let databuf_at = l.mem.alloc(DATABUF_LEN).expect("databuf region").0;
         Flat32Ptr(databuf_at)
-            .write(&mut l.mem, &[DATABUF_FILL; BUF_LEN])
+            .write(&mut l.mem, &[DATABUF_FILL; DATABUF_LEN])
             .expect("databuf region is writable");
 
         let datalen_at = l.mem.alloc(4).expect("datalen region").0;
         Flat32Ptr(datalen_at)
-            .write(&mut l.mem, &u32::try_from(BUF_LEN).unwrap().to_le_bytes())
+            .write(&mut l.mem, &u32::try_from(DATABUF_LEN).unwrap().to_le_bytes())
             .expect("datalen region is writable");
 
-        let keybuf_at = l.mem.alloc(BUF_LEN).expect("keybuf region").0;
+        let keybuf_at = l.mem.alloc(KEYBUF_LEN).expect("keybuf region").0;
         Flat32Ptr(keybuf_at)
-            .write(&mut l.mem, &[KEYBUF_FILL; BUF_LEN])
+            .write(&mut l.mem, &[KEYBUF_FILL; KEYBUF_LEN])
             .expect("keybuf region is writable");
 
         // Seven `push imm32`, in Galacticomm's own right-to-left stdcall
@@ -433,11 +444,11 @@ mod tests {
         assert_eq!(args.posblk_at, posblk_at, "posBlock pointer");
         assert_eq!(args.posblk, [POSBLK_FILL; 128], "posBlock contents");
         assert_eq!(args.databuf_at, databuf_at, "dataBuffer pointer");
-        assert_eq!(args.databuf, vec![DATABUF_FILL; BUF_LEN], "dataBuffer contents");
+        assert_eq!(args.databuf, vec![DATABUF_FILL; DATABUF_LEN], "dataBuffer contents");
         assert_eq!(args.datalen_at, datalen_at, "dataLength pointer");
-        assert_eq!(args.datalen, u32::try_from(BUF_LEN).unwrap(), "*dataLength");
+        assert_eq!(args.datalen, u32::try_from(DATABUF_LEN).unwrap(), "*dataLength");
         assert_eq!(args.keybuf_at, keybuf_at, "keyBuffer pointer");
-        assert_eq!(args.keybuf, vec![KEYBUF_FILL; BUF_LEN], "keyBuffer contents");
+        assert_eq!(args.keybuf, vec![KEYBUF_FILL; KEYBUF_LEN], "keyBuffer contents");
         assert_eq!(args.keylen, KEYLEN, "keyLength");
         assert_eq!(args.keynum, KEYNUM, "ckeynum");
     }
