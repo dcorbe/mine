@@ -347,7 +347,7 @@ pub fn create(path: &Path, spec: &FileSpec) -> Result<(), BtvError> {
         ));
     }
 
-    let physical = validate(spec).map_err(fail)?;
+    let (physical, usable) = validate(spec).map_err(fail)?;
 
     let nkeys = u16::try_from(spec.keys.len()).expect("validate bounds key count under SEGMAX");
     let pages = u32::from(nkeys) + 2;
@@ -355,7 +355,7 @@ pub fn create(path: &Path, spec: &FileSpec) -> Result<(), BtvError> {
 
     let mut bytes = vec![0u8; file_size as usize];
     bytes[..usize::from(spec.page_size)]
-        .copy_from_slice(&build_fcr(spec, physical, nkeys, pages));
+        .copy_from_slice(&build_fcr(spec, physical, usable, nkeys, pages));
 
     for (n, key) in spec.keys.iter().enumerate() {
         let number = n as u32 + 1;
@@ -374,10 +374,11 @@ pub fn create(path: &Path, spec: &FileSpec) -> Result<(), BtvError> {
 }
 
 /// Check `spec` against every limit this module's doc comment names, and
-/// return the physical (padded) record length on success -- the one value
-/// every other computation in [`create`] needs and that validation itself
-/// already has to derive to check it fits the page.
-fn validate(spec: &FileSpec) -> Result<u16, String> {
+/// return the physical (padded) record length and the page's usable byte
+/// count on success -- both values every other computation in [`create`]
+/// needs and that validation itself already has to derive to check the
+/// record fits the page.
+fn validate(spec: &FileSpec) -> Result<(u16, u16), String> {
     if spec.record_length == 0 {
         return Err("a record length of zero".to_owned());
     }
@@ -456,10 +457,19 @@ fn validate(spec: &FileSpec) -> Result<u16, String> {
     let physical = u32::from(spec.record_length) + if duplicate_keys > 0 { 8 } else { 0 };
     let physical =
         u16::try_from(physical).map_err(|_| format!("a physical record length of {physical}"))?;
-    if u32::from(physical) > u32::from(spec.page_size) {
+    // The record has to fit in what a page has left over after its own
+    // 6-byte header (`pages::HEADER`, the same subtraction `build_fcr` makes
+    // to write `fcr::PAGE_USABLE`) -- not the whole page. A record that
+    // exactly fills `page_size` still leaves no room for the header, which
+    // is how a spec once passed here and then produced a file this crate's
+    // own opener rejected as not a whole number of pages.
+    let usable = spec.page_size - pages::HEADER;
+    if physical > usable {
         return Err(format!(
-            "a {physical}-byte record in a {}-byte page",
-            spec.page_size
+            "a {physical}-byte record in a {}-byte page, which has only {usable} bytes \
+             usable after its {}-byte header",
+            spec.page_size,
+            pages::HEADER
         ));
     }
 
@@ -481,11 +491,11 @@ fn validate(spec: &FileSpec) -> Result<u16, String> {
         }
     }
 
-    Ok(physical)
+    Ok((physical, usable))
 }
 
 /// Build the file control record: page 0, exactly `page_size` bytes.
-fn build_fcr(spec: &FileSpec, physical: u16, nkeys: u16, pages: u32) -> Vec<u8> {
+fn build_fcr(spec: &FileSpec, physical: u16, usable: u16, nkeys: u16, pages: u32) -> Vec<u8> {
     let mut fcr = vec![0u8; usize::from(spec.page_size)];
 
     fcr[fcr::VERSION_BYTE] = fcr::VERSION;
@@ -503,7 +513,6 @@ fn build_fcr(spec: &FileSpec, physical: u16, nkeys: u16, pages: u32) -> Vec<u8> 
     fcr[fcr::ALLOCATED..fcr::ALLOCATED + 2].copy_from_slice(&allocated.to_le_bytes());
     fcr[fcr::DATA_PAGE_COUNT..fcr::DATA_PAGE_COUNT + 4].copy_from_slice(&pages::to_long(1));
     fcr[fcr::PAGES..fcr::PAGES + 4].copy_from_slice(&pages::to_long(pages));
-    let usable = spec.page_size - pages::HEADER;
     fcr[fcr::PAGE_USABLE..fcr::PAGE_USABLE + 2].copy_from_slice(&usable.to_le_bytes());
 
     let mut at = fcr::KEYS_BASE;
@@ -926,6 +935,50 @@ mod tests {
         let spec = single_key_spec(600, 512, false);
         let err = create(&path, &spec).expect_err("refuses");
         assert!(err.why.contains("512-byte page"), "{}", err.why);
+    }
+
+    /// The escaped case: a physical record exactly the size of the *whole*
+    /// page still leaves no room for the 6-byte page header
+    /// (`pages::HEADER`), so it has to be refused too -- not just a record
+    /// past `page_size`. This is the shape that produced a real
+    /// `WGSGEN2.DAT` this same crate's own opener then rejected as not a
+    /// whole number of pages. The message has to name all three numbers --
+    /// physical, page size, and usable -- because the whole failure mode
+    /// here was a six-byte discrepancy the old message never showed.
+    #[test]
+    fn create_refuses_a_record_exactly_the_page_size() {
+        let path = scratch("record-equals-page.dat");
+        let spec = single_key_spec(512, 512, false);
+        let err = create(&path, &spec).expect_err("refuses");
+        assert!(err.why.contains("512"), "{}", err.why);
+        assert!(err.why.contains("506"), "must name the usable byte count: {}", err.why);
+    }
+
+    /// The boundary in the other direction: a physical record of exactly
+    /// `page_size - HEADER` (506 for a 512-byte page) is the *largest* one
+    /// that fits, and must still be accepted -- one byte more (507) is the
+    /// smallest this module refuses. Confirms the fix does not over-reject.
+    #[test]
+    fn create_accepts_a_record_that_exactly_fills_the_usable_bytes() {
+        let path = scratch("record-fills-usable.dat");
+        let spec = single_key_spec(512 - pages::HEADER, 512, false);
+        create(&path, &spec).expect("506 usable bytes hold a 506-byte record");
+    }
+
+    /// A duplicate-permitting key widens the physical record by 8 bytes for
+    /// the `[prev][next]` chain before that comparison happens -- so the
+    /// check has to be made against the *widened* physical record, not the
+    /// caller's `record_length`. `record_length` 500 alone would fit
+    /// (500 <= 506), but the chain pushes physical to 508, past the
+    /// 506-byte usable ceiling: the old buggy comparison (`> page_size`,
+    /// 508 <= 512) would have let this through.
+    #[test]
+    fn create_refuses_a_duplicate_key_whose_widened_record_overflows_usable() {
+        let path = scratch("dup-key-overflows-usable.dat");
+        let spec = single_key_spec(500, 512, true);
+        let err = create(&path, &spec).expect_err("508-byte physical record, 506 usable");
+        assert!(err.why.contains("508"), "{}", err.why);
+        assert!(err.why.contains("506"), "must name the usable byte count: {}", err.why);
     }
 
     #[test]
