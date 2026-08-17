@@ -125,10 +125,30 @@ const GENERATION: usize = 0x04;
 /// own physical/logical reservation of 0 and 1) -- harmless to add, since an
 /// empty template contributes no records downstream, and carrying the
 /// special case would cost more than the uniformity it would buy.
-const OVERFLOW: usize = 0x0a;
-
 /// Byte offset, within an allocation-table page, of its first entry.
-const ENTRIES: usize = 0x0c;
+///
+/// **`0x08`, read off the engine.** It fetches entry `slot` of a block at
+/// `page + 8 + slot * 4` (`W32MKDE_decompiled.c:14282`), and this module read
+/// `0x0c` for months -- one whole entry too far in, so every slot it saw was
+/// the engine's slot *N+1* and slot 0 was invisible.
+///
+/// That off-by-one entry is the whole of what an earlier reading of this format
+/// called an `OVERFLOW` field at `0x0a`, "a second, markerless claim ... at a
+/// fixed offset". An entry is a `u16` marker then a `u16` physical page, so
+/// slot 0 occupies `0x08`-`0x0b` and its *physical-page half* lands exactly on
+/// `0x0a`. Measured on `PP2BLOCK.DAT`: physical page 2's slot 0 reads
+/// `{marker 0x8000, page 4}` and the old `OVERFLOW` word read 4; block 2's copy
+/// at physical 130 reads `{0x0000, 128}` and `OVERFLOW` read 128.
+///
+/// Two independent confirmations that `0x0c` was wrong rather than merely
+/// different. First, this module's own measured entry counts -- "509, or 381,
+/// or 1021 live entries" -- are each exactly one less than `(page_size - 8) / 4`
+/// for their page sizes, the count that a base of `0x08` gives. Second, the
+/// anomaly those counts were recorded to explain ("block *N+1*'s array always
+/// starts one logical id past where block *N*'s would have continued", and the
+/// skipped id being "a real page ... not in *any* block's regular array")
+/// disappears entirely: the skipped id was slot 0.
+const ENTRIES: usize = 0x08;
 
 /// Bytes per allocation-table entry: a `u16` marker and a `u16` physical
 /// page number, both plain little-endian -- not the high-word-first
@@ -245,35 +265,67 @@ impl Map {
         // physical 2 mislabelled block 7 becomes a lone unpaired copy that
         // is automatically live, since a single copy never reaches the
         // generation-tie check.
-        for page in [2, 3] {
-            if magic(page) && word(page, BLOCK) != 1 {
-                return Err(format!(
-                    "physical page {page} carries the \"PP\" magic but calls \
-                     itself block {}, and block 1 is the only thing that lives \
-                     there",
-                    word(page, BLOCK)
-                ));
-            }
-        }
+        let entries_per_page = (page_size - ENTRIES) / ENTRY;
 
-        // Every allocation-table page in the file, however many blocks that
-        // is -- a second block's placement is not established (Evidence 5),
-        // so this is a scan for the magic, not a formula off the first pair.
+        // Where each allocation-table block lives is a *formula*, not something
+        // to scan for -- the engine fetches block `k` by page number
+        // (`FUN_00416fb0(param_1, table, ...)`, `:14279`) and never looks for
+        // the magic anywhere. Block `k`'s shadow pair sits at physical
+        // `2 + (k - 1) * (entries_per_page + 2)` and the page after it: each
+        // block governs `entries_per_page` logical pages and its own pair of
+        // copies, so the blocks repeat on that stride.
+        //
+        // Measured across every multi-block file in `archive/modules/majormud-nt`
+        // at three page sizes, with no exceptions: 4096-byte pages put blocks 1
+        // to 14 at 2, 1026, 2050 ... 13314 (`wccnt8pj/wccmp002.vir`);
+        // 2048-byte at 2, 514 ... 3586 (`wccnt8pj/wcctext2.vir`); 1536-byte at
+        // 2 and 386 (`wccnt8pj/wccknms2.vir`); and `PP2BLOCK.DAT`'s 512-byte
+        // pages at 2 and 130.
+        //
+        // **Scanning for the magic was wrong, not merely slower.** Files carry
+        // abandoned pages that still hold `"PP"`, a block index of 1 and a
+        // *higher* generation than the real table -- `wccnt7pq/wccrace2.vir` has
+        // them at physical 8 and 9 with generations 1 and 3, against the real
+        // pair's 1 and 2. A scan picked physical 9 as live and read an entry
+        // array claiming pages 26 and 10 to 14 in a ten-page file. Twelve other
+        // files in that tree have the same shape (`wccnt7po/wccshop2.vir` at
+        // 20/21, `wccnt7pv/wccmp002.vir` at 10056/10057, and so on), always
+        // near the end of the file and never at a position this formula names.
+        // The engine cannot see them, and neither can this now.
+        let stride = entries_per_page + 2;
         let mut blocks: HashMap<u16, Vec<(usize, u16)>> = HashMap::new();
-        for page in 0..pages {
-            if magic(page) {
-                let block = word(page, BLOCK);
-                let generation = word(page, GENERATION);
-                blocks.entry(block).or_default().push((page, generation));
+        for index in 1u16.. {
+            let first = 2 + (usize::from(index) - 1) * stride;
+            if first + 1 >= pages {
+                break;
             }
+            let copies: Vec<(usize, u16)> = [first, first + 1]
+                .into_iter()
+                .filter(|&page| magic(page))
+                .map(|page| (page, word(page, GENERATION)))
+                .collect();
+            if copies.is_empty() {
+                break;
+            }
+            // Position is what identifies a block, so the index stored there has
+            // to agree -- the same check physical 2 and 3 already get below.
+            for &(page, _) in &copies {
+                if word(page, BLOCK) != index {
+                    return Err(format!(
+                        "physical page {page} is where allocation-table block \
+                         {index} lives, but it calls itself block {}",
+                        word(page, BLOCK)
+                    ));
+                }
+            }
+            blocks.insert(index, copies);
         }
 
         // The live copy of each block: highest generation wins. A tie is a
         // shape nothing has observed and this refuses rather than guesses
         // between two equally-current copies -- the same rule Task 1 applies
         // to the file control record's own shadow pair.
-        let mut claimed: HashMap<u32, u16> = HashMap::new();
-        let entries_per_page = (page_size - ENTRIES) / ENTRY;
+        let mut physical: HashMap<u32, u32> = HashMap::new();
         let mut block_indices: Vec<u16> = blocks.keys().copied().collect();
         block_indices.sort_unstable();
         for block in block_indices {
@@ -293,11 +345,27 @@ impl Map {
                 ));
             }
             let live = live[0];
+            // Which logical ids this block answers for. `block` is at least 1 --
+            // the position loop above numbers from 1 and refuses a page whose
+            // stored index disagrees -- so this subtraction cannot wrap.
+            // The engine derives the
+            // block and slot *from* the logical id it wants -- block
+            // `n / entries + 1` and slot `n % entries` for `n = logical - 1`
+            // (`W32MKDE_decompiled.c:14276-14278`) -- so inverting it gives the
+            // id a given slot answers for, and that is the only place a logical
+            // id comes from.
+            let first = u32::from(block - 1) * entries_per_page as u32;
             for entry in 0..entries_per_page {
                 let at = live * page_size + ENTRIES + entry * ENTRY;
                 let marker = u16::from_le_bytes([file[at], file[at + 1]]);
                 let claimed_page = u16::from_le_bytes([file[at + 2], file[at + 3]]);
-                if marker != 0 {
+                // The engine's own "was this ever allocated" test is the entry's
+                // *type* byte -- `(entry >> 8) & 0xff` over the whole 4-byte
+                // entry read little-endian (`:14283`, `:14286`), which is the
+                // marker's high byte. `0x44` is a data page, `0x80` a template.
+                // A marker with only its low byte set has never been allocated,
+                // which `marker != 0` would have called claimed.
+                if marker >> 8 != 0 {
                     // Physical 0 and 1 are the file control record's shadow
                     // pair. A table claiming one of them contradicts the
                     // format; refused rather than mapped, because the
@@ -313,78 +381,19 @@ impl Map {
                              logical page"
                         ));
                     }
-                    claimed.insert(u32::from(claimed_page), marker);
+                    // Now that a physical page comes from a table entry rather
+                    // than from having been found in the file, one past the end
+                    // is reachable and would hand a caller a read past EOF.
+                    if usize::from(claimed_page) >= pages {
+                        return Err(format!(
+                            "allocation-table block {block} claims physical page \
+                             {claimed_page}, and the file has only {pages} pages"
+                        ));
+                    }
+                    physical.insert(first + entry as u32 + 1, u32::from(claimed_page));
                 }
             }
 
-            // The one claim the regular array cannot represent -- see
-            // `OVERFLOW`'s own doc comment for what this is and how it was
-            // measured. Zero means this block has none (no fixture measured
-            // has shown zero, but nothing else in this format lets a bare
-            // page-number field mean anything else); any other value is
-            // claimed exactly as a regular entry with a non-zero marker
-            // would be, refused under the identical contradiction the loop
-            // above already refuses.
-            let overflow_at = live * page_size + OVERFLOW;
-            let overflow_page = u16::from_le_bytes([file[overflow_at], file[overflow_at + 1]]);
-            if overflow_page != 0 {
-                if overflow_page <= 1 {
-                    return Err(format!(
-                        "allocation-table block {block}'s overflow entry at \
-                         {OVERFLOW:#x} names physical page {overflow_page}, \
-                         which is the file control record's own shadow pair \
-                         and cannot hold a logical page"
-                    ));
-                }
-                // No separate marker exists for this field -- presence
-                // (non-zero, and past the contradiction check above) is the
-                // whole of what marks it claimed. The value stored is never
-                // read back out of `claimed` (only key membership is), so
-                // there is no real marker to synthesize here.
-                claimed.insert(u32::from(overflow_page), overflow_page);
-            }
-        }
-
-        // Every remaining page, filtered to the ones the allocation table
-        // marks claimed (Evidence 3, 3a) -- a page absent from `claimed`, or
-        // present with a zero marker, is unclaimed regardless of what its
-        // own stale header still says.
-        let mut by_logical: HashMap<u32, Vec<u32>> = HashMap::new();
-        for page in 0..pages {
-            if magic(page) {
-                continue;
-            }
-            let at = page * page_size;
-            if &file[at..at + 2] == b"FC" {
-                continue;
-            }
-            let page = page as u32;
-            if !claimed.contains_key(&page) {
-                continue;
-            }
-            let logical = u32::from(word(page as usize, LOGICAL));
-            by_logical.entry(logical).or_default().push(page);
-        }
-
-        // Sorted before iterating, same as `block_indices` above -- `HashMap`
-        // order is randomized per-process, and this loop's first collision
-        // becomes part of an error message. Without the sort, the same file
-        // reports a different colliding logical page on every separate run.
-        let mut logicals: Vec<u32> = by_logical.keys().copied().collect();
-        logicals.sort_unstable();
-        let mut physical = HashMap::with_capacity(by_logical.len());
-        for logical in logicals {
-            let mut holders = by_logical.remove(&logical).unwrap_or_default();
-            if holders.len() > 1 {
-                holders.sort_unstable();
-                return Err(format!(
-                    "logical page {logical} is claimed by {} physical pages \
-                     {holders:?} after the allocation-table marker filter -- \
-                     this design says that cannot happen",
-                    holders.len()
-                ));
-            }
-            physical.insert(logical, holders[0]);
         }
 
         Ok(Self { physical })
@@ -501,25 +510,25 @@ impl Map {
         let entries_per_page = (page_size_usize - ENTRIES) / ENTRY;
         let entry_at = |page: usize, entry: usize| page * page_size_usize + ENTRIES + entry * ENTRY;
 
-        // The highest logical id block 1's regular array already claims, and
-        // the first free entry index -- one pass, since both come from the
-        // same scan. `None` for the first only on a block with zero claimed
-        // entries, a shape not observed among the real files this task
-        // measured (every one of them, even `WCCBANK2.VIR` at zero records,
-        // already carries at least the `OVERFLOW` bootstrap entry) -- so
-        // rather than invent a rule for it, this refuses instead.
-        let mut highest_logical: Option<u32> = None;
+        // The first free slot, and that is the whole answer: a slot's position
+        // within block 1 *is* the logical id it answers for, so the new page's
+        // id is not chosen, it is wherever the entry goes (`:14276-14278`).
+        //
+        // This used to read each claimed page's own `LOGICAL` header, take the
+        // highest, and add one. That is the inverted resolution `Self::read` no
+        // longer performs, and it could hand back an id whose slot already held
+        // something -- or, on a block whose claims were not contiguous, an id
+        // belonging to a slot several places along. The special case for "a
+        // block that claims nothing to number the new page after" goes with it:
+        // an empty block's first free slot is slot 0, which is logical 1.
         let mut free_entry: Option<usize> = None;
         for entry in 0..entries_per_page {
             let at = entry_at(live, entry);
             let marker = u16::from_le_bytes([file[at], file[at + 1]]);
-            if marker == 0 {
+            if marker >> 8 == 0 {
                 free_entry = free_entry.or(Some(entry));
-                continue;
+                break;
             }
-            let claimed_page = u16::from_le_bytes([file[at + 2], file[at + 3]]);
-            let logical = u32::from(word(usize::from(claimed_page), LOGICAL));
-            highest_logical = Some(highest_logical.map_or(logical, |h: u32| h.max(logical)));
         }
         let Some(free_entry) = free_entry else {
             return Err(format!(
@@ -528,14 +537,7 @@ impl Map {
                  not implemented"
             ));
         };
-        let Some(highest_logical) = highest_logical else {
-            return Err(
-                "block 1's regular array claims nothing to number the new \
-                 page after -- no rule is measured for a block this empty"
-                    .to_owned(),
-            );
-        };
-        let new_logical = highest_logical + 1;
+        let new_logical = free_entry as u32 + 1;
         let new_logical16 = u16::try_from(new_logical)
             .map_err(|_| format!("logical id {new_logical} does not fit in this format's u16"))?;
 
@@ -690,39 +692,32 @@ impl Map {
         let logical16 = u16::try_from(logical)
             .map_err(|_| format!("logical id {logical} does not fit in this format's u16"))?;
 
-        // Find where `logical` is claimed today, in the live copy -- a
-        // regular entry, or the block's own `OVERFLOW` claim. Either is a
-        // legitimate existing claim; `Self::read`'s own resolution does not
-        // distinguish them either.
-        enum Found {
-            Entry(usize),
-            Overflow,
+        // Where `logical` is claimed is not something to search for. The engine
+        // derives the slot *from* the id -- slot `(logical - 1) % entries` of
+        // block `(logical - 1) / entries + 1` (`:14276-14278`) -- and this
+        // function handles only single-block files, so the slot is `logical - 1`
+        // outright. The old search read each claimed page's own header looking
+        // for a match, which is the inverted resolution `Self::read` no longer
+        // performs either.
+        if logical == 0 {
+            return Err("logical ids are numbered from 1".to_owned());
         }
-        let mut found: Option<Found> = None;
-        for entry in 0..entries_per_page {
-            let at = entry_at(live, entry);
-            let marker = u16::from_le_bytes([file[at], file[at + 1]]);
-            if marker == 0 {
-                continue;
-            }
-            let claimed_page = u16::from_le_bytes([file[at + 2], file[at + 3]]);
-            if word(usize::from(claimed_page), LOGICAL) == logical16 {
-                found = Some(Found::Entry(entry));
-                break;
-            }
-        }
-        if found.is_none() {
-            let overflow_page = word(live, OVERFLOW);
-            if overflow_page != 0 && word(usize::from(overflow_page), LOGICAL) == logical16 {
-                found = Some(Found::Overflow);
-            }
-        }
-        let Some(found) = found else {
+        let entry = (logical - 1) as usize;
+        if entry >= entries_per_page {
             return Err(format!(
-                "logical id {logical} is not claimed anywhere in block 1's live \
-                 copy (regular array or OVERFLOW) -- there is nothing to relocate"
+                "logical id {logical} belongs to allocation-table block \
+                 {}, and relocating only handles a single-block file",
+                entry / entries_per_page + 1
             ));
-        };
+        }
+        let at = entry_at(live, entry);
+        let marker = u16::from_le_bytes([file[at], file[at + 1]]);
+        if marker >> 8 == 0 {
+            return Err(format!(
+                "logical id {logical} is not claimed in block 1's live copy -- \
+                 there is nothing to relocate"
+            ));
+        }
 
         // Read before any mutation: `word` borrows `file` immutably.
         let new_generation = word(live, GENERATION).wrapping_add(1);
@@ -749,27 +744,17 @@ impl Map {
         // nothing. Any other unclaimed page is some other logical id's stale
         // twin, and overwriting one of those would throw away a shadow copy
         // that is not this call's to spend.
-        let claimed_physical = match found {
-            Found::Entry(entry) => {
-                let at = entry_at(live, entry);
-                usize::from(u16::from_le_bytes([file[at + 2], file[at + 3]]))
-            }
-            Found::Overflow => usize::from(word(live, OVERFLOW)),
-        };
+        let claimed_physical = usize::from(u16::from_le_bytes([file[at + 2], file[at + 3]]));
         let mut claimed = vec![false; pages];
         for entry in 0..entries_per_page {
             let at = entry_at(live, entry);
-            if u16::from_le_bytes([file[at], file[at + 1]]) == 0 {
+            if u16::from_le_bytes([file[at], file[at + 1]]) >> 8 == 0 {
                 continue;
             }
             let page = usize::from(u16::from_le_bytes([file[at + 2], file[at + 3]]));
             if page < pages {
                 claimed[page] = true;
             }
-        }
-        let overflow_page = usize::from(word(live, OVERFLOW));
-        if overflow_page < pages {
-            claimed[overflow_page] = true;
         }
         let twin = (4..pages).find(|&page| {
             page != claimed_physical
@@ -798,16 +783,8 @@ impl Map {
         let stale_at = stale * page_size_usize;
         file[stale_at..stale_at + page_size_usize].copy_from_slice(&live_page);
 
-        match found {
-            Found::Entry(entry) => {
-                let at = stale_at + ENTRIES + entry * ENTRY;
-                file[at + 2..at + 4].copy_from_slice(&new_physical16.to_le_bytes());
-            }
-            Found::Overflow => {
-                let at = stale_at + OVERFLOW;
-                file[at..at + 2].copy_from_slice(&new_physical16.to_le_bytes());
-            }
-        }
+        let repoint = stale_at + ENTRIES + entry * ENTRY;
+        file[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
 
         file[stale_at + GENERATION..stale_at + GENERATION + 2]
             .copy_from_slice(&new_generation.to_le_bytes());
@@ -932,8 +909,13 @@ mod tests {
     }
 
     /// Eight 512-byte pages: an allocation-table pair at 2/3 whose live copy
-    /// (3) claims physical 4 **and** physical 5, and three pages -- 4, 5 and
-    /// 6 -- that all stamp themselves logical 7.
+    /// (3) claims physical 4 as logical 1 **and** physical 5 as logical 2, with
+    /// three pages -- 4, 5 and 6 -- all stamping themselves logical 1.
+    ///
+    /// The claims sit in slots 0 and 1 because a slot's position within the
+    /// block *is* the logical id it answers for. An earlier version of this
+    /// fixture claimed the same two pages but stamped all three headers logical
+    /// 7, which only worked while resolution ran backwards off those headers.
     ///
     /// Malformed on purpose. One logical id with two live claims is not
     /// something a well-formed file has, which is exactly why the shape is
@@ -961,11 +943,11 @@ mod tests {
         word(&mut out, live + ENTRIES + ENTRY, 0x4400);
         word(&mut out, live + ENTRIES + ENTRY + 2, 5);
 
-        // Three pages stamped logical 7, of which 4 and 5 are claimed.
+        // Three pages stamped logical 1, of which 4 and 5 are claimed.
         for page in [4usize, 5, 6] {
             let at = page * PAGE;
             word(&mut out, at, 0x4400);
-            word(&mut out, at + LOGICAL, 7);
+            word(&mut out, at + LOGICAL, 1);
             // Something recognisable in the body, so an overwrite shows.
             out[at + 16..at + 24].fill(0xB0 + page as u8);
         }
@@ -988,8 +970,8 @@ mod tests {
 
         let mut content = vec![0u8; PAGE];
         content[32..40].fill(0xCC);
-        let to = Map::relocate(&mut file, PAGE as u16, 7, &content, [0x00, 0x44])
-            .expect("logical 7 is claimed, so it can be relocated");
+        let to = Map::relocate(&mut file, PAGE as u16, 1, &content, [0x00, 0x44])
+            .expect("logical 1 is claimed, so it can be relocated");
 
         assert_eq!(to, 6, "the unclaimed twin is the only legitimate destination");
         assert_eq!(
@@ -1002,6 +984,127 @@ mod tests {
             &file[6 * PAGE + 32..6 * PAGE + 40],
             &[0xCC; 8],
             "the new content landed on 6"
+        );
+    }
+
+    /// Ten 512-byte pages with an allocation-table pair at 2/3, copy 3 live
+    /// and claiming nothing yet.
+    ///
+    /// Entries are addressed by **slot**, because under the engine's own
+    /// resolution a slot's position within the block *is* the logical id it
+    /// answers for -- there is nothing else to read it from.
+    fn indexed_fixture() -> Vec<u8> {
+        const PAGE: usize = 512;
+        let mut out = vec![0u8; PAGE * 10];
+        for (page, generation) in [(2usize, 1u16), (3, 2)] {
+            let at = page * PAGE;
+            out[at..at + 2].copy_from_slice(MAGIC);
+            out[at + BLOCK..at + BLOCK + 2].copy_from_slice(&1u16.to_le_bytes());
+            out[at + GENERATION..at + GENERATION + 2]
+                .copy_from_slice(&generation.to_le_bytes());
+        }
+        out
+    }
+
+    /// Point block 1's entry for `logical` at `physical`, marked as a live
+    /// data page.
+    fn set_entry(file: &mut [u8], logical: u32, physical: u16) {
+        set_entry_raw(file, logical, 0x4400, physical);
+    }
+
+    /// The same, with the marker spelled out -- the marker's **high** byte is
+    /// the page type the engine tests for, so `0x0050` is an unallocated slot
+    /// and `0x4400` is a live one.
+    fn set_entry_raw(file: &mut [u8], logical: u32, marker: u16, physical: u16) {
+        const PAGE: usize = 512;
+        let slot = (logical - 1) as usize;
+        let at = 3 * PAGE + ENTRIES + slot * ENTRY;
+        file[at..at + 2].copy_from_slice(&marker.to_le_bytes());
+        file[at + 2..at + 4].copy_from_slice(&physical.to_le_bytes());
+    }
+
+    /// Stamp a page's own header with a logical id and a type tag -- the bytes
+    /// the engine never consults when resolving.
+    fn set_header(file: &mut [u8], page: usize, tag: u16, logical: u16) {
+        const PAGE: usize = 512;
+        let at = page * PAGE;
+        file[at..at + 2].copy_from_slice(&tag.to_le_bytes());
+        file[at + LOGICAL..at + LOGICAL + 2].copy_from_slice(&logical.to_le_bytes());
+    }
+
+    /// The engine indexes the allocation table; it never groups pages by the
+    /// logical id in their own headers. So a page carrying a stale header id is
+    /// not a competing claim -- it is bytes nothing reads.
+    #[test]
+    fn a_stale_header_logical_id_is_never_consulted() {
+        let mut file = indexed_fixture();
+        // The table answers logical 1 with physical 6 and logical 4 with 7.
+        set_entry(&mut file, 1, 6);
+        set_entry(&mut file, 4, 7);
+        // Both pages nonetheless stamp themselves logical 1 in their own
+        // headers -- and both are claimed, so no marker filter can separate
+        // them. Only the table's *position* can.
+        set_header(&mut file, 6, 0x4400, 1);
+        set_header(&mut file, 7, 0x4400, 1);
+
+        let map = Map::read(&file, 512).expect("no collision exists to find");
+        assert_eq!(map.physical(1), Some(6), "the table decides, not the header");
+        assert_eq!(
+            map.physical(4),
+            Some(7),
+            "page 7 answers for the slot that names it, not for what it says"
+        );
+    }
+
+    /// Two *written* pages both claiming one logical id in their headers is
+    /// likewise not a collision -- `wccnt7po`'s logical 2 (physical 5 and 8)
+    /// has exactly this shape, and the engine reads that file without
+    /// difficulty.
+    #[test]
+    fn two_written_pages_claiming_one_logical_id_are_not_a_collision() {
+        let mut file = indexed_fixture();
+        set_entry(&mut file, 2, 5);
+        set_entry(&mut file, 6, 8);
+        // Both are live, both are claimed, and both say logical 2.
+        for page in [5usize, 8] {
+            set_header(&mut file, page, 0x4400, 2);
+        }
+        let map = Map::read(&file, 512).expect("the table names exactly one");
+        assert_eq!(map.physical(2), Some(5));
+        assert_eq!(map.physical(6), Some(8));
+    }
+
+    /// A logical page whose entry carries a zero type byte was never
+    /// allocated, and must not resolve to anything -- even when the entry's
+    /// low byte is set and its page number looks plausible.
+    #[test]
+    fn an_unallocated_logical_page_resolves_to_nothing() {
+        let mut file = indexed_fixture();
+        set_entry_raw(&mut file, 3, 0x0050, 9);
+        set_header(&mut file, 9, 0x4400, 3);
+        let map = Map::read(&file, 512).expect("an unallocated slot is not an error");
+        assert_eq!(
+            map.physical(3),
+            None,
+            "the type byte is the marker's high byte, and it is zero here"
+        );
+    }
+
+    /// A slot's position within its block *is* the logical id, so the very
+    /// first slot answers for logical 1 -- the claim an earlier reading of this
+    /// format treated as a special "overflow" field at `0x0a`, which is really
+    /// just this entry's own physical-page half.
+    #[test]
+    fn the_first_slot_answers_for_logical_one() {
+        let mut file = indexed_fixture();
+        set_entry(&mut file, 1, 4);
+        let map = Map::read(&file, 512).expect("resolves");
+        assert_eq!(map.physical(1), Some(4));
+        // And that physical half sits exactly where `OVERFLOW` used to be read.
+        assert_eq!(
+            u16::from_le_bytes([file[3 * 512 + 0x0a], file[3 * 512 + 0x0b]]),
+            4,
+            "0x0a is entry slot 0's physical page, not a field of its own"
         );
     }
 
@@ -1179,34 +1282,39 @@ mod tests {
         assert!(e.contains("generation 5"), "{e}");
     }
 
-    /// Trap 2's third named refusal: two *claimed* pages holding the same
-    /// logical id. Built by hand, like the tie above -- Evidence 3a measured
-    /// zero of these on the real corpus after the marker filter, which is
-    /// exactly why this design treats it as a refusal rather than a case to
-    /// handle: nothing here has ever seen one, so nothing gets to guess.
+    /// What used to be "Trap 2's third named refusal": two *claimed* pages
+    /// holding the same logical id in their own headers, refused as a
+    /// contradiction.
+    ///
+    /// It is not one. The engine resolves a logical id by indexing the
+    /// allocation table and never reads a page's self-stamp, so two pages
+    /// agreeing on a stale id are two pages nothing asks about -- and the six
+    /// real files this refusal was rejecting are files genuine Btrieve reads
+    /// without difficulty. The refusal is gone; this test now pins the shape it
+    /// used to reject, and the two entries claim *different* slots because that
+    /// is the only thing that decides a logical id.
     #[test]
-    fn a_conflict_between_two_claimed_pages_is_refused() {
+    fn two_claimed_pages_stamped_with_one_logical_id_are_read_not_refused() {
         let mut file = vec![0u8; 512 * 6];
         let at = |page: usize| page * 512;
 
         file[at(2)..at(2) + 2].copy_from_slice(MAGIC);
         file[at(2) + BLOCK..at(2) + BLOCK + 2].copy_from_slice(&1u16.to_le_bytes());
         file[at(2) + GENERATION..at(2) + GENERATION + 2].copy_from_slice(&5u16.to_le_bytes());
-        // Two entries, each claiming a different physical page (4 and 5)
-        // with a non-zero marker.
         let entry = |n: usize| at(2) + ENTRIES + n * ENTRY;
-        file[entry(0)..entry(0) + 2].copy_from_slice(&1u16.to_le_bytes()); // marker
-        file[entry(0) + 2..entry(0) + 4].copy_from_slice(&4u16.to_le_bytes()); // page 4
-        file[entry(1)..entry(1) + 2].copy_from_slice(&1u16.to_le_bytes()); // marker
-        file[entry(1) + 2..entry(1) + 4].copy_from_slice(&5u16.to_le_bytes()); // page 5
+        file[entry(0)..entry(0) + 2].copy_from_slice(&0x4400u16.to_le_bytes());
+        file[entry(0) + 2..entry(0) + 4].copy_from_slice(&4u16.to_le_bytes());
+        file[entry(1)..entry(1) + 2].copy_from_slice(&0x4400u16.to_le_bytes());
+        file[entry(1) + 2..entry(1) + 4].copy_from_slice(&5u16.to_le_bytes());
 
-        // Both claimed pages carry the same logical id.
+        // Both claimed pages stamp themselves logical 7. Bytes nothing reads.
         file[at(4) + LOGICAL..at(4) + LOGICAL + 2].copy_from_slice(&7u16.to_le_bytes());
         file[at(5) + LOGICAL..at(5) + LOGICAL + 2].copy_from_slice(&7u16.to_le_bytes());
 
-        let e = Map::read(&file, 512).unwrap_err();
-        assert!(e.contains("logical page 7"), "{e}");
-        assert!(e.contains('4') && e.contains('5'), "{e}");
+        let map = Map::read(&file, 512).expect("no contradiction exists here");
+        assert_eq!(map.physical(1), Some(4), "slot 0 answers for logical 1");
+        assert_eq!(map.physical(2), Some(5), "slot 1 answers for logical 2");
+        assert_eq!(map.physical(7), None, "nothing claims logical 7 at all");
     }
 
     /// Physical page 0 is the file control record. Nothing in the corpus ever
@@ -1227,8 +1335,11 @@ mod tests {
         file[at(2) + BLOCK..at(2) + BLOCK + 2].copy_from_slice(&1u16.to_le_bytes());
         file[at(2) + GENERATION..at(2) + GENERATION + 2].copy_from_slice(&5u16.to_le_bytes());
 
+        // `0x4400`, a live data page: the marker's HIGH byte is the page type
+        // the engine tests, so a marker of 1 would be an unallocated slot and
+        // this fixture would assert nothing.
         let entry = at(2) + ENTRIES;
-        file[entry..entry + 2].copy_from_slice(&1u16.to_le_bytes()); // marker
+        file[entry..entry + 2].copy_from_slice(&0x4400u16.to_le_bytes()); // marker
         file[entry + 2..entry + 4].copy_from_slice(&0u16.to_le_bytes()); // physical page 0
 
         let e = Map::read(&file, 512).unwrap_err();
@@ -1280,10 +1391,17 @@ mod tests {
         content[6..10].copy_from_slice(b"NEW!");
         let logical = Map::claim(&mut file, 512, &content, [0x00, 0x44]).expect("claims");
 
-        // DUPKEY30.DAT's block 1 regular array claims only logical 2 and 5
-        // (`dupkey30_only_two_logical_ids_have_a_live_claimant`) -- one past
-        // the highest.
-        assert_eq!(logical, 6);
+        // A slot's position within block 1 *is* the logical id it answers for,
+        // so the new page's id is the first free slot rather than one past the
+        // highest claimed. Measured on this fixture's live copy (physical 3):
+        // slot 0 is allocated (type 0x80, physical 9), slot 1 is allocated
+        // (0x44, physical 10), slot 2 is free -- so the answer is logical 3.
+        //
+        // The old answer was 6, from taking the highest logical id claimed and
+        // adding one. That read each claimed page's own header to learn its id,
+        // and it would skip every hole in the array: here it left logical 3 and
+        // 4 permanently unreachable while numbering a fourth page 6.
+        assert_eq!(logical, 3);
 
         let after = Map::read(&file, 512).expect("resolves after");
         for (l, p) in before.entries() {
@@ -1292,7 +1410,7 @@ mod tests {
         let new_physical = after.physical(logical).expect("the new id resolves");
         let at = new_physical as usize * 512;
         assert_eq!(&file[at..at + 2], [0x00, 0x44], "the new page's own tag");
-        assert_eq!(&file[at + LOGICAL..at + LOGICAL + 2], 6u16.to_le_bytes());
+        assert_eq!(&file[at + LOGICAL..at + LOGICAL + 2], 3u16.to_le_bytes());
         assert_eq!(&file[at + 6..at + 10], b"NEW!", "the caller's content landed");
     }
 
