@@ -16,17 +16,17 @@ use std::rc::Rc;
 
 use dos::count::{Counters, Counting};
 use dos::service::{Serviced, Services};
-use dos_poc::bios::{Bios, Keyboard, Video, int16, int16_implemented, missing};
-use dos_poc::dos::is_implemented;
-use dos_poc::guest::{Guest, Ptr};
-use dos_poc::kvm::{Stop, VmGuest};
-use dos_poc::driver::{Driver, Script};
-use dos_poc::terminal::{RawStdin, Terminal};
-use dos_poc::uart::{COM1_BASE, IRQ4_VECTOR, Pic, Uart};
-use dos_poc::files::Files;
-use dos_poc::fossil::Fossil;
-use dos_poc::mz::{self, MzImage};
-use dos_poc::screen::Screen;
+use dos_runtime::bios::{Bios, Keyboard, Video, int16, int16_implemented, missing};
+use dos_runtime::dos::is_implemented;
+use dos_runtime::guest::{Guest, Ptr};
+use dos_runtime::kvm::{Stop, VmGuest};
+use dos_runtime::driver::{Driver, Script};
+use dos_runtime::terminal::{RawStdin, Terminal};
+use dos_runtime::uart::{COM1_BASE, IRQ4_VECTOR, Pic, Uart};
+use dos_runtime::files::Files;
+use dos_runtime::fossil::Fossil;
+use dos_runtime::mz::{self, MzImage};
+use dos_runtime::screen::Screen;
 
 /// 1 MiB: the whole real-mode address space.
 const MEM: usize = 1 << 20;
@@ -215,7 +215,7 @@ fn main() -> io::Result<()> {
         println!("door mode: COM1 at {COM1_BASE:#06x}, IRQ4, baud {baud:?}\r");
     }
 
-    let mut kernel = dos_poc::dos::Dos::default();
+    let mut kernel = dos_runtime::dos::Dos::default();
     kernel.state.files = Some(Files::new(root.into(), std::path::PathBuf::from(&root_dir)));
     // The real segment the loader built this program's PSP at, so AH=62h
     // answers with the program's own PSP rather than failing outright.
@@ -658,9 +658,9 @@ fn main() -> io::Result<()> {
     // enough for anything `Counting` tracks generically; `DosState`'s own
     // fields (`files`, `out`) are not counting state, so reading them back
     // needs the concrete type, via `as_any`.
-    let kernel_dos: Option<&dos_poc::dos::Dos> = services
+    let kernel_dos: Option<&dos_runtime::dos::Dos> = services
         .claiming(0x21)
-        .and_then(|s| s.as_any().downcast_ref::<Counting<dos_poc::dos::Dos>>())
+        .and_then(|s| s.as_any().downcast_ref::<Counting<dos_runtime::dos::Dos>>())
         .map(Counting::inner);
 
     // The program painted straight into the text buffer, which is just guest

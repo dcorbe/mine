@@ -6,7 +6,7 @@
 //!
 //! Accepted blind spots, recorded rather than closed: this is a line-based
 //! text scan, not a parse. `extern crate other_thing;` and a bare
-//! fully-qualified reference with no `use` at all (`dos_poc::kvm::VmGuest::new()`)
+//! fully-qualified reference with no `use` at all (`dos_runtime::kvm::VmGuest::new()`)
 //! are invisible to it, and a `use` statement split across multiple lines
 //! would evade the prefix match on its first line. All three are inert under
 //! `dos`'s current manifest (see `the_dos_crate_declares_no_dependency_but_libc`
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 /// These entries omit the `use ` keyword itself (matched separately, see
 /// `offences_among`) and are matched against the path with any leading `::`
 /// already stripped -- `use ::libc::c_void;` and `use libc::c_void;` name the
-/// same dependency and must be judged identically. `crates/dos-poc/src/lib.rs`
+/// same dependency and must be judged identically. `crates/dos-runtime/src/lib.rs`
 /// already writes re-exports the `::`-prefixed way (`pub use ::dos::kernel as
 /// dos;`, forced by a module-name shadow), so this is not a hypothetical
 /// style one hop from this crate.

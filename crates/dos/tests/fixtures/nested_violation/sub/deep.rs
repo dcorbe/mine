@@ -13,7 +13,7 @@
 //! It is written with a leading `::` on purpose: it also stands as a
 //! permanent check that stripping a leading `::` before matching (see
 //! `offences_among` in `independence.rs`) does not accidentally widen the
-//! allowlist -- `::dos_poc::...` must still be reported after the strip,
-//! exactly as `dos_poc::...` would be.
+//! allowlist -- `::dos_runtime::...` must still be reported after the strip,
+//! exactly as `dos_runtime::...` would be.
 
-use ::dos_poc::kvm::VmGuest;
+use ::dos_runtime::kvm::VmGuest;

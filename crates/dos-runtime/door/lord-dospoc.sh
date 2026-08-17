@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve LORD to Synchronet through the dos-poc runtime instead of dosemu.
+# Serve LORD to Synchronet through the dos-runtime crate instead of dosemu.
 #
 # Synchronet runs this under forkpty() with XTRN_NATIVE|XTRN_STDIO, so our
 # stdin and stdout are the user's telnet session. The runtime turns that into a

@@ -7,8 +7,8 @@
 
 use std::io;
 
-use dos_poc::dos::{DosState, Outcome, dispatch};
-use dos_poc::kvm::{Stop, VmGuest};
+use dos_runtime::dos::{DosState, Outcome, dispatch};
+use dos_runtime::kvm::{Stop, VmGuest};
 
 /// Where the program is loaded. `.COM` convention: PSP at `seg:0`, code at
 /// `seg:0x100`.

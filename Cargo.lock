@@ -254,7 +254,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dos-poc"
+name = "dos-runtime"
 version = "0.1.0"
 dependencies = [
  "dos",

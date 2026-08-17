@@ -42,9 +42,9 @@ change to INTERNAL`. `AH=04h` returning `0x1954` is what prevents that.
 ## Install
 
 ```sh
-cargo build --release -p dos-poc
+cargo build --release -p dos-runtime
 cp target/release/runexe            /sbbs/xtrn/lord/runexe
-cp crates/dos-poc/door/lord-dospoc.sh /sbbs/xtrn/lord/
+cp crates/dos-runtime/door/lord-dospoc.sh /sbbs/xtrn/lord/
 chmod +x /sbbs/xtrn/lord/lord-dospoc.sh
 ```
 
@@ -58,7 +58,7 @@ a pipe.
 
 ```ini
 [prog:MAIN:LORDDP]
-	name=Legend of the Red Dragon (dos-poc)
+	name=Legend of the Red Dragon (dos-runtime)
 	ars=
 	execution_ars=
 	type=3
@@ -88,7 +88,7 @@ mkdir -p /tmp/x/node9 && cp -r /sbbs/xtrn/lord /tmp/x/lord
 # ... write a 52-line DOOR.SYS to /tmp/x/node9/DOOR.SYS ...
 LORD_DIR=/tmp/x/lord SBBS_NODE_DIR=/tmp/x/node9 \
   RUNEXE=$PWD/target/release/runexe \
-  crates/dos-poc/door/lord-dospoc.sh 9
+  crates/dos-runtime/door/lord-dospoc.sh 9
 ```
 
 ## Baud
