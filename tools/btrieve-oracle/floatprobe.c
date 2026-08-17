@@ -106,7 +106,7 @@ static void die(const char *what, int st)
 }
 
 /* `width` is the key segment's length: 8 for a double, 4 for a float. */
-static void create_float(const char *path, WORD width)
+static void create_typed(const char *path, WORD width, BYTE type)
 {
     char posblk[POSBLK_SIZE];
     char keybuf[KEY_SIZE];
@@ -129,13 +129,13 @@ static void create_float(const char *path, WORD width)
     ks->position = 1;
     ks->length = width;
     ks->flags = 0x0101;   /* DUPLICATE | EXTTYPE -- see the header comment */
-    ks->ext_type = 0x02;  /* FLOAT */
+    ks->ext_type = type;
 
     st = btrcall(B_CREATE, posblk, data, &dlen, keybuf,
                  (BYTE)(strlen(keybuf) + 1), (char)0);
     if (st != 0)
         die("create", st);
-    printf("created %s reclen=16 key=1 len=%u type=0x02 (float)\n", path, width);
+    printf("created %s reclen=16 key=1 len=%u type=%#04x\n", path, width, type);
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
 
@@ -181,6 +181,75 @@ static void cmd_insert(const char *path, WORD width, const char *text, DWORD tag
     for (unsigned i = 0; i < width; i++)
         printf("%02x", record[i]);
     printf(" status=%d (%s)\n", st, status_name(st));
+
+    { DWORD d2 = 0; btrcall(B_CLOSE, posblk, NULL, &d2, NULL, 0, 0); }
+}
+
+/* Insert a key given as raw hex, so a type whose encoding is not known can
+ * still be ordered.
+ *
+ * `bfloat` (0x09) is Borland's, and is not IEEE: which byte holds the
+ * exponent and where the sign bit sits are exactly what is in question, so
+ * feeding it a C `double` would assume the answer. Feeding it chosen bit
+ * patterns and reading back the order does not. */
+static void cmd_insert_raw(const char *path, const char *hex, DWORD tag)
+{
+    char posblk[POSBLK_SIZE];
+    unsigned char record[DATA_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    DWORD dlen;
+    int st;
+    size_t i, n = strlen(hex) / 2;
+
+    st = open_file(posblk, path);
+    if (st != 0)
+        die("open", st);
+
+    memset(record, 0, 16);
+    for (i = 0; i < n && i < 8; i++) {
+        char byte[3] = { hex[2 * i], hex[2 * i + 1], 0 };
+        record[i] = (unsigned char)strtoul(byte, NULL, 16);
+    }
+    memcpy(record + 8, &tag, 4);
+
+    dlen = 16;
+    memset(keybuf, 0, sizeof keybuf);
+    st = btrcall(B_INSERT, posblk, record, &dlen, keybuf, sizeof keybuf - 1, 0);
+    printf("insert raw %-18s tag=%-3lu status=%d (%s)\n",
+           hex, (unsigned long)tag, st, status_name(st));
+
+    { DWORD d2 = 0; btrcall(B_CLOSE, posblk, NULL, &d2, NULL, 0, 0); }
+}
+
+/* Walk printing only the raw key bytes -- no interpretation at all. */
+static void cmd_walk_raw(const char *path, WORD width)
+{
+    char posblk[POSBLK_SIZE];
+    unsigned char data[DATA_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    DWORD dlen;
+    int st, n = 0;
+
+    st = open_file(posblk, path);
+    if (st != 0)
+        die("open", st);
+
+    memset(keybuf, 0, sizeof keybuf);
+    dlen = sizeof data;
+    st = btrcall(B_GET_FIRST, posblk, data, &dlen, keybuf, KEY_SIZE - 1, 0);
+    while (st == 0) {
+        DWORD tag;
+        unsigned i;
+        memcpy(&tag, data + 8, 4);
+        printf("  %2d: tag=%-3lu key=", n, (unsigned long)tag);
+        for (i = 0; i < width; i++)
+            printf("%02x", data[i]);
+        printf("\n");
+        n++;
+        dlen = sizeof data;
+        st = btrcall(B_GET_NEXT, posblk, data, &dlen, keybuf, KEY_SIZE - 1, 0);
+    }
+    printf("walked %d, ended status=%d (%s)\n", n, st, status_name(st));
 
     { DWORD d2 = 0; btrcall(B_CLOSE, posblk, NULL, &d2, NULL, 0, 0); }
 }
@@ -247,14 +316,28 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (!strcmp(cmd, "create8"))      create_float(path, 8);
-    else if (!strcmp(cmd, "create4")) create_float(path, 4);
+    if (!strcmp(cmd, "create8"))      create_typed(path, 8, 0x02);
+    else if (!strcmp(cmd, "create4")) create_typed(path, 4, 0x02);
     else if (!strcmp(cmd, "insert8")) {
         if (argc < 5) { fprintf(stderr, "FAIL: insert needs <value> <tag>\n"); return 2; }
         cmd_insert(path, 8, argv[3], (DWORD)strtoul(argv[4], NULL, 10));
     } else if (!strcmp(cmd, "insert4")) {
         if (argc < 5) { fprintf(stderr, "FAIL: insert needs <value> <tag>\n"); return 2; }
         cmd_insert(path, 4, argv[3], (DWORD)strtoul(argv[4], NULL, 10));
+    } else if (!strcmp(cmd, "insertraw")) {
+        if (argc < 5) { fprintf(stderr, "FAIL: insertraw needs <hex> <tag>\n"); return 2; }
+        cmd_insert_raw(path, argv[3], (DWORD)strtoul(argv[4], NULL, 10));
+    } else if (!strcmp(cmd, "walkraw")) {
+        if (argc < 4) { fprintf(stderr, "FAIL: walkraw needs <width>\n"); return 2; }
+        cmd_walk_raw(path, (WORD)atoi(argv[3]));
+    } else if (!strcmp(cmd, "createt")) {
+        /* Any extended type at any width, so that "will the engine even make
+         * this key" is a measurement rather than an assumption. */
+        if (argc < 5) {
+            fprintf(stderr, "FAIL: createt needs <width> <type>\n");
+            return 2;
+        }
+        create_typed(path, (WORD)atoi(argv[3]), (BYTE)strtoul(argv[4], NULL, 0));
     } else if (!strcmp(cmd, "walk8"))  cmd_walk(path, 8);
     else if (!strcmp(cmd, "walk4"))    cmd_walk(path, 4);
     else { fprintf(stderr, "FAIL: unknown command %s\n", cmd); return 2; }

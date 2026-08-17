@@ -119,10 +119,14 @@ const UNSUPPORTED: [(u16, &str); 4] = [
 ///
 /// Btrieve defines twenty-odd data types and MajorMUD's eighteen files use
 /// four of them: `Zstring` (0x0b), `Integer` (0x01), `UnsignedBinary` (0x0e)
-/// and `AutoInc` (0x0f). They collapse to three orderings, and **anything else
-/// is refused rather than guessed at** -- a `Date`, a `Decimal` or a `Bfloat`
-/// sorted as though it were bytes would put records in an order that is wrong
-/// only sometimes, which is the worst way for it to be wrong.
+/// and `AutoInc` (0x0f), which collapse to three orderings. Two more --
+/// `Float` (0x02) and `Bfloat` (0x09) -- were added once the engine's own
+/// order for each had been measured, the first because `MULTIACS.DAT` needs
+/// it and the second because measuring it turned out to be as cheap.
+///
+/// **Anything else is refused rather than guessed at.** A `Date`, a `Time` or
+/// a `Decimal` sorted as though it were bytes would put records in an order
+/// that is wrong only sometimes, which is the worst way for it to be wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// `String`, `Lstring`, `Zstring`, `OldAscii`: the bytes up to the first
@@ -139,6 +143,11 @@ pub enum Kind {
     /// `Float`: an IEEE binary float, of whatever width the segment is --
     /// eight bytes is an `f64`, four an `f32`. Both measured; see [`float`].
     Float,
+
+    /// `Bfloat`: Borland's binary float, which is **not** IEEE -- the
+    /// exponent is the last byte and the sign is a bit in the one before it.
+    /// Measured at four and eight bytes; see [`bfloat`].
+    Bfloat,
 }
 
 impl Kind {
@@ -157,6 +166,7 @@ impl Kind {
             0x01 | 0x0f => Some(Self::Signed),
             0x0d | 0x0e | 0x21 => Some(Self::Unsigned),
             0x02 => Some(Self::Float),
+            0x09 => Some(Self::Bfloat),
             _ => None,
         }
     }
@@ -224,6 +234,7 @@ impl Segment {
             Kind::Signed => signed(a, b),
             Kind::Unsigned => unsigned(a, b),
             Kind::Float => float(a, b),
+            Kind::Bfloat => bfloat(a, b),
         };
         if self.descending { order.reverse() } else { order }
     }
@@ -314,6 +325,61 @@ fn float(a: &[u8], b: &[u8]) -> Ordering {
             read(a).total_cmp(&read(b))
         }
         _ => Ordering::Equal,
+    }
+}
+
+/// Compare two Borland binary floats (`bfloat`, type `0x09`).
+///
+/// **Not IEEE**, and the difference is structural rather than cosmetic: the
+/// **last** byte is the exponent, biased by 128, and the sign is bit 7 of the
+/// byte *before* it. Everything else is mantissa. IEEE puts the sign in the
+/// top bit of the last byte and the exponent below it, so reading one as the
+/// other misorders almost everything.
+///
+/// Measured against genuine Pervasive Btrieve 6.15 by inserting chosen bit
+/// patterns -- not C floats, which would have assumed the encoding -- and
+/// stepping the key. At four bytes the engine answers
+///
+/// ```text
+/// ffffffff < 00008081 < ffffff7f < 00000001 < 00000080 < 00000081 < 00000082
+/// ```
+///
+/// which under the layout above reads
+/// `-huge < -1.0 < -0.5 < +tiny < +0.5 < +1.0 < +2.0`. Eight bytes agrees, and
+/// adds the case four bytes could not show: an all-zero key sorts **between**
+/// the negatives and the positives, which is what sign-magnitude requires and
+/// what a plain byte comparison would get wrong.
+///
+/// See `docs/2026-08-17-float-key-oracle.md`.
+fn bfloat(a: &[u8], b: &[u8]) -> Ordering {
+    /// The sign, and the magnitude most significant byte first: exponent,
+    /// then the sign's own byte with that bit cleared, then the rest.
+    fn split(field: &[u8]) -> (bool, Vec<u8>) {
+        let n = field.len();
+        if n < 2 {
+            return (false, field.to_vec());
+        }
+        let negative = field[n - 2] & 0x80 != 0;
+        let mut magnitude = Vec::with_capacity(n);
+        magnitude.push(field[n - 1]);
+        // Masking the sign off cannot change an ordering -- the match below
+        // has already split on it, so both operands of every comparison
+        // carry it identically -- and no test can pin it. It is here because
+        // a magnitude with a sign bit in it is not a magnitude.
+        magnitude.push(field[n - 2] & 0x7f);
+        magnitude.extend(field[..n - 2].iter().rev());
+        (negative, magnitude)
+    }
+
+    let (a_negative, a_magnitude) = split(a);
+    let (b_negative, b_magnitude) = split(b);
+    match (a_negative, b_negative) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        // Two negatives sort by *descending* magnitude, the same inversion a
+        // sign-magnitude representation always has.
+        (true, true) => b_magnitude.cmp(&a_magnitude),
+        (false, false) => a_magnitude.cmp(&b_magnitude),
     }
 }
 
@@ -988,6 +1054,70 @@ mod tests {
         assert_eq!(
             key.compare(&1.0f32.to_le_bytes(), &(-1.0f32).to_le_bytes()),
             Ordering::Greater,
+        );
+    }
+
+    /// The engine's own order for a `bfloat` key, as raw bytes.
+    ///
+    /// These are the exact patterns `floatprobe insertraw` fed genuine 6.15
+    /// and the exact order it walked them back in. Written as bytes rather
+    /// than as numbers on purpose: naming them `-1.0` and so on would be
+    /// asserting the encoding this test exists to pin.
+    #[test]
+    fn a_bfloat_key_is_ordered_the_way_the_engine_orders_it() {
+        let key = named(Kind::Bfloat, 4);
+        let engines_order: [[u8; 4]; 7] = [
+            [0xff, 0xff, 0xff, 0xff], // -huge
+            [0x00, 0x00, 0x80, 0x81], // -1.0
+            [0xff, 0xff, 0xff, 0x7f], // -0.5
+            [0x00, 0x00, 0x00, 0x01], // +tiny
+            [0x00, 0x00, 0x00, 0x80], // +0.5
+            [0x00, 0x00, 0x00, 0x81], // +1.0
+            [0x00, 0x00, 0x00, 0x82], // +2.0
+        ];
+        for pair in engines_order.windows(2) {
+            assert_eq!(
+                key.compare(&pair[0], &pair[1]),
+                Ordering::Less,
+                "{:02x?} sorts before {:02x?} in the engine's own walk",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// Eight bytes, and the case four could not show: zero sits between the
+    /// negatives and the positives.
+    #[test]
+    fn a_bfloat_zero_sorts_between_the_negatives_and_the_positives() {
+        let key = named(Kind::Bfloat, 8);
+        let negative = [0, 0, 0, 0, 0, 0, 0x80, 0x81];
+        let zero = [0u8; 8];
+        let positive = [0, 0, 0, 0, 0, 0, 0, 0x01];
+
+        assert_eq!(key.compare(&negative, &zero), Ordering::Less);
+        assert_eq!(key.compare(&zero, &positive), Ordering::Less);
+    }
+
+    /// A `bfloat` is not an IEEE float, and the two disagree on these bytes.
+    ///
+    /// `00 00 80 41` is negative to Borland -- the sign is bit 7 of byte 2,
+    /// which is set -- and `+16.0` to IEEE, which reads its sign from the top
+    /// bit of byte 3, which is clear. Routing one type through the other's
+    /// comparator is the silent misordering this pins against.
+    #[test]
+    fn a_bfloat_and_a_float_disagree_about_the_same_bytes() {
+        let borland = named(Kind::Bfloat, 4);
+        let ieee = named(Kind::Float, 4);
+        let negative_to_borland = [0x00, 0x00, 0x80, 0x41];
+        let zero = [0x00, 0x00, 0x00, 0x00];
+
+        assert_eq!(borland.compare(&negative_to_borland, &zero), Ordering::Less);
+        assert_eq!(
+            ieee.compare(&negative_to_borland, &zero),
+            Ordering::Greater,
+            "IEEE reads these bytes as positive, which is why the types cannot share \
+             a comparator"
         );
     }
 

@@ -875,12 +875,11 @@ mod tests {
             record_length: 8,
             page_size: 512,
             keys: vec![KeySpec {
-                // `bfloat` (0x09). Borland's BCD, explicitly not IEEE, and
-                // the one numeric type still without an ordering here --
-                // `float` (0x02) used to serve as this test's example and
-                // stopped being unreadable once the engine's own float order
-                // was measured.
-                segments: vec![SegmentSpec { offset: 0, length: 8, kind: 0x09, descending: false }],
+                // `decimal` (0x05), packed BCD. Both `float` (0x02) and
+                // `bfloat` (0x09) used to serve as this test's example of a
+                // type with no ordering, and each stopped being one as the
+                // engine's own order for it was measured.
+                segments: vec![SegmentSpec { offset: 0, length: 8, kind: 0x05, descending: false }],
                 duplicates: false,
                 modifiable: false,
             }],

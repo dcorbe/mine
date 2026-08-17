@@ -216,9 +216,10 @@ fn next_key(segment: &mbbs::btrieve::keys::Segment, highest: u64, n: u64) -> Vec
         // against what is already there" care the arms above get from the
         // caller. Panicking says so, where a `_ =>` arm would quietly forge a
         // file whose key the engine would then blame on the index.
-        Kind::Float => panic!(
-            "a float key ({length} bytes) -- this forge has never met one and has no rule \
-             for choosing a value that sorts last in it"
+        Kind::Float | Kind::Bfloat => panic!(
+            "a float key ({length} bytes, {:?}) -- this forge has never met one and has no \
+             rule for choosing a value that sorts last in it",
+            segment.kind
         ),
     }
 }
