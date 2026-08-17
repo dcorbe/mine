@@ -502,6 +502,25 @@ pub const GLOBALS: &[Global] = &[
     // `__TXTLEN` and `exports::c_name` -- which strips exactly one leading
     // underscore -- asks for `_txtlen`.
     m("_txtlen", 2),
+    // BRKTHU.H:105 -- SHORT ictact; "after btuict() or btuica():# byte avl"
+    // -- guide page 105: once a binary-input call transfers fewer than a
+    // whole block, "the global variable `ictact` can be used to find out how
+    // many bytes were transferred." `SHORT`, not `INT` -- the declarations
+    // immediately below it in the same header (`btusrs`, `btudtr`, ...) are
+    // `INT` and this one deliberately is not, so it is `Width::Bytes(2)`
+    // here rather than `Width::Int`, for the same reason `_txtlen` just
+    // above is: a fixed vendor width, not the compiler's.
+    //
+    // Placed at the tail alongside `_txtlen` rather than next to `bturno`
+    // (also `BRKTHU.H`, a few lines earlier in the header): the two are the
+    // same table either way -- [`crate::shims::entry`] finds a `Datum` by
+    // `(dll, name)`, not by array position -- and appending here means
+    // nothing already placed has to be renumbered by hand.
+    //
+    // `gsbl::btuict` is the only writer. `btuica` does not set it, even
+    // though the guide credits it too -- out of this task's scope; see
+    // `btuict`'s own doc comment.
+    s("ictact", 2),
 ];
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
@@ -1569,7 +1588,12 @@ mod tests {
         // because the streams this host opens live inside it.
         //
         // Task 4.5 then added `_8087`, two bytes: 4028 + 2 = 4030.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 4030);
+        //
+        // Phase 5 Task 4 then appended `ictact`, two bytes, at the tail
+        // beside `_txtlen` rather than beside `bturno` -- see that global's
+        // own comment for why -- so it is the last addition rather than one
+        // threaded into the middle of this chain: 4030 + 2 = 4032.
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 4032);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as

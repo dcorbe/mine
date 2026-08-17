@@ -900,6 +900,53 @@ pub fn btuxct<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
 
+/// `int btuict(int chan,char *rdbptr)` -- binary input, by the byte count
+/// prearranged with [`btutrg`] (guide `btuict`, page 105): when at least `nbyt` bytes (the trigger count) are waiting it copies them out and removes them from the input buffer; with fewer waiting it copies what there is and removes nothing.
+///
+/// [`btuica`] is the template for the pointer handling -- resolve the
+/// destination before draining, for the same R12 reason that function's own
+/// doc comment gives. What differs: the count comes from
+/// [`crate::gsbl::Channel::trigger`] rather than an argument, and **a short
+/// read must not drain**. The guide is explicit that an incomplete block
+/// stays in the buffer for a later call, so unlike `btuica` -- which always
+/// drains exactly what it copied -- this one only drains a *whole* block.
+///
+/// `ictact` receives the count either way. It is the only way a caller can
+/// tell a short read from a whole one, since both return the number of
+/// bytes transferred.
+pub fn btuict<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let at = call.ptr();
+    let Some(chan) = host.gsbl().terms().chan(chan) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    let c = host.gsbl().channel(chan);
+    let want = usize::from(c.trigger);
+    let have = c.input.len();
+    let take = want.min(have);
+
+    at.resolve(call.mem(), take)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // `want > 0` matters: an ASCII-mode channel has `trigger == 0`, and
+    // `have >= want` is trivially true against it, so without this guard an
+    // ASCII-mode call would take the drain arm and claim a whole (empty)
+    // block was satisfied instead of falling through to the copy-without-
+    // drain arm below, which is what a `take == 0` genuinely means here.
+    let bytes: Vec<u8> = if have >= want && want > 0 {
+        host.gsbl_mut().channel_mut(chan).input.drain(..take).collect()
+    } else {
+        host.gsbl().channel(chan).input.iter().take(take).copied().collect()
+    };
+    at.write(call.mem(), &bytes)
+        .expect("resolve above already validated this exact pointer and length");
+
+    host.globals()
+        .write_mem(call.mem(), "ictact", &(take as u16).to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::int_from_u32(take as u32)))
+}
+
 /// `int btuica(int chan, char *rdbptr, int max)` -- take up to `max` bytes of
 /// count-triggered input, and return how many were taken.
 ///
@@ -2148,6 +2195,101 @@ mod tests {
         assert_eq!(
             f.invoke(btuscr, &[past, b'|' as u16]).expect("btuscr"),
             Ret::U16(OUT_OF_RANGE)
+        );
+    }
+
+    // # Task 4: btuict and the ictact global
+    //
+    // btutrg's retrieval half: the block size comes from `Channel::trigger`,
+    // not an argument, and a short read must not drain -- see `btuict`'s own
+    // doc comment. `ictact` is the only way a caller can tell a short
+    // transfer from a whole one, since both return the count actually
+    // copied -- so each test below checks the global directly, not only the
+    // return value. Returning the right count while leaving `ictact`
+    // unwritten would pass every assertion except that one.
+
+    #[test]
+    fn btuict_transfers_and_flushes_once_the_trigger_count_is_present() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).trigger = 4;
+        f.host.gsbl_mut().push_input(console, b"abcdef");
+
+        let buf = f.buffer(16);
+        assert_eq!(
+            f.invoke(btuict, &[0, buf.offset, buf.selector]).expect("btuict"),
+            Ret::U16(4),
+            "the whole block, not the six bytes waiting"
+        );
+        assert_eq!(f.machine.resolve(buf, 4).expect("in bounds"), b"abcd");
+        // Flushed: only the two bytes past the block remain.
+        assert_eq!(f.host.gsbl().channel(console).input.len(), 2);
+        assert_eq!(
+            f.host.globals().word(&f.machine, "ictact").expect("ictact"),
+            4,
+            "ictact must report what btuict actually transferred"
+        );
+    }
+
+    #[test]
+    fn btuict_transfers_a_short_block_without_flushing_it() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).trigger = 8;
+        f.host.gsbl_mut().push_input(console, b"abc");
+
+        let buf = f.buffer(16);
+        assert_eq!(
+            f.invoke(btuict, &[0, buf.offset, buf.selector]).expect("btuict"),
+            Ret::U16(3)
+        );
+        assert_eq!(f.machine.resolve(buf, 3).expect("in bounds"), b"abc");
+        // Guide page 105: a short read does NOT flush.
+        assert_eq!(
+            f.host.gsbl().channel(console).input.len(),
+            3,
+            "an incomplete block must stay in the buffer for a later call"
+        );
+        assert_eq!(
+            f.host.globals().word(&f.machine, "ictact").expect("ictact"),
+            3,
+            "ictact must report the short count too, not only a whole block"
+        );
+    }
+
+    #[test]
+    fn btuict_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        let buf = f.buffer(16);
+        assert_eq!(
+            f.invoke(btuict, &[past, buf.offset, buf.selector]).expect("btuict"),
+            Ret::U16(OUT_OF_RANGE)
+        );
+    }
+
+    /// An ASCII-mode channel (`trigger == 0`) must not answer as though a
+    /// zero-byte block were satisfied. `have >= want` is trivially true when
+    /// `want` is zero, so [`btuict`] needs the `want > 0` guard to keep this
+    /// case out of the drain arm -- and since the drain and no-drain arms
+    /// behave identically when `take` is zero either way, the only thing
+    /// this test can observe is that nothing was disturbed.
+    #[test]
+    fn btuict_on_an_ascii_mode_channel_leaves_the_line_buffer_alone() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        assert_eq!(f.host.gsbl().channel(console).trigger, 0, "ASCII mode by default");
+        f.host.gsbl_mut().push_input(console, b"typing\r");
+
+        let buf = f.buffer(16);
+        assert_eq!(
+            f.invoke(btuict, &[0, buf.offset, buf.selector]).expect("btuict"),
+            Ret::U16(0)
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(console),
+            Some(Gsbl::CRSTG),
+            "the completed line is still queued -- btuict must not have touched it"
         );
     }
 }
