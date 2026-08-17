@@ -38,17 +38,25 @@ use crate::shims::ShimError;
 //
 // `A::Int` is `u16` under `Wg16` and `u32` under `Wg32`, the same shape
 // `shims::gsbl` already audited in full
-// (`docs/2026-08-14-gsbl-width-audit.md`). This file has the same two
-// surviving buckets that document names: a byte count with nothing
-// narrower behind it (`memcpy`, `memcmp`, `movmem` and `setmem`'s `count`
-// -- "genuinely wide", read whole with [`count_arg`]) and a size this
-// crate's own [`Heap`](crate::heap::Heap) already commits to sixteen bits
-// regardless of `A` (`alcmem`/`alczer`'s `size` -- "16-bit host model",
-// read with [`heap_size_arg`], which refuses rather than truncates).
-// `setmem`'s fill byte is the third, "genuinely narrow" bucket -- a `char`
-// argument that only ever contributes its low byte, exactly like
-// `memset`'s own `c` parameter -- and needs no checked reader because
-// every value of that byte is already valid.
+// (`docs/2026-08-14-gsbl-width-audit.md`). This file has three buckets: a
+// byte count with nothing narrower behind it (`memcpy`, `memcmp`, `movmem`
+// and `setmem`'s `count` -- "genuinely wide", read whole with
+// [`count_arg`]); an element size [`alcblok32`]'s own per-glob math commits
+// to sixteen bits regardless of `A` ("16-bit host model", read with
+// [`heap_size_arg`], which refuses rather than truncates); and `setmem`'s
+// fill byte, "genuinely narrow" -- a `char` argument that only ever
+// contributes its low byte, exactly like `memset`'s own `c` parameter --
+// which needs no checked reader because every value of that byte is
+// already valid.
+//
+// `alcmem`/`alczer`'s own `size` used to be in the second bucket -- read
+// with `heap_size_arg`, refused past `u16::MAX` -- but that refusal was the
+// defect this crate's own heap ceiling leaked into: [`Heap::reserve`]
+// really is capped at sixteen bits on both ABIs (deliberately, see that
+// method's doc comment), but the *request* is not, on `Wg32`. Both readers
+// now take `A::Int` at full width and branch on the *value* into either
+// [`Heap::reserve`] or [`Heap::reserve_large`](crate::heap::Heap::reserve_large)
+// -- see their own doc comments.
 
 /// Read a byte count at `A`'s own int width, never narrowed.
 ///
@@ -62,12 +70,17 @@ fn count_arg<A: Abi>(v: A::Int) -> usize {
     Into::<u32>::into(v) as usize
 }
 
-/// Read a `size`/`nbytes` argument, refusing rather than truncating if it
-/// does not fit the `u16` [`Heap::reserve`](crate::heap::Heap::reserve)
-/// takes regardless of `A` -- this crate's own heap model, committed to
-/// sixteen bits independent of what `Wg32`'s `int` can carry, the same
-/// shape `shims::gsbl`'s `u16_arg` documents
+/// Read an [`alcblok32`] *element* size, refusing rather than truncating if
+/// it does not fit the `u16` [`rounded_blok_size`]/[`elements_per_glob`]
+/// commit to regardless of `A` -- one element must still fit inside one
+/// packed region ([`Heap::reserve`](crate::heap::Heap::reserve)'s own
+/// ceiling), independent of what `Wg32`'s `int` can carry, the same shape
+/// `shims::gsbl`'s `u16_arg` documents
 /// (`docs/2026-08-14-gsbl-width-audit.md`).
+///
+/// **Not** used for `alcmem`/`alczer`'s `size` any more -- see this file's
+/// own "Argument width" note above for why that call site moved off this
+/// reader.
 fn heap_size_arg<A: Abi>(v: A::Int) -> Option<u16> {
     u16::try_from(Into::<u32>::into(v)).ok()
 }
@@ -86,13 +99,28 @@ fn heap_size_arg<A: Abi>(v: A::Int) -> Option<u16> {
 /// `docs/plans/2026-08-12-abi-border-implementation.md`, once nothing else
 /// called it), it takes `&mut A::Mem` straight from [`Call::mem`] rather
 /// than a whole `&mut Machine`.
+///
+/// # Width: packed for a small `size`, its own region for a large one
+///
+/// `size` is read at `A::Int`'s own full width, not narrowed the way this
+/// used to read it through `heap_size_arg` -- `Heap::reserve`'s `u16`
+/// ceiling is a real property of this crate's packed-region heap, not of
+/// what a `Wg32` module may ask `alcmem` for. So `size` is checked against
+/// `u16::MAX` here, at the *value*, not assumed from `A`: fits, and this
+/// still packs into a shared region through `Heap::reserve` exactly as
+/// before; does not, and it takes a dedicated region through
+/// [`Heap::reserve_large`](crate::heap::Heap::reserve_large) instead of
+/// being refused. Under `Wg16`, `A::Int` is itself `u16`, so `size` can
+/// never exceed `u16::MAX` and the large path is unreachable -- this is one
+/// function correct on both ABIs, not two behaviours multiplexed on `A`.
 pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let size = heap_size_arg::<A>(call.int())
-        .ok_or_else(|| ShimError::Failed("alcmem: size does not fit this heap's u16 block size".to_owned()))?;
-    let at = host
-        .heap
-        .reserve(call.mem(), size)
-        .map_err(|e| ShimError::Failed(format!("alcmem: {e}")))?;
+    let want: u32 = call.int().into();
+    let want = usize::try_from(want).expect("u32 fits usize on every target we build for");
+    let at = match u16::try_from(want) {
+        Ok(small) => host.heap.reserve(call.mem(), small),
+        Err(_) => host.heap.reserve_large(call.mem(), want),
+    }
+    .map_err(|e| ShimError::Failed(format!("alcmem: {e}")))?;
     Ok(abi::Ret::Ptr(at))
 }
 
@@ -219,18 +247,24 @@ pub fn galmalloc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
 /// as [`alcmem`], and the zero-fill writes through
 /// [`mbbs_machine::ptr::ModulePtr::write`] on [`Call::mem`] rather than
 /// `Machine::write`.
+///
+/// Reads `nbytes` at full width and branches into
+/// [`Heap::reserve_large`](crate::heap::Heap::reserve_large) for anything
+/// past `u16::MAX`, the same as [`alcmem`] now does -- see that function's
+/// own doc comment for why the branch is on the value rather than on `A`.
 pub fn alczer<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let size = heap_size_arg::<A>(call.int())
-        .ok_or_else(|| ShimError::Failed("alczer: size does not fit this heap's u16 block size".to_owned()))?;
-    let at = host
-        .heap
-        .reserve(call.mem(), size)
-        .map_err(|e| ShimError::Failed(format!("alczer: {e}")))?;
+    let want: u32 = call.int().into();
+    let want = usize::try_from(want).expect("u32 fits usize on every target we build for");
+    let at = match u16::try_from(want) {
+        Ok(small) => host.heap.reserve(call.mem(), small),
+        Err(_) => host.heap.reserve_large(call.mem(), want),
+    }
+    .map_err(|e| ShimError::Failed(format!("alczer: {e}")))?;
     // `A::Ptr::Error` has no `From` into `ShimError` for an arbitrary `A` --
     // only `Wg16`'s `FarPtrError` does -- so this is `map_err`, not `?`,
     // unlike the `Wg16`-only original (`shims::user::haskey`'s own comment
     // has the same note).
-    at.write(call.mem(), &vec![0u8; usize::from(size)])
+    at.write(call.mem(), &vec![0u8; want])
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Ptr(at))
 }
@@ -742,18 +776,28 @@ pub fn freblok(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 /// where the vendor puts it, `qty` in the six bytes of dead space the
 /// vendor's own `alczer` already zeroed and never reads again.
 ///
-/// # The one real divergence: this host's allocator has a ceiling the vendor's never did
+/// # The ceiling `Heap::reserve` keeps, and the region `reserve_large` takes instead
 ///
 /// `qty*size+8` can be arbitrarily large under a genuine flat 32-bit
-/// `malloc()`. This host's own [`Heap::reserve`] cannot answer more than
-/// `u16::MAX` bytes in one call, regardless of `A` (`heap.rs`'s `SEGMENT`
-/// constant is not `Abi`-scoped). The vendor's flat header has no chaining
-/// concept to fall back on the way `Wg16`'s `segarray` does -- inventing
-/// one here would mean a byte layout with no vendor counterpart at all, the
-/// opposite of what this pass is for -- so an aggregate that does not fit
-/// one `reserve` call is refused outright rather than represented some
-/// other way. Nothing in this track's ten-build survey shows a `Wg32`
-/// aggregate anywhere near that size.
+/// `malloc()`. This host's own [`Heap::reserve`] still cannot answer more
+/// than `u16::MAX` bytes in one call, on either ABI (`heap.rs`'s `SEGMENT`
+/// constant is not `Abi`-scoped, and that ceiling stays deliberate -- see
+/// `Heap::reserve`'s own doc comment). An aggregate that does not fit one
+/// `reserve` call no longer has to be refused, though: it takes a region
+/// entirely its own through
+/// [`Heap::reserve_large`](crate::heap::Heap::reserve_large), straight off
+/// `A::Mem::alloc_region` -- for `Wg32` that is `Memory::alloc`, the same
+/// flat, ceiling-free bump allocator a genuine `malloc()` would have used,
+/// so this needs no invented byte layout, only a bigger single allocation.
+///
+/// **MajorMUD-NT is the module that overtakes the previous version of this
+/// comment**, which claimed "nothing in this track's ten-build survey shows
+/// a `Wg32` aggregate anywhere near that size." Its module init calls
+/// `alcblok(1501, 1544)`: `1501 * 1544 + 8 = 2,317,552` bytes, about 35x
+/// this heap's packed-region ceiling, into a 16 MiB arena with room for it
+/// thirty times over. A survey finding no evidence of something was never
+/// proof it cannot happen -- only that this track had not yet met the
+/// module that does.
 pub fn alcblok32(call: &mut Call<Wg32>, host: &mut Host<Wg32>) -> Result<abi::Ret<Wg32>, ShimError> {
     let qty = count_arg::<Wg32>(call.int());
     let raw_size = heap_size_arg::<Wg32>(call.int()).ok_or_else(|| {
@@ -772,23 +816,22 @@ pub fn alcblok32(call: &mut Call<Wg32>, host: &mut Host<Wg32>) -> Result<abi::Re
     let total = qty
         .checked_mul(usize::from(size))
         .and_then(|n| n.checked_add(8))
-        .and_then(|n| u16::try_from(n).ok())
         .ok_or_else(|| {
             ShimError::Failed(format!(
-                "alcblok: {qty} elements of {raw_size} bytes needs more than this heap gives in one piece -- the vendor's own flat layout has no chaining to fall back on"
+                "alcblok: {qty} elements of {raw_size} bytes overflows the host's own address arithmetic"
             ))
         })?;
 
     let block = host
         .heap
-        .reserve(call.mem(), total)
+        .reserve_large(call.mem(), total)
         .map_err(|e| ShimError::Failed(format!("alcblok: {e}")))?;
 
     // ALCBLOK.C's flat branch gets its zero-fill from calling alczer for
     // the whole allocation; this host's alczer is `Heap::reserve` plus an
     // explicit zero-write, done the same way here.
     block
-        .write(call.mem(), &vec![0u8; usize::from(total)])
+        .write(call.mem(), &vec![0u8; total])
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     block
         .write(call.mem(), &wg32_blok_header(size, qty as u32))
@@ -1125,6 +1168,73 @@ mod tests {
             f.machine.resolve(b, 64).expect("readable"),
             &[0u8; 64],
             "alczer left what the last owner wrote"
+        );
+    }
+
+    /// `alcmem`/`alczer`'s branch on `size` (`u16::try_from(want)`) must
+    /// still choose the packed path for an ordinary request, not the
+    /// dedicated-region path [`Heap::reserve_large`](crate::heap::Heap::reserve_large)
+    /// exists for `Wg32`'s oversized ones.
+    ///
+    /// [`Heap::block`](crate::heap::Heap::block) is the discriminator, not
+    /// [`Heap::segments`](crate::heap::Heap::segments): a fixture's own
+    /// startup (`alcvda`) already primes one packed region before this test
+    /// ever runs, so segment *count* cannot tell "packed into what was
+    /// already there" apart from "took a dedicated region that happens not
+    /// to change the count either" -- `reserve_large` never touches
+    /// `Heap`'s own `regions` at all (that method's own doc comment), so it
+    /// would not move `segments()` either way. `Heap::block` reads the
+    /// opposite bookkeeping: it only ever answers for a pointer
+    /// [`Heap::reserve`] recorded in its own `blocks` map -- a
+    /// `reserve_large` pointer lives in a separate `large` map `block` never
+    /// looks at, so it answers `None` for one every time, correctly or not.
+    /// A `None` here is exactly the mutation this test exists to catch: flip
+    /// `u16::try_from(want)`'s `Ok`/`Err` arms in [`alcmem`]/[`alczer`] and
+    /// this fails.
+    #[test]
+    fn alcmem_and_alczer_still_pack_ordinary_sizes_into_one_region() {
+        let mut f = Fixture::new();
+        let Ret::Far(a) = f.invoke(alcmem, &[256]).expect("alcmem(256)") else {
+            panic!("alcmem returns a pointer")
+        };
+        assert!(
+            f.host.heap.block(a).is_some(),
+            "alcmem(256) must land in Heap::reserve's packed accounting, \
+             not Heap::reserve_large's dedicated one"
+        );
+
+        let Ret::Far(b) = f.invoke(alczer, &[256]).expect("alczer(256)") else {
+            panic!("alczer returns a pointer")
+        };
+        assert!(
+            f.host.heap.block(b).is_some(),
+            "alczer(256) must land in Heap::reserve's packed accounting, \
+             not Heap::reserve_large's dedicated one"
+        );
+    }
+
+    /// [`galfree`] (`shims/memory.rs:285`) is `host.heap.free(at)`,
+    /// unconditionally -- this task's own brief requires it stay that way.
+    /// Proving it still frees a [`Heap::reserve_large`](crate::heap::Heap::reserve_large)
+    /// block therefore proves `Heap::free`'s own large-block check
+    /// (`crate::heap`), not anything about `galfree` itself, which never
+    /// changed. `Wg16`'s own `alcmem`/`alczer` can never reach
+    /// `reserve_large` -- `Wg16::Int` is `u16`, so `want` can never exceed
+    /// `u16::MAX` -- so this reaches it the only way a `Wg16` fixture can:
+    /// directly, then hands the resulting pointer to the ordinary shim.
+    #[test]
+    fn galfree_round_trips_a_reserve_large_block_without_changing_galfree() {
+        let mut f = Fixture::new();
+        let a = f
+            .host
+            .heap
+            .reserve_large(f.machine.mem_mut(), 40_000)
+            .expect("a Wg16 arena has room for one 40,000-byte dedicated region");
+
+        f.invoke(galfree, &far(a)).expect("galfree frees a reserve_large block");
+        assert!(
+            f.host.heap.free(a).is_err(),
+            "a second free of the same large block is a double free"
         );
     }
 

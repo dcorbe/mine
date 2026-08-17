@@ -132,6 +132,14 @@ pub struct Heap<A: Abi> {
     /// for it.
     blocks: HashMap<A::Ptr, Block>,
 
+    /// Live allocations [`Heap::reserve_large`] made, by the pointer handed
+    /// out for each: a single allocation too big to pack into any
+    /// [`SEGMENT`]-sized [`Arena`], so there is no `region`/`at` pair to
+    /// record the way [`Block`] does -- only how long it is, so
+    /// [`Heap::free`] knows to hand the whole thing back to nobody (see that
+    /// method) rather than hunting for it in `regions`.
+    large: HashMap<A::Ptr, usize>,
+
     /// Every tiled region: the first tile's selector, how many tiles, how big.
     /// Needed because `ptrtile` is otherwise unanswerable -- the host cannot
     /// tell a tile index that is inside a region from one past its end.
@@ -163,6 +171,7 @@ impl<A: Abi> Heap<A> {
             config,
             regions: Vec::new(),
             blocks: HashMap::new(),
+            large: HashMap::new(),
             tiles: Vec::new(),
         }
     }
@@ -237,13 +246,78 @@ impl<A: Abi> Heap<A> {
         Ok(ptr)
     }
 
+    /// Reserve `size` bytes as a region entirely of its own, for a single
+    /// allocation too large to pack into any of the [`SEGMENT`]-sized
+    /// regions [`Heap::reserve`] shares among many callers.
+    ///
+    /// Goes straight to [`ModuleMem::alloc_region`] -- the same primitive
+    /// [`Heap::reserve`] itself grows through when nothing already mapped
+    /// has room -- and never joins `self.regions`' first-fit free list,
+    /// because nothing else should ever be packed alongside a block this
+    /// size. This is deliberately **not** `reserve` widened: `reserve`'s
+    /// `u16` stays exactly as narrow as it was (see [`Abi::ptr_offset`]'s
+    /// doc comment for why a wider type there would only let an
+    /// out-of-range offset compile instead of refusing to build), and
+    /// every one of `reserve`'s other 58 call sites is untouched by this
+    /// method existing.
+    ///
+    /// `Wg32`'s `alloc_region` (`Memory::alloc`, a flat bump allocator over
+    /// a fixed arena) has no ceiling of its own short of the arena's own
+    /// size, so this is where a `Wg32` allocation past `u16::MAX` bytes
+    /// actually lands -- MajorMUD-NT's module init asks `alcblok` for
+    /// 2,317,552 of them; see `shims::memory::alcblok32`'s own doc comment.
+    ///
+    /// `Wg16`'s `alloc_region` is `Machine::alloc_segment`, which refuses
+    /// anything past 64 KiB outright -- no far pointer can address across a
+    /// segment boundary, and that refusal is correct, load-bearing
+    /// behaviour, not a gap this method works around. In practice nothing
+    /// on the `Wg16` side ever calls this with a `size` [`Heap::reserve`]
+    /// could not already have answered -- `alcmem`/`alczer` branch into
+    /// this only once `size` no longer fits `u16`, and `Wg16`'s own `Int`
+    /// is `u16`, so a `Wg16` module can never produce such a `size` in the
+    /// first place. If something ever does reach this on `Wg16`, it fails
+    /// the same way growing `reserve` a fresh region would: cleanly, naming
+    /// why, not by finding a way around a limit that exists on purpose.
+    ///
+    /// This block is invisible to [`Heap::left`]'s accounting: `left`
+    /// counts `self.regions` and how many more of them the configured
+    /// `heap` total could still map, and a large block is neither packed
+    /// into one nor counted against that total. That is a real limitation
+    /// of `farcoreleft`'s honesty once a module starts making large
+    /// allocations, not an oversight this task's brief asked to fix.
+    ///
+    /// # Errors
+    ///
+    /// If `size` is zero, or `mem.alloc_region` refuses.
+    pub fn reserve_large(&mut self, mem: &mut A::Mem, size: usize) -> Result<A::Ptr, String> {
+        if size == 0 {
+            return Err("an allocation of zero bytes".to_owned());
+        }
+        let ptr = mem.alloc_region(size).map_err(|e| e.to_string())?;
+        self.large.insert(ptr, size);
+        Ok(ptr)
+    }
+
     /// Give `at` back.
+    ///
+    /// Checked against [`Heap::reserve_large`]'s own list first: a large
+    /// block was never packed into any `Arena`'s free list, so the ordinary
+    /// path below would never find it. Handing it back only forgets it --
+    /// nothing here ever reclaims a `ModuleMem::alloc_region` mapping, the
+    /// same as an ordinary region once grown (see [`Heap::reserve`]) -- but
+    /// forgetting it is enough to make a second `free` of the same pointer
+    /// fall through to the "was not allocated, or was freed already" refusal
+    /// below, same as any other double free.
     ///
     /// # Errors
     ///
     /// If `at` was never allocated, or has already been freed. Both are module
     /// bugs the real host would have absorbed silently.
     pub fn free(&mut self, at: A::Ptr) -> Result<(), String> {
+        if self.large.remove(&at).is_some() {
+            return Ok(());
+        }
+
         let block = self
             .blocks
             .remove(&at)
@@ -333,14 +407,142 @@ impl<A: Abi> Heap<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::Wg16;
+    use crate::abi::{Wg16, Wg32};
     use mbbs_machine::m16::{FarPtr, Machine};
+    use mbbs_machine::ptr::ModulePtr;
 
     fn heap() -> (Machine, Heap<Wg16>) {
         (
             Machine::new().expect("machine"),
             Heap::new(Config::default()),
         )
+    }
+
+    // # Wg32 fixtures build a `Memory` only, never a `Machine`
+    //
+    // `reserve_large` (like `reserve`) only ever touches `A::Mem`, never
+    // `A::Cpu` -- so a `mbbs_machine::m32::Memory` on its own is everything
+    // these tests need, and nothing here calls `mbbs_machine::m32::Machine::new`, which is
+    // the call that registers with the process-wide fault arbiter
+    // (`crates/mbbs/tests/wg32_abi.rs`'s own module doc comment explains why
+    // any test that *does* build a `Wg32Cpu` stays out of this binary
+    // entirely). Duplicated rather than shared, per this crate family's own
+    // convention for this exact fixture -- see `mbbs_machine::m32::mem`'s and
+    // `mbbs_machine::m32::flatptr`'s own test modules, and
+    // `crates/mbbs/tests/wg32_abi.rs`'s `minimal_with_one_section`.
+    const WG32_SIZE_OF_IMAGE: u32 = 0x0000_2000;
+
+    fn wg32_minimal_with_one_section() -> Vec<u8> {
+        let mut v = vec![0u8; 0x200];
+        v[0..2].copy_from_slice(b"MZ");
+        v[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        v[0x80..0x84].copy_from_slice(b"PE\0\0");
+        v[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes());
+        v[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        v[0x94..0x96].copy_from_slice(&0xe0u16.to_le_bytes());
+        v[0x96..0x98].copy_from_slice(&0x010eu16.to_le_bytes());
+        v[0x98..0x9a].copy_from_slice(&0x010bu16.to_le_bytes());
+
+        let opt = 0x98;
+        v[opt + 16..opt + 20].copy_from_slice(&0x0000_1111u32.to_le_bytes());
+        v[opt + 28..opt + 32].copy_from_slice(&0x2222_0000u32.to_le_bytes());
+        v[opt + 32..opt + 36].copy_from_slice(&0x0000_1000u32.to_le_bytes());
+        v[opt + 36..opt + 40].copy_from_slice(&0x0000_0400u32.to_le_bytes());
+        v[opt + 56..opt + 60].copy_from_slice(&WG32_SIZE_OF_IMAGE.to_le_bytes());
+
+        let sec = opt + 0xe0;
+        v.resize(sec + 40 + 0x200, 0);
+        v[sec..sec + 8].copy_from_slice(b"CODE\0\0\0\0");
+        v[sec + 8..sec + 12].copy_from_slice(&0x100u32.to_le_bytes());
+        v[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        v[sec + 16..sec + 20].copy_from_slice(&0x80u32.to_le_bytes());
+        v[sec + 20..sec + 24].copy_from_slice(&((sec + 40) as u32).to_le_bytes());
+        v[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        v
+    }
+
+    fn wg32_mem(arena_len: usize) -> mbbs_machine::m32::Memory {
+        let file = wg32_minimal_with_one_section();
+        let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
+        let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
+        mbbs_machine::m32::Memory::new(image, arena_len).expect("arena mapping")
+    }
+
+    /// The scenario this task exists for: MajorMUD-NT's module init calls
+    /// `alcblok(1501, 1544)`, `1501 * 1544 + 8 = 2,317,552` bytes -- about
+    /// 35x `Heap::reserve`'s packed-region ceiling
+    /// (`shims::memory::alcblok32`'s own doc comment). A 4 MiB arena holds
+    /// it three times over, so `reserve_large` must answer a real,
+    /// end-to-end writable pointer, and `free` must take it back.
+    #[test]
+    fn reserve_large_is_writable_across_its_full_length_and_frees_on_wg32() {
+        let mut mem = wg32_mem(4 * 1024 * 1024);
+        let mut h = Heap::<Wg32>::new(Config::default());
+
+        let size = 1501 * 1544 + 8;
+        let ptr = h
+            .reserve_large(&mut mem, size)
+            .expect("a 4 MiB arena holds 2,317,552 bytes three times over");
+
+        let full = vec![0xABu8; size];
+        ptr.write(&mut mem, &full)
+            .expect("the whole block must be writable, not merely its head");
+        assert_eq!(
+            ptr.resolve(&mem, size).expect("readable back"),
+            &full[..],
+            "every byte written must read back, end to end"
+        );
+
+        // A second allocation must start at or past the end of the first
+        // one's full requested `size` -- not merely somewhere the first
+        // write happened to succeed. `Memory::alloc` is a flat arena with no
+        // per-allocation bounds check of its own, so a `reserve_large` that
+        // silently asked `mem.alloc_region` for less than `size` (e.g.
+        // clamped to one `SEGMENT`) would still let the write/read-back
+        // above pass -- the bytes are still inside the arena mapping,
+        // simply not inside what was actually reserved. Only a pointer that
+        // overlaps the first allocation's own claimed length catches that.
+        let second = h
+            .reserve_large(&mut mem, 64)
+            .expect("a second, small dedicated region");
+        assert!(
+            second.0 >= ptr.0 + size as u32,
+            "the second reserve_large call must not land inside the first \
+             one's own {size}-byte span -- overlap here means the first \
+             call did not actually reserve its full requested size"
+        );
+
+        h.free(ptr).expect("free accepts a reserve_large pointer");
+        assert!(
+            h.free(ptr).is_err(),
+            "a second free of the same large block is a double free, same as any other block"
+        );
+    }
+
+    #[test]
+    fn reserve_large_refuses_zero_bytes_on_wg32() {
+        let mut mem = wg32_mem(4096);
+        let mut h = Heap::<Wg32>::new(Config::default());
+        assert!(h.reserve_large(&mut mem, 0).is_err());
+    }
+
+    /// `Wg16`'s `alloc_region` is `Machine::alloc_segment`, which refuses
+    /// anything past 64 KiB outright -- correct, load-bearing behaviour
+    /// (no far pointer can address across a segment boundary), not a gap
+    /// `reserve_large` should paper over. Pinned so a future change cannot
+    /// "fix" this refusal without the test naming exactly what it would
+    /// break.
+    #[test]
+    fn reserve_large_refuses_cleanly_on_wg16_naming_why() {
+        let (mut m, mut h) = heap();
+        let e = h
+            .reserve_large(m.mem_mut(), 100_000)
+            .expect_err("no far pointer can address across a 64 KiB segment boundary");
+        assert!(e.contains("100000"), "the refusal should name the size asked for: {e}");
+        assert!(
+            e.to_lowercase().contains("segment"),
+            "the refusal should name why, not just that it failed: {e}"
+        );
     }
 
     #[test]

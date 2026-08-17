@@ -439,6 +439,141 @@ fn the_same_arg_list_encodes_to_a_different_byte_length_under_each_abi() {
     assert_eq!(&frame32[4..8], &B.to_le_bytes(), "Wg32: B's bytes at offset 4");
 }
 
+/// `alcmem`/`alczer` on a real `Wg32` ABI: an ordinary request still packs
+/// into one shared `crate::heap::Heap` region, rather than each taking a
+/// dedicated one of its own through
+/// [`Heap::reserve_large`](mbbs::heap::Heap::reserve_large) -- the guard
+/// against `shims::memory::alcmem`/`alczer`'s own `u16::try_from(want)`
+/// branch silently becoming the only path (see this task's own mutation
+/// table: flipping that branch's arms is exactly the mutation this test
+/// exists to catch, and it is the one mutation `Wg16`-only coverage cannot
+/// reach on its own, since `Wg16::Int` never produces a `want` past
+/// `u16::MAX` in the first place).
+///
+/// A real `Call<Wg32>`/`Host<Wg32>`, not merely `Heap<Wg32>` in isolation:
+/// `Host::heap()`'s own public accessor is what this reaches the heap
+/// through, so this proves the *shim* dispatches correctly, not only that
+/// the heap underneath it can.
+///
+/// [`Heap::block`](mbbs::heap::Heap::block), not
+/// [`Heap::segments`](mbbs::heap::Heap::segments), is the discriminator:
+/// `Host::new` already primes at least one packed region before this test's
+/// own `alcmem` calls run (measured -- see the arena-sizing comment below),
+/// so segment *count* cannot tell "packed into what was already there"
+/// apart from "took a dedicated region that happens not to move the count
+/// either", since `reserve_large` never touches `Heap`'s own `regions` at
+/// all. `Heap::block` reads the opposite bookkeeping instead: it only ever
+/// answers for a pointer `Heap::reserve` recorded in its own `blocks` map, a
+/// `reserve_large` pointer never appears there, so it answers `None` for
+/// one every time -- correctly or not.
+#[test]
+fn alcmem_and_alczer_still_pack_ordinary_wg32_sizes() {
+    // `cpu()`'s own 4 KiB placeholder arena is too small here: `Host::new`
+    // itself reserves some of it before this test ever calls `alcmem`
+    // (measured: 13,216 bytes), and `Heap::reserve`'s own grow-by-region
+    // policy maps a full `SEGMENT` (65,535 bytes, `crate::heap`'s own
+    // constant) the first time anything asks it for room, regardless of how
+    // small that first request is -- so even one `alcmem(256)` needs far
+    // more arena than 256 bytes behind it. 256 KiB clears both with room to
+    // spare.
+    let file = minimal_with_one_section();
+    let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
+    let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
+    let mem = mbbs_machine::m32::Memory::new(image, 256 * 1024).expect("arena mapping");
+    let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
+    let mut cpu = Wg32Cpu::new(machine, mem);
+
+    let mut host = mbbs::Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), mbbs::Terms::new(1))
+        .expect("host builds against the placeholder memory");
+
+    let frame = 256u32.to_le_bytes();
+
+    let mut call = Call::<Wg32>::new(&mut cpu, &frame);
+    let Ret::Ptr(a) = mbbs::shims::memory::alcmem(&mut call, &mut host).expect("alcmem(256)")
+    else {
+        panic!("alcmem returns a pointer")
+    };
+
+    let mut call = Call::<Wg32>::new(&mut cpu, &frame);
+    let Ret::Ptr(b) = mbbs::shims::memory::alcmem(&mut call, &mut host).expect("alcmem(256) again")
+    else {
+        panic!("alcmem returns a pointer")
+    };
+    assert_ne!(a, b, "two allocations must not overlap");
+    assert!(
+        host.heap().block(a).is_some() && host.heap().block(b).is_some(),
+        "both ordinary alcmem(256) calls must land in Heap::reserve's packed \
+         accounting, not Heap::reserve_large's dedicated one"
+    );
+
+    let mut call = Call::<Wg32>::new(&mut cpu, &frame);
+    let Ret::Ptr(c) = mbbs::shims::memory::alczer(&mut call, &mut host).expect("alczer(256)")
+    else {
+        panic!("alczer returns a pointer")
+    };
+    assert!(
+        host.heap().block(c).is_some(),
+        "alczer(256) must land in Heap::reserve's packed accounting too -- \
+         it is the same branch alcmem's own assertion above proves"
+    );
+
+    // galfree round-trips the first block back, through the real shim, on
+    // the real Wg32 ABI -- shims::memory::galfree itself needed no change
+    // for this task; only Heap::free's own large-block list did.
+    let free_frame = <Wg32 as Abi>::ptr_to_bytes(a);
+    let mut call = Call::<Wg32>::new(&mut cpu, &free_frame);
+    mbbs::shims::memory::galfree(&mut call, &mut host)
+        .expect("galfree frees a packed Wg32 block");
+}
+
+/// The defect this task exists to close, end to end: MajorMUD-NT's own
+/// module-init call, `alcblok(1501, 1544)` -- `1501 * 1544 + 8 =
+/// 2,317,552` bytes, about 35x `Heap::reserve`'s packed-region ceiling --
+/// against a real `Call<Wg32>`/`Host<Wg32>`. Before this task this refused
+/// outright (`shims::memory::alcblok32`'s own doc comment carries the exact
+/// error text); now it must take a dedicated region through
+/// [`Heap::reserve_large`](mbbs::heap::Heap::reserve_large) and free
+/// cleanly back through `freblok32`.
+#[test]
+fn alcblok32_answers_majormud_nts_own_call_and_frees_cleanly() {
+    // A 4 MiB arena: `Memory::alloc`'s own ceiling, comfortably past the
+    // 2,317,552 bytes this request needs -- `cpu()`'s own 4 KiB placeholder
+    // arena exists only to satisfy `Mapping::new`'s "no zero-length
+    // mapping" requirement for tests that never allocate anything real, and
+    // is far too small here.
+    let file = minimal_with_one_section();
+    let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
+    let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
+    let mem = mbbs_machine::m32::Memory::new(image, 4 * 1024 * 1024).expect("arena mapping");
+    let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
+    let mut cpu = Wg32Cpu::new(machine, mem);
+
+    let mut host = mbbs::Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), mbbs::Terms::new(1))
+        .expect("host builds against the placeholder memory");
+
+    let mut frame = Vec::new();
+    frame.extend(1501u32.to_le_bytes());
+    frame.extend(1544u32.to_le_bytes());
+    let mut call = Call::<Wg32>::new(&mut cpu, &frame);
+    let Ret::Ptr(block) = mbbs::shims::memory::alcblok32(&mut call, &mut host).expect(
+        "alcblok(1501, 1544) -- MajorMUD-NT's own module-init call -- must no longer refuse",
+    ) else {
+        panic!("alcblok32 returns a pointer")
+    };
+
+    // Writable across the block's full length, not merely at its head --
+    // the same "did the pointer actually resolve, end to end" proof this
+    // task's own heap.rs unit tests hold `reserve_large` to directly.
+    let full = vec![0xABu8; 1501 * 1544 + 8];
+    mbbs_machine::ptr::ModulePtr::write(&block, &mut cpu.mem, &full)
+        .expect("the whole 2,317,552-byte block must be writable");
+
+    let free_frame = <Wg32 as Abi>::ptr_to_bytes(block);
+    let mut call = Call::<Wg32>::new(&mut cpu, &free_frame);
+    mbbs::shims::memory::freblok32(&mut call, &mut host)
+        .expect("freblok32 frees the dedicated region back");
+}
+
 /// A live `mbbs-server` bug, reproduced twice against a real board: booting
 /// `LUNATIX.DLL` faulted --
 /// `module faulted with signal 11 at 0x413de00d` (and, a second run under a
