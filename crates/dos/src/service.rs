@@ -93,9 +93,22 @@ impl<G: Guest> Services<G> {
     /// If two services claim the same vector. That is a table bug, and the
     /// house rule is to crash rather than pick one -- a silently shadowed
     /// service is the defect that took 44 shim registrations dead once before.
+    ///
+    /// If this would be the 256th service. `route`'s entries are `u8`, and
+    /// `u8::MAX` is the sentinel meaning "unclaimed" -- so the question is
+    /// never whether `self.services.len()` *fits* in a `u8` (255 does), it's
+    /// whether the resulting index collides with the sentinel. It does at
+    /// exactly 255 services already composed, i.e. when adding the 256th.
     pub fn with(mut self, s: impl Service<G> + 'static) -> Self {
-        let index = u8::try_from(self.services.len())
-            .expect("more than 255 services composed");
+        assert!(
+            self.services.len() < usize::from(u8::MAX),
+            "at most {} services can be composed; index {} would collide \
+             with the u8::MAX sentinel that means \"no service claims this \
+             vector\"",
+            u8::MAX,
+            self.services.len()
+        );
+        let index = self.services.len() as u8;
         for &v in s.claims() {
             assert!(
                 self.route[usize::from(v)] == u8::MAX,
@@ -204,5 +217,20 @@ mod tests {
         let _ = Services::<TestGuest>::new()
             .with(Fake(vec![0x21], 1))
             .with(Fake(vec![0x21], 2));
+    }
+
+    #[test]
+    #[should_panic(expected = "sentinel")]
+    fn the_256th_service_panics_rather_than_colliding_with_the_sentinel() {
+        // 256 services, each claiming a distinct vector so no claim ever
+        // collides -- the only thing under test is the length guard. The
+        // 255th `.with` (index 255, the u8::MAX sentinel value) must be the
+        // one that panics, not some later call that never happens because a
+        // vector is only ever 0..=255.
+        let mut s = Services::<TestGuest>::new();
+        for v in 0u8..255 {
+            s = s.with(Fake(vec![v], v));
+        }
+        let _ = s.with(Fake(vec![255], 255));
     }
 }
