@@ -184,8 +184,14 @@ pub enum Format {
 ///
 /// Generous: the point of a run is to find the first thing this host cannot
 /// answer, and a program that gets further than this has already told us far
-/// more than the budget would.
-const PE_CALL_BUDGET: usize = 100_000;
+/// more than the budget would. Raised from the original 100,000 once
+/// `wccmmutl.exe -recover` measured what "generous" has to mean for a batch
+/// maintenance utility walking real board data: `re/wg33src/SRC/api/gcommlib/
+/// DFAAPI.C`'s own `btvu` issues one `BTRCALL` per record, and this board's
+/// larger files (`WCCITEM2.DAT` alone is 2.7 MB) hold many thousands of
+/// them -- 100,000 calls was enough to prove marshalling and dispatch work,
+/// not enough to reach a real stopping point.
+const PE_CALL_BUDGET: usize = 20_000_000;
 
 /// Which runtime `file` belongs to.
 ///
@@ -223,6 +229,18 @@ pub fn format_of(file: &[u8]) -> Format {
 /// the program can complete.
 fn run_pe32(path: &str, data: &[u8], tail: &str, root_dir: &str) -> io::Result<()> {
     let mut loaded = win32::load::load(data)?;
+    // `Machine`'s own default per-entry-point watchdog is five wall-clock
+    // seconds (`mbbs_machine::m32::DEFAULT_BUDGET`), sized for the kind of
+    // module call this crate mostly runs. `-recover` genuinely burns that
+    // much native CPU *between* two import calls: measured, it walked a
+    // large record file (`WCCKNMS2.DAT`, 895 KB of monster records) with no
+    // `BTRCALL`/CRT call at all for the whole five seconds and got cut off
+    // mid-pass, not stuck -- the progress line it had already painted
+    // ("Known Monsters") is real work in flight, not a spin. A batch
+    // maintenance utility has no operator waiting on a prompt the way the
+    // door/interactive real-mode paths do, so there is no reason to hold
+    // it to the same five seconds.
+    loaded.machine.set_budget(std::time::Duration::from_secs(120));
     println!(
         "{path}: PE32 image, {} imports, entry {:#010x}",
         loaded.imports.len(),
