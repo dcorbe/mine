@@ -193,37 +193,31 @@ fn sized(databuf: &[u8], capacity: u32) -> Vec<u8> {
 /// genuine engine's `C:\btrieve\...` never did.
 ///
 /// Returns one `(status, databuf-after-the-call)` pair per call, in order.
-/// Call 0's own `databuf` is not meaningful to compare -- see [`sized`] and
-/// `open_maxlen` below, both of which this harness overrides for Open
-/// alone -- so [`replay_and_diff`] skips it deliberately rather than by
-/// accident.
+/// Call 0's own `databuf` is not meaningful to compare -- [`sized`] gives it
+/// the length the fixture recorded, which for an Open is zero -- so
+/// [`replay_and_diff`] skips it deliberately rather than by accident.
 fn drive(calls: &[Request], path: &Path) -> Vec<(i16, Vec<u8>)> {
     let mut mem = FlatMem::new(64 * 1024);
     let mut heap = FlatHeap::new(0x100);
     let mut session: Btrieve<Flat> = Btrieve::default();
     let mut posblk = [0u8; 128];
 
-    // The genuine wire's `B_OPEN` carries `datalen: 0` in every committed
-    // fixture (`open_request` in `scenario.rs`'s generator) -- real Btrieve
-    // has no use for a buffer-size hint at Open. This crate's own numeric
-    // facade disagrees on purpose: `Btrieve::open` allocates the module's
-    // record buffer at `maxlen` bytes and fixes every later `Get`/`Step`'s
-    // truncation ceiling to it (`crates/btrieve/src/lib.rs`'s own `open`
-    // doc comment, "what the module said its records are"), and Task 3's
-    // own reference test opens with a real, non-zero `datalen` rather than
-    // 0 for exactly that reason. Replaying the fixture's literal 0 here
-    // would starve every subsequent call, which is a fact about how this
-    // harness must call the numeric Open, not a defect the replay found --
-    // see Task 12's report. Sizing it to the largest `datalen` any call in
-    // this scenario asks for keeps the choice tied to the scenario's own
-    // data rather than an arbitrary constant.
-    let open_maxlen = calls.iter().map(|c| c.datalen).max().unwrap_or(64).min(u32::from(u16::MAX));
+    // Every call is replayed with the `datalen` the fixture recorded,
+    // including the `B_OPEN`'s own `0`. This harness used to override that
+    // one, sizing it to the largest `datalen` anywhere in the scenario,
+    // because this crate's numeric Open fixed every later Get/Step's
+    // truncation ceiling to it and replaying the genuine `0` starved them
+    // all. The ceiling is now taken per call, from the caller's own buffer
+    // (`crates/btrieve/src/ops.rs`'s `deliver_current`), which is what the
+    // genuine wire does -- so the override has nothing left to work around
+    // and is gone. A harness that has to rewrite its own recorded input to
+    // get a pass is describing a defect in what it is testing.
 
     calls
         .iter()
         .enumerate()
         .map(|(i, call)| {
-            let mut datalen = if i == 0 { open_maxlen } else { call.datalen };
+            let mut datalen = call.datalen;
             let mut databuf = sized(&call.databuf, datalen);
             let mut keybuf = if i == 0 {
                 let mut b = path.to_string_lossy().as_bytes().to_vec();

@@ -282,6 +282,25 @@ fn open<M: Mem>(
     }
 }
 
+/// How many bytes of record *this* call can take back.
+///
+/// The buffer itself, not `*call.datalen`. The two agree on every edge --
+/// each sizes `databuf` from the guest's own declared length before dispatch
+/// -- but `datalen` is an in/out field this dispatch overwrites on the way
+/// out, and `databuf` is the thing actually written back to the guest. Op 15
+/// (`stat`) has always measured its own truncation this way; the delivering
+/// ops now do too.
+///
+/// Not [`crate::Block::maxlen`], which is the length a *module* named once at
+/// `opnbtv(filnam, maxlen)` and belongs to the shim edge -- see
+/// [`crate::Block::deliver_current`]'s own doc comment for why a ceiling
+/// taken at Open is a number genuine Btrieve's wire never had (its Open
+/// carries `datalen: 0`), and for the guest-buffer overrun that followed from
+/// using one.
+fn offered(call: &Call<'_>) -> u16 {
+    u16::try_from(call.databuf.len()).unwrap_or(u16::MAX)
+}
+
 /// The file handle Open recorded in the position block.
 fn handle_of<M: Mem>(posblk: &[u8; 128]) -> M::Ptr {
     M::ptr_from_bytes(&posblk[..M::PTR_WIDTH])
@@ -323,7 +342,7 @@ fn get<M: Mem>(
     let key = u16::try_from(call.keynum.max(0)).unwrap_or(0);
     let value = &call.keybuf[..usize::from(call.keylen).min(call.keybuf.len())];
 
-    match session.open[index].get(key, op, value, 0, &mut session.locks) {
+    match session.open[index].get(key, op, value, 0, &mut session.locks, offered(&call)) {
         Ok(Some(d)) => {
             *call.datalen = u32::try_from(d.bytes.len()).unwrap_or(u32::MAX);
             call.databuf.clear();
@@ -441,7 +460,7 @@ fn acquire_absolute<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> 
     let position = u32::from_le_bytes(call.databuf[..4].try_into().expect("checked above"));
     let key = u16::try_from(call.keynum.max(0)).unwrap_or(0);
 
-    match session.open[index].acquire_absolute(position, key, 0, &mut session.locks) {
+    match session.open[index].acquire_absolute(position, key, 0, &mut session.locks, offered(&call)) {
         Ok(Some(d)) => {
             *call.datalen = u32::try_from(d.bytes.len()).unwrap_or(u32::MAX);
             call.databuf.clear();
@@ -480,7 +499,7 @@ fn step_op<M: Mem>(
     let at = handle_of::<M>(call.posblk);
     let index = session.find(at).map_err(|why| Gap { what: why })?;
 
-    match session.open[index].step(step, 0, &mut session.locks) {
+    match session.open[index].step(step, 0, &mut session.locks, offered(&call)) {
         Ok(Some(d)) => {
             *call.datalen = u32::try_from(d.bytes.len()).unwrap_or(u32::MAX);
             call.databuf.clear();
@@ -1677,5 +1696,143 @@ mod tests {
         )
         .expect("Acquire Absolute is modelled");
         assert_eq!(status, Status(9), "no record at that position");
+    }
+
+    /// Open with a small buffer, Get with a large one -- the shape no guest
+    /// measured so far exercises, and the one the truncation ceiling used to
+    /// get wrong in both directions.
+    ///
+    /// Genuine Btrieve's own wire Open carries `datalen: 0` (every recorded
+    /// fixture), so an Open that declared a buffer at all was already more
+    /// than the real engine asks for; tying every later Get to it meant a
+    /// faithful replay of a genuine `0` starved every read that followed.
+    /// The ceiling is the caller's buffer for *this* call, so an Open of 1
+    /// byte constrains nothing.
+    #[test]
+    fn a_get_is_bounded_by_its_own_buffer_not_the_one_open_declared() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("get-bounded-by-its-own-buffer");
+
+        let mut posblk = [0u8; 128];
+        let mut keybuf = path.to_string_lossy().as_bytes().to_vec();
+        keybuf.push(0);
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 0,
+                posblk: &mut posblk,
+                databuf: &mut Vec::new(),
+                // One byte, and an empty buffer -- less than a single 8-byte
+                // record, and less than the Get below offers.
+                datalen: &mut 1,
+                keybuf: &mut keybuf,
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Open is modelled");
+        assert_eq!(status, Status::OK, "the scratch file opened");
+
+        let mut databuf = vec![7, 0, 0, 0, 1, 2, 3, 4];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 2,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Insert is modelled");
+        assert_eq!(status, Status::OK, "the record was inserted");
+
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![7, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(
+            status,
+            Status::OK,
+            "a buffer big enough for the record is not truncated by what Open said"
+        );
+        assert_eq!(datalen, 8, "the whole record came back");
+        assert_eq!(databuf, vec![7, 0, 0, 0, 1, 2, 3, 4]);
+    }
+
+    /// The other direction, and the one that reaches past a guest's own
+    /// memory: Open with a generous buffer, Get with a small one. The
+    /// delivery must be cut to the small one and answer status 22 -- both
+    /// guest edges write the delivered bytes straight back to the guest's
+    /// `databuf` pointer without re-checking the length, so over-delivering
+    /// here is an overrun there.
+    #[test]
+    fn a_get_with_a_smaller_buffer_than_open_declared_is_truncated() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("get-smaller-buffer-than-open");
+        // `open_scratch` declares 64 bytes, eight times the record length.
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+
+        let mut databuf = vec![9, 0, 0, 0, 5, 6, 7, 8];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 2,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Insert is modelled");
+        assert_eq!(status, Status::OK, "the record was inserted");
+
+        let mut databuf = vec![0u8; 4];
+        let mut datalen = 4u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![9, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status(22), "a record longer than this call's buffer");
+        assert_eq!(datalen, 4, "and only what the buffer holds came back");
+        assert_eq!(databuf, vec![9, 0, 0, 0]);
     }
 }

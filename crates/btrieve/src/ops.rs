@@ -1002,12 +1002,13 @@ impl<M: Mem> Block<M> {
         value: &[u8],
         lock: i16,
         locks: &mut LockTable,
+        offered: u16,
     ) -> Result<Option<Delivery>, OpError> {
         if !self.query(key, op, value)? {
             return Ok(None);
         }
         self.take_lock(lock, locks)?;
-        Ok(Some(self.deliver_current(Some(key))?))
+        Ok(Some(self.deliver_current(Some(key), offered)?))
     }
 
     /// Btrieve op 22, `dfaAbs` -- where the file is currently positioned, as
@@ -1061,6 +1062,7 @@ impl<M: Mem> Block<M> {
         key: u16,
         lock: i16,
         locks: &mut LockTable,
+        offered: u16,
     ) -> Result<Option<Delivery>, OpError> {
         if usize::from(key) >= self.keys().len() {
             return Err(OpError::NoSuchKey(key));
@@ -1083,7 +1085,7 @@ impl<M: Mem> Block<M> {
         };
         self.seek_to(cursor);
         self.take_lock(lock, locks)?;
-        Ok(Some(self.deliver_current(Some(key))?))
+        Ok(Some(self.deliver_current(Some(key), offered)?))
     }
 
     /// Btrieve ops 24 and 33-35, `dfaStepLock` -- physical order, no key at
@@ -1115,7 +1117,13 @@ impl<M: Mem> Block<M> {
     /// it; see this task's final report for the measurement in full.
     /// [`OpError::CursorStale`] if an ordered cursor's record no longer
     /// resolves to a physical one. If the records cannot be read.
-    pub fn step(&mut self, step: Step, lock: i16, locks: &mut LockTable) -> Result<Option<Delivery>, OpError> {
+    pub fn step(
+        &mut self,
+        step: Step,
+        lock: i16,
+        locks: &mut LockTable,
+        offered: u16,
+    ) -> Result<Option<Delivery>, OpError> {
         let cursor = self.cursor();
         let count = self.records()?.len();
 
@@ -1147,7 +1155,7 @@ impl<M: Mem> Block<M> {
         }
         self.seek_to(Cursor::Physical { at });
         self.take_lock(lock, locks)?;
-        Ok(Some(self.deliver_current(None)?))
+        Ok(Some(self.deliver_current(None, offered)?))
     }
 
     /// This block's identity, for [`LockTable`] -- see [`BlockId`]'s own
@@ -1210,17 +1218,40 @@ impl<M: Mem> Block<M> {
     /// (`shims/btrieve.rs`'s `stpbtvl` passes `NULL` for the key buffer,
     /// `:1469`), and `Some` for every other delivering operation.
     ///
+    /// # `offered` is the *call's* buffer, not the block's
+    ///
+    /// This used to read [`Block::maxlen`] -- the length the module named
+    /// once, at `opnbtv(filnam, maxlen)`. That is the right ceiling for the
+    /// shim edge, where one module allocates one buffer and reuses it for the
+    /// file's whole open lifetime, and `crates/mbbs`'s shims read `maxlen()`
+    /// directly for exactly that. It is the wrong ceiling here: this function
+    /// is reached only through [`Block::get`], [`Block::step`] and
+    /// [`Block::acquire_absolute`], and all three are called only by the
+    /// numeric BTRCALL wire, whose caller declares a buffer length on *every*
+    /// call and is free to change it between them. Genuine Btrieve's own
+    /// Open carries no buffer-size hint at all (`datalen: 0` in every
+    /// recorded fixture), so a ceiling taken at Open is a number the real
+    /// engine never had.
+    ///
+    /// Under the old rule a later call offering a *smaller* buffer than Open
+    /// did was delivered a record longer than it asked for, and both guest
+    /// edges write the delivery straight back to the guest's own pointer
+    /// (`crates/dos-runtime/src/btrieve.rs`'s `guest.write(datbuf_ptr, ..)`,
+    /// and the Win32 edge's `Flat32Ptr(databuf_at).write(..)`) without
+    /// re-checking its length. That is an overrun of the guest's buffer, not
+    /// merely a fidelity gap.
+    ///
     /// # Errors
     ///
     /// [`OpError::NotPositioned`] if the cursor names nothing -- callers
     /// only reach this right after setting the cursor to a record they just
     /// found, so this is defensive rather than reachable. [`OpError::
     /// NoSuchKey`] if `key` is `Some` and the file has no such key.
-    fn deliver_current(&self, key: Option<u16>) -> Result<Delivery, OpError> {
+    fn deliver_current(&self, key: Option<u16>, offered: u16) -> Result<Delivery, OpError> {
         let record = self.current().ok_or(OpError::NotPositioned)?;
-        let maxlen = usize::from(self.maxlen());
-        let truncated = record.bytes.len() > maxlen;
-        let take = maxlen.min(record.bytes.len());
+        let offered = usize::from(offered);
+        let truncated = record.bytes.len() > offered;
+        let take = offered.min(record.bytes.len());
         let bytes = record.bytes[..take].to_vec();
 
         let key = match key {
@@ -1881,16 +1912,17 @@ impl<M: Mem> Block<M> {
         start: ExtendedStart,
         lock: i16,
         locks: &mut LockTable,
+        offered: u16,
     ) -> Result<Vec<Delivery>, OpError> {
         let mut out = Vec::new();
         if count == 0 {
             return Ok(out);
         }
         if start == ExtendedStart::AtCurrent {
-            out.push(self.deliver_current(Some(key))?);
+            out.push(self.deliver_current(Some(key), offered)?);
         }
         while (out.len() as u16) < count {
-            match self.get(key, op, &[], lock, locks)? {
+            match self.get(key, op, &[], lock, locks, offered)? {
                 Some(delivery) => out.push(delivery),
                 None => break,
             }
@@ -1906,8 +1938,9 @@ impl<M: Mem> Block<M> {
         start: ExtendedStart,
         lock: i16,
         locks: &mut LockTable,
+        offered: u16,
     ) -> Result<Vec<Delivery>, OpError> {
-        self.get_extended(key, Op::Next, count, start, lock, locks)
+        self.get_extended(key, Op::Next, count, start, lock, locks, offered)
     }
 
     /// Btrieve op 37, `Get Previous Extended`. See [`Block::get_extended`].
@@ -1918,8 +1951,9 @@ impl<M: Mem> Block<M> {
         start: ExtendedStart,
         lock: i16,
         locks: &mut LockTable,
+        offered: u16,
     ) -> Result<Vec<Delivery>, OpError> {
-        self.get_extended(key, Op::Previous, count, start, lock, locks)
+        self.get_extended(key, Op::Previous, count, start, lock, locks, offered)
     }
 
     /// Btrieve op 38, `Step Next Extended` -- pp. 185-190. Always "EG"; see
@@ -1929,10 +1963,11 @@ impl<M: Mem> Block<M> {
         count: u16,
         lock: i16,
         locks: &mut LockTable,
+        offered: u16,
     ) -> Result<Vec<Delivery>, OpError> {
         let mut out = Vec::new();
         while (out.len() as u16) < count {
-            match self.step(Step::Next, lock, locks)? {
+            match self.step(Step::Next, lock, locks, offered)? {
                 Some(delivery) => out.push(delivery),
                 None => break,
             }
@@ -1946,10 +1981,11 @@ impl<M: Mem> Block<M> {
         count: u16,
         lock: i16,
         locks: &mut LockTable,
+        offered: u16,
     ) -> Result<Vec<Delivery>, OpError> {
         let mut out = Vec::new();
         while (out.len() as u16) < count {
-            match self.step(Step::Previous, lock, locks)? {
+            match self.step(Step::Previous, lock, locks, offered)? {
                 Some(delivery) => out.push(delivery),
                 None => break,
             }
@@ -2190,6 +2226,7 @@ impl<M: Mem> Block<M> {
         percentage: u16,
         lock: i16,
         locks: &mut LockTable,
+        offered: u16,
     ) -> Result<Delivery, OpError> {
         let percentage = usize::from(percentage.min(10_000));
         match basis {
@@ -2201,7 +2238,7 @@ impl<M: Mem> Block<M> {
                 let at = (percentage * count / 10_000).min(count - 1);
                 self.seek_to(Cursor::Ordered { key, at });
                 self.take_lock(lock, locks)?;
-                self.deliver_current(Some(key))
+                self.deliver_current(Some(key), offered)
             }
             PercentageBasis::Physical => {
                 let count = self.records()?.len();
@@ -2211,7 +2248,7 @@ impl<M: Mem> Block<M> {
                 let at = (percentage * count / 10_000).min(count - 1);
                 self.seek_to(Cursor::Physical { at });
                 self.take_lock(lock, locks)?;
-                self.deliver_current(None)
+                self.deliver_current(None, offered)
             }
         }
     }
@@ -2605,7 +2642,7 @@ mod tests {
         let mut b = fixture("get_equal_on_a_unique_key_finds_the_one_record");
         let mut locks = LockTable::default();
         let d = b
-            .get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks)
+            .get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN)
             .expect("no error")
             .expect("found");
         assert_eq!(tag(&d), 2);
@@ -2615,10 +2652,10 @@ mod tests {
     fn get_equal_that_finds_nothing_leaves_the_cursor_where_it_was() {
         let mut b = fixture("get_equal_that_finds_nothing_leaves_the_cursor_where_it_was");
         let mut locks = LockTable::default();
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(b.cursor(), Cursor::Ordered { key: 0, at: 2 });
 
-        let miss = b.get(0, Op::Equal, &999u16.to_le_bytes(), 0, &mut locks).expect("no error");
+        let miss = b.get(0, Op::Equal, &999u16.to_le_bytes(), 0, &mut locks, RECLEN).expect("no error");
         assert!(miss.is_none(), "999 is not a key-0 value in the fixture");
         assert_eq!(
             b.cursor(),
@@ -2635,7 +2672,7 @@ mod tests {
         // lower physical position, so it is first -- Records::reindex's own
         // tie-break, oracle-confirmed for this exact fixture by
         // `position_ops_oracle_scenarios`'s `S3`.
-        let d = b.get(1, Op::Equal, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        let d = b.get(1, Op::Equal, &1u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&d), 0);
     }
 
@@ -2643,8 +2680,8 @@ mod tests {
     fn get_next_after_equal_on_a_duplicate_continues_to_the_next_match() {
         let mut b = fixture("get_next_after_equal_on_a_duplicate_continues_to_the_next_match");
         let mut locks = LockTable::default();
-        b.get(1, Op::Equal, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
-        let d = b.get(1, Op::Next, &[], 0, &mut locks).unwrap().unwrap();
+        b.get(1, Op::Equal, &1u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
+        let d = b.get(1, Op::Next, &[], 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&d), 2, "the second key-1=1 match, tag 2");
     }
 
@@ -2653,7 +2690,7 @@ mod tests {
         let mut b = fixture("get_greater_lands_past_every_equal_record_not_on_the_first_one");
         let mut locks = LockTable::default();
         // key 1 = 1 matches two records (tags 0, 2); Greater must skip both.
-        let d = b.get(1, Op::Greater, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        let d = b.get(1, Op::Greater, &1u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_ne!(tag(&d), 0);
         assert_ne!(tag(&d), 2, "Greater must not land on an equal record");
     }
@@ -2662,7 +2699,7 @@ mod tests {
     fn get_at_most_lands_on_the_last_equal_record_of_a_duplicate_group() {
         let mut b = fixture("get_at_most_lands_on_the_last_equal_record_of_a_duplicate_group");
         let mut locks = LockTable::default();
-        let d = b.get(1, Op::AtMost, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        let d = b.get(1, Op::AtMost, &1u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&d), 2, "the last of the two key-1=1 records");
     }
 
@@ -2670,8 +2707,8 @@ mod tests {
     fn get_lowest_and_highest_find_the_ends_of_key_0() {
         let mut b = fixture("get_lowest_and_highest_find_the_ends_of_key_0");
         let mut locks = LockTable::default();
-        assert_eq!(tag(&b.get(0, Op::Lowest, &[], 0, &mut locks).unwrap().unwrap()), 0);
-        assert_eq!(tag(&b.get(0, Op::Highest, &[], 0, &mut locks).unwrap().unwrap()), 5);
+        assert_eq!(tag(&b.get(0, Op::Lowest, &[], 0, &mut locks, RECLEN).unwrap().unwrap()), 0);
+        assert_eq!(tag(&b.get(0, Op::Highest, &[], 0, &mut locks, RECLEN).unwrap().unwrap()), 5);
     }
 
     // -- Op::Next / Op::Previous: the oracle-measured cases --
@@ -2684,7 +2721,7 @@ mod tests {
         let mut b = fixture("get_next_with_nothing_positioned_behaves_like_lowest");
         let mut locks = LockTable::default();
         assert_eq!(b.cursor(), Cursor::Nowhere);
-        let d = b.get(0, Op::Next, &[], 0, &mut locks).unwrap().unwrap();
+        let d = b.get(0, Op::Next, &[], 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&d), 0);
     }
 
@@ -2694,7 +2731,7 @@ mod tests {
         // Highest either.
         let mut b = fixture("get_previous_with_nothing_positioned_answers_not_found");
         let mut locks = LockTable::default();
-        let d = b.get(0, Op::Previous, &[], 0, &mut locks).unwrap();
+        let d = b.get(0, Op::Previous, &[], 0, &mut locks, RECLEN).unwrap();
         assert!(d.is_none());
     }
 
@@ -2704,8 +2741,8 @@ mod tests {
         // Btrieve status 7, not a translation into key 1's order.
         let mut b = fixture("get_next_on_a_different_key_than_the_current_position_is_refused");
         let mut locks = LockTable::default();
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
-        let err = b.get(1, Op::Next, &[], 0, &mut locks).expect_err("a different key is refused");
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
+        let err = b.get(1, Op::Next, &[], 0, &mut locks, RECLEN).expect_err("a different key is refused");
         assert_eq!(
             err,
             OpError::DifferentKey {
@@ -2721,11 +2758,11 @@ mod tests {
         // status 8 both times, not `Records::place_in`'s translation.
         let mut b = fixture("get_next_after_a_step_is_refused_not_translated");
         let mut locks = LockTable::default();
-        b.step(Step::First, 0, &mut locks).unwrap().unwrap();
+        b.step(Step::First, 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(b.cursor(), Cursor::Physical { at: 0 });
-        let err = b.get(1, Op::Next, &[], 0, &mut locks).expect_err("a physical step establishes no key");
+        let err = b.get(1, Op::Next, &[], 0, &mut locks, RECLEN).expect_err("a physical step establishes no key");
         assert_eq!(err, OpError::NoKeyEstablished);
-        let err0 = b.get(0, Op::Next, &[], 0, &mut locks).expect_err("neither key continues after a step");
+        let err0 = b.get(0, Op::Next, &[], 0, &mut locks, RECLEN).expect_err("neither key continues after a step");
         assert_eq!(err0, OpError::NoKeyEstablished);
     }
 
@@ -2733,9 +2770,9 @@ mod tests {
     fn get_next_at_end_of_file_fails_but_leaves_the_cursor_there() {
         let mut b = fixture("get_next_at_end_of_file_fails_but_leaves_the_cursor_there");
         let mut locks = LockTable::default();
-        b.get(0, Op::Highest, &[], 0, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Highest, &[], 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(b.cursor(), Cursor::Ordered { key: 0, at: 5 });
-        let miss = b.get(0, Op::Next, &[], 0, &mut locks).expect("no error");
+        let miss = b.get(0, Op::Next, &[], 0, &mut locks, RECLEN).expect("no error");
         assert!(miss.is_none());
         assert_eq!(
             b.cursor(),
@@ -2743,7 +2780,7 @@ mod tests {
             "S2: the cursor stays on the last record a successful call found"
         );
         // And Get Previous from there steps back to the record before it.
-        let d = b.get(0, Op::Previous, &[], 0, &mut locks).unwrap().unwrap();
+        let d = b.get(0, Op::Previous, &[], 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&d), 4);
     }
 
@@ -2755,9 +2792,9 @@ mod tests {
         let mut locks = LockTable::default();
         // Physical order is insertion order here (tags 0..6, in slot
         // order), which key 1's order is NOT (see the fixture table).
-        let first = b.step(Step::First, 0, &mut locks).unwrap().unwrap();
+        let first = b.step(Step::First, 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&first), 0);
-        let next = b.step(Step::Next, 0, &mut locks).unwrap().unwrap();
+        let next = b.step(Step::Next, 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(next.key, None, "a step has no key");
         assert_eq!(tag(&next), 1, "physical slot 1, tag 1 -- not key 1's next (tag 2)");
     }
@@ -2766,16 +2803,16 @@ mod tests {
     fn step_first_and_last_find_the_physical_ends() {
         let mut b = fixture("step_first_and_last_find_the_physical_ends");
         let mut locks = LockTable::default();
-        assert_eq!(tag(&b.step(Step::First, 0, &mut locks).unwrap().unwrap()), 0);
-        assert_eq!(tag(&b.step(Step::Last, 0, &mut locks).unwrap().unwrap()), 5);
+        assert_eq!(tag(&b.step(Step::First, 0, &mut locks, RECLEN).unwrap().unwrap()), 0);
+        assert_eq!(tag(&b.step(Step::Last, 0, &mut locks, RECLEN).unwrap().unwrap()), 5);
     }
 
     #[test]
     fn step_next_past_end_of_file_finds_nothing() {
         let mut b = fixture("step_next_past_end_of_file_finds_nothing");
         let mut locks = LockTable::default();
-        b.step(Step::Last, 0, &mut locks).unwrap().unwrap();
-        assert!(b.step(Step::Next, 0, &mut locks).unwrap().is_none());
+        b.step(Step::Last, 0, &mut locks, RECLEN).unwrap().unwrap();
+        assert!(b.step(Step::Next, 0, &mut locks, RECLEN).unwrap().is_none());
     }
 
     #[test]
@@ -2783,11 +2820,11 @@ mod tests {
         let mut b = fixture("step_next_and_previous_with_nothing_positioned_are_refused");
         let mut locks = LockTable::default();
         assert_eq!(
-            b.step(Step::Next, 0, &mut locks).expect_err("nothing has positioned this file"),
+            b.step(Step::Next, 0, &mut locks, RECLEN).expect_err("nothing has positioned this file"),
             OpError::NotPositioned
         );
         assert_eq!(
-            b.step(Step::Previous, 0, &mut locks).expect_err("nothing has positioned this file"),
+            b.step(Step::Previous, 0, &mut locks, RECLEN).expect_err("nothing has positioned this file"),
             OpError::NotPositioned
         );
     }
@@ -2809,10 +2846,10 @@ mod tests {
         // slot 2+1=3, tag 3.
         let mut b = fixture("step_after_a_keyed_position_resolves_through_that_keys_order");
         let mut locks = LockTable::default();
-        b.get(1, Op::Equal, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
-        let d = b.get(1, Op::Next, &[], 0, &mut locks).unwrap().unwrap();
+        b.get(1, Op::Equal, &1u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
+        let d = b.get(1, Op::Next, &[], 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&d), 2, "key 1 = 1's second match");
-        let d = b.step(Step::Next, 0, &mut locks).unwrap().unwrap();
+        let d = b.step(Step::Next, 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&d), 3, "the physical record after tag 2's slot, not its key-1 rank + 1");
     }
 
@@ -2828,7 +2865,7 @@ mod tests {
     fn get_position_reports_the_current_records_physical_position() {
         let mut b = fixture("get_position_reports_the_current_records_physical_position");
         let mut locks = LockTable::default();
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
         let position = b.get_position().expect("positioned");
         let expected = b.records().unwrap().find_physical(position).map(|_| ());
         assert!(expected.is_some(), "the reported position must resolve back to a record");
@@ -2843,15 +2880,15 @@ mod tests {
         // (key 0's next).
         let mut b = fixture("acquire_absolute_establishes_the_key_path_for_a_following_get_next");
         let mut locks = LockTable::default();
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
         let position = b.get_position().unwrap();
         b.seek_to(Cursor::Nowhere); // as though nothing had positioned it
 
-        let direct = b.acquire_absolute(position, 1, 0, &mut locks).unwrap().unwrap();
+        let direct = b.acquire_absolute(position, 1, 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&direct), 2);
         assert_eq!(direct.key.as_deref(), Some(&1u16.to_le_bytes()[..]));
 
-        let next = b.get(1, Op::Next, &[], 0, &mut locks).unwrap().unwrap();
+        let next = b.get(1, Op::Next, &[], 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(tag(&next), 1, "key 1's own next record after tag 2, not key 0's (tag 3)");
     }
 
@@ -2859,9 +2896,9 @@ mod tests {
     fn acquire_absolute_at_an_unknown_position_finds_nothing_and_keeps_the_cursor() {
         let mut b = fixture("acquire_absolute_at_an_unknown_position_finds_nothing_and_keeps_the_cursor");
         let mut locks = LockTable::default();
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
         let before = b.cursor();
-        let miss = b.acquire_absolute(999_999, 0, 0, &mut locks).expect("no error");
+        let miss = b.acquire_absolute(999_999, 0, 0, &mut locks, RECLEN).expect("no error");
         assert!(miss.is_none());
         assert_eq!(b.cursor(), before);
     }
@@ -2871,11 +2908,11 @@ mod tests {
         let mut b = fixture("acquire_absolute_refuses_a_key_the_file_does_not_have");
         let mut locks = LockTable::default();
         let position = {
-            b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap();
+            b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap();
             b.get_position().unwrap()
         };
         assert_eq!(
-            b.acquire_absolute(position, 2, 0, &mut locks).expect_err("only keys 0 and 1 exist"),
+            b.acquire_absolute(position, 2, 0, &mut locks, RECLEN).expect_err("only keys 0 and 1 exist"),
             OpError::NoSuchKey(2)
         );
     }
@@ -2889,9 +2926,9 @@ mod tests {
         let mut b = fixture("a_single_lock_auto_releases_when_the_session_takes_another_single_lock");
         let mut locks = LockTable::default();
 
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 100, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 100, &mut locks, RECLEN).unwrap().unwrap();
         let a = b.current().unwrap().position;
-        b.get(0, Op::Equal, &20u16.to_le_bytes(), 100, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &20u16.to_le_bytes(), 100, &mut locks, RECLEN).unwrap().unwrap();
         let held = b.current().unwrap().position;
 
         assert_eq!(locks.get(b.id(), a), None, "the first lock auto-released");
@@ -2904,9 +2941,9 @@ mod tests {
         let mut b = fixture("a_multiple_lock_accumulates");
         let mut locks = LockTable::default();
 
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks, RECLEN).unwrap().unwrap();
         let a = b.current().unwrap().position;
-        b.get(0, Op::Equal, &20u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &20u16.to_le_bytes(), 300, &mut locks, RECLEN).unwrap().unwrap();
         let bb = b.current().unwrap().position;
 
         assert_eq!(locks.get(b.id(), a), Some(300), "the first stays held");
@@ -2932,9 +2969,9 @@ mod tests {
         let mut two = fixture("closing_one_file_leaves_another_alone_two");
         let mut locks = LockTable::default();
 
-        one.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        one.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks, RECLEN).unwrap().unwrap();
         let in_one = one.current().unwrap().position;
-        two.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        two.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks, RECLEN).unwrap().unwrap();
         let in_two = two.current().unwrap().position;
 
         locks.release_all_for(one.id());
@@ -2961,7 +2998,7 @@ mod tests {
         let mut b = fixture("step_takes_a_lock_at_the_position_it_lands_on");
         let mut locks = LockTable::default();
 
-        b.step(Step::First, 100, &mut locks).unwrap().unwrap();
+        b.step(Step::First, 100, &mut locks, RECLEN).unwrap().unwrap();
         let position = b.current().unwrap().position;
         assert_eq!(locks.get(b.id(), position), Some(100));
     }
@@ -2971,11 +3008,11 @@ mod tests {
         let mut b = fixture("acquire_absolute_takes_a_lock_at_the_position_it_lands_on");
         let mut locks = LockTable::default();
 
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
         let position = b.get_position().unwrap();
         b.seek_to(Cursor::Nowhere);
 
-        b.acquire_absolute(position, 1, 100, &mut locks).unwrap().unwrap();
+        b.acquire_absolute(position, 1, 100, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(locks.get(b.id(), position), Some(100));
     }
 
@@ -2990,11 +3027,11 @@ mod tests {
         );
         let mut locks = LockTable::default();
 
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 100, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 100, &mut locks, RECLEN).unwrap().unwrap();
         let single = b.current().unwrap().position;
 
         let err = b
-            .get(0, Op::Equal, &20u16.to_le_bytes(), 300, &mut locks)
+            .get(0, Op::Equal, &20u16.to_le_bytes(), 300, &mut locks, RECLEN)
             .expect_err("mode mixing is refused");
         assert_eq!(
             err,
@@ -3009,7 +3046,7 @@ mod tests {
 
         // "release the single lock first and the identical call succeeds."
         locks.release_at(b.id(), single);
-        b.get(0, Op::Equal, &20u16.to_le_bytes(), 300, &mut locks)
+        b.get(0, Op::Equal, &20u16.to_le_bytes(), 300, &mut locks, RECLEN)
             .expect("no error")
             .expect("found");
         assert_eq!(locks.get(b.id(), refused), Some(300), "now taken, in multiple mode");
@@ -3028,9 +3065,9 @@ mod tests {
         );
         let mut locks = LockTable::default();
 
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks, RECLEN).unwrap().unwrap();
         let err = b
-            .get(0, Op::Equal, &20u16.to_le_bytes(), 100, &mut locks)
+            .get(0, Op::Equal, &20u16.to_le_bytes(), 100, &mut locks, RECLEN)
             .expect_err("mode mixing, the other direction");
         assert_eq!(
             err,
@@ -3048,9 +3085,9 @@ mod tests {
         let mut b = fixture("relocking_a_record_already_held_is_a_harmless_no_op");
         let mut locks = LockTable::default();
 
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks, RECLEN).unwrap().unwrap();
         let a = b.current().unwrap().position;
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks)
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks, RECLEN)
             .expect("re-locking is not refused")
             .expect("found");
         assert_eq!(locks.get(b.id(), a), Some(300), "unchanged");
@@ -3063,7 +3100,7 @@ mod tests {
         let mut b = fixture("a_get_that_finds_nothing_takes_no_lock");
         let mut locks = LockTable::default();
         let miss = b
-            .get(0, Op::Equal, &999u16.to_le_bytes(), 100, &mut locks)
+            .get(0, Op::Equal, &999u16.to_le_bytes(), 100, &mut locks, RECLEN)
             .expect("no error -- a miss is Ok(None), not a refusal");
         assert!(miss.is_none());
         assert!(locks.is_empty(), "nothing was found, so nothing was locked");
@@ -3076,7 +3113,7 @@ mod tests {
         let mut b = fixture("unlock_releases_the_lock_at_the_current_position_and_is_ok_even_with_nothing_locked");
         let mut locks = LockTable::default();
 
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 100, &mut locks).unwrap().unwrap();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 100, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(b.lock_at_current(&locks), Some(100));
 
         b.unlock(&mut locks);
@@ -3092,23 +3129,50 @@ mod tests {
     // -- Truncation (the returned-length contract) --
 
     #[test]
-    fn a_record_longer_than_maxlen_is_delivered_truncated() {
-        let mut b = fixture("a_record_longer_than_maxlen_is_delivered_truncated");
+    fn a_record_longer_than_the_offered_buffer_is_delivered_truncated() {
+        let mut b = fixture("a_record_longer_than_the_offered_buffer_is_delivered_truncated");
         let mut locks = LockTable::default();
-        b.maxlen = 4; // shorter than RECLEN (8)
-        let d = b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        let d = b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, 4).unwrap().unwrap();
         assert_eq!(d.bytes.len(), 4);
         assert!(d.truncated);
     }
 
     #[test]
-    fn a_record_no_longer_than_maxlen_is_not_marked_truncated() {
-        let mut b = fixture("a_record_no_longer_than_maxlen_is_not_marked_truncated");
+    fn a_record_no_longer_than_the_offered_buffer_is_not_marked_truncated() {
+        let mut b = fixture("a_record_no_longer_than_the_offered_buffer_is_not_marked_truncated");
         let mut locks = LockTable::default();
-        assert_eq!(b.maxlen, RECLEN);
-        let d = b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        let d = b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap().unwrap();
         assert_eq!(d.bytes.len(), usize::from(RECLEN));
         assert!(!d.truncated);
+    }
+
+    /// The block's own `maxlen` is the *module's* buffer, read directly by
+    /// `crates/mbbs`'s shims and by nothing here. A delivery that still
+    /// consulted it would either starve a wire caller that offered more (the
+    /// genuine wire's Open declares `0`) or overrun one that offered less --
+    /// so it is set to both extremes here and neither is allowed to move the
+    /// answer.
+    #[test]
+    fn the_blocks_own_maxlen_does_not_bound_a_delivery() {
+        let mut locks = LockTable::default();
+
+        let mut starved = fixture("the_blocks_own_maxlen_does_not_bound_a_delivery_starved");
+        starved.maxlen = 0;
+        let d = starved
+            .get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.bytes.len(), usize::from(RECLEN), "maxlen 0 starved the delivery");
+        assert!(!d.truncated);
+
+        let mut generous = fixture("the_blocks_own_maxlen_does_not_bound_a_delivery_generous");
+        generous.maxlen = u16::MAX;
+        let d = generous
+            .get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.bytes.len(), 4, "maxlen overrode the caller's own buffer");
+        assert!(d.truncated);
     }
 
     // -- Op code parsing --
@@ -3430,9 +3494,9 @@ mod tests {
         let mut two = fixture("lock_table_clear_all_releases_every_locked_block_not_just_one_two");
         let mut locks = LockTable::default();
 
-        one.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        one.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks, RECLEN).unwrap().unwrap();
         let in_one = one.current().unwrap().position;
-        two.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        two.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks, RECLEN).unwrap().unwrap();
         let in_two = two.current().unwrap().position;
 
         locks.clear_all();
@@ -3530,7 +3594,7 @@ mod tests {
     fn update_chunks_on_a_v6_file_passes_the_gate_and_reaches_the_still_refused_v6_write() {
         let mut b = fixture_v6("update_chunks_on_a_v6_file_passes_the_gate_and_reaches_the_still_refused_v6_write");
         let mut locks = LockTable::default();
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 0, &mut locks).unwrap();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap();
         let err = b
             .update_chunks(&[(4, vec![9])])
             .expect_err("v6 write does not exist yet (Task 13)");
@@ -3556,7 +3620,7 @@ mod tests {
     fn update_chunks_offset_past_the_record_is_refused() {
         let mut b = fixture_v6("update_chunks_offset_past_the_record_is_refused");
         let mut locks = LockTable::default();
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 0, &mut locks).unwrap();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap();
         let err = b.update_chunks(&[(100, vec![1])]).expect_err("past the end of the record");
         assert_eq!(err, OpError::ChunkOffsetTooBig);
     }
@@ -3581,7 +3645,7 @@ mod tests {
     fn get_next_extended_after_current_retrieves_the_requested_count_forward() {
         let mut b = fixture("get_next_extended_after_current_retrieves_the_requested_count_forward");
         let mut locks = LockTable::default();
-        let out = b.get_next_extended(0, 3, ExtendedStart::AfterCurrent, 0, &mut locks).unwrap();
+        let out = b.get_next_extended(0, 3, ExtendedStart::AfterCurrent, 0, &mut locks, RECLEN).unwrap();
         let tags: Vec<u8> = out.iter().map(tag).collect();
         assert_eq!(tags, vec![0, 1, 2], "S1: nothing positioned behaves like Lowest, then walks forward");
     }
@@ -3590,7 +3654,7 @@ mod tests {
     fn get_next_extended_stops_at_end_of_file_short_of_count() {
         let mut b = fixture("get_next_extended_stops_at_end_of_file_short_of_count");
         let mut locks = LockTable::default();
-        let out = b.get_next_extended(0, 100, ExtendedStart::AfterCurrent, 0, &mut locks).unwrap();
+        let out = b.get_next_extended(0, 100, ExtendedStart::AfterCurrent, 0, &mut locks, RECLEN).unwrap();
         assert_eq!(out.len(), 6, "only six records exist -- the fourth documented stop condition, p. 130");
     }
 
@@ -3598,8 +3662,8 @@ mod tests {
     fn get_next_extended_at_current_includes_the_positioned_record_first() {
         let mut b = fixture("get_next_extended_at_current_includes_the_positioned_record_first");
         let mut locks = LockTable::default();
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap();
-        let out = b.get_next_extended(0, 2, ExtendedStart::AtCurrent, 0, &mut locks).unwrap();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap();
+        let out = b.get_next_extended(0, 2, ExtendedStart::AtCurrent, 0, &mut locks, RECLEN).unwrap();
         let tags: Vec<u8> = out.iter().map(tag).collect();
         assert_eq!(tags, vec![2, 3], "UC: begins with the positioned record (tag 2), then the next");
     }
@@ -3608,8 +3672,8 @@ mod tests {
     fn get_previous_extended_walks_backward() {
         let mut b = fixture("get_previous_extended_walks_backward");
         let mut locks = LockTable::default();
-        b.get(0, Op::Highest, &[], 0, &mut locks).unwrap();
-        let out = b.get_previous_extended(0, 2, ExtendedStart::AfterCurrent, 0, &mut locks).unwrap();
+        b.get(0, Op::Highest, &[], 0, &mut locks, RECLEN).unwrap();
+        let out = b.get_previous_extended(0, 2, ExtendedStart::AfterCurrent, 0, &mut locks, RECLEN).unwrap();
         let tags: Vec<u8> = out.iter().map(tag).collect();
         assert_eq!(tags, vec![4, 3]);
     }
@@ -3618,7 +3682,7 @@ mod tests {
     fn get_next_extended_with_count_zero_returns_nothing() {
         let mut b = fixture("get_next_extended_with_count_zero_returns_nothing");
         let mut locks = LockTable::default();
-        let out = b.get_next_extended(0, 0, ExtendedStart::AfterCurrent, 0, &mut locks).unwrap();
+        let out = b.get_next_extended(0, 0, ExtendedStart::AfterCurrent, 0, &mut locks, RECLEN).unwrap();
         assert!(out.is_empty());
     }
 
@@ -3626,8 +3690,8 @@ mod tests {
     fn step_next_extended_walks_physical_order_after_the_current_position() {
         let mut b = fixture("step_next_extended_walks_physical_order_after_the_current_position");
         let mut locks = LockTable::default();
-        b.step(Step::First, 0, &mut locks).unwrap();
-        let out = b.step_next_extended(2, 0, &mut locks).unwrap();
+        b.step(Step::First, 0, &mut locks, RECLEN).unwrap();
+        let out = b.step_next_extended(2, 0, &mut locks, RECLEN).unwrap();
         let tags: Vec<u8> = out.iter().map(tag).collect();
         assert_eq!(tags, vec![1, 2], "always EG: starts after the current position, p. 126");
     }
@@ -3636,8 +3700,8 @@ mod tests {
     fn step_previous_extended_walks_backward_in_physical_order() {
         let mut b = fixture("step_previous_extended_walks_backward_in_physical_order");
         let mut locks = LockTable::default();
-        b.step(Step::Last, 0, &mut locks).unwrap();
-        let out = b.step_previous_extended(2, 0, &mut locks).unwrap();
+        b.step(Step::Last, 0, &mut locks, RECLEN).unwrap();
+        let out = b.step_previous_extended(2, 0, &mut locks, RECLEN).unwrap();
         let tags: Vec<u8> = out.iter().map(tag).collect();
         assert_eq!(tags, vec![4, 3]);
     }
@@ -3647,7 +3711,7 @@ mod tests {
         let mut b = fixture("step_next_extended_with_nothing_positioned_is_refused_not_silently_empty");
         let mut locks = LockTable::default();
         let err = b
-            .step_next_extended(3, 0, &mut locks)
+            .step_next_extended(3, 0, &mut locks, RECLEN)
             .expect_err("Step Next Extended needs prior positioning, same as Step Next");
         assert_eq!(err, OpError::NotPositioned);
     }
@@ -3735,7 +3799,7 @@ mod tests {
     fn get_by_percentage_zero_is_the_lowest_record() {
         let mut b = fixture("get_by_percentage_zero_is_the_lowest_record");
         let mut locks = LockTable::default();
-        let d = b.get_by_percentage(PercentageBasis::Key(0), 0, 0, &mut locks).unwrap();
+        let d = b.get_by_percentage(PercentageBasis::Key(0), 0, 0, &mut locks, RECLEN).unwrap();
         assert_eq!(tag(&d), 0);
     }
 
@@ -3743,7 +3807,7 @@ mod tests {
     fn get_by_percentage_10000_is_the_highest_record() {
         let mut b = fixture("get_by_percentage_10000_is_the_highest_record");
         let mut locks = LockTable::default();
-        let d = b.get_by_percentage(PercentageBasis::Key(0), 10_000, 0, &mut locks).unwrap();
+        let d = b.get_by_percentage(PercentageBasis::Key(0), 10_000, 0, &mut locks, RECLEN).unwrap();
         assert_eq!(tag(&d), 5);
     }
 
@@ -3751,7 +3815,7 @@ mod tests {
     fn get_by_percentage_clamps_a_value_past_10000() {
         let mut b = fixture("get_by_percentage_clamps_a_value_past_10000");
         let mut locks = LockTable::default();
-        let d = b.get_by_percentage(PercentageBasis::Key(0), 60_000, 0, &mut locks).unwrap();
+        let d = b.get_by_percentage(PercentageBasis::Key(0), 60_000, 0, &mut locks, RECLEN).unwrap();
         assert_eq!(tag(&d), 5, "clamped to the highest record, not out of range");
     }
 
@@ -3759,7 +3823,7 @@ mod tests {
     fn get_by_percentage_physical_basis_returns_no_key() {
         let mut b = fixture("get_by_percentage_physical_basis_returns_no_key");
         let mut locks = LockTable::default();
-        let d = b.get_by_percentage(PercentageBasis::Physical, 0, 0, &mut locks).unwrap();
+        let d = b.get_by_percentage(PercentageBasis::Physical, 0, 0, &mut locks, RECLEN).unwrap();
         assert!(d.key.is_none(), "p. 86: physical basis returns nothing in the Key Buffer");
     }
 
@@ -3768,7 +3832,7 @@ mod tests {
         let mut b = fixture("get_by_percentage_no_such_key_is_refused");
         let mut locks = LockTable::default();
         let err = b
-            .get_by_percentage(PercentageBasis::Key(9), 0, 0, &mut locks)
+            .get_by_percentage(PercentageBasis::Key(9), 0, 0, &mut locks, RECLEN)
             .expect_err("no such key");
         assert_eq!(err, OpError::NoSuchKey(9));
     }
