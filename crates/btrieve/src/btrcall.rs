@@ -15,6 +15,7 @@
 //! does. Folding the two would let a differential harness score a gap as a
 //! passing disagreement, and let a guest branch on a lie.
 
+use crate::mem::{Alloc, Mem};
 use crate::ops::{Op, OpError, Step};
 
 /// A real Btrieve status word. Zero is success.
@@ -164,6 +165,266 @@ pub fn describe(op: u16) -> Outcome {
     }
 }
 
+/// One BTRCALL's arguments, already marshalled out of whichever guest made it.
+///
+/// This is the parameter block both edges carry, in host terms: the real-mode
+/// edge reads it out of a 28-byte `btvdat` at `DS:DX`, and the Win32 edge
+/// reads it off a stdcall stack. Neither shape appears here.
+pub struct Call<'a> {
+    /// The Btrieve operation code.
+    pub op: u16,
+
+    /// The guest's 128-byte position block.
+    ///
+    /// **This engine does not serialise its own state here.** Its private
+    /// state is far larger than 128 bytes and would never match genuine
+    /// Btrieve's layout anyway. Instead Open writes this session's file
+    /// pointer into the first `M::PTR_WIDTH` bytes and every later operation
+    /// reads it back, so the block is a handle rather than a snapshot.
+    ///
+    /// That relies on the guest keeping **one stable position block per open
+    /// file**, which Galacticomm's own `DFAAPI.C` does -- it passes
+    /// `dfa->posblk`, a field of a heap-allocated `DFAFILE`. A guest that
+    /// copied a position block elsewhere and kept using it would be told the
+    /// file is not open.
+    pub posblk: &'a mut [u8; 128],
+
+    /// The data buffer: the record in, or the record out.
+    pub databuf: &'a mut Vec<u8>,
+
+    /// How many bytes of `databuf` the caller offered, and how many this
+    /// engine used. Written back on every operation that delivers a record.
+    pub datalen: &'a mut u32,
+
+    /// The key buffer -- the value to search for, or the filename on Open.
+    pub keybuf: &'a mut Vec<u8>,
+
+    /// How many bytes of `keybuf` are meaningful. `DFAAPI.C` always passes
+    /// `255`.
+    pub keylen: u8,
+
+    /// Which key to work by. Negative numbers name the Btrieve options that
+    /// are not keys at all.
+    pub keynum: i8,
+}
+
+/// Answer one BTRCALL.
+///
+/// # Errors
+///
+/// [`Gap`] where this engine does not model what was asked. A gap is never a
+/// status: see this module's own doc comment.
+pub fn btrcall<M: Mem>(
+    session: &mut crate::Btrieve<M>,
+    memory: &mut M::Memory,
+    heap: &mut impl Alloc<M>,
+    call: Call<'_>,
+) -> Result<Status, Gap> {
+    match describe(call.op) {
+        Outcome::Open => open(session, memory, heap, call),
+        Outcome::Close => close(session, memory, heap, call),
+        Outcome::Get(op) => get(session, op, call),
+        Outcome::Step(step) => step_op(session, step, call),
+        Outcome::Insert => insert(session, call),
+        Outcome::Update => update(session, call),
+        Outcome::Delete => delete(session, call),
+        Outcome::Query(_) | Outcome::Stat | Outcome::Stop => Err(Gap {
+            what: format!("operation {} is named but not yet dispatched", call.op),
+        }),
+        Outcome::Unmodelled(n) => Err(Gap {
+            what: format!("operation code {n} is not modelled by this engine"),
+        }),
+    }
+}
+
+fn open<M: Mem>(
+    session: &mut crate::Btrieve<M>,
+    memory: &mut M::Memory,
+    heap: &mut impl Alloc<M>,
+    call: Call<'_>,
+) -> Result<Status, Gap> {
+    // Btrieve's Open takes the filename in the key buffer, NUL-terminated.
+    let end = call.keybuf.iter().position(|b| *b == 0).unwrap_or(call.keybuf.len());
+    let name = String::from_utf8_lossy(&call.keybuf[..end]).into_owned();
+    let path = std::path::PathBuf::from(&name);
+    let leaf = path
+        .file_name()
+        .map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned());
+
+    let geometry = match crate::Geometry::read(&leaf, &path) {
+        Ok(g) => g,
+        // A file that will not open is a real Btrieve answer: status 12,
+        // "the MicroKernel cannot find the specified file".
+        Err(_) => return Ok(Status(12)),
+    };
+    let maxlen = u16::try_from(*call.datalen).unwrap_or(u16::MAX);
+
+    match session.open(memory, heap, &leaf, &path, geometry, maxlen) {
+        Ok(at) => {
+            let bytes = M::ptr_to_bytes(at);
+            call.posblk[..bytes.len()].copy_from_slice(&bytes);
+            Ok(Status::OK)
+        }
+        Err(why) => Err(Gap {
+            what: format!("opening {leaf}: {why}"),
+        }),
+    }
+}
+
+/// The file handle Open recorded in the position block.
+fn handle_of<M: Mem>(posblk: &[u8; 128]) -> M::Ptr {
+    M::ptr_from_bytes(&posblk[..M::PTR_WIDTH])
+}
+
+/// Close the file Open recorded in `call.posblk`.
+///
+/// [`crate::Btrieve::close`] answers `Ok(false)` for a pointer that names no
+/// open file -- a second close of the same block, or one that never opened.
+/// `PLBTVSTF.C` cannot tell those two apart either, and neither the shim
+/// edge (`clsbtv`, which discards the bool outright) nor any measured
+/// Btrieve status distinguishes them from an ordinary close, so both bools
+/// answer [`Status::OK`] here. Only [`BtvError`](crate::BtvError) -- the
+/// block still holding an unflushed transaction pre-image, or a failed
+/// allocation free -- is a hole this table does not name a status for, and
+/// becomes a [`Gap`].
+fn close<M: Mem>(
+    session: &mut crate::Btrieve<M>,
+    memory: &mut M::Memory,
+    heap: &mut impl Alloc<M>,
+    call: Call<'_>,
+) -> Result<Status, Gap> {
+    let at = handle_of::<M>(call.posblk);
+    match session.close(memory, heap, at) {
+        Ok(_) => Ok(Status::OK),
+        Err(why) => Err(Gap {
+            what: format!("closing: {why}"),
+        }),
+    }
+}
+
+fn get<M: Mem>(
+    session: &mut crate::Btrieve<M>,
+    op: Op,
+    call: Call<'_>,
+) -> Result<Status, Gap> {
+    let at = handle_of::<M>(call.posblk);
+    let index = session.find(at).map_err(|why| Gap { what: why })?;
+    let key = u16::try_from(call.keynum.max(0)).unwrap_or(0);
+    let value = &call.keybuf[..usize::from(call.keylen).min(call.keybuf.len())];
+
+    match session.open[index].get(key, op, value, 0, &mut session.locks) {
+        Ok(Some(d)) => {
+            *call.datalen = u32::try_from(d.bytes.len()).unwrap_or(u32::MAX);
+            call.databuf.clear();
+            call.databuf.extend_from_slice(&d.bytes);
+            if let Some(k) = d.key {
+                call.keybuf.clear();
+                call.keybuf.extend_from_slice(&k);
+            }
+            // A record that did not fit the caller's buffer is a success with
+            // a truncated answer, not a failure -- real Btrieve status 22.
+            Ok(if d.truncated { Status(22) } else { Status::OK })
+        }
+        // No record matched: status 9, end of file.
+        Ok(None) => Ok(Status(9)),
+        Err(e) => status_of(&e),
+    }
+}
+
+/// Ops 24, 33-35: physical order, no key. Same shape as [`get`], but
+/// [`crate::ops::Block::step`] takes no search value and its
+/// [`crate::ops::Delivery::key`] is always `None` -- a step has no key at
+/// all.
+fn step_op<M: Mem>(
+    session: &mut crate::Btrieve<M>,
+    step: Step,
+    call: Call<'_>,
+) -> Result<Status, Gap> {
+    let at = handle_of::<M>(call.posblk);
+    let index = session.find(at).map_err(|why| Gap { what: why })?;
+
+    match session.open[index].step(step, 0, &mut session.locks) {
+        Ok(Some(d)) => {
+            *call.datalen = u32::try_from(d.bytes.len()).unwrap_or(u32::MAX);
+            call.databuf.clear();
+            call.databuf.extend_from_slice(&d.bytes);
+            Ok(if d.truncated { Status(22) } else { Status::OK })
+        }
+        Ok(None) => Ok(Status(9)),
+        Err(e) => status_of(&e),
+    }
+}
+
+/// Op 2: append `call.databuf` as a new record.
+///
+/// Real Btrieve establishes currency on the record an insert just created;
+/// this engine's [`crate::ops::Block::insert`] does not move
+/// [`crate::Cursor`] at all, so a `Get Next`/`Get Previous` issued right
+/// after an insert sees wherever the file was positioned before it, not the
+/// new record. No test in this task exercises that difference; it is a
+/// known gap, not a decision.
+fn insert<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
+    let at = handle_of::<M>(call.posblk);
+    let index = session.find(at).map_err(|why| Gap { what: why })?;
+    let len = usize::try_from(*call.datalen).unwrap_or(0).min(call.databuf.len());
+
+    match session.open[index].insert(&call.databuf[..len]) {
+        Ok(_) => Ok(Status::OK),
+        Err(why) => Err(Gap {
+            what: format!("inserting: {why}"),
+        }),
+    }
+}
+
+/// Op 3: rewrite the record the file is currently positioned on.
+///
+/// Btrieve's Update always targets *the current record*, never a position
+/// the caller names -- the same convention `mbbs`'s `dupdbtv` shim reads out
+/// of [`crate::ops::Block::current`]. No record positioned is real Btrieve
+/// status 8, the same status [`OpError::NotPositioned`] and
+/// [`OpError::NoKeyEstablished`] already answer with in [`status_of`].
+fn update<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
+    let at = handle_of::<M>(call.posblk);
+    let index = session.find(at).map_err(|why| Gap { what: why })?;
+    let Some(position) = session.open[index].current().map(|r| r.position) else {
+        return Ok(Status(8));
+    };
+    let len = usize::try_from(*call.datalen).unwrap_or(0).min(call.databuf.len());
+
+    match session.open[index].update(position, &call.databuf[..len]) {
+        Ok(()) => Ok(Status::OK),
+        Err(why) => Err(Gap {
+            what: format!("updating: {why}"),
+        }),
+    }
+}
+
+/// Op 4: delete the record the file is currently positioned on.
+///
+/// Same currency rule as [`update`]: no record positioned is status 8. After
+/// a successful delete, `mbbs`'s `delbtv` shim seeks the block to
+/// [`crate::Cursor::Nowhere`] -- documented there as a decision rather than
+/// a measurement, because what real Btrieve leaves current after a delete
+/// was never put to the Wine oracle. This dispatch follows the same
+/// decision so a deleted record does not stay reachable as "current".
+fn delete<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
+    let at = handle_of::<M>(call.posblk);
+    let index = session.find(at).map_err(|why| Gap { what: why })?;
+    let Some(position) = session.open[index].current().map(|r| r.position) else {
+        return Ok(Status(8));
+    };
+
+    match session.open[index].delete(position) {
+        Ok(()) => {
+            session.open[index].seek_to(crate::Cursor::Nowhere);
+            Ok(Status::OK)
+        }
+        Err(why) => Err(Gap {
+            what: format!("deleting: {why}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +537,179 @@ mod tests {
     fn an_unmodelled_operation_names_its_own_number() {
         assert_eq!(describe(60_000), Outcome::Unmodelled(60_000));
         assert_eq!(describe(31), Outcome::Unmodelled(31), "Create Index");
+    }
+
+    use crate::testing::{Flat, FlatHeap, FlatMem};
+    use crate::{Btrieve, Geometry};
+    use std::path::Path;
+
+    /// The whole round trip through numbers: open a real file, read its
+    /// lowest record by key 0, and close it -- without naming a single typed
+    /// operation at the call site.
+    #[test]
+    fn a_file_opens_reads_and_closes_through_numbers_alone() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../mbbs/tests/data/SAMPLE.DAT");
+
+        let mut posblk = [0u8; 128];
+        let mut databuf = Vec::new();
+        let mut datalen = 64u32;
+        let mut keybuf = path.to_string_lossy().as_bytes().to_vec();
+        keybuf.push(0);
+
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 0,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut keybuf,
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Open is modelled");
+        assert_eq!(status, Status::OK, "the file opened");
+        assert_ne!(posblk[..4], [0, 0, 0, 0], "Open recorded a handle");
+
+        // Op 12 is Get First -- the lowest key, not "the twelfth get".
+        let mut databuf = vec![0u8; 64];
+        let mut datalen = 64u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 12,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get First is modelled");
+        assert_eq!(status, Status::OK, "a record came back");
+        assert!(datalen > 0, "and its length was reported back");
+
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 1,
+                posblk: &mut posblk,
+                databuf: &mut Vec::new(),
+                datalen: &mut 0,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Close is modelled");
+        assert_eq!(status, Status::OK, "the file closed");
+    }
+
+    /// An unmodelled operation is a gap, not a fabricated status.
+    #[test]
+    fn an_unmodelled_operation_is_a_gap() {
+        let mut mem = FlatMem::new(1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let gap = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 31, // Create Index
+                posblk: &mut [0u8; 128],
+                databuf: &mut Vec::new(),
+                datalen: &mut 0,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect_err("Create Index is not modelled");
+        assert!(gap.what.contains("31") || gap.what.contains("ndex"));
+    }
+
+    /// A read past the end of the file is status 9, not a fabricated
+    /// success. Task 3 Step 7's second mutation -- `get`'s `Ok(None) =>
+    /// Ok(Status(9))` collapsed to `Ok(Status::OK)` -- made every other test
+    /// in this module pass anyway; this is the test that closes that gap.
+    #[test]
+    fn a_get_past_the_end_of_the_file_answers_status_nine() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mbbs/tests/data/SAMPLE.DAT");
+        let mut posblk = [0u8; 128];
+        let mut keybuf = path.to_string_lossy().as_bytes().to_vec();
+        keybuf.push(0);
+
+        btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 0,
+                posblk: &mut posblk,
+                databuf: &mut Vec::new(),
+                datalen: &mut 64,
+                keybuf: &mut keybuf,
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Open is modelled");
+
+        // Op 13 is Get Last -- the highest key -- so the very next Get Next
+        // has nowhere left to go.
+        let mut databuf = vec![0u8; 64];
+        let mut datalen = 64u32;
+        btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 13,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Last is modelled");
+
+        let mut databuf = vec![0u8; 64];
+        let mut datalen = 64u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 6, // Get Next
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Next is modelled");
+        assert_eq!(status, Status(9), "no record past the last one");
     }
 }
