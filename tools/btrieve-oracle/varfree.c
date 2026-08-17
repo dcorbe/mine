@@ -159,6 +159,46 @@ static void cmd_create(const char *path)
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
 
+/* The same rig, but with the key permitting DUPLICATES -- WGSGEN2.DAT's
+ * shape, which is what stops MajorMUD's boot once variable-length writes
+ * work. Inserting several records under one key value is what shows where
+ * the chain joining them lives and what the index entry carries.
+ *
+ * Attribute 0x0001 is DUPLICATE; 0x0100 is EXTTYPE, as in cmd_create. */
+static void cmd_create_dup(const char *path)
+{
+    char posblk[POSBLK_SIZE];
+    char keybuf[KEY_SIZE];
+    unsigned char data[sizeof(FileSpec) + sizeof(KeySpec)];
+    FileSpec *fs = (FileSpec *)data;
+    KeySpec *ks = (KeySpec *)(data + sizeof(FileSpec));
+    DWORD dlen = sizeof data;
+    int st;
+
+    memset(posblk, 0, sizeof posblk);
+    memset(data, 0, sizeof data);
+    memset(keybuf, 0, sizeof keybuf);
+    strncpy(keybuf, path, sizeof keybuf - 1);
+
+    fs->reclen = 22;
+    fs->pagesize = 512;
+    fs->indexes_raw = 1;
+    fs->flags = 0x0001;   /* variable-length records */
+
+    ks->position = 1;
+    ks->length = 4;
+    ks->flags = 0x0101;   /* DUPLICATE | EXTTYPE */
+    ks->ext_type = 0x0e;  /* unsigned binary */
+
+    st = btrcall(B_CREATE, posblk, data, &dlen, keybuf,
+                 (BYTE)(strlen(keybuf) + 1), (char)0);
+    if (st != 0)
+        die("create_dup", st);
+    printf("created %s reclen=22 pagesize=512 variable, key 0 permits duplicates\n",
+           path);
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
 static int open_file(char *posblk, const char *path)
 {
     char keybuf[KEY_SIZE];
@@ -304,7 +344,7 @@ int main(int argc, char **argv)
 
     if (argc < 3) {
         fprintf(stderr,
-            "usage: varfree <create|insert|get|delete> <file.DAT> ...\n"
+            "usage: varfree <create|create_dup|insert|get|delete> <file.DAT> ...\n"
             "  create <path>\n"
             "  insert <path> <key> <total> <fillbyte>\n"
             "  get    <path> <key>\n");
@@ -327,6 +367,8 @@ int main(int argc, char **argv)
 
     if (!strcmp(cmd, "create")) {
         cmd_create(path);
+    } else if (!strcmp(cmd, "create_dup")) {
+        cmd_create_dup(path);
     } else if (!strcmp(cmd, "insert")) {
         if (argc < 6) {
             fprintf(stderr, "FAIL: insert needs <key> <total> <fillbyte>\n");
