@@ -2061,7 +2061,7 @@ impl<M: Mem> Block<M> {
             }
 
             built.push(Rebuilt {
-                root: raw_root & 0x7fff_ffff,
+                root: raw_root & pages::fcr::ROOT_PAGE,
                 image: index.nodes[0].image.clone(),
                 count_at: definition + pages::fcr::KEY_RECORDS,
                 count: u32::try_from(len).expect("far fewer records than u32::MAX"),
@@ -4257,7 +4257,7 @@ mod tests {
             "the v6 marker bit must survive the close"
         );
         let root_physical = map
-            .physical(raw_root & 0x7fff_ffff)
+            .physical(raw_root & pages::fcr::ROOT_PAGE)
             .expect("the root is a claimed logical page");
         let start = root_physical as usize * usize::from(page_size);
         let index = pages::decode_index_page(&file[start..start + usize::from(page_size)], key.shape())
@@ -4646,7 +4646,7 @@ mod tests {
         let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
         let raw_root = pages::long(&file[definition + pages::fcr::KEY_ROOT..][..4]);
         let map = v6::Map::read(file, block.geometry.page).expect("the allocation table");
-        map.physical(raw_root & 0x7fff_ffff)
+        map.physical(raw_root & pages::fcr::ROOT_PAGE)
             .expect("the key's root is a claimed logical page")
     }
 
@@ -5291,7 +5291,7 @@ mod tests {
         let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
         let root_at = definition + pages::fcr::KEY_ROOT;
         let raw_root = pages::long(&file[root_at..root_at + 4]);
-        let root_logical = raw_root & 0x7fff_ffff;
+        let root_logical = raw_root & pages::fcr::ROOT_PAGE;
         let root_physical = map
             .physical(root_logical)
             .expect("the key's root is a claimed logical page");
@@ -5348,6 +5348,70 @@ mod tests {
     /// `dinsbtv` on `WCCTEXT.DAT` would silently cut a 2,022-byte buffer down
     /// to a 22-byte `reclen` and answer 1, success -- the next task writes
     /// `WCCTEXT`, and that is not a plausible answer to give it.
+    /// A key's index root is the low **24** bits of its root field, not the
+    /// low 31.
+    ///
+    /// `WGSGEN2.VIR` is the file that found this: genuine Worldgroup's own
+    /// generic user database, two keys, and the second one's root reads
+    /// `0x81000003`. Masking with `0x7fffffff` leaves the key number in the
+    /// top byte and turns logical page 3 into 16,777,219, which
+    /// `v6::Map::relocate` then refuses as not fitting a `u16` -- the error
+    /// that stopped MajorMUD's boot once duplicate keys worked.
+    ///
+    /// **A single-key file cannot catch this**, because its only root has a
+    /// top byte of exactly `0x80` and the two masks agree. Every other
+    /// fixture here is single-key, which is why this test needs a file of its
+    /// own rather than an assertion added to an existing one.
+    #[test]
+    fn a_keys_root_is_its_low_twenty_four_bits_even_on_a_second_key() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/variable/WGSGEN2.VIR");
+        let geometry = Geometry::read("WGSGEN2.VIR", &path).expect("a genuine v6 file");
+        assert_eq!(geometry.keys, 2, "the point of this fixture is its second key");
+
+        let whole = std::fs::read(&path).expect("the file reads");
+        let page = usize::from(geometry.page);
+        let generation = |at: usize| u16::from_le_bytes([whole[at + 4], whole[at + 5]]);
+        let live = if generation(0) > generation(page) { 0 } else { page };
+        let fcr = &whole[live..live + FCR];
+        let tables = acs_tables(&path, &geometry, fcr).expect("its collating tables load");
+        let keys = keys::parse("WGSGEN2.VIR", fcr, geometry.keys, &tables).expect("its keys parse");
+
+        let root_of = |key: &Key| {
+            let at = pages::fcr::KEYS
+                + usize::from(key.definition) * pages::fcr::KEY_WIDTH
+                + pages::fcr::KEY_ROOT;
+            pages::long(&fcr[at..at + 4])
+        };
+
+        let first = root_of(&keys[0]);
+        let second = root_of(&keys[1]);
+        assert_eq!(first, 0x8000_0002, "key 0's root, as the vendor shipped it");
+        assert_eq!(second, 0x8100_0003, "key 1's root carries its own number too");
+
+        // Both must resolve to a page the file actually has.
+        let map = v6::Map::read(&whole, geometry.page).expect("its allocation table reads");
+        for (key, raw) in [(&keys[0], first), (&keys[1], second)] {
+            let logical = raw & pages::fcr::ROOT_PAGE;
+            assert!(
+                logical < geometry.pages,
+                "key {}: root {raw:#010x} masks to logical {logical}, and the file has \
+                 {} pages",
+                key.number,
+                geometry.pages
+            );
+            assert!(
+                map.physical(logical).is_some(),
+                "key {}: logical {logical} is claimed in the allocation table",
+                key.number
+            );
+        }
+
+        // The mask this replaced agreed on the first key and not the second.
+        assert_eq!(first & 0x7fff_ffff, first & pages::fcr::ROOT_PAGE);
+        assert_ne!(second & 0x7fff_ffff, second & pages::fcr::ROOT_PAGE);
+    }
+
     /// A `Block` over a real file, with the geometry and keys the file itself
     /// declares rather than invented ones.
     ///
@@ -7761,3 +7825,4 @@ mod tests {
         );
     }
 }
+

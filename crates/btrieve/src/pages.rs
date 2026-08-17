@@ -54,6 +54,25 @@ pub mod fcr {
     /// `0xffffffff`.
     pub const FREE_V6: usize = 0x9c;
 
+    /// The bits of a key's root field that are the logical page.
+    ///
+    /// A v6 key root reads `0x80000002`, `0x81000003`, `0x82000004` and so
+    /// on: the low **24** bits are the page, and the top byte is `0x80` set
+    /// with the key's own number.
+    ///
+    /// Masking with `0x7fffffff` instead -- which this host did until the
+    /// 32-bit MajorMUD boot reached a second key -- leaves that number in
+    /// place and turns logical page 3 into 16,777,219. It is invisible on a
+    /// single-key file, because there the top byte is exactly `0x80` and the
+    /// two masks agree.
+    ///
+    /// Measured across every version 6 file in this repository: **616 files,
+    /// 840 key roots, top bytes `0x80` through `0x85`, and in every one of
+    /// them the low 24 bits name a page the file actually has.** 224 of those
+    /// roots are on a key that is not the file's first, and each of them
+    /// would have been misread.
+    pub const ROOT_PAGE: u32 = 0x00ff_ffff;
+
     /// Head of the **variable free-space chain**: which variable page still
     /// has room for a fragment. A [`long`](super::long), holding a *page*
     /// number rather than the record position [`FREE_V6`] holds.
