@@ -193,6 +193,27 @@ impl Pointer {
         }
     }
 
+    /// The inverse of [`Self::decode`]: `[high][low][mid][fragment]`.
+    ///
+    /// The engine's own pack is `FUN_00421c50` at
+    /// `W32MKDE_decompiled.c:19968`. **Only the on-disk form is produced.**
+    /// The engine also keeps an in-memory variant with a page-type byte
+    /// spliced into byte 1, which is why its code masks with `0xffff00ff`;
+    /// nothing here reproduces that, and a record trailer holding it would
+    /// name a page no file has.
+    ///
+    /// Confirmed against genuine 6.15: a fragment continued onto logical page
+    /// 3 carries `00 03 00 00`, which is what this produces for
+    /// `Pointer { page: 3, fragment: 0 }`.
+    pub(crate) fn encode(self) -> [u8; POINTER] {
+        [
+            (self.page >> 16) as u8,
+            self.page as u8,
+            (self.page >> 8) as u8,
+            self.fragment,
+        ]
+    }
+
     /// Whether this pointer ends a chain rather than naming a fragment.
     fn is_end(self) -> bool {
         self.page == END_PAGE && self.fragment == END_FRAGMENT
@@ -744,6 +765,368 @@ impl PagesMut for FilePages<'_> {
     }
 }
 
+/// The two-byte type tag a variable page carries, as [`super::v6::Map::claim`]
+/// wants it: `0x00` then the letter, so the page reads `0x5600` as a
+/// little-endian `u16` and [`TAG`] finds `'V'` at byte 1.
+pub(crate) const V_TAG: [u8; 2] = [0x00, b'V'];
+
+/// [`PagesMut`], plus the ability to bring a *new* page into the file.
+///
+/// Separate from [`PagesMut`] because claiming is the one thing v5 and v6
+/// disagree about in kind rather than in degree: v6 claims a **logical** id
+/// through the `"PP"` allocation table, and v5 takes a **physical** page off
+/// the file's own free chain or appends one. Folding that into [`PagesMut`]
+/// would hand every reader a capability it never uses, which is the mistake
+/// [`PagesMut`]'s own doc comment already declines to make.
+pub(crate) trait PageSource: PagesMut {
+    /// Bring `content` into the file as a new variable page, and answer with
+    /// the number a [`Pointer`] must name to reach it -- **logical** for v6,
+    /// physical for v5.
+    fn claim(&mut self, content: &[u8]) -> Result<u32, String>;
+
+    /// Bytes per page. Fragment placement needs it and [`Pages`] does not
+    /// expose it.
+    fn page_size(&self) -> u16;
+}
+
+/// A v6 file's pages, resolved and written through its `"PP"` allocation
+/// table.
+///
+/// Holds the whole file, which is the shape `Block::insert_v6` already works
+/// in: it reads the file to a `Vec`, mutates it, and writes it back.
+///
+/// **The map is re-read after every claim and every write**, because both
+/// move pages: `relocate` writes a logical page to its *other* physical twin
+/// and rewrites the allocation-table entry, so a `Map` taken before the call
+/// resolves to the stale twin afterwards. Re-reading costs a pass over the
+/// table per page written and is what makes the alternative -- caching a map
+/// and hoping -- not worth reasoning about.
+#[allow(dead_code, reason = "consumed by `Block::insert`; landed with `Space` first")]
+pub(crate) struct V6Pages<'a> {
+    file: &'a mut Vec<u8>,
+    page_size: u16,
+    map: super::v6::Map,
+}
+
+impl<'a> V6Pages<'a> {
+    /// Read the allocation table and take the file.
+    #[allow(dead_code, reason = "consumed by `Block::insert`; landed with `Space` first")]
+    pub(crate) fn new(file: &'a mut Vec<u8>, page_size: u16) -> Result<Self, String> {
+        let map = super::v6::Map::read(file, page_size)?;
+        Ok(Self {
+            file,
+            page_size,
+            map,
+        })
+    }
+}
+
+impl Pages for V6Pages<'_> {
+    fn page(&mut self, number: u32) -> Result<&[u8], String> {
+        let physical = self.map.physical(number).ok_or_else(|| {
+            format!(
+                "logical page {number}, and the allocation table names no live physical \
+                 page for it"
+            )
+        })?;
+        let at = usize::from(self.page_size) * physical as usize;
+        let end = at + usize::from(self.page_size);
+        self.file.get(at..end).ok_or_else(|| {
+            format!(
+                "logical page {number} resolves to physical {physical}, past the end of a \
+                 {}-byte file",
+                self.file.len()
+            )
+        })
+    }
+}
+
+impl PagesMut for V6Pages<'_> {
+    fn write_page(&mut self, number: u32, page: &[u8]) -> Result<(), String> {
+        super::v6::Map::relocate(self.file, self.page_size, number, page, V_TAG)?;
+        self.map = super::v6::Map::read(self.file, self.page_size)?;
+        Ok(())
+    }
+}
+
+impl PageSource for V6Pages<'_> {
+    fn claim(&mut self, content: &[u8]) -> Result<u32, String> {
+        let logical = super::v6::Map::claim(self.file, self.page_size, content, V_TAG)?;
+        self.map = super::v6::Map::read(self.file, self.page_size)?;
+        Ok(logical)
+    }
+
+    fn page_size(&self) -> u16 {
+        self.page_size
+    }
+}
+
+/// A variable page with no fragments on it yet.
+///
+/// Fragment count zero, [`FREE_CHAIN`] saying the page is not on the chain,
+/// and entry 0 already naming [`FIRST_FRAGMENT`] -- the array always holds one
+/// more entry than the page has fragments, so even an empty page has entry 0,
+/// and it says where fragment 0 will begin.
+///
+/// [`Header::read`] refuses a page with zero fragments, so this is not
+/// readable as a header until its first fragment lands. That is deliberate:
+/// [`Space::place`] writes the count and the entry together, and a page that
+/// is briefly neither one thing nor the other should not be readable as
+/// either.
+fn blank_page(page_size: u16, version: Version) -> Vec<u8> {
+    let len = usize::from(page_size);
+    let mut page = vec![0u8; len];
+    if version == Version::V6 {
+        page[..2].copy_from_slice(&V_TAG);
+    }
+    page[FREE_CHAIN..FREE_CHAIN + 4].copy_from_slice(&super::pages::to_long(NO_PAGE));
+    page[len - 2..len].copy_from_slice(&(FIRST_FRAGMENT as u16).to_le_bytes());
+    page
+}
+
+/// Write a page's free-chain field. See [`FreeChain`].
+fn set_chain(page: &mut [u8], chain: FreeChain) {
+    let value = match chain {
+        FreeChain::Off => NO_PAGE,
+        FreeChain::Last => END_PAGE,
+        FreeChain::Next(next) => next,
+    };
+    page[FREE_CHAIN..FREE_CHAIN + 4].copy_from_slice(&super::pages::to_long(value));
+}
+
+/// Read entry `which` of a page as a plain offset, without going through
+/// [`Header`].
+///
+/// [`Header::read`] refuses a page with zero fragments, and a page being built
+/// has zero fragments right up until its first one lands, so the allocator
+/// cannot reach its entries the way a reader does.
+fn entry(page: &[u8], which: u32) -> Result<u32, String> {
+    let at = entry_at(page.len() as u32, which)?;
+    Ok(Entry::decode(&page[at..at + 2]).offset)
+}
+
+/// Write entry `which` of a page.
+fn set_entry(page: &mut [u8], which: u32, offset: u32) -> Result<(), String> {
+    let at = entry_at(page.len() as u32, which)?;
+    let bytes = (offset as u16).to_le_bytes();
+    page[at..at + 2].copy_from_slice(&bytes);
+    Ok(())
+}
+
+/// How many fragments a page says it holds, read without a [`Header`].
+fn fragment_count(page: &[u8]) -> u16 {
+    u16::from_le_bytes([page[FRAGMENT_COUNT], page[FRAGMENT_COUNT + 1]])
+}
+
+/// Write a page's fragment count.
+fn set_fragment_count(page: &mut [u8], fragments: u16) {
+    page[FRAGMENT_COUNT..FRAGMENT_COUNT + 2].copy_from_slice(&fragments.to_le_bytes());
+}
+
+/// The allocator: what puts a fragment on a page.
+///
+/// The read half of this file has always been able to *follow* a chain. This
+/// is the first thing here that can build one, and it is the absence
+/// [`rewrite_fragment_in_place`] named as the reason for each of its four
+/// refusals.
+///
+/// # The free-space chain
+///
+/// A file offers its part-full variable pages through a chain: a head in the
+/// live file control record at [`FREE_HEAD`], and each member naming the next
+/// at [`FREE_CHAIN`]. `Space` walks it to find a page with room and takes a
+/// page off it once it no longer has any.
+///
+/// The head is **passed in and handed back** rather than read from the file
+/// here. `Space` writes pages; the file control record belongs to `Block`,
+/// which already reads and rewrites it for the record free list at
+/// `fcr::FREE_V6` and would otherwise have two places doing it.
+///
+/// Every rule here is measured in `docs/2026-08-17-variable-write-oracle.md`
+/// against genuine Pervasive 6.15, not inferred from the decompile.
+pub(crate) struct Space<'a, S: PageSource> {
+    source: &'a mut S,
+    version: Version,
+    head: Option<u32>,
+}
+
+impl<'a, S: PageSource> Space<'a, S> {
+    /// Take a page source and the file's current free-space head.
+    pub(crate) fn new(source: &'a mut S, version: Version, head: Option<u32>) -> Self {
+        Self {
+            source,
+            version,
+            head,
+        }
+    }
+
+    /// The free-space head after whatever this `Space` has done, for the
+    /// caller to write back to [`FREE_HEAD`].
+    pub(crate) fn head(&self) -> Option<u32> {
+        self.head
+    }
+
+    /// Write `body` as a fragment and answer with a pointer to it.
+    ///
+    /// A v6 fragment always carries four leading bytes of pointer, continued
+    /// or not (`W32MKDE_decompiled.c:19419`, and seen directly on disk: a
+    /// 200-byte body occupies 204 bytes and leads with `ff ff ff ff`). A v5
+    /// fragment carries them only when continued, and says so with the
+    /// entry's `0x8000` bit.
+    ///
+    /// # Errors
+    ///
+    /// If the body needs more room than one page can give -- splitting is not
+    /// implemented yet and is refused rather than truncated -- or if a page
+    /// cannot be read, claimed or written.
+    pub(crate) fn place(&mut self, body: &[u8]) -> Result<Pointer, String> {
+        let leads = self.version == Version::V6;
+        let needed = body.len() + if leads { POINTER } else { 0 };
+        let page_size = usize::from(self.source.page_size());
+
+        // A fresh page's usable room: everything after the header, less the
+        // two entries a single fragment needs (its own start, and the one
+        // that says where it ends).
+        let most = page_size - FIRST_FRAGMENT as usize - 4;
+        if needed > most {
+            return Err(format!(
+                "a {}-byte body needs {needed} bytes with its pointer, and a fresh \
+                 {page_size}-byte page holds {most} -- splitting a body across pages is \
+                 not implemented, and truncating it to fit is the silent wrong answer \
+                 this crate refuses",
+                body.len()
+            ));
+        }
+
+        let (number, fresh) = self.room_for(needed)?;
+        // Read back even when the page was just claimed: `v6::Map::claim`
+        // stamps the tag and the page's own logical id into the first four
+        // bytes, and `Header::read` checks both. Rebuilding a blank here
+        // instead would hand `reoffer` a page claiming to be logical 0.
+        let mut page = self.source.page(number)?.to_vec();
+
+        // Where this fragment goes is where the last entry already says the
+        // fragments end -- entry `i` names fragment `i`'s start, so the array
+        // has one more entry than the page has fragments and the extra one is
+        // the free-space boundary.
+        let fragments = fragment_count(&page);
+        let at = entry(&page, u32::from(fragments))? as usize;
+        if at == UNUSED as usize {
+            return Err(format!(
+                "page {number}'s entry {fragments} is free, so nothing says where its \
+                 fragments end"
+            ));
+        }
+
+        if leads {
+            let end = Pointer {
+                page: END_PAGE,
+                fragment: END_FRAGMENT,
+            };
+            page[at..at + POINTER].copy_from_slice(&end.encode());
+            page[at + POINTER..at + needed].copy_from_slice(body);
+        } else {
+            page[at..at + needed].copy_from_slice(body);
+        }
+
+        set_fragment_count(&mut page, fragments + 1);
+        set_entry(&mut page, u32::from(fragments) + 1, (at + needed) as u32)?;
+
+        self.reoffer(number, &mut page, fresh)?;
+        self.source.write_page(number, &page)?;
+
+        Ok(Pointer {
+            page: number,
+            fragment: fragments as u8,
+        })
+    }
+
+    /// Find a page with `needed` bytes free, or claim one.
+    ///
+    /// Walks the free-space chain from the head. Answers the page's number
+    /// and whether it is brand new -- a fresh page has no readable header
+    /// yet, so the caller builds it rather than reading it.
+    fn room_for(&mut self, needed: usize) -> Result<(u32, bool), String> {
+        let mut at = self.head;
+        let mut seen = HashSet::new();
+        while let Some(number) = at {
+            if !seen.insert(number) {
+                return Err(format!(
+                    "the free-space chain returns to page {number}"
+                ));
+            }
+            let page = self.source.page(number)?;
+            let header = Header::read(page, number, self.version)?;
+            // The new fragment's own bytes, plus the entry that will say
+            // where it ends.
+            if free_bytes(page, header)? as usize >= needed + 2 {
+                return Ok((number, false));
+            }
+            at = match header.free_chain {
+                FreeChain::Next(next) => Some(next),
+                FreeChain::Last | FreeChain::Off => None,
+            };
+        }
+
+        let blank = blank_page(self.source.page_size(), self.version);
+        let number = self.source.claim(&blank)?;
+        Ok((number, true))
+    }
+
+    /// Put a page on the free-space chain, or take it off, according to
+    /// whether it still has room.
+    ///
+    /// A page joins at the **head**, which is what the oracle ladder measured:
+    /// each delete that freed space made that page the head, giving
+    /// `3 -> 5 -> 4 -> end`.
+    fn reoffer(&mut self, number: u32, page: &mut Vec<u8>, fresh: bool) -> Result<(), String> {
+        let header = Header::read(page, number, self.version)?;
+        let roomy = is_roomy(page, header)?;
+
+        if roomy {
+            if fresh {
+                // A new page goes on the front; the old head follows it.
+                set_chain(
+                    page,
+                    match self.head {
+                        Some(next) => FreeChain::Next(next),
+                        None => FreeChain::Last,
+                    },
+                );
+                self.head = Some(number);
+            }
+            // An existing chain member that still has room keeps its place
+            // and its successor.
+            return Ok(());
+        }
+
+        // Out of room: unlink it. Only the head case is reachable today --
+        // `room_for` returns the first page on the chain with space, and a
+        // page deeper in the chain is only reached when the ones before it
+        // are too full to take this fragment, which cannot then fill *this*
+        // one. Refusing the other case is cheaper than writing an unlink
+        // whose correctness nothing here can demonstrate.
+        let successor = match header.free_chain {
+            FreeChain::Next(next) => Some(next),
+            FreeChain::Last | FreeChain::Off => None,
+        };
+        if fresh {
+            // Never joined the chain; nothing to unlink.
+            set_chain(page, FreeChain::Off);
+            return Ok(());
+        }
+        if self.head != Some(number) {
+            return Err(format!(
+                "page {number} filled up but is not the head of the free-space chain, and \
+                 unlinking from the middle of it has not been measured"
+            ));
+        }
+        set_chain(page, FreeChain::Off);
+        self.head = successor;
+        Ok(())
+    }
+}
+
 /// The divisor behind the engine's default roominess threshold.
 ///
 /// `W32MKDE_decompiled.c:19937-19939`: when the file's own threshold is zero
@@ -1258,6 +1641,246 @@ mod tests {
         assert_eq!(header.number, 0x1234);
         assert_eq!(header.fragments, 1);
         assert_eq!(header.free_chain, FreeChain::Off, "a full page is not on the chain");
+    }
+
+    /// Pages in memory, stamped the way a real claim stamps them but without
+    /// an allocation table underneath.
+    ///
+    /// [`Space`] is what these tests are about. `v6::Map` has its own tests
+    /// and its own oracle validation, and routing through it here would make
+    /// an allocator bug and a table bug look the same.
+    struct Scratch {
+        pages: Vec<Vec<u8>>,
+        page_size: u16,
+        version: Version,
+    }
+
+    impl Scratch {
+        fn new(page_size: u16, version: Version) -> Self {
+            Self {
+                // Page 0 stands in for the file control record, so the first
+                // claimable id is 1 and a page number is never confusable
+                // with "no page".
+                pages: vec![vec![0u8; usize::from(page_size)]],
+                page_size,
+                version,
+            }
+        }
+
+        /// Stamp a page with the id it answers for, as `v6::Map::claim` does.
+        fn stamp(&self, page: &mut [u8], number: u32) {
+            match self.version {
+                Version::V5 => {
+                    page[PAGE_NUMBER..PAGE_NUMBER + 4]
+                        .copy_from_slice(&super::super::pages::to_long(number));
+                }
+                Version::V6 => {
+                    page[..2].copy_from_slice(&V_TAG);
+                    page[LOGICAL..LOGICAL + 2]
+                        .copy_from_slice(&(number as u16).to_le_bytes());
+                }
+            }
+        }
+
+        fn claimed(&self) -> usize {
+            self.pages.len() - 1
+        }
+    }
+
+    impl Pages for Scratch {
+        fn page(&mut self, number: u32) -> Result<&[u8], String> {
+            self.pages
+                .get(number as usize)
+                .map(Vec::as_slice)
+                .ok_or_else(|| format!("no page {number}"))
+        }
+    }
+
+    impl PagesMut for Scratch {
+        fn write_page(&mut self, number: u32, page: &[u8]) -> Result<(), String> {
+            let mut copy = page.to_vec();
+            self.stamp(&mut copy, number);
+            *self
+                .pages
+                .get_mut(number as usize)
+                .ok_or_else(|| format!("no page {number}"))? = copy;
+            Ok(())
+        }
+    }
+
+    impl PageSource for Scratch {
+        fn claim(&mut self, content: &[u8]) -> Result<u32, String> {
+            let number = self.pages.len() as u32;
+            let mut copy = content.to_vec();
+            self.stamp(&mut copy, number);
+            self.pages.push(copy);
+            Ok(number)
+        }
+
+        fn page_size(&self) -> u16 {
+            self.page_size
+        }
+    }
+
+    /// `encode` is `decode`'s inverse. The scramble is not symmetric, so a
+    /// backwards encode reads back as a different page -- and only an
+    /// asymmetric page number can show it.
+    #[test]
+    fn a_pointer_survives_the_round_trip_through_its_scramble() {
+        for (page, fragment) in [(0u32, 0u8), (1, 0), (3, 0), (0x1234, 3), (0xab_cdef, 0xfe)] {
+            let there = Pointer { page, fragment };
+            assert_eq!(Pointer::decode(there.encode()), there, "page {page:#x}");
+        }
+    }
+
+    /// The bytes genuine 6.15 wrote for a fragment continued onto logical
+    /// page 3, read straight out of the oracle ladder.
+    #[test]
+    fn a_continuation_to_page_three_encodes_the_way_the_engine_wrote_it() {
+        let at = Pointer {
+            page: 3,
+            fragment: 0,
+        };
+        assert_eq!(at.encode(), [0x00, 0x03, 0x00, 0x00]);
+
+        let end = Pointer {
+            page: END_PAGE,
+            fragment: END_FRAGMENT,
+        };
+        assert_eq!(end.encode(), [0xff; POINTER], "and the terminator it wrote");
+        assert!(Pointer::decode(end.encode()).is_end());
+    }
+
+    /// The shape that stops MajorMUD's boot: a body short enough to need no
+    /// split. In v6 the fragment still leads with four bytes of pointer, and
+    /// with nothing after it those bytes are the terminator.
+    #[test]
+    fn placing_a_short_v6_body_writes_one_terminated_fragment() {
+        let mut source = Scratch::new(512, Version::V6);
+        let body = [0xa1u8; 7];
+
+        let at = Space::new(&mut source, Version::V6, None)
+            .place(&body)
+            .expect("seven bytes fit anywhere");
+
+        let mut got = Vec::new();
+        Chain::follow(&mut source, Version::V6, at, &mut got).expect("the chain reads");
+        assert_eq!(got, body, "what was placed is what comes back");
+
+        let page = source.page(at.page).expect("the page reads");
+        assert_eq!(fragment_count(page), 1);
+        assert_eq!(
+            &page[FIRST_FRAGMENT as usize..FIRST_FRAGMENT as usize + POINTER],
+            &[0xff; POINTER],
+            "a v6 fragment always leads with a pointer, and this chain ends here"
+        );
+    }
+
+    /// A second body goes on the *same* page while that page has room. The
+    /// free-space chain exists so that a file does not spend a page per
+    /// record, and a `Space` that always claimed would pass the test above
+    /// and fail this one.
+    #[test]
+    fn a_second_body_reuses_the_page_the_first_left_room_on() {
+        let mut source = Scratch::new(512, Version::V6);
+        let mut head = None;
+
+        let mut at = Vec::new();
+        for fill in [0xa1u8, 0xa2, 0xa3] {
+            let mut space = Space::new(&mut source, Version::V6, head);
+            at.push(space.place(&[fill; 20]).expect("twenty bytes fit"));
+            head = space.head();
+        }
+
+        assert_eq!(source.claimed(), 1, "three small bodies, one page");
+        assert!(
+            at.iter().all(|p| p.page == at[0].page),
+            "and all three fragments are on it: {at:?}"
+        );
+        assert_eq!(
+            at.iter().map(|p| p.fragment).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "each takes the next fragment index"
+        );
+
+        for (p, fill) in at.iter().zip([0xa1u8, 0xa2, 0xa3]) {
+            let mut got = Vec::new();
+            Chain::follow(&mut source, Version::V6, *p, &mut got).expect("reads");
+            assert_eq!(got, vec![fill; 20], "fragment {} survived its neighbours", p.fragment);
+        }
+    }
+
+    /// A body that outgrows a page is refused, not truncated. Splitting is
+    /// the next task; a silently short record is never an answer.
+    #[test]
+    fn a_body_too_large_for_one_page_is_refused_rather_than_cut_down() {
+        let mut source = Scratch::new(512, Version::V6);
+        let why = Space::new(&mut source, Version::V6, None)
+            .place(&[0xcc; 600])
+            .expect_err("600 bytes cannot fit a 512-byte page");
+        assert!(why.contains("splitting"), "{why}");
+        assert_eq!(source.claimed(), 0, "and nothing was claimed on the way out");
+    }
+
+    /// A page **already on the chain** that fills up is unlinked from it.
+    ///
+    /// Distinct from the fresh-page case below, and not a duplicate of it: a
+    /// fresh page that never had room takes an early return and never touches
+    /// the unlink. Deleting the unlink entirely left every other test in this
+    /// file green, which is what this one exists to stop.
+    #[test]
+    fn a_chain_member_that_fills_up_is_unlinked_from_it() {
+        let mut source = Scratch::new(512, Version::V6);
+
+        // A 20-byte body leaves the page far more than the 512/20 = 25 bytes
+        // the engine calls roomy, so it stays on the chain.
+        let mut space = Space::new(&mut source, Version::V6, None);
+        let small = space.place(&[0xe1; 20]).expect("20 fits");
+        let head = space.head();
+        assert_eq!(head, Some(small.page), "a roomy page is offered");
+
+        // 450 more, on that same page, leaves 16 -- under the threshold.
+        let mut space = Space::new(&mut source, Version::V6, head);
+        let big = space.place(&[0xe2; 450]).expect("450 still fits");
+        assert_eq!(big.page, small.page, "it went on the page that had room");
+        assert_eq!(space.head(), None, "which is now off the chain, leaving none");
+
+        let page = source.page(small.page).expect("reads");
+        let header = Header::read(page, small.page, Version::V6).expect("a header");
+        assert_eq!(header.free_chain, FreeChain::Off, "and the page says so itself");
+
+        // Both records still read back whole.
+        for (at, fill) in [(small, 0xe1u8), (big, 0xe2)] {
+            let mut got = Vec::new();
+            Chain::follow(&mut source, Version::V6, at, &mut got).expect("reads");
+            assert_eq!(got.len(), if fill == 0xe1 { 20 } else { 450 });
+            assert!(got.iter().all(|b| *b == fill), "fragment {} intact", at.fragment);
+        }
+    }
+
+    /// A page that never had room does not go on the chain at all.
+    #[test]
+    fn a_page_that_fills_up_is_taken_off_the_free_space_chain() {
+        let mut source = Scratch::new(512, Version::V6);
+
+        // 512 less the 12-byte header and the two entries a lone fragment
+        // needs is 496; a 470-byte body plus its four-byte pointer leaves 22,
+        // under the 512/20 = 25 the engine calls roomy.
+        let mut space = Space::new(&mut source, Version::V6, None);
+        let first = space.place(&[0xd1; 470]).expect("470 fits");
+        assert_eq!(
+            space.head(),
+            None,
+            "the page it used has no room left, so nothing is offered"
+        );
+
+        let page = source.page(first.page).expect("reads");
+        let header = Header::read(page, first.page, Version::V6).expect("a header");
+        assert_eq!(
+            header.free_chain,
+            FreeChain::Off,
+            "a full page says it is not on the chain"
+        );
     }
 
     /// A variable page with the given entry offsets, laid out the way the
