@@ -163,6 +163,36 @@ impl Watched {
         self.set(Duration::ZERO, Duration::ZERO)
     }
 
+    /// Is the clock running?
+    ///
+    /// Asks the kernel with `timer_gettime` rather than tracking a flag,
+    /// because a flag would agree with whatever `arm`/`disarm` believed they
+    /// did rather than with what actually happened. The mirror of
+    /// `crate::m32::watchdog::Watched::armed`, which has the fuller account
+    /// of why it exists; here it is what lets [`crate::m16::Machine::jump`]
+    /// re-arm a cold machine without restarting a budget that is already
+    /// running.
+    ///
+    /// # Errors
+    ///
+    /// If `timer_gettime` fails, which for a timer this type owns and has
+    /// not deleted should not happen.
+    pub(crate) fn armed(&self) -> io::Result<bool> {
+        let mut spec = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        };
+        // SAFETY: `self.timer` is a live timer this value owns, and `spec` is
+        // a local the kernel only writes.
+        let rc = unsafe { libc::timer_gettime(self.timer, &raw mut spec) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // `it_value` all-zero is how `timer_gettime` spells "disarmed" -- the
+        // same encoding `set` uses in the other direction.
+        Ok(spec.it_value.tv_sec != 0 || spec.it_value.tv_nsec != 0)
+    }
+
     /// Has a tick been recorded against this context since it was armed?
     ///
     /// Volatile because the writer is a signal handler on this same thread: the

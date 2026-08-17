@@ -290,6 +290,28 @@ unsafe fn rewrite(
         // disassembly of the module image is annotated with.
         (*ctx16).out_cs = u64::from(faulting_cs);
         (*ctx16).out_ip = gregs[libc::REG_RIP as usize] as u64;
+
+        // The general-purpose registers and the stack at the same instant.
+        // The trampoline fills these `out_*` fields on an ordinary return,
+        // but a fault never reaches it, so without this
+        // [`crate::m16::Machine::regs`] would report whatever the *previous*
+        // crossing left -- a plausible register set belonging to another
+        // moment. Only the low 16 bits mean anything: the module runs in
+        // 16-bit mode, and the rest is the host's business.
+        //
+        // `SS` comes from the interrupted frame rather than from `Ctx`,
+        // because a module that faulted *while switching stacks* is exactly
+        // when the two disagree, and the honest answer is the one the CPU
+        // was actually using.
+        (*ctx16).out_ax = (gregs[libc::REG_RAX as usize] as u64) & 0xffff;
+        (*ctx16).out_bx = (gregs[libc::REG_RBX as usize] as u64) & 0xffff;
+        (*ctx16).out_cx = (gregs[libc::REG_RCX as usize] as u64) & 0xffff;
+        (*ctx16).out_dx = (gregs[libc::REG_RDX as usize] as u64) & 0xffff;
+        (*ctx16).out_si = (gregs[libc::REG_RSI as usize] as u64) & 0xffff;
+        (*ctx16).out_di = (gregs[libc::REG_RDI as usize] as u64) & 0xffff;
+        (*ctx16).out_bp = (gregs[libc::REG_RBP as usize] as u64) & 0xffff;
+        (*ctx16).out_sp = (gregs[libc::REG_RSP as usize] as u64) & 0xffff;
+        (*ctx16).out_ss = u64::from((packed >> SS_SHIFT) as u16);
     }
 
     // DS is not part of the x86-64 signal frame, so `sigreturn` will not put it

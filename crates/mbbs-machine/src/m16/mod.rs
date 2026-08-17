@@ -225,6 +225,58 @@ pub enum Exit {
     Timeout { cs: u16, ip: u16 },
 }
 
+/// Every register a 16-bit crossing carries, in both directions.
+///
+/// Read with [`Machine::regs`], written with [`Machine::set_regs`] or the
+/// individual setters, and honoured wholesale by [`Machine::jump`]. The
+/// 16-bit mirror of `crate::m32::Regs`, with the segments that ABI does not
+/// need: a 32-bit crossing runs flat on one host code selector, while this
+/// one enters through the module's own `CS`, on its own `SS`, with its own
+/// `DS`.
+///
+/// [`Machine::call`] and [`Machine::resume`] compute most of these and
+/// overwrite whatever was set -- `CS:IP` from the [`FarPtr`] they were given
+/// or read off the module's stack, `SS:SP` from this machine's one stack
+/// segment, `AX`/`DX` from a host call's [`Ret`] -- and restore
+/// `BX`/`CX`/`SI`/`DI`/`BP`/`DS` from what the module last left. [`Machine::jump`]
+/// overwrites nothing.
+///
+/// # `ES` is absent
+///
+/// The crossing never loads it (`m16/asm.rs`'s `Ctx` has no field for it),
+/// so a setter here would write nothing the module could observe. See
+/// `crate::m32::Regs`'s own note on `ECX` for the same rule applied to the
+/// other ABI: a register this machine cannot actually carry gets no field,
+/// because a setter that silently does nothing is worse than its absence.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Regs {
+    /// The code segment entered through.
+    pub cs: u16,
+    /// The offset within it.
+    pub ip: u16,
+    /// The stack segment.
+    pub ss: u16,
+    /// The stack pointer, as a segment offset -- never a linear address.
+    pub sp: u16,
+    /// A host call's result, or a module return's.
+    pub ax: u16,
+    /// Scratch under cdecl, but Borland's runtime helpers preserve it -- see
+    /// `m16/asm.rs`'s `Ctx::bx`.
+    pub bx: u16,
+    /// Scratch, and destroyed by every call thunk -- see [`Machine::cx`].
+    pub cx: u16,
+    /// The high half of a 32-bit result, or a far pointer's segment.
+    pub dx: u16,
+    /// Callee-saved under Borland's cdecl.
+    pub si: u16,
+    /// See [`Regs::si`].
+    pub di: u16,
+    /// See [`Regs::si`] -- the module's frame pointer.
+    pub bp: u16,
+    /// The module's data segment, Borland's `DGROUP`. Callee-saved too.
+    pub ds: u16,
+}
+
 /// Why a machine will not be entered again.
 ///
 /// The first two are the same shape as the [`Exit`] that produced them, kept so
@@ -1027,6 +1079,182 @@ impl Machine {
         self.frame_sp.expect("sp() with no outstanding call")
     }
 
+    /// The register set the next crossing will carry -- see [`Regs`].
+    ///
+    /// The single-register getters above answer about the *outstanding call*
+    /// and panic without one; this answers about the next entry, always, and
+    /// after a crossing it holds what the module left (see
+    /// [`Machine::jump`]).
+    pub fn regs(&self) -> Regs {
+        Regs {
+            cs: self.ctx.target_selector,
+            ip: self.ctx.target_offset as u16,
+            ss: self.ctx.ss16,
+            sp: self.ctx.sp as u16,
+            ax: self.ctx.ax as u16,
+            bx: self.ctx.bx as u16,
+            cx: self.ctx.cx as u16,
+            dx: self.ctx.dx as u16,
+            si: self.ctx.si as u16,
+            di: self.ctx.di as u16,
+            bp: self.ctx.bp as u16,
+            ds: self.ctx.ds as u16,
+        }
+    }
+
+    /// Replace the whole register set. Delegates to the individual setters,
+    /// for the reason `crate::m32::Machine::set_regs` gives: several of them
+    /// have a second field to keep in step, and a second copy of that rule
+    /// here is a place for the two to drift apart.
+    pub fn set_regs(&mut self, regs: Regs) {
+        self.set_cs(regs.cs);
+        self.set_ip(regs.ip);
+        self.set_ss(regs.ss);
+        self.set_sp(regs.sp);
+        self.set_ax(regs.ax);
+        self.set_bx(regs.bx);
+        self.set_cx(regs.cx);
+        self.set_dx(regs.dx);
+        self.set_si(regs.si);
+        self.set_di(regs.di);
+        self.set_bp(regs.bp);
+        self.set_ds(regs.ds);
+    }
+
+    /// The code segment to enter through. Overwritten by [`Machine::call`]
+    /// and [`Machine::resume`], which take a [`FarPtr`] or read one off the
+    /// module's own stack.
+    pub fn set_cs(&mut self, cs: u16) {
+        self.ctx.target_selector = cs;
+    }
+
+    /// The offset within [`Machine::set_cs`]'s segment. Overwritten by the
+    /// same two.
+    pub fn set_ip(&mut self, ip: u16) {
+        self.ctx.target_offset = u32::from(ip);
+    }
+
+    /// The stack segment. Overwritten by both structured entry points with
+    /// the module's own -- this machine has exactly one stack segment, and a
+    /// jump to another is a caller's deliberate choice.
+    pub fn set_ss(&mut self, ss: u16) {
+        self.ctx.ss16 = ss;
+    }
+
+    /// The stack pointer, as a **segment offset** -- never a linear address;
+    /// see [`asm::Ctx::sp`]. Overwritten by both structured entry points.
+    pub fn set_sp(&mut self, sp: u16) {
+        self.ctx.sp = u64::from(sp);
+    }
+
+    /// Overwritten by [`Machine::resume`], which carries a host call's result
+    /// here (`DX:AX` for a 32-bit one) -- see [`Ret`].
+    pub fn set_ax(&mut self, ax: u16) {
+        self.ctx.ax = u64::from(ax);
+    }
+
+    /// The high half of a 32-bit result. Overwritten alongside
+    /// [`Machine::set_ax`].
+    pub fn set_dx(&mut self, dx: u16) {
+        self.ctx.dx = u64::from(dx);
+    }
+
+    /// `BX`, which Borland's runtime helpers leave alone and so a module may
+    /// hold a live value in across a call (see [`asm::Ctx::bx`]).
+    ///
+    /// Writes the outbound mirror too, so the value survives a
+    /// [`Machine::resume`] -- that entry point restores `BX` from what the
+    /// module last left, and a setter that wrote only the entry field would
+    /// be undone on the way back in.
+    pub fn set_bx(&mut self, bx: u16) {
+        self.ctx.bx = u64::from(bx);
+        self.ctx.out_bx = u64::from(bx);
+    }
+
+    /// `CX`, whose recovered copy is kept separately because every call thunk
+    /// destroys the register to name itself -- so this writes
+    /// [`Machine::cx`]'s source as well, for the reason
+    /// [`Machine::set_bx`] gives.
+    pub fn set_cx(&mut self, cx: u16) {
+        self.ctx.cx = u64::from(cx);
+        self.call_cx = cx;
+    }
+
+    /// One of the callee-saved trio. Survives a [`Machine::resume`], like
+    /// [`Machine::set_bx`].
+    pub fn set_si(&mut self, si: u16) {
+        self.ctx.si = u64::from(si);
+        self.ctx.out_si = u64::from(si);
+    }
+
+    /// See [`Machine::set_si`].
+    pub fn set_di(&mut self, di: u16) {
+        self.ctx.di = u64::from(di);
+        self.ctx.out_di = u64::from(di);
+    }
+
+    /// See [`Machine::set_si`].
+    pub fn set_bp(&mut self, bp: u16) {
+        self.ctx.bp = u64::from(bp);
+        self.ctx.out_bp = u64::from(bp);
+    }
+
+    /// The module's data segment -- Borland's `DGROUP`. Callee-saved, and
+    /// survives a [`Machine::resume`] like [`Machine::set_si`].
+    pub fn set_ds(&mut self, ds: u16) {
+        self.ctx.ds = u64::from(ds);
+        self.ctx.out_ds = u64::from(ds);
+    }
+
+    /// Enter the module with exactly the registers [`Machine::regs`] reports
+    /// -- the non-local jump, and the 16-bit mirror of
+    /// `crate::m32::Machine::jump`. See that method's doc comment: the
+    /// reasoning, the watchdog rule and the poison refusal are identical, one
+    /// register narrower and with the segments a 16-bit crossing also needs.
+    ///
+    /// # `CS` and `SS` are checked, and that is not politeness
+    ///
+    /// Both must name a segment this machine actually described. The two
+    /// structured entry points cannot get this wrong -- they vend `CS` from a
+    /// [`FarPtr`] this machine handed out and `SS` from its own one stack
+    /// segment -- but a caller setting registers by hand can, and the
+    /// consequence is not an ordinary fault.
+    ///
+    /// Fault recovery works by *claiming* the faulting `CS`
+    /// (`m16/fault.rs`'s `owner`/selector check): a fault taken under a
+    /// selector this machine does not recognise is not ours to recover, so
+    /// the handler passes it on and the **host process dies**. Measured, not
+    /// reasoned: making `set_cs` a no-op turned this crate's own test binary
+    /// into a SIGSEGV rather than a failed assertion. A bad `DS` is not
+    /// checked and does not need to be -- it faults on first use, under a
+    /// `CS` that is still this machine's, which recovers normally.
+    ///
+    /// # Errors
+    ///
+    /// If this machine is [`Machine::poisoned`], if `CS` or `SS` names no
+    /// segment of this machine's, or if the watchdog's timer cannot be read
+    /// or armed.
+    pub fn jump(&mut self) -> io::Result<Exit> {
+        if let Some(poison) = &self.poisoned {
+            return Err(io::Error::other(format!(
+                "refusing to enter a poisoned module: {poison}"
+            )));
+        }
+        for (name, selector) in [("CS", self.ctx.target_selector), ("SS", self.ctx.ss16)] {
+            self.mem.segment(selector).map_err(|_| {
+                io::Error::other(format!(
+                    "refusing to jump with {name}={selector:#06x}: it names no segment of \
+                     this machine's, and a fault taken under a selector this machine \
+                     cannot claim would kill the host process rather than poison the module"
+                ))
+            })?;
+        }
+        if !self.ctx.armed()? {
+            self.ctx.arm(self.budget)?;
+        }
+        self.enter()
+    }
+
     /// `SI` as the module last left it.
     pub fn si(&self) -> u16 {
         self.ctx.out_si as u16
@@ -1125,6 +1353,16 @@ impl Machine {
         self.ctx.bx = self.ctx.out_bx;
         self.ctx.cx = u64::from(self.call_cx);
 
+        self.enter()
+    }
+
+    /// Cross with the register set already in `self.ctx`, and classify how it
+    /// came back.
+    ///
+    /// The tail [`Machine::run`] and [`Machine::jump`] share, and the mirror
+    /// of `crate::m32::Machine::enter` -- see that one's doc comment for why
+    /// the split falls here.
+    fn enter(&mut self) -> io::Result<Exit> {
         // The trampoline writes SS as a bare 16-bit store, so the rest of the
         // slot has to start clean.
         self.ctx.out_sp = 0;
@@ -1132,11 +1370,24 @@ impl Machine {
         self.ctx.out_signo = 0;
         self.ctx.out_cx = 0;
 
-        // SAFETY: every field the assembly reads is set immediately above; the
-        // code and stack segments are mapped, described and live for as long as
-        // `self`; and the trampoline the module will far-jump to was written
-        // into the code segment by `new`.
+        // SAFETY: every field the assembly reads is set by whichever entry
+        // point called this, or immediately above; the code and stack
+        // segments are mapped, described and live for as long as `self`; and
+        // the trampoline the module will far-jump to was written into the
+        // code segment by `new`.
         unsafe { mbbs16_enter(self.ctx.as_ptr()) };
+
+        // What the module left, folded back into the set the next entry would
+        // carry, so [`Machine::regs`] answers about the module rather than
+        // about the values this crossing started with. The callee-saved four
+        // are always meaningful; `AX` and `CX` are not, and are handled per
+        // exit below, because a call thunk destroys both to name itself.
+        self.ctx.si = self.ctx.out_si;
+        self.ctx.di = self.ctx.out_di;
+        self.ctx.bp = self.ctx.out_bp;
+        self.ctx.ds = self.ctx.out_ds;
+        self.ctx.bx = self.ctx.out_bx;
+        self.ctx.dx = self.ctx.out_dx;
 
         if self.ctx.out_signo != 0 {
             let signo = self.ctx.out_signo as i32;
@@ -1144,6 +1395,18 @@ impl Machine {
             // The CPU pushed a 16-bit IP; the wider field is only how the
             // handler could store it.
             let ip = self.ctx.out_ip as u16;
+
+            // A fault is the one exit that reached no thunk, so `AX`, `CX`
+            // and `SS:SP` are the module's own here and nowhere else -- the
+            // handler captured them from the interrupted context
+            // (`m16/fault.rs`'s `rewrite`).
+            self.ctx.ax = self.ctx.out_ax;
+            self.ctx.cx = self.ctx.out_cx;
+            self.call_cx = self.ctx.out_cx as u16;
+            self.ctx.sp = self.ctx.out_sp;
+            self.ctx.ss16 = self.ctx.out_ss as u16;
+            self.ctx.target_selector = cs;
+            self.ctx.target_offset = u32::from(ip);
 
             // Which signal it was is the whole distinction. Everything else --
             // the recovery, the poisoning, the lost state -- is identical.
@@ -1166,6 +1429,14 @@ impl Machine {
         // been destroyed if the answer lived in AX, so it lives in CX.
         if self.ctx.out_cx as u16 == KIND_RETURN {
             self.frame_sp = None;
+            // `AX` is the module's own on this path -- the return thunk does
+            // not destroy it, which is the whole reason the kind travels in
+            // `CX`. `CX` itself is gone: it holds the discriminant, and
+            // nothing recovers what the module had, so it is left as whatever
+            // the last entry carried rather than filled with a lie.
+            self.ctx.ax = self.ctx.out_ax;
+            self.ctx.sp = self.ctx.out_sp;
+            self.ctx.ss16 = self.ctx.out_ss as u16;
             // The entry point is over, so its budget is too. Leaving the timer
             // armed would charge the next call for this one's leftovers.
             self.ctx.disarm()?;
@@ -1195,6 +1466,16 @@ impl Machine {
         self.call_cx = self.mem.stack().read_u16(usize::from(out_sp));
         self.call_ax = self.mem.stack().read_u16(usize::from(out_sp) + 2);
         self.frame_sp = Some(frame);
+
+        // The module's own `AX`/`CX`, recovered from where the thunk pushed
+        // them, rather than the index and discriminant the thunk itself left
+        // in those registers. `SP` is the frame -- past the thunk's own two
+        // words -- which is what every other reader of this machine means by
+        // the module's stack pointer at a call.
+        self.ctx.ax = u64::from(self.call_ax);
+        self.ctx.cx = u64::from(self.call_cx);
+        self.ctx.sp = u64::from(frame);
+        self.ctx.ss16 = self.ctx.out_ss as u16;
 
         Ok(Exit::Call {
             index: self.ctx.out_ax as u16,
@@ -1230,4 +1511,268 @@ fn current_cs() -> u16 {
         std::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags))
     };
     cs
+}
+
+/// [`Machine::jump`] and the register setters it exists to honour -- the
+/// 16-bit mirror of `crate::m32`'s own `register_tests`, and held to the same
+/// standard: every claim is proven by what the *module* did with a value,
+/// never by reading back the field it was written into.
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    const THUNK: u16 = 0;
+    const SCRATCH: u16 = 0x200;
+
+    /// Every module below is loaded behind this much padding, and entered by
+    /// setting `IP` past it. Without the offset a no-op [`Machine::set_ip`]
+    /// would be invisible: a fresh `Ctx` already holds zero, so entering "at
+    /// 0" is what a broken setter does anyway. The filler is `hlt`, which a
+    /// module cannot execute -- so a jump that lands on it faults instead of
+    /// quietly running the right code for the wrong reason.
+    const ENTRY: u16 = 0x10;
+
+    /// `code` behind [`ENTRY`] bytes of `hlt`.
+    fn at_entry(code: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xf4u8; ENTRY as usize];
+        out.extend_from_slice(code);
+        out
+    }
+
+    /// A module that stores one register to `DS:SCRATCH` and then far-calls
+    /// the thunk. `modrm` is `89 /r` with the 16-bit `disp16` r/m form
+    /// (`00 rrr 110`), so `rrr` names which register is stored.
+    fn stores(machine: &Machine, modrm: u8) -> Vec<u8> {
+        let mut code = vec![0x89, modrm];
+        code.extend_from_slice(&SCRATCH.to_le_bytes());
+        code.push(0x9a); // lcall $CS, $thunk
+        code.extend_from_slice(&machine.thunk_address(THUNK).to_bytes());
+        code
+    }
+
+    fn scratch_word(machine: &Machine) -> u16 {
+        let ptr = FarPtr {
+            offset: SCRATCH,
+            selector: machine.data_selector(),
+        };
+        let bytes = machine.mem().resolve(ptr, 2).expect("scratch is mapped");
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    /// Point every register at a working machine: the module's own code,
+    /// stack and data segments, and a stack pointer with room under it.
+    fn aim(machine: &mut Machine) {
+        machine.set_cs(machine.code_selector());
+        machine.set_ip(ENTRY);
+        machine.set_ss(machine.mem().stack_selector());
+        machine.set_sp(INITIAL_SP);
+        machine.set_ds(machine.data_selector());
+    }
+
+    /// **Every** setter reaches the module, one row per register.
+    ///
+    /// `CS`, `IP` and `DS` need no row of their own: every row only runs
+    /// because [`Machine::set_cs`]/[`Machine::set_ip`] aimed it at the code,
+    /// and only lands its store because [`Machine::set_ds`] gave it the data
+    /// segment to store into. A no-op in any of the three faults instead.
+    #[test]
+    fn every_register_setter_reaches_the_module() {
+        type Setter = fn(&mut Machine, u16);
+        let rows: &[(&str, Setter, u8)] = &[
+            ("ax", |m, v| m.set_ax(v), 0x06),
+            ("cx", |m, v| m.set_cx(v), 0x0e),
+            ("dx", |m, v| m.set_dx(v), 0x16),
+            ("bx", |m, v| m.set_bx(v), 0x1e),
+            ("sp", |m, v| m.set_sp(v), 0x26),
+            ("bp", |m, v| m.set_bp(v), 0x2e),
+            ("si", |m, v| m.set_si(v), 0x36),
+            ("di", |m, v| m.set_di(v), 0x3e),
+        ];
+
+        for (name, set, modrm) in rows {
+            let mut machine = Machine::new().expect("16-bit machine");
+            let code = at_entry(&stores(&machine, *modrm));
+            machine.load_code(&code).expect("module fits");
+
+            aim(&mut machine);
+            // `SP` has to stay a usable stack -- the `lcall` below pushes on
+            // it -- so its row is checked at a real, distinct offset rather
+            // than a magic constant. The store happens first either way.
+            let value = if *name == "sp" { INITIAL_SP - 0x20 } else { 0x1000 | u16::from(*modrm) };
+            set(&mut machine, value);
+
+            let exit = machine.jump().expect("a jump into the loaded code");
+            assert!(
+                matches!(exit, Exit::Call { index: THUNK }),
+                "{name}: the module did not run and call out: {exit:?}"
+            );
+            assert_eq!(
+                scratch_word(&machine),
+                value,
+                "{name} did not reach the module -- its setter wrote a field \
+                 the crossing does not load"
+            );
+        }
+    }
+
+    /// The callee-saved registers set between crossings survive a
+    /// [`Machine::resume`], which is why those setters write the outbound
+    /// mirror as well as the entry field. `resume` restores them from what
+    /// the module last left, so writing only the entry field would be undone
+    /// on the way back in -- working under `jump` and doing nothing under the
+    /// entry point production actually uses.
+    #[test]
+    fn callee_saved_registers_set_between_crossings_survive_a_resume() {
+        type Setter = fn(&mut Machine, u16);
+        let rows: &[(&str, Setter, u8)] = &[
+            ("bx", |m, v| m.set_bx(v), 0x1e),
+            ("cx", |m, v| m.set_cx(v), 0x0e),
+            ("si", |m, v| m.set_si(v), 0x36),
+            ("di", |m, v| m.set_di(v), 0x3e),
+            ("bp", |m, v| m.set_bp(v), 0x2e),
+        ];
+
+        for (name, set, modrm) in rows {
+            let mut machine = Machine::new().expect("16-bit machine");
+
+            // lcall thunk; mov [SCRATCH], reg; lcall thunk; lret
+            let mut code = vec![0x9a];
+            code.extend_from_slice(&machine.thunk_address(THUNK).to_bytes());
+            code.extend_from_slice(&stores(&machine, *modrm));
+            code.push(0xcb);
+            machine.load_code(&code).expect("module fits");
+
+            let entry = machine.code_ptr(0);
+            let exit = machine.call(entry, &[]).expect("called");
+            assert!(matches!(exit, Exit::Call { index: THUNK }), "{name}: {exit:?}");
+
+            let value = 0x2000 | u16::from(*modrm);
+            set(&mut machine, value);
+            let exit = machine.resume(Ret::Void).expect("resumed");
+            assert!(matches!(exit, Exit::Call { index: THUNK }), "{name}: {exit:?}");
+
+            assert_eq!(
+                scratch_word(&machine),
+                value,
+                "{name}: resume restored the module's own value over the one set"
+            );
+        }
+    }
+
+    /// After a fault, the registers reported are the module's at the faulting
+    /// instruction. Without `m16/fault.rs`'s own capture they would be
+    /// whatever the previous crossing left.
+    #[test]
+    fn regs_after_a_fault_are_the_modules_own_at_the_faulting_instruction() {
+        const ENTERED: u16 = 0x3333;
+        const MODULE_SET: u16 = 0x4444;
+
+        let mut machine = Machine::new().expect("16-bit machine");
+        // mov si, MODULE_SET; then a far call through a null selector, which
+        // faults inside 16-bit mode.
+        let mut code = vec![0xbe];
+        code.extend_from_slice(&MODULE_SET.to_le_bytes());
+        code.push(0x9a);
+        code.extend_from_slice(&[0, 0, 0, 0]);
+        machine.load_code(&at_entry(&code)).expect("module fits");
+
+        aim(&mut machine);
+        machine.set_si(ENTERED);
+
+        let exit = machine.jump().expect("a jump into the loaded code");
+        assert!(
+            matches!(exit, Exit::Fault { .. }),
+            "the module was meant to fault: {exit:?}"
+        );
+        assert_eq!(
+            machine.regs().si,
+            MODULE_SET,
+            "the fault path reported a register from an earlier moment"
+        );
+    }
+
+    /// A jump is an entry like any other, so a poisoned machine refuses it.
+    #[test]
+    fn a_poisoned_machine_refuses_to_be_jumped_into() {
+        let mut machine = Machine::new().expect("16-bit machine");
+        let mut code = vec![0x9a];
+        code.extend_from_slice(&[0, 0, 0, 0]); // lcall through a null selector
+        machine.load_code(&at_entry(&code)).expect("module fits");
+
+        aim(&mut machine);
+        machine.jump().expect("the first jump faults");
+        assert!(machine.poisoned().is_some(), "a fault must poison");
+
+        let refused = machine.jump().expect_err("a poisoned machine refuses");
+        assert!(
+            refused.to_string().contains("poisoned"),
+            "the refusal must say why: {refused}"
+        );
+    }
+
+    /// A `CS` or `SS` this machine never described is refused, rather than
+    /// entered and then not recoverable.
+    ///
+    /// This test exists because a mutation produced it: making `set_cs` a
+    /// no-op did not fail an assertion, it killed the test binary with
+    /// SIGSEGV. Fault recovery claims faults by their `CS`, so one taken
+    /// under a selector this machine does not own is passed on to the
+    /// process. An entry point a caller aims by hand needs the check the two
+    /// structured ones get for free.
+    #[test]
+    fn a_jump_through_a_selector_this_machine_does_not_own_is_refused() {
+        for bad in ["CS", "SS"] {
+            let mut machine = Machine::new().expect("16-bit machine");
+            let mut code = vec![0x9a];
+            code.extend_from_slice(&machine.thunk_address(THUNK).to_bytes());
+            machine.load_code(&at_entry(&code)).expect("module fits");
+
+            aim(&mut machine);
+            // An ordinary-looking LDT selector that this machine does not in
+            // fact describe -- asked for rather than assumed, because the
+            // first version of this test picked `0x0f` by eye and that IS one
+            // of the three segments every machine here builds, so the jump
+            // was accepted and killed the test binary.
+            let unknown = (1u16..)
+                .map(|i| (i << 3) | 0b111)
+                .find(|sel| machine.mem().segment(*sel).is_err())
+                .expect("some selector is not this machine's");
+            if bad == "CS" {
+                machine.set_cs(unknown);
+            } else {
+                machine.set_ss(unknown);
+            }
+
+            let refused = machine.jump().expect_err("an unknown selector is refused");
+            let text = refused.to_string();
+            assert!(
+                text.contains(bad) && text.contains("names no segment"),
+                "the refusal must name which selector and why: {text}"
+            );
+            assert!(
+                machine.poisoned().is_none(),
+                "a refused jump is not a fault -- the machine is still usable"
+            );
+        }
+    }
+
+    /// A caller driving the machine by jumps alone still gets a watchdog.
+    #[test]
+    fn a_cold_jump_arms_the_watchdog() {
+        let mut machine = Machine::new().expect("16-bit machine");
+        let mut code = vec![0x9a];
+        code.extend_from_slice(&machine.thunk_address(THUNK).to_bytes());
+        machine.load_code(&at_entry(&code)).expect("module fits");
+
+        assert!(
+            !machine.ctx.armed().expect("gettime"),
+            "a fresh machine's watchdog is stopped"
+        );
+        aim(&mut machine);
+        machine.jump().expect("a jump into the loaded code");
+        assert!(
+            machine.ctx.armed().expect("gettime"),
+            "a cold jump left the module running unwatched"
+        );
+    }
 }
