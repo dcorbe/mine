@@ -802,6 +802,7 @@ pub(crate) fn write_fcr(
     records: u32,
     key_record_counts: &[(usize, u32)],
     free_head: Option<u32>,
+    variable_head: Option<Option<u32>>,
 ) -> Result<(), String> {
     let page_size_usize = usize::from(page_size);
     if file.len() < 2 * page_size_usize || !file.len().is_multiple_of(page_size_usize) {
@@ -844,6 +845,18 @@ pub(crate) fn write_fcr(
     if let Some(free) = free_head {
         let free_at = stale_at + super::pages::fcr::FREE_V6;
         file[free_at..free_at + 4].copy_from_slice(&super::pages::to_long(free));
+    }
+
+    // The *variable* free-space chain's head, which is a different list from
+    // the one above: that threads free record slots, this threads variable
+    // pages with room left. Doubly optional on purpose -- the outer `None`
+    // means "this caller did not touch the chain", and `Some(None)` means
+    // "the chain is now empty", which are different instructions and would be
+    // indistinguishable through one layer.
+    if let Some(head) = variable_head {
+        let at = stale_at + super::pages::fcr::VARIABLE_HEAD;
+        let value = head.unwrap_or(super::pages::fcr::NO_VARIABLE_HEAD);
+        file[at..at + 4].copy_from_slice(&super::pages::to_long(value));
     }
 
     for &(offset, count) in key_record_counts {

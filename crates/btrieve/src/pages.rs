@@ -53,6 +53,38 @@ pub mod fcr {
     /// with all of its slots already threaded onto this list, ending at
     /// `0xffffffff`.
     pub const FREE_V6: usize = 0x9c;
+
+    /// Head of the **variable free-space chain**: which variable page still
+    /// has room for a fragment. A [`long`](super::long), holding a *page*
+    /// number rather than the record position [`FREE_V6`] holds.
+    ///
+    /// A different list from [`FREE_V6`] entirely, and the two must not be
+    /// confused: that one threads free *record slots* on data pages, this one
+    /// threads variable pages with space left. Each member names the next at
+    /// its own `0x06`; see `variable::FreeChain`.
+    ///
+    /// Measured 2026-08-17 against genuine Btrieve 6.15
+    /// (`docs/2026-08-17-variable-write-oracle.md`): on a 512-byte-page file
+    /// of 22-byte records, six inserts and three deletes walked it 4 -> 5 ->
+    /// 3 -> 3, with the chain itself reading 3 -> 5 -> 4 -> end at the last
+    /// step, so a page freeing space becomes the head. **Not recoverable from
+    /// the decompile**, which reads this head out of the engine's in-memory
+    /// file block; on-disk `0x1c`, which that same routine reads as the
+    /// general free-page chain, is this format's record count.
+    ///
+    /// Cross-checked against every populated `wcctext2.vir` here, in each of
+    /// which it names a page the file tags `'V'`.
+    pub const VARIABLE_HEAD: usize = 0xa0;
+
+    /// What [`VARIABLE_HEAD`] reads when no page is offered.
+    ///
+    /// The engine's own in-memory "nothing", which for *this* field does
+    /// reach the disk: every virgin variable-length file here holds it. Page
+    /// `0` is treated as nothing too -- logical 0 is the control record and
+    /// can never be a variable page -- because a file this host created from
+    /// scratch leaves zeroes rather than this value.
+    pub const NO_VARIABLE_HEAD: u32 = 0xff00_ffff;
+
     /// Record count, high half. The low half is two bytes later.
     pub const RECORDS_HIGH: usize = 0x1a;
     /// Record count, low half.

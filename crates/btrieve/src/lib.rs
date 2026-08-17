@@ -1193,14 +1193,46 @@ impl<M: Mem> Block<M> {
         let fcr = self.v6_live_fcr(&file).map_err(&fail)?;
         let head = pages::long(&fcr[pages::fcr::FREE_V6..pages::fcr::FREE_V6 + 4]);
 
+        // A variable-length record's body goes down **first**, on a variable
+        // page, and what lands in the data-page slot is the fixed part plus
+        // four bytes of pointer to it.
+        //
+        // Body first because the two writes cannot be made atomic: if placing
+        // the body fails there is nothing to unwind, whereas a slot written
+        // first and then orphaned leaves a record pointing at fragments that
+        // were never allocated. Note the whole file is still in memory here
+        // and is not written to disk until the very end, so a failure past
+        // this point discards the fragment with everything else.
+        let (slot, variable_head) = if self.geometry.variable {
+            let reclen = usize::from(self.geometry.reclen);
+            let was = variable::head_of(&fcr);
+            let mut source =
+                variable::V6Pages::new(&mut file, page_size).map_err(&fail)?;
+            let mut space = variable::Space::new(&mut source, Version::V6, was);
+            let at = space.place(&bytes[reclen..]).map_err(|why| {
+                fail(format!(
+                    "placing the {}-byte body of a {}-byte record: {why}",
+                    bytes.len() - reclen,
+                    bytes.len()
+                ))
+            })?;
+            let now = space.head();
+
+            let mut slot = bytes[..reclen].to_vec();
+            slot.extend_from_slice(&at.encode());
+            (slot, Some(now))
+        } else {
+            (bytes.clone(), None)
+        };
+
         // Where the record goes, and what the free-list head becomes: pop the
         // head if it names a free slot, and claim a whole new pre-threaded
         // page if the list is empty. Both are what genuine 6.15 does; see
         // `Self::v6_pop_free` and `Self::v6_claim_threaded_page`.
         let (new_position, new_head) = if head == records::NOWHERE {
-            self.v6_claim_threaded_page(&mut file, layout, &bytes).map_err(&fail)?
+            self.v6_claim_threaded_page(&mut file, layout, &slot).map_err(&fail)?
         } else {
-            self.v6_pop_free(&mut file, layout, head, &bytes).map_err(&fail)?
+            self.v6_pop_free(&mut file, layout, head, &slot).map_err(&fail)?
         };
 
         // The model, updated on a copy first: every key's index below is
@@ -1230,6 +1262,7 @@ impl<M: Mem> Block<M> {
             total_records,
             &key_record_counts,
             Some(new_head),
+            variable_head,
         )
         .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
@@ -1627,7 +1660,7 @@ impl<M: Mem> Block<M> {
 
         let total_records =
             u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
-        v6::write_fcr(&mut file, page_size, total_records, &key_record_counts, None)
+        v6::write_fcr(&mut file, page_size, total_records, &key_record_counts, None, None)
             .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
         self.capture_for_journal()?;
@@ -1734,6 +1767,8 @@ impl<M: Mem> Block<M> {
             total_records,
             &key_record_counts,
             Some(position),
+            // A delete does not yet touch the variable free-space chain.
+            None,
         )
         .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
@@ -1972,21 +2007,27 @@ impl<M: Mem> Block<M> {
         self.records()?;
         let name = self.name.clone();
 
-        if self.geometry.variable {
-            return Err(BtvError {
-                file: name,
-                why: format!(
-                    "holds variable-length records up to {} bytes, and this host does \
-                     not write them -- inserting this {}-byte buffer would silently \
-                     truncate it to fit the file's own reclen, the same wrong answer \
-                     update already refuses to give",
-                    self.geometry.reclen,
-                    bytes.len()
-                ),
-            });
-        }
-
-        let bytes = normalized(bytes, self.geometry.reclen);
+        // A variable-length record is **not** normalised. `reclen` is the
+        // length of its fixed part, not of the record, and cutting the buffer
+        // down to it is exactly the silent truncation this used to refuse the
+        // whole write to avoid. What is past `reclen` is the record's body,
+        // and `Self::insert_v6` puts it on a variable page.
+        let bytes = if self.geometry.variable {
+            let reclen = usize::from(self.geometry.reclen);
+            if bytes.len() < reclen {
+                return Err(BtvError {
+                    file: name,
+                    why: format!(
+                        "a {}-byte buffer is shorter than the {reclen}-byte fixed part \
+                         every record of this file has",
+                        bytes.len()
+                    ),
+                });
+            }
+            bytes.to_vec()
+        } else {
+            normalized(bytes, self.geometry.reclen)
+        };
 
         // v6 diverges completely below this point -- a record's position
         // names a *logical* page, not a byte offset, so every remaining line
@@ -1995,6 +2036,25 @@ impl<M: Mem> Block<M> {
         // v6 equivalent, with its own narrower scope; see its doc comment.
         if self.geometry.version == Version::V6 {
             return self.insert_v6(bytes);
+        }
+
+        // v5 variable-length files still refuse: `variable::Space` has a v6
+        // page source and no v5 one, and v5 takes a physical page off the
+        // file's own free chain rather than claiming a logical id through an
+        // allocation table. Refusing here rather than in `Space` keeps the
+        // v5 arithmetic below reachable only for the shape it was written
+        // for.
+        if self.geometry.variable {
+            return Err(BtvError {
+                file: name,
+                why: format!(
+                    "is a version 5 file holding variable-length records up to {} bytes, \
+                     and this host writes them only to version 6 files so far -- v5 takes \
+                     a fresh variable page off the file's own free chain, which has not \
+                     been measured",
+                    self.geometry.reclen
+                ),
+            });
         }
 
         // Reached only for v5 now, but kept explicit rather than deleted:
@@ -5040,6 +5100,109 @@ mod tests {
     /// `dinsbtv` on `WCCTEXT.DAT` would silently cut a 2,022-byte buffer down
     /// to a 22-byte `reclen` and answer 1, success -- the next task writes
     /// `WCCTEXT`, and that is not a plausible answer to give it.
+    /// A `Block` over a real file, with the geometry and keys the file itself
+    /// declares rather than invented ones.
+    ///
+    /// `block` above hand-builds both, which is right for a scratch fixture
+    /// it also hand-builds. A test whose whole point is that a *genuine*
+    /// engine's file is handled correctly must not get to choose what that
+    /// file says about itself.
+    fn block_from_file(path: PathBuf, name: &str) -> Block<Flat> {
+        let geometry = Geometry::read(name, &path).expect("a readable Btrieve file");
+        let whole = std::fs::read(&path).expect("the file reads");
+        let page = usize::from(geometry.page);
+
+        // A v6 control record is shadowed across pages 0 and 1 and the higher
+        // generation is live; a v5 file has only the one copy.
+        let fcr = match geometry.version {
+            Version::V5 => whole[..FCR].to_vec(),
+            Version::V6 => {
+                let generation = |at: usize| {
+                    u16::from_le_bytes([
+                        whole[at + at::GENERATION],
+                        whole[at + at::GENERATION + 1],
+                    ])
+                };
+                let live = if generation(0) > generation(page) { 0 } else { page };
+                whole[live..live + FCR].to_vec()
+            }
+        };
+        let tables = acs_tables(&path, &geometry, &fcr).expect("its collating tables load");
+        let keys = keys::parse(name, &fcr, geometry.keys, &tables).expect("its keys parse");
+
+        Block {
+            id: ops::BlockId::fresh(),
+            name: name.to_owned(),
+            path,
+            maxlen: geometry.reclen,
+            geometry,
+            keys,
+            block: FlatPtr::NULL,
+            data: FlatPtr::NULL,
+            key: FlatPtr::NULL,
+            records: None,
+            cursor: Cursor::Nowhere,
+            dirty: false,
+            txn_active: false,
+            pre_image: None,
+        }
+    }
+
+    /// A record this host inserts into a file **genuine Btrieve 6.15 wrote**,
+    /// read back whole from disk.
+    ///
+    /// `tests/data/variable/V6VAR.DAT` was created and filled by
+    /// `tools/btrieve-oracle/varfree.c` running against the real engine under
+    /// Wine: 512-byte pages, reclen 22, one unique key, and six records whose
+    /// bodies are already fragments spread over two variable pages. The
+    /// engine's own free-space chain is live in it. See
+    /// `docs/2026-08-17-variable-write-oracle.md`.
+    ///
+    /// The body here is 300 bytes -- larger than the room left on the page
+    /// the chain offers, so this exercises claiming a page as well as
+    /// placing on one.
+    #[test]
+    fn insert_writes_a_variable_length_record_into_a_file_the_engine_made() {
+        let dir = crate::testing::scratch("v6-variable-insert-real");
+        let path = dir.join("V6VAR.DAT");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/variable/V6VAR.DAT"),
+            &path,
+        )
+        .expect("the fixture copies into a scratch directory");
+
+        let mut block = block_from_file(path, "V6VAR.DAT");
+        assert!(block.geometry.variable, "the fixture holds variable-length records");
+        assert_eq!(block.geometry.version, Version::V6);
+
+        let before = block.records().expect("the engine's own records read").len();
+        assert!(before > 0, "the fixture is not empty: {before} records");
+
+        let reclen = usize::from(block.geometry.reclen);
+        let mut record = vec![0xeeu8; reclen];
+        record[..4].copy_from_slice(&99u32.to_le_bytes());
+        record.extend_from_slice(&[0x5a; 300]);
+
+        block.insert(&record).expect("a 322-byte record over a 22-byte reclen");
+
+        // Dropped, so this is a fresh walk of what actually reached the disk
+        // rather than the model that was just updated in memory.
+        block.records = None;
+        let after = block.records().expect("a fresh read from disk");
+        assert_eq!(after.len(), before + 1, "the record went in");
+
+        let mine = (0..after.len())
+            .filter_map(|at| after.physical(at))
+            .find(|r| r.bytes.starts_with(&99u32.to_le_bytes()))
+            .expect("the new record is found by its key");
+        assert_eq!(
+            mine.bytes.len(),
+            record.len(),
+            "all 322 bytes come back, not the 22-byte fixed part"
+        );
+        assert_eq!(mine.bytes, record, "byte for byte");
+    }
+
     #[test]
     fn insert_refuses_a_variable_length_file_rather_than_truncate() {
         let dir = crate::testing::scratch("block-insert-refuses-variable-length");

@@ -85,16 +85,17 @@ const TAG: usize = 0x01;
 /// chain starts.
 const FREE_CHAIN: usize = 0x06;
 
-/// Where the file control record keeps the head of the free-space chain.
+/// Read the free-space chain's head out of a file control record.
 ///
-/// A [`super::pages::long`] in the **live** half of the control-record shadow
-/// pair. Not recoverable from the decompile, which reads the head out of the
-/// engine's in-memory file block: measured in
-/// `docs/2026-08-17-variable-write-oracle.md` by filling one variable page and
-/// spilling onto a second, then cross-checked against every populated
-/// `wcctext2.vir` here, in each of which it names a page the file tags `'V'`.
-#[allow(dead_code, reason = "consumed by `Space`; landed with its measurement first")]
-pub(crate) const FREE_HEAD: usize = 0xa0;
+/// The offset and its "nothing" value live in [`super::pages::fcr`] beside
+/// the record free list they must not be confused with.
+pub(crate) fn head_of(fcr: &[u8]) -> Option<u32> {
+    use super::pages::fcr;
+    match super::pages::long(&fcr[fcr::VARIABLE_HEAD..fcr::VARIABLE_HEAD + 4]) {
+        fcr::NO_VARIABLE_HEAD | 0 => None,
+        page => Some(page),
+    }
+}
 
 /// Where a page says how many fragments it holds.
 const FRAGMENT_COUNT: usize = 0x0a;
@@ -933,7 +934,7 @@ fn set_fragment_count(page: &mut [u8], fragments: u16) {
 /// # The free-space chain
 ///
 /// A file offers its part-full variable pages through a chain: a head in the
-/// live file control record at [`FREE_HEAD`], and each member naming the next
+/// live file control record at [`super::pages::fcr::VARIABLE_HEAD`], and each member naming the next
 /// at [`FREE_CHAIN`]. `Space` walks it to find a page with room and takes a
 /// page off it once it no longer has any.
 ///
@@ -961,7 +962,7 @@ impl<'a, S: PageSource> Space<'a, S> {
     }
 
     /// The free-space head after whatever this `Space` has done, for the
-    /// caller to write back to [`FREE_HEAD`].
+    /// caller to write back to [`super::pages::fcr::VARIABLE_HEAD`].
     pub(crate) fn head(&self) -> Option<u32> {
         self.head
     }
