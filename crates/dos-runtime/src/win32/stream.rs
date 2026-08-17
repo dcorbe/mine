@@ -539,6 +539,23 @@ pub fn dispatch(
             let fp = machine.arg_u32(mem.stack(), 0);
             Some(Answer::cdecl(process.streams.fclose(fp)))
         }
+        // int fseek(FILE *fp, long offset, int whence)
+        //
+        // `whence` is SEEK_SET/SEEK_CUR/SEEK_END as 0/1/2, matching what
+        // `Streams::seek` (and `dos::files::Files::seek` beneath it) already
+        // expects, so it passes through unmodified. `fseek` returns 0 on
+        // success and non-zero on failure -- the opposite polarity to the
+        // `Option` this host's `seek` returns.
+        "_fseek" => {
+            let fp = machine.arg_u32(mem.stack(), 0);
+            let offset = machine.arg_u32(mem.stack(), 1) as i32;
+            let whence = machine.arg_u32(mem.stack(), 2) as u8;
+            let ok = process
+                .streams
+                .seek(mem, fp, i64::from(offset), whence)
+                .is_some();
+            Some(Answer::cdecl(u32::from(!ok)))
+        }
         // int vsprintf(char *buf, const char *fmt, va_list ap)
         //
         // A `va_list` on 32-bit cdecl is a bare pointer to the first variable

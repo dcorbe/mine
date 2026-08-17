@@ -696,7 +696,7 @@ mod tests {
             out,
             Outcome::Unimplemented {
                 module: "cw3220mt.DLL".to_owned(),
-                symbol: "_fseek".to_owned(),
+                symbol: "_fread".to_owned(),
             },
             "with a catalogue present the program never throws, so it runs on \
              past where the unwind gate used to be, into ordinary C runtime \
