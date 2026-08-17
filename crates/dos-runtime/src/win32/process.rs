@@ -655,12 +655,20 @@ mod tests {
     /// was set -- added deliberately, for API completeness, rather than
     /// speculatively. `m16` has the same.
     ///
-    /// What is still missing is the part that was never a setter: the layout
-    /// of the register block Borland's unwind reads. Nothing tracked
-    /// describes it -- see `docs/2026-08-16-phase3-4-handoff.md`'s note that
-    /// the sibling `jmp_buf` layout exists only in a gitignored Turbo C
-    /// header -- so wiring this symbol still needs a measurement, not more
-    /// machine surface.
+    /// **And the other half is wrong.** Disassembled from the runtime this
+    /// repo ships (`re/wg/CW3220MT.DLL`, export 430),
+    /// `__Return_unwind` restores no registers at all: it is twelve
+    /// instructions of ordinary cdecl that call a destructor-table walk and
+    /// then pop the SEH chain with `mov %eax,%fs:0x0`. Its callee reaches
+    /// module code through an indirect `call`, which `Machine::call`/`resume`
+    /// already service.
+    ///
+    /// The non-local transfer lives in `_longjmp` and in
+    /// `KERNEL32!RtlUnwind` -- an import, so a *host* symbol -- and the
+    /// `jmp_buf` layout both of them use is now measured, from four
+    /// independent builds. See `docs/2026-08-17-borland-unwind-layout.md`.
+    /// What remains is implementing `RtlUnwind`, which is what the register
+    /// API exists for.
     ///
     /// The program reaches it because it throws: `WCCMMUD.MCV` does not exist
     /// (only the uncompiled `WCCMMUD.MSG` does), so it reports the failure,
