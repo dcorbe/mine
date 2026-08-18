@@ -1140,6 +1140,82 @@ impl<M: Mem> Block<M> {
         }
     }
 
+    /// Replace this file's whole contents, atomically.
+    ///
+    /// Every v6 write is a read-modify-write of the entire file
+    /// ([`Self::insert_v6`]'s doc comment says why: claiming, relocating and
+    /// the control record are each an append-elsewhere-and-flip, not an
+    /// in-place edit). A plain `std::fs::write` truncates the target and then
+    /// refills it, so for as long as that takes there is no complete file on
+    /// disk -- and if the process stops in that window, what is left is a
+    /// prefix whose control record describes a file much larger than the bytes
+    /// that remain.
+    ///
+    /// That is not hypothetical. Killing `mbbs-server` during a
+    /// `WCCMP002.DAT` write left 7,168 pages on disk under a control record
+    /// still claiming 13,572, and the next open refused it:
+    ///
+    /// ```text
+    /// allocation-table block 1 claims physical page 13603, and the file has
+    /// only 7168 pages
+    /// ```
+    ///
+    /// 55 MB is a wide window, and MajorMUD-NT rewrites that file on every
+    /// update. So the new bytes go to a sibling temporary file, are flushed to
+    /// the platter, and are then moved over the original with a rename --
+    /// atomic on any single filesystem, which a Btrieve file and its own
+    /// directory always share. A reader either sees all of the old file or all
+    /// of the new one, never a prefix of either.
+    ///
+    /// The temporary is named from the target so two processes writing
+    /// different files never collide, and it is removed if anything fails.
+    ///
+    /// # Errors
+    ///
+    /// If the temporary cannot be written, flushed, or renamed over the
+    /// target. The original is left untouched in every one of those cases.
+    fn write_whole(&self, file: &[u8]) -> Result<(), BtvError> {
+        let fail = |why: String| BtvError {
+            file: self.name.clone(),
+            why,
+        };
+        // The suffix is *appended* to the whole file name rather than
+        // replacing its extension: `with_extension` would turn both `FOO.DAT`
+        // and `FOO.IX` into the same `FOO.btv-tmp-N`, and two writes racing
+        // through one temporary is the corruption this function exists to
+        // stop, reintroduced by its own scratch file.
+        let mut name = self
+            .path
+            .file_name()
+            .ok_or_else(|| fail(format!("{}: has no file name", self.path.display())))?
+            .to_owned();
+        name.push(format!(".btv-tmp-{}", std::process::id()));
+        let temp = self.path.with_file_name(name);
+
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut out = std::fs::File::create(&temp)?;
+            out.write_all(file)?;
+            // Flushed before the rename, not after: a rename that beats its
+            // own data to the platter is exactly the corruption this exists to
+            // prevent, just with a smaller window.
+            out.sync_all()?;
+            drop(out);
+            // The original's permissions, not the umask's -- a data file that
+            // silently became mode 600 on its first write would be a fine way
+            // to break a board that runs as more than one user.
+            if let Ok(meta) = std::fs::metadata(&self.path) {
+                let _ = std::fs::set_permissions(&temp, meta.permissions());
+            }
+            std::fs::rename(&temp, &self.path)
+        };
+
+        write().map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            fail(format!("{}: writing the file: {e}", self.path.display()))
+        })
+    }
+
     /// Insert a record into a v6 file.
     ///
     /// The v5 half of [`Self::insert`] seeks a physical offset and writes one
@@ -1319,9 +1395,7 @@ impl<M: Mem> Block<M> {
         // is taken here rather than at the top of the function.
         self.capture_for_journal()?;
 
-        std::fs::write(&self.path, &file).map_err(|e| {
-            fail(format!("{}: writing the file: {e}", self.path.display()))
-        })?;
+        self.write_whole(&file)?;
 
         self.records = Some(records_clone);
         self.geometry.records = total_records;
@@ -1712,8 +1786,7 @@ impl<M: Mem> Block<M> {
             .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
         self.capture_for_journal()?;
-        std::fs::write(&self.path, &file)
-            .map_err(|e| fail(format!("{}: writing the file: {e}", self.path.display())))?;
+        self.write_whole(&file)?;
 
         self.records = Some(records_clone);
         self.geometry.pages = u32::try_from(file.len())
@@ -1821,8 +1894,7 @@ impl<M: Mem> Block<M> {
         .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
         self.capture_for_journal()?;
-        std::fs::write(&self.path, &file)
-            .map_err(|e| fail(format!("{}: writing the file: {e}", self.path.display())))?;
+        self.write_whole(&file)?;
 
         self.records = Some(records_clone);
         self.geometry.records = total_records;
@@ -5782,6 +5854,67 @@ mod tests {
         assert_eq!(mine.bytes, record, "byte for byte");
     }
 
+
+    /// A v6 write that fails partway leaves the original file whole.
+    ///
+    /// Every v6 write replaces the entire file, and `std::fs::write` truncates
+    /// its target before refilling it. Killing `mbbs-server` inside that window
+    /// on `WCCMP002.DAT` left 7,168 pages under a control record still claiming
+    /// 13,572, and the next open refused the file outright. 55 MB is a wide
+    /// window and MajorMUD-NT rewrites that file on every update, so
+    /// [`Block::write_whole`] renames a fully-flushed temporary over the target
+    /// instead.
+    ///
+    /// A SIGKILL cannot be staged from a test, so the failure is staged where
+    /// it can be: a **directory** sitting on the temporary's own path makes
+    /// `File::create` fail, which stands in for any interruption before the
+    /// rename. What is asserted is the property that matters either way --
+    /// the original file is still there, still its original length, still
+    /// byte-for-byte what it was, and still readable.
+    #[test]
+    fn a_failed_v6_write_leaves_the_original_file_untouched() {
+        let dir = crate::testing::scratch("v6-atomic-write");
+        let path = dir.join("IDXPROBE.DAT");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/variable/IDXPROBE.DAT"),
+            &path,
+        )
+        .expect("the engine-built fixture copies into a scratch directory");
+        let original = std::fs::read(&path).expect("reads");
+
+        let mut block = block_from_file(path.clone(), "IDXPROBE.DAT");
+        let before = block.records().expect("records read").len();
+
+        // Occupy the temporary's path with a directory, which cannot be
+        // opened as a file.
+        let mut temp_name = path.file_name().expect("a file name").to_owned();
+        temp_name.push(format!(".btv-tmp-{}", std::process::id()));
+        let temp = path.with_file_name(temp_name);
+        std::fs::create_dir(&temp).expect("the temporary's path is taken");
+
+        let mut record = vec![0u8; usize::from(block.geometry.reclen)];
+        record[..4].copy_from_slice(&777u32.to_le_bytes());
+        record[4..8].copy_from_slice(&777u32.to_le_bytes());
+        let refused = block.insert(&record);
+        assert!(refused.is_err(), "the write could not have succeeded");
+
+        let after = std::fs::read(&path).expect("the original is still there");
+        assert_eq!(
+            after.len(),
+            original.len(),
+            "the original was truncated by a write that never completed"
+        );
+        assert_eq!(after, original, "the original changed despite a failed write");
+
+        // And it still opens and reads, which a truncated file does not.
+        std::fs::remove_dir(&temp).expect("cleanup");
+        let mut reopened = block_from_file(path, "IDXPROBE.DAT");
+        assert_eq!(
+            reopened.records().expect("still readable").len(),
+            before,
+            "every record survived"
+        );
+    }
 
     /// A v6 key whose index spans more than one page is maintained, not
     /// refused -- and the tree the engine built is *reused*, not replaced.
