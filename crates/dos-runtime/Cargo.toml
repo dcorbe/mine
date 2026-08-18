@@ -11,6 +11,7 @@ clap = { version = "4", features = ["derive"] }
 dos = { path = "../dos" }
 libc = "0.2"
 mbbs-machine = { path = "../mbbs-machine" }
+textscreen = { path = "../textscreen" }
 
 [lints]
 workspace = true

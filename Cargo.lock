@@ -269,6 +269,7 @@ dependencies = [
  "dos",
  "libc",
  "mbbs-machine",
+ "textscreen",
 ]
 
 [[package]]
