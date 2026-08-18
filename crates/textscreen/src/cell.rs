@@ -105,6 +105,26 @@ impl Cells {
         None
     }
 
+    /// Write one cell. Out of range is dropped.
+    ///
+    /// Dropping rather than panicking is deliberate: a widget handed a bad
+    /// rectangle should paint wrong, not kill the process. In an editor that
+    /// difference is the sysop's unsaved work.
+    pub fn put(&mut self, row: usize, col: usize, ch: u8, attr: u8) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+        self.cells[row * self.cols + col] = Cell { ch, attr };
+    }
+
+    /// Write bytes left to right, stopping at `max` characters or the right
+    /// edge, whichever comes first.
+    pub fn write_str(&mut self, row: usize, col: usize, s: &[u8], attr: u8, max: usize) {
+        for (i, &b) in s.iter().take(max).enumerate() {
+            self.put(row, col + i, b, attr);
+        }
+    }
+
     /// The background colour that most of the screen uses.
     fn dominant_background(&self) -> u8 {
         let mut counts = [0u32; 8];

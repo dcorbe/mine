@@ -11,3 +11,4 @@
 pub mod cell;
 pub mod cp437;
 pub mod paint;
+pub mod widget;
