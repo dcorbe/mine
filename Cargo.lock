@@ -486,6 +486,7 @@ dependencies = [
  "mbbs",
  "mbbs-machine",
  "mud-core",
+ "textscreen",
  "tokio",
 ]
 
@@ -548,6 +549,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "textscreen",
  "tokio",
  "toml",
 ]
@@ -568,6 +570,7 @@ dependencies = [
  "clap",
  "mud-core",
  "rusqlite",
+ "textscreen",
  "tokio",
 ]
 

@@ -870,7 +870,7 @@ mod tests {
     async fn pump_applies_modern_transcoding_to_every_chunk() {
         use crate::msg::{In, Out};
         use crate::termcompat::Stack;
-        use mud_core::cp437;
+        use textscreen::cp437;
         use std::sync::mpsc as std_mpsc;
         use tokio::io::AsyncReadExt;
         use tokio::net::{TcpListener, TcpStream};
@@ -904,7 +904,7 @@ mod tests {
             .expect("read until pump closes the socket");
         pump_task.await.expect("pump task did not panic").expect("pump exited cleanly");
 
-        let want = cp437::decode(&cp437_bytes).into_bytes();
+        let want = cp437::decode_wire(&cp437_bytes).into_bytes();
         assert_eq!(
             received, want,
             "pump must hand every Out::Bytes chunk to Stack::modern() before \
@@ -1017,7 +1017,7 @@ mod tests {
     async fn each_port_gets_its_own_stack() {
         use crate::msg::{In, Out};
         use crate::termcompat::Stack;
-        use mud_core::cp437;
+        use textscreen::cp437;
         use std::sync::mpsc as std_mpsc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
@@ -1080,7 +1080,7 @@ mod tests {
         // `IAC WILL SGA`/`IAC WILL ECHO` (`handle`'s telnet negotiation) go
         // out before either `Stack` ever sees a byte, identically on both
         // ports. The chunk this test cares about is the suffix, after login.
-        let modern_want = cp437::decode(&chunk).into_bytes();
+        let modern_want = cp437::decode_wire(&chunk).into_bytes();
         assert!(
             modern_bytes.ends_with(&modern_want),
             "the modern-stack listener must hand its client Stack::modern's UTF-8, \
@@ -1089,7 +1089,7 @@ mod tests {
         assert!(
             !modern_want.contains(&0xFF),
             "sanity check on the expected value itself: UTF-8 cannot contain a raw \
-             0xFF byte, so cp437::decode's output here never should either"
+             0xFF byte, so cp437::decode_wire's output here never should either"
         );
 
         let mut raw_want = Vec::new();

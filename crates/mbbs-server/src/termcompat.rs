@@ -21,7 +21,7 @@
 //! same reason `home_on_clear` does: it needs to differ between `modern`
 //! and `raw`, and it needs carry-over state across calls (see `pending`).
 
-use mud_core::cp437;
+use textscreen::cp437;
 
 /// Telnet's `IAC` byte (RFC 854) — coincides with CP437's non-breaking
 /// space, 0xFF. [`Stack::raw`] doubles it so a strict telnet client does not
@@ -144,7 +144,7 @@ impl Stack {
         };
 
         if self.transcode {
-            expand_c0_glyphs(&cp437::decode(&bytes)).into_bytes()
+            expand_c0_glyphs(&cp437::decode_wire(&bytes)).into_bytes()
         } else {
             let mut out = Vec::with_capacity(bytes.len());
             for &b in &bytes {
@@ -173,7 +173,7 @@ impl Stack {
     /// **This must run after `crate::iac::Filter::feed`, never before.**
     /// `cp437::encode` can *synthesize* a `0xFF` byte -- CP437's
     /// non-breaking space -- out of an ordinary typed character no
-    /// different from any other (see `mud_core::cp437`'s `HIGH` table,
+    /// different from any other (see `textscreen::cp437::TABLE`'s
     /// last entry). `0xFF` also happens to be telnet's `IAC` (RFC 854). If
     /// this ran before the IAC filter saw the client's real bytes, a typed
     /// non-breaking space would look exactly like the start of a genuine
@@ -287,7 +287,7 @@ impl Stack {
 /// printable glyph in the IBM PC's text-mode font -- smiley faces, card
 /// suits, arrows, musical notes -- because on real DOS hardware a byte
 /// written to video memory is just a font index, with no ASCII control
-/// meaning at all. `mud_core::cp437::decode` maps every byte `< 0x80` to
+/// meaning at all. `textscreen::cp437::decode_wire` maps every byte `< 0x80` to
 /// itself (see that module's doc comment: this matches Python's `cp437`
 /// *text* codec, which treats these bytes as controls, not glyphs -- verify
 /// with `python3 -c "print(repr(bytes([0x11]).decode('cp437')))"`, which
@@ -340,7 +340,7 @@ impl Stack {
 /// Cost Chart's `◄──────┤` connector rows -- and a live capture of that
 /// chart on port 2323 has exactly 3 rows misaligned, matching.
 ///
-/// **Why this lives here, not in `mud_core::cp437`.** `cp437::decode` is
+/// **Why this lives here, not in `textscreen::cp437`.** `cp437::decode_wire` is
 /// shared with `mud-client` and `mud-server` -- callers with no stake in
 /// how *this* transport's FSD renders on *this* port. The defect was
 /// created by `Stack::modern`'s outbound translation (the raw port hands
@@ -348,20 +348,20 @@ impl Stack {
 /// font and is unaffected), so the fix stays where the defect was made,
 /// same reasoning the per-port `Stack` split itself was built on.
 ///
-/// **Why this runs after `cp437::decode`, not before or merged into it.**
+/// **Why this runs after `cp437::decode_wire`, not before or merged into it.**
 /// This operates on the decoded `char`s, not the raw CP437 bytes: a C0
 /// byte decodes to the literal control character (`0x11` -> `'\u{11}'`)
 /// today, so mapping specific `char`s here is exactly equivalent to
 /// mapping the bytes that produced them, without needing to know anything
 /// about multi-byte UTF-8 layout. Running it on raw bytes instead (before
-/// `cp437::decode`) would require re-deriving UTF-8 boundary logic this
+/// `cp437::decode_wire`) would require re-deriving UTF-8 boundary logic this
 /// function has no reason to duplicate. Running it before
 /// `home_cursor_after_clear` (which matches literal `ESC[2J` bytes and
 /// carries partial-match state across calls) is not an option either: that
 /// matcher must see the host's original bytes, unmodified, or an
 /// `ESC[2J` split by a translated byte landing mid-pattern could desync
 /// its `ed2_match` counter. The order in `outbound` --
-/// `home_cursor_after_clear` (raw bytes) -> `cp437::decode` (bytes ->
+/// `home_cursor_after_clear` (raw bytes) -> `cp437::decode_wire` (bytes ->
 /// chars) -> `expand_c0_glyphs` (chars -> chars) -- keeps each stage
 /// working on the representation it was designed for.
 ///
@@ -411,14 +411,14 @@ mod tests {
     use super::*;
 
     /// A chunk of CP437 box drawing, decoded through `modern()`, matches
-    /// `cp437::decode` directly -- this is meant to be a pure move, not a
+    /// `cp437::decode_wire` directly -- this is meant to be a pure move, not a
     /// reimplementation.
     #[test]
     fn modern_round_trips_box_drawing_like_cp437_decode() {
         let box_drawing: Vec<u8> = vec![0xC9, 0xCD, 0xCD, 0xBB, 0xBA, 0x20, 0xC8, 0xCD, 0xBC];
         let mut stack = Stack::modern();
         let got = stack.outbound(&box_drawing);
-        let want = cp437::decode(&box_drawing).into_bytes();
+        let want = cp437::decode_wire(&box_drawing).into_bytes();
         assert_eq!(got, want);
     }
 
@@ -444,7 +444,7 @@ mod tests {
         assert_eq!(got, vec![b'a', 0xFF, 0xFF, b'b']);
     }
 
-    /// `modern()` never needed the doubling above because `cp437::decode`
+    /// `modern()` never needed the doubling above because `cp437::decode_wire`
     /// emits UTF-8, which cannot contain a raw 0xFF byte anywhere -- not
     /// even for the input byte that maps to it. Confirms the asymmetry
     /// between the two variants is real, not assumed.
@@ -759,7 +759,7 @@ mod tests {
     //
     // CP437 gives every byte 0x00-0x1F a printable glyph in the DOS
     // text-mode font -- arrows, card suits, musical notes -- distinct from
-    // what the same byte means as an ASCII control code. `cp437::decode`
+    // what the same byte means as an ASCII control code. `cp437::decode_wire`
     // (shared with `mud-client` and `mud-server`, see its own doc comment)
     // deliberately does not know about this: it maps every byte < 0x80 to
     // itself, so on a modern terminal a CP437 glyph byte that also happens
@@ -894,7 +894,7 @@ mod tests {
     /// `inbound` is the reverse direction (client -> host, UTF-8 -> CP437)
     /// and must not know anything about C0 glyph expansion, which is an
     /// outbound-only, video-font concept. A client that types (or pastes)
-    /// a literal U+25C4 is not asking for CP437 byte 0x11 -- `cp437::HIGH`
+    /// a literal U+25C4 is not asking for CP437 byte 0x11 -- `cp437::TABLE`
     /// (the only table `encode` consults) has no entry for it, so it maps
     /// to `?` exactly like any other character outside the codepage. This
     /// pins that `inbound` was not accidentally wired to the same map.
