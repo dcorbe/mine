@@ -18,51 +18,10 @@
 
 use std::io::{self, Write};
 
+use textscreen::paint::Painter;
+
 use crate::driver::{Driver, Key};
-use crate::screen::{Cell, Cells, Screen};
-
-/// CP437 as Unicode. Index is the byte the guest wrote.
-///
-/// **This is a second copy of a table the workspace already has**, in
-/// `mud_core::cp437::HIGH`. Above `0x7F` the two agree entry for entry, and a
-/// test below pins that. They are not merged because `mud_core` is the MUD
-/// game crate -- the wrong direction for a DOS runtime to depend in -- and
-/// because only the table is shareable, not the function around it.
-///
-/// `mud_core::cp437::decode` is *identity* below `0x80` on purpose: it decodes
-/// the wire, where ANSI escapes, line endings and the anti-bot backspaces must
-/// pass through untouched. A text screen is the opposite case. Bytes under
-/// `0x20` in a screen cell are glyphs -- `0x11` is `◄` -- so decoding a screen
-/// with `decode` blanks every arrow a menu draws with. Using the right table
-/// through the wrong function is the failure mode here, not a missing table.
-///
-/// `0x00` is the one deliberate departure from CP437 proper: a cleared cell is
-/// a NUL, and rendering its glyph would fill the screen with noise.
-const CP437: [char; 256] = [
-    ' ', '☺', '☻', '♥', '♦', '♣', '♠', '•', '◘', '○', '◙', '♂', '♀', '♪', '♫', '☼', //
-    '►', '◄', '↕', '‼', '¶', '§', '▬', '↨', '↑', '↓', '→', '←', '∟', '↔', '▲', '▼', //
-    ' ', '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', //
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?', //
-    '@', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', //
-    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', //
-    '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', //
-    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '⌂', //
-    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', //
-    'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ', //
-    'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', //
-    '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐', //
-    '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧', //
-    '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀', //
-    'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', //
-    '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{A0}',
-];
-
-/// DOS colour index to ANSI colour index.
-///
-/// The two orders differ: DOS counts blue as 1 and red as 4, ANSI the other way
-/// round. Passing the index through unchanged swaps every red and blue on the
-/// screen, which looks plausible enough to ship by mistake.
-const TO_ANSI: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+use crate::screen::{Cells, Screen};
 
 /// Put stdin in raw mode without touching the screen.
 ///
@@ -142,7 +101,7 @@ impl Drop for RawMode {
 /// Paints the guest's screen and feeds back what the user types.
 pub struct Terminal {
     _raw: RawMode,
-    last: Vec<Cell>,
+    painter: Painter,
     quit: bool,
     painted: std::time::Instant,
 }
@@ -155,7 +114,7 @@ impl Terminal {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
             _raw: RawMode::enter()?,
-            last: Vec::new(),
+            painter: Painter::new(),
             quit: false,
             painted: std::time::Instant::now(),
         })
@@ -168,55 +127,14 @@ impl Terminal {
     /// that host owns its cells outright instead of sampling `B800:0000`, and
     /// has a `Screen` nowhere in it. Nothing about turning a grid into ANSI
     /// cares which of the two filled the grid in.
+    ///
+    /// The flush stays here rather than in [`Painter`]: the painter
+    /// deliberately does not flush, because a caller batching several paints
+    /// should not pay for each one.
     fn paint(&mut self, grid: &Cells, cursor: (u8, u8), cursor_visible: bool) {
-        let mut out = String::with_capacity(8 * 1024);
-        out.push_str("\x1b[?25l");
-
-        let unchanged = self.last.len() == grid.cells.len();
-        for row in 0..grid.rows {
-            let start = row * grid.cols;
-            let end = start + grid.cols;
-            if unchanged && self.last[start..end] == grid.cells[start..end] {
-                continue;
-            }
-            out.push_str(&format!("\x1b[{};1H", row + 1));
-            let mut attr = None;
-            for col in 0..grid.cols {
-                let cell = grid.cell(row, col);
-                if attr != Some(cell.attr) {
-                    let fg = cell.foreground();
-                    let bg = cell.background();
-                    let fg_code = if fg >= 8 {
-                        90 + u16::from(TO_ANSI[usize::from(fg - 8)])
-                    } else {
-                        30 + u16::from(TO_ANSI[usize::from(fg)])
-                    };
-                    let bg_code = 40 + u16::from(TO_ANSI[usize::from(bg)]);
-                    out.push_str(&format!("\x1b[0;{fg_code};{bg_code}m"));
-                    attr = Some(cell.attr);
-                }
-                out.push(CP437[usize::from(cell.ch)]);
-            }
-            out.push_str("\x1b[0m");
-        }
-
-        // Park the real cursor where the guest put its own, and show it only if
-        // the guest wants it shown.
-        let (row, col) = cursor;
-        out.push_str(&format!(
-            "\x1b[{};{}H",
-            u16::from(row) + 1,
-            u16::from(col) + 1
-        ));
-        out.push_str(if cursor_visible {
-            "\x1b[?25h"
-        } else {
-            "\x1b[?25l"
-        });
-
-        print!("{out}");
-        let _ = io::stdout().flush();
-        self.last = grid.cells.clone();
+        let mut out = io::stdout().lock();
+        let _ = self.painter.paint(&mut out, grid, cursor, cursor_visible);
+        let _ = out.flush();
     }
 
     /// One byte from the terminal, or `None` at end of input.
@@ -374,48 +292,5 @@ impl Driver for Terminal {
         } else {
             "terminal input ended".to_string()
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_c0_range_carries_glyphs_rather_than_control_codes() {
-        // The trap this table exists to avoid: treating a PC text screen's
-        // bytes below 0x20 as unprintable loses the arrows menus draw with.
-        assert_eq!(CP437[0x11], '◄');
-        assert_eq!(CP437[0x1a], '→');
-        assert_eq!(CP437[0x00], ' ', "a cleared cell is blank, not a glyph");
-    }
-
-    #[test]
-    fn dos_colour_indices_are_remapped_not_passed_through() {
-        // DOS blue is 1 and red is 4; ANSI has them the other way round.
-        assert_eq!(TO_ANSI[1], 4, "DOS blue becomes ANSI blue");
-        assert_eq!(TO_ANSI[4], 1, "DOS red becomes ANSI red");
-        assert_eq!(TO_ANSI[0], 0);
-        assert_eq!(TO_ANSI[7], 7);
-    }
-
-    /// The high half is duplicated from `mud_core::cp437::HIGH`. These are the
-    /// entries a divergence would show up in first: the one that was actually
-    /// wrong (0xFF was a space, not a no-break space), and the ends of the
-    /// range. A real guard would compare the whole table, which needs the two
-    /// copies to live in one crate.
-    #[test]
-    fn the_high_half_agrees_with_the_workspace_copy() {
-        assert_eq!(CP437[0x80], 'Ç');
-        assert_eq!(CP437[0xff], '\u{A0}', "CP437 0xFF is a no-break space");
-        assert_eq!(CP437[0xe1], 'ß');
-        assert_eq!(CP437[0x9e], '₧');
-    }
-
-    #[test]
-    fn the_box_drawing_range_survives_translation() {
-        assert_eq!(CP437[0xc9], '╔');
-        assert_eq!(CP437[0xbb], '╗');
-        assert_eq!(CP437[0xdb], '█');
     }
 }
