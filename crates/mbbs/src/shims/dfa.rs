@@ -230,7 +230,7 @@ fn stricmp_eq(a: &[u8], b: &[u8]) -> bool {
 /// cannot have.
 pub fn dfaOpen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let filnam = call.ptr();
-    let maxlen = btv::u16_arg::<A>(call.int(), "dfaOpen")?;
+    let maxlen = btv::ushort_arg::<A>(call.int());
     let owner = call.ptr();
     if owner != Btrieve::<AbiMem<A>>::null() {
         return Err(ShimError::Failed(
@@ -948,7 +948,7 @@ fn dfa_insert<A: Abi>(
 /// unguarded reads.
 pub fn dfaInsertV<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let recptr = call.ptr();
-    let length = btv::u16_arg::<A>(call.int(), "dfaInsertV")?;
+    let length = btv::ushort_arg::<A>(call.int());
     let block = dfa_required(host, "dfaInsertV")?;
     dfa_insert(call, host, "dfaInsertV", block, recptr, length, true)?;
     Ok(abi::Ret::Void)
@@ -1057,7 +1057,7 @@ fn dfa_update_dup<A: Abi>(
 /// `dfa->key`/`dfa->lastkn` read unguarded -- so a missing file is refused.
 pub fn dfaUpdateV<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let recptr = call.ptr();
-    let length = btv::u16_arg::<A>(call.int(), "dfaUpdateV")?;
+    let length = btv::ushort_arg::<A>(call.int());
     let block = dfa_required(host, "dfaUpdateV")?;
     btv::update_variable(call, host, "dfaUpdateV", block, recptr, length)?;
     Ok(abi::Ret::Void)
@@ -1268,7 +1268,7 @@ pub fn dfaRecLen<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
 /// **`ASSERT` only, no runtime guard** (`:814`) -- a missing file is
 /// refused.
 pub fn dfaStat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let len = btv::u16_arg::<A>(call.int(), "dfaStat")?;
+    let len = btv::ushort_arg::<A>(call.int());
     let block = dfa_required(host, "dfaStat")?;
 
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
@@ -1489,7 +1489,7 @@ pub fn dfaCreate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
     let filnam = call.ptr();
     let databuf = call.ptr();
     let keyno = btv::i16_arg::<A>(call.int());
-    let lendbuf = btv::u16_arg::<A>(call.int(), "dfaCreate")?;
+    let lendbuf = btv::ushort_arg::<A>(call.int());
 
     let named = String::from_utf8_lossy(
         filnam.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?,

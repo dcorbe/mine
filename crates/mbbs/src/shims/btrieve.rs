@@ -241,6 +241,36 @@ pub(crate) fn u16_arg<A: Abi>(v: A::Int, who: &str) -> Result<u16, ShimError> {
         .map_err(|_| ShimError::Failed(format!("{who}: {wide}, which does not fit in 16 bits")))
 }
 
+/// Read the next argument as a `USHORT` the vendor *declared* -- sixteen
+/// bits, masked, not range-checked.
+///
+/// # Why this is not [`u16_arg`], which it otherwise looks exactly like
+///
+/// The two families this file serves differ in their headers, and the
+/// difference decides which reader is correct:
+///
+/// - `btv*` has no C prototype at all (`BTVSTF.H:23` is K&R:
+///   `BTVFILE *opnbtv();`), and its *definition* is
+///   `opnbtv(char *filnam, int maxlen)` (`PLBTVSTF.C:110-112`). `int` is
+///   genuinely thirty-two bits under `Wg32`, so a value above 65535 is a
+///   real out-of-range argument and [`u16_arg`] is right to refuse it.
+/// - `dfa*` is fully prototyped and spells these parameters `USHORT`
+///   (`DFAAPI.H:219, 309, 322, 352, 388`). The parameter is sixteen bits
+///   wide, so the top half of a `Wg32` stack slot holding one is not the
+///   caller's to promise -- the vendor's own prologue reads it with `movzx`
+///   and cannot see it. There is no out-of-range value to reject, because
+///   the upper half was never part of the value.
+///
+/// This is the same distinction `shims::memory`'s `ushort_arg` documents
+/// (and the same defect: reading `alcblok`'s `USHORT qty` at full width
+/// asked for 1.15 TB and stopped MajorMUD-NT's init). Here it is quieter
+/// and would have been harder to find -- a valid `dfaOpen`/`dfaInsertV`
+/// would be refused, intermittently and data-dependently, with an error
+/// naming the module's own record length as the culprit.
+pub(crate) fn ushort_arg<A: Abi>(v: A::Int) -> u16 {
+    Into::<u32>::into(v) as u16
+}
+
 /// The five modes `BTVSTF.H:41-45` defines for `omdbtv`.
 ///
 ///
@@ -3468,7 +3498,40 @@ fn decode_file_spec(bytes: &[u8]) -> Result<crate::btrieve::FileSpec, ShimError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg32;
     use crate::testing::Fixture;
+
+    /// The two 16-bit readers this file offers answer *differently* on the
+    /// same bits, and which one a call site picks is decided by the vendor's
+    /// declaration -- see `ushort_arg`'s own doc comment.
+    ///
+    /// `0x4052_02ef` is not invented: it is the literal `qty` slot
+    /// MajorMUD-NT's own module init produced for `alcblok`, a stale address
+    /// in the top half of a slot holding a `USHORT`. `dfa*`'s parameters sit
+    /// in exactly such slots.
+    #[test]
+    fn ushort_arg_masks_where_u16_arg_refuses() {
+        // Declared USHORT (`dfa*`): the upper half is not part of the value.
+        assert_eq!(ushort_arg::<Wg32>(0x4052_02ef), 751);
+        assert_eq!(ushort_arg::<Wg32>(70_000), 4464);
+        assert_eq!(ushort_arg::<Wg32>(4096), 4096);
+
+        // Declared int (`btv*`): the same bits ARE a real out-of-range value.
+        assert!(u16_arg::<Wg32>(0x4052_02ef, "opnbtv").is_err());
+        assert!(u16_arg::<Wg32>(70_000, "opnbtv").is_err());
+        assert_eq!(u16_arg::<Wg32>(4096, "opnbtv").expect("in range"), 4096);
+    }
+
+    /// Under `Wg16` there is no upper half for either reader to disagree
+    /// about, so the fix must be a `Wg32` correction and not a behaviour
+    /// change on the ABI that was already right.
+    #[test]
+    fn the_two_readers_agree_on_everything_wg16_can_produce() {
+        for v in [0u16, 1, 4096, u16::MAX] {
+            assert_eq!(ushort_arg::<Wg16>(v), v);
+            assert_eq!(u16_arg::<Wg16>(v, "opnbtv").expect("always in range"), v);
+        }
+    }
 
     /// Open `SAMPLE.DAT`, as a module would.
     fn open(f: &mut Fixture, name: &str, maxlen: u16) -> FarPtr {
