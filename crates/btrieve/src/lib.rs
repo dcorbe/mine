@@ -5799,6 +5799,126 @@ mod tests {
         }
     }
 
+    /// What one v6 record update actually costs on a real 53 MB file, and how
+    /// little of that file it actually changes.
+    ///
+    /// Measured 2026-08-18 on `WCCMP002.DAT` (4096-byte pages, 13,607 pages,
+    /// 26,720 records), release build, warm page cache:
+    ///
+    /// ```text
+    /// one update: 617ms, read 53 MB, wrote 53 MB (file is 53 MB)
+    /// 3 of 13713 pages differ: [1, 2, 8]
+    /// ```
+    ///
+    /// Those three are the stale half of the file control record's shadow pair
+    /// (0/1, tagged `"FC"`), the stale half of allocation-table block 0's
+    /// (2/3, tagged `"PP"`), and the data page the record lives on. Which half
+    /// of each pair moves alternates with every write, and a run that also
+    /// relocates the data page to its twin touches six rather than three --
+    /// either way it is **12-24 KB of a 53 MB file, rewritten in full: a write
+    /// amplification of two to four thousand**, and the whole 53 MB is
+    /// `sync_all`'d before the rename.
+    ///
+    /// The shape of those three is the whole argument for a paged writer: they
+    /// are shadow pairs, so the format already defines a crash-safe order --
+    /// put the new data page down, flush, then flip the table and control
+    /// record whose generation counters decide which copy is live.
+    ///
+    /// The first update of a freshly opened file is not representative -- it
+    /// claims 106 shadow twins that every later update then reuses -- so this
+    /// warms up once and measures the second.
+    ///
+    /// Ignored because it needs a `WCCMP002.DAT`, which is not in the repo
+    /// ([[capture-files-never-committed]] applies to board data too). Run it
+    /// with:
+    ///
+    /// ```text
+    /// WCCMP002=/path/to/WCCMP002.DAT \
+    ///   cargo test --release -p btrieve --lib -- --ignored --nocapture \
+    ///   v6_update_rewrites_the_whole_file_to_change_six_pages
+    /// ```
+    #[test]
+    #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+    fn v6_update_rewrites_the_whole_file_to_change_six_pages() {
+        let Ok(source) = std::env::var("WCCMP002") else {
+            eprintln!("set WCCMP002=/path/to/WCCMP002.DAT to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v6-update-io-cost");
+        let path = dir.join("WCCMP002.DAT");
+        std::fs::copy(&source, &path).expect("the file copies into scratch");
+
+        // `/proc/self/io` rather than `perf`, which produced zero samples on
+        // this box twice; the counters are bytes this process asked the kernel
+        // for, which is exactly the question.
+        let io = || -> (u64, u64) {
+            let text = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(name))
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            (field("rchar:"), field("wchar:"))
+        };
+
+        let mut block = block_from_file(path, "WCCMP002.DAT");
+        assert_eq!(block.geometry.version, Version::V6);
+        let page = usize::from(block.geometry.page);
+
+        let found = block
+            .records()
+            .expect("the records read")
+            .physical(0)
+            .expect("a first record");
+        let (position, bytes) = (found.position, found.bytes.to_vec());
+
+        block.update(position, &bytes).expect("a warm-up update");
+
+        let before = std::fs::read(&block.path).expect("the file reads");
+        let (read_before, wrote_before) = io();
+        let start = std::time::Instant::now();
+        block.update(position, &bytes).expect("a no-op update of record 0");
+        let took = start.elapsed();
+        let (read_after, wrote_after) = io();
+
+        let after = std::fs::read(&block.path).expect("the file reads back");
+        let common = before.len().min(after.len()) / page;
+        let differing: Vec<usize> = (0..common)
+            .filter(|n| before[n * page..(n + 1) * page] != after[n * page..(n + 1) * page])
+            .collect();
+
+        let (read, wrote) = (read_after - read_before, wrote_after - wrote_before);
+        eprintln!(
+            "one update: {took:?}, read {} MB, wrote {} MB (file is {} MB)",
+            read / 1_048_576,
+            wrote / 1_048_576,
+            before.len() / 1_048_576
+        );
+        eprintln!(
+            "{} of {common} pages differ: {differing:?}",
+            differing.len()
+        );
+
+        // The measurement this test exists to hold: a single-record update
+        // changes a handful of pages. If a paged writer ever lands, `wrote`
+        // drops to roughly `differing.len() * page` and this assertion is the
+        // one that says so.
+        assert!(
+            differing.len() * page < before.len() / 100,
+            "an update changed {} pages of {common} -- more than 1% of the file, \
+             so the premise that a paged write would help no longer holds",
+            differing.len()
+        );
+        assert!(
+            wrote as usize >= before.len(),
+            "the whole file is still being rewritten ({wrote} bytes for {} bytes \
+             of real change); if this now fails, the paged writer landed and this \
+             test should assert the new bound instead",
+            differing.len() * page
+        );
+    }
+
     /// A record this host inserts into a file **genuine Btrieve 6.15 wrote**,
     /// read back whole from disk.
     ///
