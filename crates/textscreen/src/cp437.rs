@@ -59,12 +59,22 @@ pub fn decode_wire(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The glyph a single text-screen cell paints as.
+///
+/// Every byte is a glyph, C0 included -- this is the screen reading of a
+/// single byte, with `0x00`'s departure (see `TABLE`) living here and
+/// nowhere else.
+#[must_use]
+pub fn glyph(byte: u8) -> char {
+    TABLE[byte as usize]
+}
+
 /// Decode the contents of text-screen cells.
 ///
 /// Every byte is a glyph, C0 included.
 #[must_use]
 pub fn decode_screen(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| TABLE[b as usize]).collect()
+    bytes.iter().map(|&b| glyph(b)).collect()
 }
 
 /// Encode text as CP437.

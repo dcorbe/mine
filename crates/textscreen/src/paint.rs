@@ -7,7 +7,7 @@
 use std::io::{self, Write};
 
 use crate::cell::{Cell, Cells};
-use crate::cp437::TABLE;
+use crate::cp437;
 
 /// DOS attribute colour order to ANSI's.
 ///
@@ -66,7 +66,7 @@ impl Painter {
                     buf.push_str(&format!("\x1b[0;{fg_code};{bg_code}m"));
                     attr = Some(cell.attr);
                 }
-                buf.push(TABLE[usize::from(cell.ch)]);
+                buf.push(cp437::glyph(cell.ch));
             }
             buf.push_str("\x1b[0m");
         }
