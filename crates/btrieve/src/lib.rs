@@ -5643,8 +5643,8 @@ mod tests {
     }
 
 
-    /// Reproduction of the wall MajorMUD-NT's boot hits: three successive
-    /// variable-length inserts into `WGSGEN2.DAT` leave the header's record
+    /// The wall MajorMUD-NT's boot used to hit: three successive
+    /// variable-length inserts into `WGSGEN2.DAT` left the header's record
     /// count and the page walk disagreeing.
     ///
     /// ```text
@@ -5653,50 +5653,61 @@ mod tests {
     /// ```
     ///
     /// The module inserts one demo-clock record per boot and re-reads the
-    /// file afterwards, so this is not a exotic path -- it is the second and
-    /// third time anything is written to a file this host created.
+    /// file afterwards, so this was not an exotic path -- it was the second
+    /// and third time anything was written to a file this host created.
     ///
-    /// # Measured so far, for whoever picks this up
+    /// # The cause, and why it took three inserts to show
     ///
-    /// All three records land on logical page 4 (positions 16390, 16467,
-    /// 16544 -- `physical` is 77 here: a 2-byte slot marker, the 55-byte
-    /// fixed part, a 4-byte variable pointer, and 8 bytes of duplicate chain
-    /// for each of the file's two dup-permitting keys). Its slot markers,
-    /// dumped from the file after each insert:
+    /// `WGSGEN2.DAT`'s key 0 is a **segmented duplicate key**, and `keys.rs`
+    /// read every key's in-record chain offset off its *last* definition. A
+    /// segmented key carries that offset in its *first* one, so key 0's chain
+    /// offset came back as 0 -- not a chain at all, but the front of the slot.
+    /// [`Self::v6_reindex`] then wrote each duplicate pair at `slot + 0`, and
+    /// because [`pages::to_long`] stores a long word-swapped, a `prev` of
+    /// position 16390 (`0x4006`) laid down `00 00 06 40`, clearing the
+    /// two-byte marker of the very slot it was describing.
+    ///
+    /// Three inserts, because a chain pair is only non-`NOWHERE` once a record
+    /// has a neighbour on both sides. The first two inserts wrote
+    /// `ff ff ff ff` over their markers, which reads as occupied and so did no
+    /// visible harm; the third gave the middle record a real `prev`, whose
+    /// swapped high word is zero, and the marker read free. The slot markers
+    /// after each insert:
     ///
     /// ```text
     /// insert 0   [ffff,    0,    0]
     /// insert 1   [ffff, ffff,    0]
-    /// insert 2   [ffff,    0, ffff]     <- slot 1 went back to "free"
+    /// insert 2   [ffff,    0, ffff]     <- slot 1 now reads free
     /// ```
     ///
-    /// Two further divergences from a file the engine itself wrote, both
-    /// unexplained and either of which may be the same root cause:
+    /// See `keys.rs`'s
+    /// `a_segmented_duplicate_key_reads_its_chain_offset_from_its_first_segment`
+    /// for the fixture's own key descriptors and the fix.
     ///
-    /// 1. **The shadow pair share a generation.** Physical pages 7 and 10
-    ///    both carry logical id 4, and both carry `0x8000` at the page
-    ///    header's generation word. In `V6VAR.DAT` -- created and filled by
-    ///    genuine 6.15 -- logical page 2's two copies carry `0x8005` and
-    ///    `0x8006`. This host never advances that word, so nothing
-    ///    distinguishes a data page's live copy from its stale one.
-    /// 2. **The two allocation-table copies disagree about pages already
-    ///    claimed.** Reading the live block-1 copy after each insert gives
-    ///    `2->11, 3->12, 5->9`, then `2->5, 3->6, 5->8`, then `2->11, 3->12,
-    ///    5->9` again -- it alternates with which copy is live, so a claim is
-    ///    being lost rather than carried forward by the copy-on-write in
-    ///    `v6::Map::claim`.
+    /// # Two things an earlier reading recorded as suspects, both wrong
     ///
-    /// Genuine 6.15 cannot read the result either -- `B_GET_FIRST` on key 0
-    /// returns status 82 against the file this host wrote, while `B_STAT` on
-    /// the same file agrees with the header that it holds three records. So
-    /// this is a write defect, not a defect in this crate's own walk.
+    /// Kept because they cost a session and would cost another. Neither is a
+    /// divergence from genuine 6.15:
     ///
-    /// Ignored rather than deleted: it is a five-millisecond reproduction of
-    /// a wall that otherwise takes a two-minute board boot to reach, and the
-    /// fix needs the marker and generation semantics measured against the
-    /// engine (a `tools/btrieve-oracle` probe) rather than guessed.
+    /// 1. **"Physical pages 7 and 10 both carry logical id 4, and this host
+    ///    never advances their generation word."** They are logical 4's shadow
+    ///    *twin pair*, which is exactly what [`v6::Map::relocate`] measured the
+    ///    engine doing -- a page alternates between two physical homes on
+    ///    successive writes. Nothing needs to distinguish them by a stamp of
+    ///    their own: the allocation table says which one is live, and a data
+    ///    page's `[0x04]` is a modification stamp, not the generation counter
+    ///    an allocation-table or control-record page carries.
+    /// 2. **"The two allocation-table copies disagree about pages already
+    ///    claimed, so a claim is being lost."** Traced entry by entry across
+    ///    all three inserts, the live table is correct at every step and never
+    ///    loses a claim. What alternates is which *physical* page each logical
+    ///    id resolves to -- twin flipping again -- and which of physical 2 and
+    ///    3 is live, which is what copy-on-write means.
+    ///
+    /// Both readings were taken from snapshots of the file between inserts.
+    /// The defect was never in the allocation table; it was eight bytes
+    /// written at the wrong offset inside a record.
     #[test]
-    #[ignore = "reproduces an open v6 variable-insert defect; see the doc comment"]
     fn repeated_variable_inserts_keep_the_header_count_and_the_walk_agreeing() {
         let dir = crate::testing::scratch("wgsgen2-repeated-variable-insert");
         let path = dir.join("WGSGEN2.DAT");

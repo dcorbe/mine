@@ -841,21 +841,34 @@ pub fn parse(
                 // produce a file at all. All four multi-segment keys in this
                 // repository's real files agree across their segments, checked.
                 modifiable: attributes & flag::MODIFIABLE != 0,
-                // Read from *this* definition -- the key's last one, which is
-                // also its first and only one for every duplicate-permitting
-                // key MajorMUD ships (none of the four is segmented). A
-                // segmented duplicate key would need this read at
-                // `start_definition` instead, same as `Self::definition`; none
-                // exists to measure that against.
+                // Read from the key's **first** definition, at
+                // `start_definition` -- the same coordinate [`Key::definition`]
+                // already uses, and for the same reason. A segmented duplicate
+                // key carries its chain offset only in its first segment; its
+                // later segments read 0 there.
+                //
+                // This used to read *this* definition, the key's last, on the
+                // grounds that "none of the four [duplicate-permitting keys]
+                // MajorMUD ships is segmented". `WGSGEN2.DAT` is: two keys in
+                // three definitions, the first of them segmented, with chain
+                // offsets 61 and 69 sitting in definitions 0 and 2 while
+                // definition 1 -- key 0's last -- reads 0. That zero is not a
+                // chain, it is the front of the slot, and eight bytes written
+                // there overwrite the two-byte marker `records::walk_v6` reads
+                // to decide whether the slot holds a record at all. See
+                // `a_segmented_duplicate_key_reads_its_chain_offset_from_its_first_segment`
+                // for what that cost.
+                //
                 // `None` when the key repeats its duplicates in the index
                 // rather than chaining the records: such a key has no pair to
                 // point at, and its definition duly reads 0 here. Writing
                 // eight bytes at offset 0 would land on the front of the
                 // record -- which is why the write paths ask for this and
                 // refuse when it is absent, rather than defaulting.
-                chain: (duplicates
-                    && attributes & flag::REPEATING_DUPLICATES == 0)
-                    .then(|| word(at::CHAIN)),
+                chain: (duplicates && attributes & flag::REPEATING_DUPLICATES == 0).then(|| {
+                    let at = BASE + start_definition * WIDTH + at::CHAIN;
+                    u16::from_le_bytes([fcr[at], fcr[at + 1]])
+                }),
                 // Which bit wins if a definition somehow set both is not
                 // measured, and no file here sets either; `Any` is the
                 // stricter of the two and omitting more than the engine does
@@ -968,6 +981,113 @@ mod tests {
         let unique = parse("WCCRACE.DAT", &fcr(&[definition(flag::EXTENDED, 0, 2, 0x0e)]), 1, &[])
             .expect("parses");
         assert_eq!(unique[0].chain, None, "a unique key has no chain to offset");
+    }
+
+    /// A **segmented** duplicate key carries its chain offset in its *first*
+    /// definition, and its later segments read zero there.
+    ///
+    /// Measured off `WGSGEN2.VIR`'s own file control record, the virgin
+    /// generator file MajorMUD-NT's boot writes to. It declares two keys in
+    /// three definitions, `reclen` 55 and `physical` 77:
+    ///
+    /// ```text
+    /// def0  attrs 0x0133 (DUPLICATES|ANOSEG|...)  chain 61  offset  2  len 30
+    /// def1  attrs 0x0123 (DUPLICATES, no ANOSEG)  chain  0  offset 32  len 25
+    /// def2  attrs 0x0123 (DUPLICATES, no ANOSEG)  chain 69  offset 32  len 25
+    /// ```
+    ///
+    /// def0 and def1 are one segmented key; def2 is the second key. The two
+    /// chain offsets that are actually there -- 61 and 69 -- are exactly the
+    /// eight-byte pairs a 77-byte slot has room for once its two-byte marker,
+    /// 55-byte fixed part and four-byte variable pointer are counted
+    /// (2 + 55 + 4 = 61, then 69). Reading the offset off the key's *last*
+    /// definition gives key 0 a chain offset of **0**, which is not a chain at
+    /// all: it is the front of the slot, and eight bytes written there land on
+    /// the two-byte slot marker `records::walk_v6` reads to decide whether the
+    /// slot holds a record.
+    ///
+    /// This is what broke MajorMUD-NT's boot. `Block::insert_v6` wrote each
+    /// duplicate chain at `slot + 0`, and because `pages::to_long` stores a
+    /// long word-swapped, a `prev` of position 16390 (`0x4006`) laid down
+    /// `00 00 06 40` -- clearing the marker of the slot it was meant to
+    /// describe. The third insert into `WGSGEN2.DAT` therefore left markers
+    /// reading `[ffff, 0000, ffff]`, the walk found two records where the
+    /// header said three, and `dfaacqlock` refused the file.
+    ///
+    /// The comment this replaces said a segmented duplicate key "would need
+    /// this read at `start_definition` instead ... none exists to measure
+    /// that against". One does, and it ships in every MajorMUD-NT install.
+    ///
+    /// # The corpus agrees, ten shapes out of ten
+    ///
+    /// Every Btrieve file in `archive/`, `peepeebbs/` and this crate's own
+    /// fixtures was scanned for a segmented duplicate key. Ten distinct shapes
+    /// exist, across three unrelated module families and **both** file
+    /// versions, and all ten carry the offset in the first segment and zero in
+    /// the later one -- there is no counterexample:
+    ///
+    /// ```text
+    /// WGSGEN2.VIR   v6  key 0  chains [61, 0]  reclen   55  physical   77
+    /// WCCBANK2.VIR  v6  key 0  chains [78, 0]  reclen   76  physical   86
+    /// WCCITOW2.VIR  v6  key 1  chains [70, 0]  reclen   68  physical   78
+    /// WCCITOW2.DAT  v6  key 1  chains [74, 0]  reclen   72  physical   82
+    /// ELWGEMAL.DAT  v6  key 1  chains [1466,0] reclen 1456  physical 1474
+    /// MBMGEMAL.DAT  v5  key 1  chains [1008,0] reclen 1000  physical 1016
+    /// MBMG2MAL.DAT  v5  key 1  chains [246, 0] reclen  238  physical  254
+    /// SAVGEMAL.DAT  v5  key 1  chains [246, 0] reclen  238  physical  254
+    /// ```
+    ///
+    /// Independently corroborated by arithmetic: [`at::CHAIN`]'s own rule is
+    /// that a file's last duplicate key chains at `physical - 8`, and every
+    /// row above satisfies it from the **first** segment's number and none
+    /// from the second. `WGSGEN2` is the only file here with *two* duplicate
+    /// keys, and it is key 1 that reads 69 (= 77 - 8) while key 0 reads 61,
+    /// the eight bytes before it.
+    ///
+    /// So this was never a `WGSGEN2` quirk. `WCCBANK2.DAT` -- every player's
+    /// bank balance -- and `WCCITOW2.DAT` carry the same shape, and any insert
+    /// into either would have written eight bytes over a slot marker the same
+    /// way.
+    #[test]
+    fn a_segmented_duplicate_key_reads_its_chain_offset_from_its_first_segment() {
+        let keys = parse(
+            "WGSGEN2.DAT",
+            &fcr(&[
+                definition_with_chain(
+                    flag::EXTENDED | flag::DUPLICATES | flag::ANOSEG | flag::MODIFIABLE,
+                    2,
+                    30,
+                    0x0e,
+                    61,
+                ),
+                definition_with_chain(
+                    flag::EXTENDED | flag::DUPLICATES | flag::MODIFIABLE,
+                    32,
+                    25,
+                    0x0e,
+                    0,
+                ),
+                definition_with_chain(
+                    flag::EXTENDED | flag::DUPLICATES | flag::MODIFIABLE,
+                    32,
+                    25,
+                    0x0e,
+                    69,
+                ),
+            ]),
+            2,
+            &[],
+        )
+        .expect("parses");
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].segments.len(), 2, "def0 and def1 are one key");
+        assert_eq!(
+            keys[0].chain,
+            Some(61),
+            "the chain offset comes from the key's first definition, not its last"
+        );
+        assert_eq!(keys[1].chain, Some(69), "an unsegmented key is unaffected");
     }
 
     #[test]
