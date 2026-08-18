@@ -441,6 +441,40 @@ impl Process {
         }
     }
 
+    /// Give the driver a chance to repaint while the program is busy.
+    ///
+    /// **This is what makes an interactive run live.** `_getch` and `_kbhit`
+    /// paint too -- a `Terminal` paints the screen it is handed before reading
+    /// -- but a program that draws a progress line and then keeps working
+    /// would show nothing until its next input call, which for a batch
+    /// operation may be never. Called after every import, this repaints while
+    /// it works.
+    ///
+    /// **`poll_due` is checked first, and that ordering is the whole cost
+    /// control.** Building a [`Screen`](crate::screen::Screen) clones the
+    /// entire cell grid; doing that per import over a hundred thousand imports
+    /// would dwarf the run. `Terminal::poll_due` is a clock comparison that
+    /// answers true about sixty times a second, and the default `Driver`
+    /// implementation answers `false` outright -- so a scripted or keyed run
+    /// pays one boolean per import and never builds a screen at all.
+    ///
+    /// A key the poll happens to pick up is parked rather than dropped: this
+    /// is a repaint, not a read, and swallowing input here would lose
+    /// keystrokes typed while the program was working.
+    pub fn pump_display(&mut self) {
+        if self.pending_key.is_some() {
+            return;
+        }
+        let due = self.keys.as_ref().is_some_and(|d| d.poll_due());
+        if !due {
+            return;
+        }
+        let screen = self.screen();
+        if let Some(driver) = self.keys.as_mut() {
+            self.pending_key = driver.poll_key(&screen).map(key_byte);
+        }
+    }
+
     /// Is a keystroke waiting? Does **not** consume it.
     pub fn key_waiting(&mut self) -> bool {
         if self.pending_key.is_some() {
@@ -625,6 +659,9 @@ pub fn run(loaded: &mut Loaded, process: &mut Process, budget: usize) -> io::Res
         }
 
         let module = site.module.clone();
+        // Repaint if the driver says one is due. Costs one boolean per import
+        // unless something is actually watching -- see `pump_display`.
+        process.pump_display();
         match dispatch(process, &mut loaded.machine, &mut loaded.mem, site) {
             Some(answer) => {
                 if let Some(code) = process.exit_code {
@@ -1020,6 +1057,105 @@ mod tests {
             screen.contains("Updating Rooms"),
             "expected \"Updating Rooms\" somewhere on the console; got:\n{screen}"
         );
+    }
+
+    /// A driver that records what it was shown and when it was asked.
+    ///
+    /// State is shared through an `Rc<RefCell<_>>` rather than recovered by
+    /// downcasting, because `Process` owns the driver as a `Box<dyn Driver>`
+    /// and the trait has no `Any` on it -- adding one so a test could look
+    /// inside would be shaping the production type around the test.
+    #[derive(Default)]
+    struct SpyState {
+        polls: usize,
+        seen: Vec<String>,
+    }
+
+    struct Spy {
+        due: bool,
+        key: Option<u8>,
+        state: std::rc::Rc<std::cell::RefCell<SpyState>>,
+    }
+
+    impl crate::driver::Driver for Spy {
+        fn next_key(&mut self, _screen: &crate::screen::Screen) -> Option<crate::driver::Key> {
+            self.key.take().map(crate::driver::Key::Char)
+        }
+        fn poll_due(&self) -> bool {
+            self.due
+        }
+        fn poll_key(&mut self, screen: &crate::screen::Screen) -> Option<crate::driver::Key> {
+            let mut st = self.state.borrow_mut();
+            st.polls += 1;
+            st.seen.push(screen.grid.line(0).trim_end().to_string());
+            drop(st);
+            self.key.take().map(crate::driver::Key::Char)
+        }
+    }
+
+    fn with_spy(
+        due: bool,
+        key: Option<u8>,
+    ) -> (Process, std::rc::Rc<std::cell::RefCell<SpyState>>) {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(SpyState::default()));
+        let mut p = Process::new("X.EXE", &[]);
+        p.keys = Some(Box::new(Spy {
+            due,
+            key,
+            state: std::rc::Rc::clone(&state),
+        }));
+        (p, state)
+    }
+
+    /// **A repaint shows the driver the console as it stands now.** This is
+    /// what makes an interactive run live rather than a final snapshot.
+    #[test]
+    fn a_due_poll_repaints_with_the_current_console() {
+        let (mut p, state) = with_spy(true, None);
+
+        p.console.write_output_character(0, 0, b"FIRST");
+        p.pump_display();
+        p.console.write_output_character(0, 0, b"SECOND");
+        p.pump_display();
+
+        assert_eq!(
+            state.borrow().seen,
+            vec!["FIRST".to_string(), "SECOND".to_string()],
+            "each repaint must show what was on screen at that moment"
+        );
+    }
+
+    /// **A driver that is not due is never asked**, and no screen is built for
+    /// it. That check is the only thing keeping a per-import repaint from
+    /// cloning the whole cell grid a hundred thousand times.
+    #[test]
+    fn a_driver_that_is_not_due_is_never_polled() {
+        let (mut p, state) = with_spy(false, None);
+        for _ in 0..1000 {
+            p.pump_display();
+        }
+        assert_eq!(state.borrow().polls, 0);
+    }
+
+    /// A key the repaint happens to collect is parked, not dropped -- it was
+    /// typed while the program was working and `getch` must still get it.
+    #[test]
+    fn a_key_collected_by_a_repaint_is_not_lost() {
+        let (mut p, _state) = with_spy(true, Some(b'Z'));
+        p.pump_display();
+        assert_eq!(p.next_key(), Some(b'Z'), "the parked key survives");
+    }
+
+    /// A repaint must not draw a key out from under a pending one, or the
+    /// order keystrokes arrive in stops matching the order they were typed.
+    #[test]
+    fn a_repaint_does_not_run_while_a_key_is_already_parked() {
+        let (mut p, state) = with_spy(true, Some(b'A'));
+        p.pump_display();
+        assert_eq!(state.borrow().polls, 1);
+        p.pump_display();
+        assert_eq!(state.borrow().polls, 1, "still parked, so no second poll");
+        assert_eq!(p.next_key(), Some(b'A'));
     }
 
     /// **`kbhit` peeks and `getch` consumes.** A host that let `kbhit` draw and

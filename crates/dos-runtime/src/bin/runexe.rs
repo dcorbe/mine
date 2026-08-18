@@ -309,6 +309,7 @@ fn run_pe32(
     root_dir: &str,
     keys: &str,
     script_path: Option<&str>,
+    interactive: bool,
 ) -> io::Result<()> {
     let mut loaded = win32::load::load(data)?;
     // `Machine`'s own default per-entry-point watchdog is five wall-clock
@@ -359,20 +360,41 @@ fn run_pe32(
     // path on this side, which is what `_getch` reads. A script wins over
     // literal keys, as it does for the DOS path, because a script is the more
     // specific instruction.
-    process.keys = match script_path {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)?;
-            Some(Box::new(Script::parse(&text).map_err(io::Error::other)?)
-                as Box<dyn dos_runtime::driver::Driver>)
+    process.keys = if interactive {
+        // The terminal takes the screen from here, exactly as it does for the
+        // real-mode guest: it paints the console it is handed on every read
+        // and every due poll, so wiring it as the driver *is* the live
+        // console. Nothing may be printed until it is dropped -- see the
+        // report below.
+        println!("interactive: Ctrl-] gives control back");
+        Some(Box::new(Terminal::new()?) as Box<dyn dos_runtime::driver::Driver>)
+    } else {
+        match script_path {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)?;
+                Some(Box::new(Script::parse(&text).map_err(io::Error::other)?)
+                    as Box<dyn dos_runtime::driver::Driver>)
+            }
+            None if !keys.is_empty() => Some(Box::new(dos_runtime::driver::Keys::new(keys))),
+            None => None,
         }
-        None if !keys.is_empty() => Some(Box::new(dos_runtime::driver::Keys::new(keys))),
-        None => None,
     };
 
     let outcome = win32::process::run(&mut loaded, &mut process, PE_CALL_BUDGET)?;
+
+    // Drop the terminal before printing anything. While it lives it owns the
+    // alternate screen, and a report written into that lands in the middle of
+    // the program's own output and is then wiped when the screen is restored.
+    // The real-mode path defers its report for the same reason.
+    let ending = process.keys.as_ref().map(|d| d.ending());
+    process.keys = None;
+
     println!("--- {outcome:?} ---");
     show_console(&process);
     report_diagnostics(&process);
+    if let Some(ending) = ending {
+        println!("driver: {ending}");
+    }
     Ok(())
 }
 
@@ -487,7 +509,15 @@ fn main() -> io::Result<()> {
     // real-mode path and is unchanged; a PE32 leaves here instead.
     match format_of(&data) {
         Format::Pe32 => {
-            return run_pe32(&path, &data, &tail, &root_dir, &keys, script_path.as_deref());
+            return run_pe32(
+                &path,
+                &data,
+                &tail,
+                &root_dir,
+                &keys,
+                script_path.as_deref(),
+                interactive,
+            );
         }
         Format::Unsupported => {
             return Err(io::Error::new(

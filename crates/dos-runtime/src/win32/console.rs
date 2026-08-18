@@ -133,6 +133,23 @@ impl Console {
     /// - it writes spaces rather than NULs, because the program reads its own
     ///   screen back and a NUL is not what a cleared cell holds.
     ///
+    /// **It clears to column 79, and that visibly damages the screen -- which
+    /// is correct.** Measured: the program calls this ten times, at column 19
+    /// on rows 5..=14, to clear the region it is about to draw a menu into. On
+    /// rows it then redraws, nothing shows. On the one blank row between the
+    /// title and the first menu item, the clear also wipes the decorative
+    /// panel and the right-hand border the program had already drawn, and it
+    /// never redraws them -- so the finished screen has a gap in its frame.
+    ///
+    /// That looked like a bug in this function and is not. Borland's `clreol`
+    /// clears to the right edge of the current *text window*, and this program
+    /// never narrows one: **`_clreol` is the only conio symbol in its whole
+    /// import table** -- no `window`, no `gotoxy`, no `clrscr`, no
+    /// `wherex`/`wherey`. With the default full-screen window, clearing to
+    /// column 79 is what the real runtime does, so the gap is the vendor's own
+    /// behaviour reproduced rather than introduced. Do not "fix" it by
+    /// stopping short of the margin.
+    ///
     /// Attributes are left alone. Borland's `clreol` clears to the *current*
     /// text attribute, and this host has no separate notion of one to apply --
     /// `SetConsoleTextAttribute` tracks it, but a cell's colour only changes
