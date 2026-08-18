@@ -414,7 +414,7 @@ mod tests {
     /// `cp437::decode_wire` directly -- this is meant to be a pure move, not a
     /// reimplementation.
     #[test]
-    fn modern_round_trips_box_drawing_like_cp437_decode() {
+    fn modern_round_trips_box_drawing_like_cp437_decode_wire() {
         let box_drawing: Vec<u8> = vec![0xC9, 0xCD, 0xCD, 0xBB, 0xBA, 0x20, 0xC8, 0xCD, 0xBC];
         let mut stack = Stack::modern();
         let got = stack.outbound(&box_drawing);
