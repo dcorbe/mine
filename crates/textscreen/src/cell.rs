@@ -23,13 +23,13 @@ impl Cell {
 
 /// A grid of character cells, and nothing else.
 ///
-/// Split out of [`Screen`] because the two ways a grid comes to exist have
-/// nothing in common but the grid. A DOS program pokes `B800:0000` and
-/// [`Screen::snapshot`] *samples* the result; a Win32 console program has no
-/// memory-mapped buffer at all, and every change arrives as an explicit call to
-/// a host that owns the cells (see [`crate::win32`]). What both share is the
-/// grid itself and everything that reads one -- which is all of the querying
-/// below, and the painter in [`crate::terminal`].
+/// Split out of the `Screen` type in `dos-runtime` because the two ways a
+/// grid comes to exist have nothing in common but the grid. A DOS program
+/// pokes `B800:0000` and `Screen`'s snapshot routine *samples* the result; a
+/// Win32 console host has no memory-mapped buffer at all, and every change
+/// arrives as an explicit call to a host that owns the cells outright. What
+/// both share is the grid itself and everything that reads one -- which is
+/// all of the querying below, and the painter that turns a grid into ANSI.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cells {
     pub cols: usize,
