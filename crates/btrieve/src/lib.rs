@@ -5642,6 +5642,96 @@ mod tests {
         assert_eq!(mine.bytes, record, "byte for byte");
     }
 
+
+    /// Reproduction of the wall MajorMUD-NT's boot hits: three successive
+    /// variable-length inserts into `WGSGEN2.DAT` leave the header's record
+    /// count and the page walk disagreeing.
+    ///
+    /// ```text
+    /// WGSERVER.EXE.dfaacqlock refused: WGSGEN2.DAT: the header says 3
+    /// records and walking the pages found 2
+    /// ```
+    ///
+    /// The module inserts one demo-clock record per boot and re-reads the
+    /// file afterwards, so this is not a exotic path -- it is the second and
+    /// third time anything is written to a file this host created.
+    ///
+    /// # Measured so far, for whoever picks this up
+    ///
+    /// All three records land on logical page 4 (positions 16390, 16467,
+    /// 16544 -- `physical` is 77 here: a 2-byte slot marker, the 55-byte
+    /// fixed part, a 4-byte variable pointer, and 8 bytes of duplicate chain
+    /// for each of the file's two dup-permitting keys). Its slot markers,
+    /// dumped from the file after each insert:
+    ///
+    /// ```text
+    /// insert 0   [ffff,    0,    0]
+    /// insert 1   [ffff, ffff,    0]
+    /// insert 2   [ffff,    0, ffff]     <- slot 1 went back to "free"
+    /// ```
+    ///
+    /// Two further divergences from a file the engine itself wrote, both
+    /// unexplained and either of which may be the same root cause:
+    ///
+    /// 1. **The shadow pair share a generation.** Physical pages 7 and 10
+    ///    both carry logical id 4, and both carry `0x8000` at the page
+    ///    header's generation word. In `V6VAR.DAT` -- created and filled by
+    ///    genuine 6.15 -- logical page 2's two copies carry `0x8005` and
+    ///    `0x8006`. This host never advances that word, so nothing
+    ///    distinguishes a data page's live copy from its stale one.
+    /// 2. **The two allocation-table copies disagree about pages already
+    ///    claimed.** Reading the live block-1 copy after each insert gives
+    ///    `2->11, 3->12, 5->9`, then `2->5, 3->6, 5->8`, then `2->11, 3->12,
+    ///    5->9` again -- it alternates with which copy is live, so a claim is
+    ///    being lost rather than carried forward by the copy-on-write in
+    ///    `v6::Map::claim`.
+    ///
+    /// Genuine 6.15 cannot read the result either -- `B_GET_FIRST` on key 0
+    /// returns status 82 against the file this host wrote, while `B_STAT` on
+    /// the same file agrees with the header that it holds three records. So
+    /// this is a write defect, not a defect in this crate's own walk.
+    ///
+    /// Ignored rather than deleted: it is a five-millisecond reproduction of
+    /// a wall that otherwise takes a two-minute board boot to reach, and the
+    /// fix needs the marker and generation semantics measured against the
+    /// engine (a `tools/btrieve-oracle` probe) rather than guessed.
+    #[test]
+    #[ignore = "reproduces an open v6 variable-insert defect; see the doc comment"]
+    fn repeated_variable_inserts_keep_the_header_count_and_the_walk_agreeing() {
+        let dir = crate::testing::scratch("wgsgen2-repeated-variable-insert");
+        let path = dir.join("WGSGEN2.DAT");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/variable/WGSGEN2.VIR"),
+            &path,
+        )
+        .expect("the virgin fixture copies into a scratch directory");
+
+        let mut block = block_from_file(path.clone(), "WGSGEN2.DAT");
+        assert!(block.geometry.variable);
+        let reclen = usize::from(block.geometry.reclen);
+
+        for n in 0..3u32 {
+            let mut record = vec![0u8; reclen];
+            record[..4].copy_from_slice(&(n + 1).to_le_bytes());
+            // The module's own record runs past `reclen` -- 62 bytes over a
+            // 55-byte fixed part -- which is what makes it variable at all.
+            record.extend_from_slice(&[0xa5u8; 7]);
+            block.insert(&record).unwrap_or_else(|e| panic!("insert {n}: {e:?}"));
+
+            block.records = None;
+            let seen = block
+                .records()
+                .unwrap_or_else(|e| panic!("re-read after insert {n}: {e:?}"))
+                .len();
+            assert_eq!(
+                seen,
+                n as usize + 1,
+                "after insert {n} the walk must find every record the header counts"
+            );
+        }
+    }
+
+
     #[test]
     fn insert_refuses_a_variable_length_file_rather_than_truncate() {
         let dir = crate::testing::scratch("block-insert-refuses-variable-length");
