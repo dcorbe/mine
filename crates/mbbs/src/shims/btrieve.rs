@@ -1860,7 +1860,7 @@ pub(crate) fn key_number<A: Abi>(
     block: A::Ptr,
     keynum: i16,
 ) -> Result<u16, ShimError> {
-    let at = A::ptr_offset(block, LASTKN);
+    let at = A::ptr_offset(block, btrieve::Layout::of::<AbiMem<A>>().lastkn);
     if keynum < 0 {
         let bytes = at.resolve(call.mem(), 2).map_err(|e| ShimError::Failed(e.to_string()))?;
         return Ok(u16::from_le_bytes([bytes[0], bytes[1]]));
@@ -1879,8 +1879,14 @@ pub(crate) fn key_number<A: Abi>(
     Ok(keynum as u16)
 }
 
-/// Where `lastkn` sits in a `struct btvblk`.
-pub(crate) const LASTKN: u16 = 142;
+// `lastkn`'s offset is NOT a constant here any more. It was --
+// `pub(crate) const LASTKN: u16 = 142` -- and that second, independent copy of
+// a layout `crate::btrieve` already owned is precisely what broke MajorMUD-NT:
+// 142 is `lastkn` under the packed 16-bit layout and the *top half of `data`*
+// under `DFAAPI.H`'s `GCWINNT` one, so writing a key number through it
+// silently truncated the record buffer pointer the module then dereferenced.
+// `btrieve::Layout` is the one source; see `BlockAbi` for why there are two
+// answers to ask it for.
 
 /// How many bytes of the module's buffer are a key value.
 pub(crate) fn key_length<A: Abi>(host: &Host<A>, block: A::Ptr, key: u16) -> Result<u16, ShimError> {

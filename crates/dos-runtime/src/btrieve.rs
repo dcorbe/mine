@@ -155,6 +155,13 @@ impl<G: Guest> Mem for DosMem<G> {
     /// why that distinction is not academic here.
     const PTR_WIDTH: usize = 4;
 
+    /// A real-mode DOS guest is a 16-bit compiler's output, so its
+    /// `struct btvblk` is the packed one -- `int` is two bytes and nothing
+    /// needs padding to put a far pointer on a four-byte boundary. This is
+    /// the layout `BTVSTF.H` describes with `ECLIPSE`'s `realseg`/`keyseg`
+    /// tail, which is exactly what `Packed16` carries.
+    const BLOCK: btrieve::mem::BlockAbi = btrieve::mem::BlockAbi::Packed16;
+
     fn null_ptr() -> Ptr {
         Ptr::new(0, 0)
     }

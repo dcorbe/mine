@@ -67,7 +67,7 @@ pub(crate) mod v6;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::mem::{Alloc, Mem};
+use crate::mem::{Alloc, BlockAbi, Mem};
 
 pub use crate::create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use crate::keys::Key;
@@ -645,25 +645,83 @@ fn acs_tables(
 /// Each field is written as the one before it plus that one's width, so the
 /// struct's total size cannot drift from the offsets inside it. The absolute
 /// numbers are pinned by [`tests::the_block_is_laid_out_the_way_btvstf_h_declares_it`].
-mod field {
-    use super::SEGMAX;
-
+/// Where each field of a module's file block sits, for one [`BlockAbi`].
+///
+/// This used to be a `mod field` of plain constants, which was correct for
+/// exactly as long as this host ran only 16-bit modules. It is not one layout
+/// -- see [`BlockAbi`] -- and the difference is not cosmetic: a module reads
+/// `bb->data`/`dfa->data` itself, so two bytes of compiler padding this host
+/// does not reproduce hand it a pointer field it will read straight through.
+///
+/// Every offset is derived from the field sequence rather than written down
+/// twice, so the two layouts cannot drift apart; [`Layout::of`]'s own tests
+/// pin both against the vendor headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
     /// Btrieve's own 128-byte position block. Opaque to everybody, including
     /// the real host, which only ever handed its address to the TSR.
-    pub const POSBLK: u16 = 0;
-    pub const FILNAM: u16 = POSBLK + 128;
-    pub const RECLEN: u16 = FILNAM + 4;
-    pub const KEY: u16 = RECLEN + 2;
-    pub const DATA: u16 = KEY + 4;
-    pub const LASTKN: u16 = DATA + 4;
-    pub const KEYLNS: u16 = LASTKN + 2;
-    /// Real-mode segment of the block, for the DOS extender. Nothing here has a
-    /// real mode to have a segment in, so it stays zero.
-    pub const REALSEG: u16 = KEYLNS + SEGMAX * 2;
-    /// Real-mode segment of the key buffer. Zero, for the same reason.
-    pub const KEYSEG: u16 = REALSEG + 2;
-    /// The whole struct.
-    pub const SIZE: u16 = KEYSEG + 2;
+    pub posblk: u16,
+    pub filnam: u16,
+    pub reclen: u16,
+    pub key: u16,
+    pub data: u16,
+    pub lastkn: u16,
+    pub keylns: u16,
+    /// One past the last `keylns` entry -- the bound a key-length write must
+    /// stay inside. Under [`BlockAbi::Packed16`] this is also where
+    /// `realseg`/`keyseg` begin.
+    pub keylns_end: u16,
+    /// The whole struct, which is what gets allocated.
+    pub size: u16,
+}
+
+impl Layout {
+    /// The layout `M`'s own compiler produced.
+    pub fn of<M: Mem>() -> Self {
+        Self::new(M::PTR_WIDTH as u16, M::BLOCK)
+    }
+
+    fn new(ptr_width: u16, abi: BlockAbi) -> Self {
+        let posblk = 0;
+        let filnam = posblk + 128;
+        let reclen = filnam + ptr_width;
+        // The whole difference between the two layouts, in one line. A
+        // 16-bit compiler puts `key` straight after `reclen`'s two bytes; a
+        // 32-bit one aligns a pointer to four, so `key` -- and `data`, and
+        // everything after -- moves up by two.
+        let key = match abi {
+            BlockAbi::Packed16 => reclen + 2,
+            BlockAbi::WinNt32 => (reclen + 2).next_multiple_of(4),
+        };
+        let data = key + ptr_width;
+        let lastkn = data + ptr_width;
+        // `lastkn` is `INT` in `btvblk` and `SHORT` in `dfablk`; both are two
+        // bytes under `Packed16`, and under `WinNt32` this host lays out
+        // `dfablk` (see `BlockAbi::WinNt32` for why `btvblk` is not
+        // represented), where it is two.
+        let keylns = lastkn + 2;
+        let keylns_end = keylns + SEGMAX * 2;
+        let size = match abi {
+            // `realseg` then `keyseg`.
+            BlockAbi::Packed16 => keylns_end + 4,
+            // `flddefList[SEGMAX]`, a pointer array and so realigned to four,
+            // then `unpackKeySiz[SEGMAX]`.
+            BlockAbi::WinNt32 => {
+                keylns_end.next_multiple_of(4) + SEGMAX * ptr_width + SEGMAX * 2
+            }
+        };
+        Self {
+            posblk,
+            filnam,
+            reclen,
+            key,
+            data,
+            lastkn,
+            keylns,
+            keylns_end,
+            size,
+        }
+    }
 }
 
 /// `BTVSTF.H:13` -- key segments per file, which sizes `keylns`.
@@ -3232,23 +3290,24 @@ impl<M: Mem> Btrieve<M> {
         M::write(key, mem, &vec![0u8; usize::from(longest) + 1])
             .map_err(|e| e.to_string())?;
 
-        let block = heap.reserve(mem, field::SIZE)?;
-        let mut image = vec![0u8; usize::from(field::SIZE)];
+        let field = Layout::of::<M>();
+        let block = heap.reserve(mem, field.size)?;
+        let mut image = vec![0u8; usize::from(field.size)];
         let put = |image: &mut Vec<u8>, offset: u16, bytes: &[u8]| {
             let at = usize::from(offset);
             image[at..at + bytes.len()].copy_from_slice(bytes);
         };
-        put(&mut image, field::FILNAM, &M::ptr_to_bytes(filnam));
-        put(&mut image, field::RECLEN, &maxlen.to_le_bytes());
-        put(&mut image, field::DATA, &M::ptr_to_bytes(data));
-        put(&mut image, field::KEY, &M::ptr_to_bytes(key));
+        put(&mut image, field.filnam, &M::ptr_to_bytes(filnam));
+        put(&mut image, field.reclen, &maxlen.to_le_bytes());
+        put(&mut image, field.data, &M::ptr_to_bytes(data));
+        put(&mut image, field.key, &M::ptr_to_bytes(key));
 
         // `bb->keylns[n]`, which `clckln()` fills in and which `qrybtv` and the
         // acquire family read to know how many bytes of the module's buffer are
         // the key. Every one this host knows is written; the rest stay zero.
         for definition in &parsed {
-            let at = field::KEYLNS + definition.number * 2;
-            if at + 2 <= field::REALSEG {
+            let at = field.keylns + definition.number * 2;
+            if at + 2 <= field.keylns_end {
                 put(&mut image, at, &definition.length().to_le_bytes());
             }
         }
@@ -3742,7 +3801,7 @@ impl<M: Mem> Btrieve<M> {
             ));
         }
 
-        let filnam_at = M::ptr_offset(at, field::FILNAM);
+        let filnam_at = M::ptr_offset(at, Layout::of::<M>().filnam);
         let bytes = M::resolve(filnam_at, mem, M::PTR_WIDTH)
             .map_err(|e| fail(e.to_string()))?;
         let filnam = M::ptr_from_bytes(bytes);
@@ -3924,16 +3983,79 @@ mod tests {
         // module's own `bb->reclen` compiles to, and a host that placed them
         // anywhere else would be handing back a struct of the right size with
         // everything in the wrong place.
-        assert_eq!(field::POSBLK, 0);
-        assert_eq!(field::FILNAM, 128);
-        assert_eq!(field::RECLEN, 132);
-        assert_eq!(field::KEY, 134);
-        assert_eq!(field::DATA, 138);
-        assert_eq!(field::LASTKN, 142);
-        assert_eq!(field::KEYLNS, 144);
-        assert_eq!(field::REALSEG, 192, "the first of the two PHARLAP fields");
-        assert_eq!(field::KEYSEG, 194);
-        assert_eq!(field::SIZE, 196);
+        let f = Layout::new(4, BlockAbi::Packed16);
+        assert_eq!(f.posblk, 0);
+        assert_eq!(f.filnam, 128);
+        assert_eq!(f.reclen, 132);
+        assert_eq!(f.key, 134);
+        assert_eq!(f.data, 138);
+        assert_eq!(f.lastkn, 142);
+        assert_eq!(f.keylns, 144);
+        assert_eq!(f.keylns_end, 192, "the first of the two PHARLAP fields");
+        assert_eq!(f.size, 196);
+    }
+
+    /// `DFAAPI.H:119-129`, the `GCWINNT` branch -- the layout MajorMUD-NT is
+    /// compiled against, and the one this host got wrong until the boot
+    /// described below.
+    ///
+    ///
+    /// `reclen` is `USHORT`, so a 32-bit compiler pads two bytes before
+    /// `key` to put the pointer back on a four-byte boundary. **Every offset
+    /// from `key` on is therefore two higher than the 16-bit layout above**,
+    /// and `data` -- the field modules read directly -- lands at `0x8c`.
+    ///
+    /// # Measured, not derived
+    ///
+    /// Serving the packed layout to a 32-bit module stopped MajorMUD-NT's
+    /// init at `wccmmud.dll` RVA `0x60336`, which is
+    /// `strcpy(dst, dfa->data)` against the `DFAFILE *` global at
+    /// `ds:0x47914c`. Reading a dword at `0x8c` of a block whose `data` sits
+    /// at `0x8a` returns the *high half* of that pointer with `lastkn`'s two
+    /// zero bytes above it -- a 32-bit heap pointer of `0x40809b8e` reads
+    /// back as `0x00004080`:
+    ///
+    /// ```text
+    /// cw3220mt.DLL.strcpy refused: 1 bytes at 0x00004080 runs past the end
+    /// of the image
+    /// ```
+    ///
+    /// The low half changed every run with the arena's base and the high
+    /// half did not, which is what identified it as a pointer read two bytes
+    /// off rather than a corrupt one.
+    #[test]
+    fn the_32_bit_block_is_laid_out_the_way_dfaapi_hs_gcwinnt_branch_declares_it() {
+        let f = Layout::new(4, BlockAbi::WinNt32);
+        assert_eq!(f.posblk, 0x00);
+        assert_eq!(f.filnam, 0x80);
+        assert_eq!(f.reclen, 0x84);
+        assert_eq!(f.key, 0x88, "two bytes of padding sit between these");
+        assert_eq!(f.data, 0x8c, "the offset MajorMUD-NT reads directly");
+        assert_eq!(f.lastkn, 0x90);
+        assert_eq!(f.keylns, 0x92);
+        assert_eq!(f.keylns_end, 0xc2);
+        // flddefList realigns to 0xc4, runs 24*4 to 0x124, then
+        // unpackKeySiz runs 24*2 to 0x154.
+        assert_eq!(f.size, 0x154);
+    }
+
+    /// The two layouts agree on everything up to `reclen` and on nothing
+    /// after it. Stated as its own assertion because the whole defect was
+    /// the assumption that they agreed throughout -- a reader who changes
+    /// one of the two tests above should be made to notice the other.
+    #[test]
+    fn the_two_layouts_diverge_at_key_and_not_before() {
+        let packed = Layout::new(4, BlockAbi::Packed16);
+        let winnt = Layout::new(4, BlockAbi::WinNt32);
+
+        assert_eq!(packed.posblk, winnt.posblk);
+        assert_eq!(packed.filnam, winnt.filnam);
+        assert_eq!(packed.reclen, winnt.reclen);
+
+        assert_eq!(winnt.key - packed.key, 2);
+        assert_eq!(winnt.data - packed.data, 2);
+        assert_eq!(winnt.lastkn - packed.lastkn, 2);
+        assert_ne!(packed.size, winnt.size);
     }
 
     #[test]
@@ -6767,15 +6889,16 @@ mod tests {
         let key = heap.reserve(mem, 3).expect("alloc key");
         Flat::write(key, mem, &[0u8; 3]).expect("write key");
 
-        let at = heap.reserve(mem, field::SIZE).expect("alloc block");
-        let mut image = vec![0u8; usize::from(field::SIZE)];
+        let field = Layout::of::<Flat>();
+        let at = heap.reserve(mem, field.size).expect("alloc block");
+        let mut image = vec![0u8; usize::from(field.size)];
         let put = |image: &mut Vec<u8>, offset: u16, bytes: &[u8]| {
             let start = usize::from(offset);
             image[start..start + bytes.len()].copy_from_slice(bytes);
         };
-        put(&mut image, field::FILNAM, &Flat::ptr_to_bytes(filnam));
-        put(&mut image, field::DATA, &Flat::ptr_to_bytes(data));
-        put(&mut image, field::KEY, &Flat::ptr_to_bytes(key));
+        put(&mut image, field.filnam, &Flat::ptr_to_bytes(filnam));
+        put(&mut image, field.data, &Flat::ptr_to_bytes(data));
+        put(&mut image, field.key, &Flat::ptr_to_bytes(key));
         Flat::write(at, mem, &image).expect("write block");
 
         block.block = at;
@@ -6892,7 +7015,7 @@ mod tests {
         // rather than relying on an allocator landing where the test needs it,
         // and it keeps the subject where it belongs: the re-entrancy guard,
         // not the allocator that happened to expose it.
-        Flat::write(at, &mut mem, &[0xaau8; field::SIZE as usize])
+        Flat::write(at, &mut mem, &vec![0xaau8; usize::from(Layout::of::<Flat>().size)])
             .expect("a module writes into what it was just given");
 
         let second = btrieve

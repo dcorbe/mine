@@ -33,6 +33,53 @@
 //! the whole of it, and it is what lets a DOS guest and a Win32 host satisfy
 //! this without pretending to be a module ABI.
 
+/// Which compiler laid out the file block a module is handed back.
+///
+/// `struct btvblk` (`BTVSTF.H:6-19`) and `struct dfablk` (`DFAAPI.H:103-145`)
+/// are the *same* field sequence -- `posblk`, `filnam`, `reclen`, `key`,
+/// `data`, `lastkn`, `keylns[SEGMAX]` -- and a host that assumed one byte
+/// layout served both for as long as it only hosted 16-bit modules. It does
+/// not generalise, and this enum is why.
+///
+/// A module reads these fields directly. `bb->data` is Galacticomm's
+/// documented direct-access convention, not an implementation detail, so the
+/// offsets are load-bearing: MajorMUD-NT's own module init does
+/// `strcpy(dst, dfa->data)` off a `dfaOpen` return value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlockAbi {
+    /// The 16-bit compiler's layout: nothing is padded, because every field
+    /// is two or four bytes and every offset is already even. `reclen` and
+    /// `lastkn` are two bytes here whether the header spells them `INT`
+    /// (`btvblk`) or `USHORT`/`SHORT` (`dfablk`) -- which is exactly why one
+    /// layout could serve both families, and why that stopped being true at
+    /// 32 bits.
+    ///
+    /// The tail is `GCDOSP`'s `realseg`/`keyseg` (`DFAAPI.H:140-143`), two
+    /// real-mode segment numbers this host has no real mode to fill in.
+    Packed16,
+
+    /// `DFAAPI.H`'s `GCWINNT` branch (`:119-129`), the 32-bit Worldgroup
+    /// layout: `reclen` is `USHORT`, so the compiler inserts **two bytes of
+    /// padding** before `key` to put a pointer back on a four-byte boundary.
+    /// Everything from `key` on therefore sits two bytes higher than
+    /// [`Packed16`](BlockAbi::Packed16) puts it.
+    ///
+    /// The tail is `flddefList[SEGMAX]`/`unpackKeySiz[SEGMAX]`, the arrays
+    /// that drive `cvtDataIP`'s field marshalling. This host does no such
+    /// conversion and never fills them, but they are still counted in the
+    /// block's size, because the size is what it allocates and a real
+    /// `DFAFILE` is that big.
+    ///
+    /// The 32-bit `btvblk` is a third layout again (`INT reclen`/`INT
+    /// lastkn`, four bytes each) that happens to agree with this one on
+    /// `key` and `data` and diverges after them. It is not represented here:
+    /// no 32-bit module in the surveyed corpus imports a single `btv*`
+    /// symbol -- MajorMUD-NT imports seventeen `dfa*` and zero `btv*` -- so
+    /// inventing its layout would be a guess with nothing to check it
+    /// against.
+    WinNt32,
+}
+
 /// A pointer-and-memory provider for the Btrieve session.
 ///
 /// Implemented by whoever owns the memory a module's pointers address: this
@@ -54,6 +101,12 @@ pub trait Mem {
 
     /// The width of `Ptr` in bytes, as stored in a program's memory.
     const PTR_WIDTH: usize;
+
+    /// Which `struct dfablk`/`struct btvblk` shape this consumer's compiler
+    /// produced. See [`BlockAbi`] -- it is not the same on both, and getting
+    /// it wrong hands a module a struct of plausible size with its pointers
+    /// two bytes from where the module reads them.
+    const BLOCK: BlockAbi;
 
     /// The pointer that addresses nothing.
     fn null_ptr() -> Self::Ptr;

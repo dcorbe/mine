@@ -166,6 +166,12 @@ impl Mem for Flat {
 
     const PTR_WIDTH: usize = 4;
 
+    // `Flat` stands in for a 16-bit module's memory in this crate's own tests
+    // -- four-byte far pointers, two-byte ints -- so it takes the packed
+    // layout. The `WinNt32` layout is exercised through `mbbs`'s `AbiMem<Wg32>`
+    // and by `Layout`'s own tests below.
+    const BLOCK: crate::mem::BlockAbi = crate::mem::BlockAbi::Packed16;
+
     fn null_ptr() -> Self::Ptr {
         FlatPtr::NULL
     }

@@ -62,6 +62,12 @@ impl Mem for Win32Mem {
 
     const PTR_WIDTH: usize = 4;
 
+    /// A Win32 Worldgroup utility is compiled against `DFAAPI.H`'s `GCWINNT`
+    /// branch, the same branch `mbbs`'s `Wg32` modules are -- 32-bit Borland,
+    /// `USHORT reclen`, and therefore two bytes of padding before `key`. See
+    /// `btrieve::mem::BlockAbi` for what that moves and why it matters.
+    const BLOCK: btrieve::mem::BlockAbi = btrieve::mem::BlockAbi::WinNt32;
+
     fn null_ptr() -> Self::Ptr {
         Flat32Ptr(0)
     }

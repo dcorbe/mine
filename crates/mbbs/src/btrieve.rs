@@ -53,6 +53,18 @@ impl<A: crate::abi::Abi> Mem for AbiMem<A> {
 
     const PTR_WIDTH: usize = <A as crate::abi::Abi>::PTR_WIDTH;
 
+    // Which `struct dfablk`/`btvblk` the module was compiled against, decided
+    // by the width of its own `int` -- that is precisely the question
+    // `BlockAbi` asks, because the padding before `key` exists only when the
+    // compiler aligns a pointer to four. `Wg16`'s `INT_WIDTH` is 2 and
+    // `Wg32`'s is 4; there is no third answer to fall through to, so this
+    // matches exhaustively rather than defaulting.
+    const BLOCK: btrieve::mem::BlockAbi = match <A as crate::abi::Abi>::INT_WIDTH {
+        2 => btrieve::mem::BlockAbi::Packed16,
+        4 => btrieve::mem::BlockAbi::WinNt32,
+        _ => panic!("an ABI whose int is neither 2 nor 4 bytes has no known dfablk layout"),
+    };
+
     fn null_ptr() -> Self::Ptr {
         <A as crate::abi::Abi>::null_ptr()
     }
