@@ -2033,6 +2033,26 @@ impl<M: Mem> Block<M> {
             image: Vec<u8>,
             count_at: usize,
             count: u32,
+            /// The two-byte page type an index page of *this* key carries:
+            /// `0x8000` for key 0, `0x8100` for key 1, and so on.
+            ///
+            /// Measured against genuine Btrieve 6.15 (`crtprobe.exe`,
+            /// 2026-08-17): a two-key v6 file with 120 records gives key 1 a
+            /// root whose page opens `00 81`, and every child pointer inside
+            /// it reads `0x81......`. The key's number is in the top byte of
+            /// the pointer *and* in the page's own tag -- the same byte
+            /// `pages::fcr::ROOT_PAGE`'s doc comment already establishes for
+            /// the file control record's `KEY_ROOT` field.
+            ///
+            /// This used to be a hardcoded `[0x00, 0x80]`, which tagged every
+            /// key's index pages as key 0's. It went unnoticed because
+            /// `v6::Map::relocate` rewrites only the *page number* half of an
+            /// allocation-table entry and leaves the marker alone, so the
+            /// table kept saying `0x8100` while the page it named said
+            /// `0x8000`. Measured on `WGSGEN2.DAT` after one boot: key 1's
+            /// root page carried `0x8000` where the virgin file the engine
+            /// wrote carries `0x8100`.
+            tag: [u8; 2],
         }
         let mut built: Vec<Rebuilt> = Vec::with_capacity(self.keys.len());
 
@@ -2121,11 +2141,23 @@ impl<M: Mem> Block<M> {
                 ));
             }
 
+            let tag_high = 0x80u8
+                .checked_add(u8::try_from(key.number).map_err(|_| {
+                    format!("key {}: does not fit a page tag's low byte", key.number)
+                })?)
+                .ok_or_else(|| {
+                    format!(
+                        "key {}: a page tag's high byte is 0x80 plus the key's \
+                         own number, and this key's number does not fit",
+                        key.number
+                    )
+                })?;
             built.push(Rebuilt {
                 root: raw_root & pages::fcr::ROOT_PAGE,
                 image: index.nodes[0].image.clone(),
                 count_at: definition + pages::fcr::KEY_RECORDS,
                 count: u32::try_from(len).expect("far fewer records than u32::MAX"),
+                tag: [0x00, tag_high],
             });
         }
 
@@ -2146,7 +2178,7 @@ impl<M: Mem> Block<M> {
                 }
             }
 
-            v6::Map::relocate(file, page_size, rebuilt.root, &rebuilt.image, [0x00, 0x80])
+            v6::Map::relocate(file, page_size, rebuilt.root, &rebuilt.image, rebuilt.tag)
                 .map_err(|why| {
                     format!("relocating the index root at logical {}: {why}", rebuilt.root)
                 })?;
@@ -5642,6 +5674,73 @@ mod tests {
         assert_eq!(mine.bytes, record, "byte for byte");
     }
 
+
+    /// Key **1**'s index pages are tagged `0x8100`, not key 0's `0x8000`.
+    ///
+    /// A v6 index page's type tag carries the key's own number in its high
+    /// byte -- `0x8000` for key 0, `0x8100` for key 1 -- exactly as the file
+    /// control record's `KEY_ROOT` field does
+    /// ([`pages::fcr::ROOT_PAGE`]'s doc comment). Measured against genuine
+    /// Btrieve 6.15 (`crtprobe.exe`, 2026-08-17): a two-key v6 file built and
+    /// filled with 120 records by the engine gives key 1 a root page opening
+    /// `00 81`, with every child pointer in it reading `0x81......`, against
+    /// key 0's `00 80` and `0x80......`.
+    ///
+    /// `WGSGEN2.VIR` is the same shape and says the same thing before anything
+    /// has been written to it: key 0's root is logical 2 on a page tagged
+    /// `0x8000`, key 1's is logical 3 on a page tagged `0x8100`.
+    ///
+    /// This host wrote `0x8000` for both. The mistake survived because
+    /// [`v6::Map::relocate`] rewrites only the page-number half of an
+    /// allocation-table entry and leaves the marker untouched, so the table
+    /// went on saying `0x8100` while the page it pointed at said `0x8000` --
+    /// a disagreement no reader in this crate consults and every one of its
+    /// tests was blind to.
+    #[test]
+    fn each_keys_index_pages_are_tagged_with_that_keys_own_number() {
+        let dir = crate::testing::scratch("wgsgen2-index-page-tags");
+        let path = dir.join("WGSGEN2.DAT");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/variable/WGSGEN2.VIR"),
+            &path,
+        )
+        .expect("the virgin fixture copies into a scratch directory");
+
+        let mut block = block_from_file(path.clone(), "WGSGEN2.DAT");
+        let reclen = usize::from(block.geometry.reclen);
+        let mut record = vec![0u8; reclen];
+        record[..4].copy_from_slice(&1u32.to_le_bytes());
+        record.extend_from_slice(&[0xa5u8; 7]);
+        block.insert(&record).expect("one record goes in");
+
+        // Read the roots back off the file exactly as `v6_reindex` found them.
+        let whole = std::fs::read(&path).expect("the file reads");
+        let page = usize::from(block.geometry.page);
+        let live = block.v6_live_fcr(&whole).expect("a live control record");
+        let map = v6::Map::read(&whole, block.geometry.page).expect("resolves");
+
+        for key in &block.keys {
+            let definition =
+                pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+            let raw = pages::long(&live[definition..definition + 4]);
+            let logical = raw & pages::fcr::ROOT_PAGE;
+            let physical = map.physical(logical).expect("the root is claimed") as usize;
+            let tag = u16::from_le_bytes([whole[physical * page], whole[physical * page + 1]]);
+
+            let want = 0x8000u16 | (key.number << 8);
+            assert_eq!(
+                tag, want,
+                "key {}'s index root (logical {logical}, physical {physical}) is tagged \
+                 {tag:#06x}, and this key's pages are {want:#06x}",
+                key.number
+            );
+            assert_eq!(
+                (raw >> 24) as u16,
+                0x80 | key.number,
+                "and the control record's own root field agrees"
+            );
+        }
+    }
 
     /// The wall MajorMUD-NT's boot used to hit: three successive
     /// variable-length inserts into `WGSGEN2.DAT` left the header's record
