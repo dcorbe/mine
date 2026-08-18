@@ -82,16 +82,23 @@ fn encode_can_synthesize_the_telnet_iac_byte() {
 ///
 /// 223 of the 256 entries (0x20..=0x7E and 0x80..=0xFF) therefore come from
 /// Python's stdlib `cp437` codec -- an authority independent of this crate's
-/// own `TABLE`. The other 33 (0x00..=0x1F and 0x7F) cannot come from Python:
-/// its `cp437` codec maps them to raw C0/DEL control characters, not the OEM
-/// control-picture glyphs a text screen shows in those cells. Those 33 are
-/// hand-transcribed instead, from the published IBM PC OEM CP437 mapping
-/// (as tabulated in unicode.org's `CP437.TXT` vendor mapping) -- independent
-/// of `TABLE`'s own source, but still a manual transcription, so they carry
-/// the same transcription risk the original table did. All 256 entries are,
-/// as of this fixture, protected against a *future* accidental edit to
-/// `TABLE`; the 33 hand-pinned ones are not protected against a transcription
-/// error shared by both this fixture and `TABLE` on day one.
+/// own `TABLE`. The other 33 (0x00..=0x1F and 0x7F) cannot come from Python,
+/// and cannot come from any character-encoding mapping at all: Unicode
+/// vendor mappings for CP437 (e.g. `CP437.TXT`) deliberately encode that
+/// range as identity C0/DEL control characters, the same thing Python's
+/// codec does, because they describe *encoding*, not *display*. The glyphs
+/// `TABLE` and this fixture use there -- the smiley, the arrows, the house
+/// -- are a separate thing: the IBM PC ROM character generator's on-screen
+/// rendering of those bytes, a hardware display convention with no
+/// character-encoding authority to cite. Those 33 are hand-transcribed
+/// instead, from the Code page 437 control-picture glyph table as commonly
+/// tabulated (e.g. the "Control codes" column of the Code page 437
+/// reference table) -- independent of `TABLE`'s own source, but still a
+/// manual transcription, so they carry the same transcription risk the
+/// original table did. All 256 entries are, as of this fixture, protected
+/// against a *future* accidental edit to `TABLE`; the 33 hand-pinned ones
+/// are not protected against a transcription error shared by both this
+/// fixture and `TABLE` on day one.
 const REFERENCE: &str = include_str!("cp437-reference.txt");
 
 #[test]
