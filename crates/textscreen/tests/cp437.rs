@@ -90,15 +90,25 @@ fn encode_can_synthesize_the_telnet_iac_byte() {
 /// `TABLE` and this fixture use there -- the smiley, the arrows, the house
 /// -- are a separate thing: the IBM PC ROM character generator's on-screen
 /// rendering of those bytes, a hardware display convention with no
-/// character-encoding authority to cite. Those 33 are hand-transcribed
+/// character-encoding authority to cite. 32 of those 33 are hand-transcribed
 /// instead, from the Code page 437 control-picture glyph table as commonly
 /// tabulated (e.g. the "Control codes" column of the Code page 437
 /// reference table) -- independent of `TABLE`'s own source, but still a
 /// manual transcription, so they carry the same transcription risk the
-/// original table did. All 256 entries are, as of this fixture, protected
-/// against a *future* accidental edit to `TABLE`; the 33 hand-pinned ones
-/// are not protected against a transcription error shared by both this
-/// fixture and `TABLE` on day one.
+/// original table did.
+///
+/// Entry 0x00 is the one exception even to that: it is pinned here as `' '`,
+/// not the control-picture table's NUL glyph, matching `TABLE`'s own
+/// deliberate departure (a cleared cell should paint as a blank, not as
+/// visible noise). There is no independent authority for this entry at
+/// all -- the "authority outside this crate" framing below does not cover
+/// it, and this fixture agreeing with `TABLE` here only proves the two were
+/// edited together, not that either is right.
+///
+/// All 256 entries are, as of this fixture, protected against a *future*
+/// accidental edit to `TABLE`; the 33 hand-pinned ones are not protected
+/// against a transcription error shared by both this fixture and `TABLE`
+/// on day one, and entry 0x00 additionally has no external check at all.
 const REFERENCE: &str = include_str!("cp437-reference.txt");
 
 #[test]

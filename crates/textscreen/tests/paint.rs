@@ -71,3 +71,20 @@ fn a_c0_byte_in_a_cell_paints_as_a_glyph() {
     let out = paint(&mut p, &grid);
     assert!(out.contains('\u{25c4}'), "expected an arrow glyph: {out:?}");
 }
+
+#[test]
+fn a_cleared_cell_paints_as_a_space_not_a_nul() {
+    // A cell holding raw 0x00 is what still-zeroed guest VRAM looks like, and
+    // `Terminal::paint` fires on a 16ms due-poll regardless of guest state --
+    // so a poll can genuinely sample one. NUL is a no-op on a VT100-class
+    // terminal: it does not advance the cursor and does not overwrite
+    // whatever glyph is already there. Painting it as NUL would silently
+    // fail to clear the screen; painting it as a space clears it the way a
+    // real cleared cell should.
+    let mut grid = Cells::blank(1, 1);
+    grid.cells[0] = Cell { ch: 0x00, attr: 7 };
+    let mut p = Painter::new();
+    let out = paint(&mut p, &grid);
+    assert!(out.contains(' '), "expected a space glyph: {out:?}");
+    assert!(!out.contains('\0'), "must not emit a literal NUL byte: {out:?}");
+}

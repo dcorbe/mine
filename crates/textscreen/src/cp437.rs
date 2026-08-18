@@ -13,8 +13,16 @@
 //! harness relies on that agreement.
 
 /// CP437 as Unicode, all 256 entries. Index is the byte.
+///
+/// `0x00` is the one deliberate departure from CP437 proper: a cleared cell
+/// (raw guest VRAM, or a freshly allocated grid) is a NUL, and rendering
+/// its glyph would fill the screen with noise every time something reads
+/// still-zeroed memory. `' '` is what a cleared cell should look like on a
+/// terminal, so that is what lives here instead of the standard's NUL
+/// entry. A future reader tempted to "correct" this back to the standard
+/// mapping needs to argue with this comment first.
 pub const TABLE: [char; 256] = [
-    '\u{0}', '\u{263a}', '\u{263b}', '\u{2665}', '\u{2666}', '\u{2663}', '\u{2660}', '\u{2022}',
+    ' ', '\u{263a}', '\u{263b}', '\u{2665}', '\u{2666}', '\u{2663}', '\u{2660}', '\u{2022}',
     '\u{25d8}', '\u{25cb}', '\u{25d9}', '\u{2642}', '\u{2640}', '\u{266a}', '\u{266b}', '\u{263c}',
     '\u{25ba}', '\u{25c4}', '\u{2195}', '\u{203c}', '\u{b6}', '\u{a7}', '\u{25ac}', '\u{21a8}',
     '\u{2191}', '\u{2193}', '\u{2192}', '\u{2190}', '\u{221f}', '\u{2194}', '\u{25b2}', '\u{25bc}',
