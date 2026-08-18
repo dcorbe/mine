@@ -418,6 +418,101 @@ impl Map {
     /// at physical 2 and 3, if their generations tie, if the regular entry
     /// array is already full, or if `content` is not exactly `page_size`
     /// bytes.
+    /// How many regular entries one allocation-table block holds.
+    ///
+    /// One number, one place. Both write paths and [`Self::read`] agree on it
+    /// because a block's capacity is what turns a logical id into a
+    /// (block, slot) pair, and two of those arithmetics that disagreed
+    /// anywhere would put an entry in a slot the other could not find.
+    fn entries_per_block(page_size: usize) -> usize {
+        (page_size - ENTRIES) / ENTRY
+    }
+
+    /// The (block, slot) an already-claimed or about-to-be-claimed logical id
+    /// belongs to, both 1-based and 0-based respectively.
+    ///
+    /// The engine's own arithmetic: `n = logical - 1`, block
+    /// `n / entries + 1`, slot `n % entries`
+    /// (`W32MKDE_decompiled.c:14276-14278`). Stated once here rather than
+    /// open-coded at each call site.
+    fn block_of(logical: u32, page_size: usize) -> Result<(usize, usize), String> {
+        if logical == 0 {
+            return Err("logical ids are numbered from 1".to_owned());
+        }
+        let entries = Self::entries_per_block(page_size);
+        let n = (logical - 1) as usize;
+        Ok((n / entries + 1, n % entries))
+    }
+
+    /// Which of allocation-table block `index`'s two shadow copies is stale
+    /// and which is live, as `(stale, live)` physical page numbers.
+    ///
+    /// **Where a block lives is a formula, never a scan.** Block `k`'s pair
+    /// sits at physical `2 + (k - 1) * (entries_per_block + 2)` and the page
+    /// after it -- the same arithmetic [`Self::read`] already resolves every
+    /// block by, and for the same reason: real files carry abandoned pages
+    /// that still hold the `"PP"` magic and a *higher* generation than the
+    /// live table, so a scan finds them and the engine never can. See this
+    /// module's own doc comment for the measurement across three page sizes.
+    ///
+    /// The generation comparison is bounded to **this block's own two
+    /// copies**. The counter is file-global, so comparing it across blocks
+    /// means nothing; within a pair, the higher one is current.
+    ///
+    /// # Errors
+    ///
+    /// If the block's pair would fall outside the file, if neither copy
+    /// carries the magic, if a copy calls itself some other block, or if the
+    /// two generations tie -- the same refusals [`Self::read`] makes, so a
+    /// file this can write is a file that can be read back.
+    fn pair_of(
+        file: &[u8],
+        page_size: usize,
+        index: usize,
+    ) -> Result<(usize, usize), String> {
+        let pages = file.len() / page_size;
+        let stride = Self::entries_per_block(page_size) + 2;
+        let first = 2 + (index - 1) * stride;
+        if first + 1 >= pages {
+            return Err(format!(
+                "allocation-table block {index} would have its shadow pair at \
+                 physical {first} and {}, past the end of a {pages}-page file",
+                first + 1
+            ));
+        }
+        let word = |page: usize, offset: usize| -> u16 {
+            let at = page * page_size + offset;
+            u16::from_le_bytes([file[at], file[at + 1]])
+        };
+        let magic = |page: usize| -> bool { file[page * page_size..][..2] == *MAGIC };
+
+        if !(magic(first) || magic(first + 1)) {
+            return Err(format!(
+                "neither physical page {first} nor {} carries the \"PP\" \
+                 allocation-table magic -- there is no block {index} there",
+                first + 1
+            ));
+        }
+        for page in [first, first + 1] {
+            if magic(page) && usize::from(word(page, BLOCK)) != index {
+                return Err(format!(
+                    "physical page {page} is where allocation-table block \
+                     {index} lives, but it calls itself block {}",
+                    word(page, BLOCK)
+                ));
+            }
+        }
+        match word(first, GENERATION).cmp(&word(first + 1, GENERATION)) {
+            std::cmp::Ordering::Greater => Ok((first + 1, first)),
+            std::cmp::Ordering::Less => Ok((first, first + 1)),
+            std::cmp::Ordering::Equal => Err(format!(
+                "both copies of block {index} claim generation {}, and there is \
+                 no rule measured for choosing between them",
+                word(first, GENERATION)
+            )),
+        }
+    }
+
     pub(crate) fn claim(
         file: &mut Vec<u8>,
         page_size: u16,
@@ -446,18 +541,6 @@ impl Map {
         let magic =
             |page: usize| -> bool { file[page * page_size_usize..][..2] == *MAGIC };
 
-        // Single block only -- see the doc comment above. A scan, the same
-        // shape `read` already trusts, rather than assuming physical 2/3 are
-        // the only "PP" pages without checking.
-        for page in 0..pages {
-            if magic(page) && word(page, BLOCK) != 1 {
-                return Err(format!(
-                    "physical page {page} is allocation-table block {}, and \
-                     claiming a page only handles a single-block file",
-                    word(page, BLOCK)
-                ));
-            }
-        }
         if pages < 4 || !(magic(2) || magic(3)) {
             return Err(
                 "neither physical page 2 nor 3 carries the \"PP\" allocation-\
@@ -466,19 +549,7 @@ impl Map {
             );
         }
 
-        let (stale, live) = match word(2, GENERATION).cmp(&word(3, GENERATION)) {
-            std::cmp::Ordering::Greater => (3usize, 2usize),
-            std::cmp::Ordering::Less => (2usize, 3usize),
-            std::cmp::Ordering::Equal => {
-                return Err(format!(
-                    "both copies of block 1 claim generation {}, and there is \
-                     no rule measured for choosing between them",
-                    word(2, GENERATION)
-                ));
-            }
-        };
-
-        let entries_per_page = (page_size_usize - ENTRIES) / ENTRY;
+        let entries_per_page = Self::entries_per_block(page_size_usize);
         let entry_at = |page: usize, entry: usize| page * page_size_usize + ENTRIES + entry * ENTRY;
 
         // The first free slot, and that is the whole answer: a slot's position
@@ -492,23 +563,36 @@ impl Map {
         // belonging to a slot several places along. The special case for "a
         // block that claims nothing to number the new page after" goes with it:
         // an empty block's first free slot is slot 0, which is logical 1.
-        let mut free_entry: Option<usize> = None;
-        for entry in 0..entries_per_page {
-            let at = entry_at(live, entry);
-            let marker = u16::from_le_bytes([file[at], file[at + 1]]);
-            if marker >> 8 == 0 {
-                free_entry = free_entry.or(Some(entry));
+        // Blocks in order, and within a block, slots in order: the first free
+        // slot anywhere is the id this claim takes. Scanning past block 1 is
+        // what lets a file that has outgrown one block keep claiming --
+        // `WCCMP002.DAT` ships with fourteen.
+        //
+        // The scan stops at the first block whose pair is not there, rather
+        // than at block 1: `pair_of` refuses a block past the end of the file,
+        // and that refusal is the end of the table, not an error.
+        let mut found: Option<(usize, usize, usize, usize)> = None;
+        for block in 1usize.. {
+            let Ok((stale, live)) = Self::pair_of(file, page_size_usize, block) else {
+                break;
+            };
+            let free = (0..entries_per_page).find(|&entry| {
+                let at = entry_at(live, entry);
+                u16::from_le_bytes([file[at], file[at + 1]]) >> 8 == 0
+            });
+            if let Some(entry) = free {
+                found = Some((block, entry, stale, live));
                 break;
             }
         }
-        let Some(free_entry) = free_entry else {
+        let Some((block, free_entry, stale, live)) = found else {
             return Err(format!(
-                "block 1's regular array already claims every one of its \
-                 {entries_per_page} entries -- growing to a second block is \
+                "every allocation-table block in this file already claims all \
+                 {entries_per_page} of its entries -- growing a new block is \
                  not implemented"
             ));
         };
-        let new_logical = free_entry as u32 + 1;
+        let new_logical = ((block - 1) * entries_per_page + free_entry) as u32 + 1;
         let new_logical16 = u16::try_from(new_logical)
             .map_err(|_| format!("logical id {new_logical} does not fit in this format's u16"))?;
 
@@ -629,36 +713,12 @@ impl Map {
         let magic =
             |page: usize| -> bool { file[page * page_size_usize..][..2] == *MAGIC };
 
-        for page in 0..pages {
-            if magic(page) && word(page, BLOCK) != 1 {
-                return Err(format!(
-                    "physical page {page} is allocation-table block {}, and \
-                     relocating a page only handles a single-block file",
-                    word(page, BLOCK)
-                ));
-            }
-        }
-        if pages < 4 || !(magic(2) || magic(3)) {
-            return Err(
-                "neither physical page 2 nor 3 carries the \"PP\" allocation-\
-                 table magic -- there is no block 1 to relocate a page in"
-                    .to_owned(),
-            );
-        }
+        // Which block answers for this logical id, and which half of that
+        // block's pair is live. Both by formula -- see [`Self::pair_of`].
+        let (block, entry) = Self::block_of(logical, page_size_usize)?;
+        let (stale, live) = Self::pair_of(file, page_size_usize, block)?;
 
-        let (stale, live) = match word(2, GENERATION).cmp(&word(3, GENERATION)) {
-            std::cmp::Ordering::Greater => (3usize, 2usize),
-            std::cmp::Ordering::Less => (2usize, 3usize),
-            std::cmp::Ordering::Equal => {
-                return Err(format!(
-                    "both copies of block 1 claim generation {}, and there is \
-                     no rule measured for choosing between them",
-                    word(2, GENERATION)
-                ));
-            }
-        };
-
-        let entries_per_page = (page_size_usize - ENTRIES) / ENTRY;
+        let entries_per_page = Self::entries_per_block(page_size_usize);
         let entry_at = |page: usize, entry: usize| page * page_size_usize + ENTRIES + entry * ENTRY;
         let logical16 = u16::try_from(logical)
             .map_err(|_| format!("logical id {logical} does not fit in this format's u16"))?;
@@ -670,17 +730,6 @@ impl Map {
         // outright. The old search read each claimed page's own header looking
         // for a match, which is the inverted resolution `Self::read` no longer
         // performs either.
-        if logical == 0 {
-            return Err("logical ids are numbered from 1".to_owned());
-        }
-        let entry = (logical - 1) as usize;
-        if entry >= entries_per_page {
-            return Err(format!(
-                "logical id {logical} belongs to allocation-table block \
-                 {}, and relocating only handles a single-block file",
-                entry / entries_per_page + 1
-            ));
-        }
         let at = entry_at(live, entry);
         let marker = u16::from_le_bytes([file[at], file[at + 1]]);
         if marker >> 8 == 0 {
@@ -716,13 +765,17 @@ impl Map {
         // twin, and overwriting one of those would throw away a shadow copy
         // that is not this call's to spend.
         let claimed_physical = usize::from(u16::from_le_bytes([file[at + 2], file[at + 3]]));
+
+        // Claimed by **any** block, not just this one. Read through
+        // [`Self::read`], which resolves every block's live copy by the same
+        // formula [`Self::pair_of`] uses -- one authority for "what does this
+        // file currently claim", rather than a second walk here that would
+        // only ever see the block this call happens to be writing. On a
+        // multi-block file the difference is a live page belonging to another
+        // block being picked as this id's twin and written over.
         let mut claimed = vec![false; pages];
-        for entry in 0..entries_per_page {
-            let at = entry_at(live, entry);
-            if u16::from_le_bytes([file[at], file[at + 1]]) >> 8 == 0 {
-                continue;
-            }
-            let page = usize::from(u16::from_le_bytes([file[at + 2], file[at + 3]]));
+        for (_, page) in Self::read(file, page_size)?.entries() {
+            let page = page as usize;
             if page < pages {
                 claimed[page] = true;
             }
@@ -969,6 +1022,231 @@ mod tests {
             &[0xCC; 8],
             "the new content landed on 6"
         );
+    }
+
+    /// Claiming a page in a file that *has* a second block works, even when
+    /// the free slot itself is in block 1.
+    ///
+    /// [`Map::claim`] used to scan every page for the `"PP"` magic and refuse
+    /// the whole file if any of them called itself something other than block
+    /// 1. That refused `PP2BLOCK.DAT` outright -- not because the claim needed
+    /// block 2, but because block 2 existed at all.
+    #[test]
+    fn claiming_works_on_a_file_that_has_a_second_block() {
+        const PAGE: usize = 512;
+        let mut file = fixture("PP2BLOCK.DAT");
+        let before = Map::read(&file, PAGE as u16).expect("resolves");
+        let was = file.len() / PAGE;
+
+        let mut content = vec![0u8; PAGE];
+        content[32..40].fill(0xDD);
+        let logical = Map::claim(&mut file, PAGE as u16, &content, [0x00, 0x44])
+            .expect("a two-block file can still be claimed in");
+
+        assert_eq!(before.physical(logical), None, "the id claimed was free before");
+        let after = Map::read(&file, PAGE as u16).expect("still resolves");
+        assert_eq!(
+            after.physical(logical),
+            Some(was as u32),
+            "the new page was appended and the table points at it"
+        );
+        assert_eq!(
+            &file[was * PAGE + 32..was * PAGE + 40],
+            &[0xDD; 8],
+            "the caller's content reached the new page"
+        );
+
+        // Nothing that already resolved may move.
+        for (id, physical) in before.entries() {
+            assert_eq!(after.physical(id), Some(physical), "logical {id} moved");
+        }
+    }
+
+    /// Relocating a block-2 id must not pick a twin that **block 1** claims.
+    ///
+    /// [`Map::relocate`] chooses where to write by scanning for a page that
+    /// carries this logical id and that nothing claims. "Nothing claims" has
+    /// to mean nothing in the *whole file*: the entry arrays are per block,
+    /// and a walk of only the block being written sees none of the other
+    /// blocks' live pages, so any of them is a candidate to be overwritten.
+    ///
+    /// Built to discriminate, because the obvious version of this test cannot.
+    /// Twelve-byte pages give one entry a block, so block 1 answers logical 1
+    /// and block 2 answers logical 2. Physical 4 is **claimed by block 1** and
+    /// stamps itself logical 2 -- a stale self-stamp, which this format's own
+    /// doc comment establishes is decorative and outlives the claim that put
+    /// it there. Physical 8 is unclaimed and stamps itself logical 2 as well.
+    /// Relocating logical 2 must land on 8; a claimed-set gathered from block 2
+    /// alone finds 4 first and destroys a live page.
+    #[test]
+    fn relocating_never_takes_a_twin_another_block_still_claims() {
+        let page_size: usize = ENTRIES + ENTRY;
+        let mut file = vec![0u8; page_size * 9];
+        let at = |page: usize| page * page_size;
+
+        for (first, index) in [(2usize, 1u16), (5, 2)] {
+            for page in [first, first + 1] {
+                file[at(page)..at(page) + 2].copy_from_slice(MAGIC);
+                file[at(page) + BLOCK..at(page) + BLOCK + 2]
+                    .copy_from_slice(&index.to_le_bytes());
+            }
+            file[at(first) + GENERATION..at(first) + GENERATION + 2]
+                .copy_from_slice(&1u16.to_le_bytes());
+            file[at(first + 1) + GENERATION..at(first + 1) + GENERATION + 2]
+                .copy_from_slice(&2u16.to_le_bytes());
+        }
+
+        // Block 1's live copy (physical 3) claims logical 1 at physical 4.
+        let entry = at(3) + ENTRIES;
+        file[entry..entry + 2].copy_from_slice(&0x4400u16.to_le_bytes());
+        file[entry + 2..entry + 4].copy_from_slice(&4u16.to_le_bytes());
+        // Block 2's live copy (physical 6) claims logical 2 at physical 7.
+        let entry = at(6) + ENTRIES;
+        file[entry..entry + 2].copy_from_slice(&0x4400u16.to_le_bytes());
+        file[entry + 2..entry + 4].copy_from_slice(&7u16.to_le_bytes());
+
+        // Physical 4 (block 1's live page), 7 (block 2's) and 8 (unclaimed)
+        // all stamp themselves logical 2.
+        for page in [4usize, 7, 8] {
+            file[at(page)..at(page) + 2].copy_from_slice(&[0x00, 0x44]);
+            file[at(page) + LOGICAL..at(page) + LOGICAL + 2]
+                .copy_from_slice(&2u16.to_le_bytes());
+        }
+        file[at(4) + 8..at(4) + 12].fill(0xB1);
+        let block1_page = file[at(4)..at(4) + page_size].to_vec();
+
+        let mut content = vec![0u8; page_size];
+        content[8..12].fill(0xCC);
+        let to = Map::relocate(&mut file, page_size as u16, 2, &content, [0x00, 0x44])
+            .expect("logical 2 is claimed in block 2");
+
+        assert_eq!(to, 8, "the only twin no block claims");
+        assert_eq!(
+            file[at(4)..at(4) + page_size],
+            block1_page[..],
+            "physical 4 is block 1's live page and must not be written over"
+        );
+        let map = Map::read(&file, page_size as u16).expect("resolves");
+        assert_eq!(map.physical(1), Some(4), "block 1 still resolves to its page");
+        assert_eq!(map.physical(2), Some(8), "logical 2 moved to the free twin");
+    }
+
+    /// With block 1 full and a block 2 present, a claim lands in block 2 and
+    /// the new logical id is numbered from block 2's own base.
+    ///
+    /// This is the capability, as opposed to
+    /// [`claiming_works_on_a_file_that_has_a_second_block`], which only shows
+    /// the blanket refusal is gone. A slot's position within its block is the
+    /// id it answers for, so block 2 slot 0 is logical
+    /// `entries_per_block + 1` -- getting that arithmetic wrong writes a real
+    /// entry under an id nothing will ever resolve to.
+    ///
+    /// Twelve-byte pages: one entry a block, stride three, so block 1's pair
+    /// is at physical 2/3 and block 2's at 5/6.
+    #[test]
+    fn a_claim_lands_in_the_second_block_once_the_first_is_full() {
+        let page_size: usize = ENTRIES + ENTRY;
+        assert_eq!(Map::entries_per_block(page_size), 1, "one entry a block");
+        let mut file = vec![0u8; page_size * 8];
+        let at = |page: usize| page * page_size;
+
+        // Block 1 at 2/3, copy 3 live, its single entry already claimed.
+        // Block 2 at 5/6, copy 6 live, claiming nothing.
+        for (first, index) in [(2usize, 1u16), (5, 2)] {
+            for page in [first, first + 1] {
+                file[at(page)..at(page) + 2].copy_from_slice(MAGIC);
+                file[at(page) + BLOCK..at(page) + BLOCK + 2]
+                    .copy_from_slice(&index.to_le_bytes());
+            }
+            file[at(first) + GENERATION..at(first) + GENERATION + 2]
+                .copy_from_slice(&1u16.to_le_bytes());
+            file[at(first + 1) + GENERATION..at(first + 1) + GENERATION + 2]
+                .copy_from_slice(&2u16.to_le_bytes());
+        }
+        let entry = at(3) + ENTRIES;
+        file[entry..entry + 2].copy_from_slice(&0x4400u16.to_le_bytes());
+        file[entry + 2..entry + 4].copy_from_slice(&4u16.to_le_bytes());
+        file[at(4) + LOGICAL..at(4) + LOGICAL + 2].copy_from_slice(&1u16.to_le_bytes());
+
+        let content = vec![0u8; page_size];
+        let logical = Map::claim(&mut file, page_size as u16, &content, [0x00, 0x44])
+            .expect("block 1 is full, so the claim belongs to block 2");
+
+        assert_eq!(logical, 2, "block 2 slot 0 is logical entries_per_block + 1");
+        let map = Map::read(&file, page_size as u16).expect("resolves");
+        assert_eq!(map.physical(2), Some(8), "the appended page, claimed by block 2");
+        assert_eq!(map.physical(1), Some(4), "block 1's claim is untouched");
+    }
+
+    /// A logical id whose slot lives in allocation-table block **2** relocates
+    /// through block 2's own shadow pair.
+    ///
+    /// `PP2BLOCK.DAT`'s 512-byte pages give `(512 - 8) / 4 == 126` entries a
+    /// block, so block 1 answers logical 1 to 126 and block 2 answers 127
+    /// onward from its pair at physical 130/131. [`Map::read`] has resolved
+    /// both blocks by formula since the page-addressing plan's Task 3; the
+    /// write paths did not, and refused any file with a second block outright
+    /// -- which is the wall MajorMUD-NT's boot hits on `WCCMP002.DAT`:
+    ///
+    /// ```text
+    /// WGSERVER.EXE.dfaupdatedup refused: WCCMP002.DAT: relocating the
+    /// record's page: physical page 1026 is allocation-table block 2, and
+    /// relocating a page only handles a single-block file
+    /// ```
+    ///
+    /// Logical 127 is block 2's slot 0, claimed at physical 128. Relocating it
+    /// must rewrite **block 2's** stale copy and bump **block 2's** generation,
+    /// leaving block 1's pair untouched -- a generation counter is only ever
+    /// compared within one block's own two copies.
+    #[test]
+    fn a_logical_id_in_the_second_block_relocates_through_that_blocks_pair() {
+        const PAGE: usize = 512;
+        let mut file = fixture("PP2BLOCK.DAT");
+        let before = Map::read(&file, PAGE as u16).expect("resolves");
+        assert_eq!(
+            before.physical(127),
+            Some(128),
+            "logical 127 is block 2's slot 0, claimed at physical 128"
+        );
+        let block1 = file[2 * PAGE..4 * PAGE].to_vec();
+
+        let mut content = vec![0u8; PAGE];
+        content[32..40].fill(0xCC);
+        let to = Map::relocate(&mut file, PAGE as u16, 127, &content, [0x00, 0x44])
+            .expect("logical 127 is claimed in block 2, so it can be relocated");
+
+        assert_ne!(to, 128, "a relocation never writes the page it supersedes");
+        assert_eq!(
+            &file[to as usize * PAGE + 32..to as usize * PAGE + 40],
+            &[0xCC; 8],
+            "the new content landed on the page the call named"
+        );
+
+        let after = Map::read(&file, PAGE as u16).expect("still resolves");
+        assert_eq!(
+            after.physical(127),
+            Some(to),
+            "block 2's table now points logical 127 at its new home"
+        );
+        assert_eq!(
+            file[2 * PAGE..4 * PAGE],
+            block1[..],
+            "block 1's pair is untouched -- the write belonged to block 2"
+        );
+
+        // Every other id still resolves exactly where it did. A block-2 write
+        // that clobbered block 1, or renumbered slots across the boundary,
+        // shows up here and nowhere else.
+        for (logical, physical) in before.entries() {
+            if logical == 127 {
+                continue;
+            }
+            assert_eq!(
+                after.physical(logical),
+                Some(physical),
+                "logical {logical} moved, and only 127 was relocated"
+            );
+        }
     }
 
     /// Ten 512-byte pages with an allocation-table pair at 2/3, copy 3 live
@@ -1478,18 +1756,15 @@ mod tests {
         );
     }
 
-    /// A multi-block file is refused outright rather than silently claiming
-    /// into block 1 and leaving block 2 unrelated to the new page.
-    #[test]
-    fn claim_refuses_a_file_that_already_has_a_second_block() {
-        let mut file = fixture("PP2BLOCK.DAT");
-        let content = vec![0u8; 512];
-        let e = Map::claim(&mut file, 512, &content, [0x00, 0x44]).unwrap_err();
-        assert!(e.contains("single-block"), "{e}");
-    }
-
-    /// A block with no free entry left is refused rather than silently
-    /// growing a second block -- Step 1's own stated scope boundary.
+    /// A file whose blocks are all full is refused rather than silently
+    /// growing a *new* block -- still the stated scope boundary, now that
+    /// claiming scans every block that already exists.
+    ///
+    /// Twelve-byte pages give one entry a block and a stride of three, so
+    /// block 2's pair would sit at physical 5 and 6 of a five-page file:
+    /// past the end, which [`Map::pair_of`] refuses and the scan reads as
+    /// the end of the table. Block 1 is full and there is no block 2, so
+    /// there is nowhere left to put a claim.
     #[test]
     fn claim_refuses_a_block_with_no_free_entry_left() {
         // A tiny page (the smallest this format allows an entry array on)
@@ -1514,7 +1789,7 @@ mod tests {
 
         let content = vec![0u8; page_size];
         let e = Map::claim(&mut file, page_size as u16, &content, [0x00, 0x44]).unwrap_err();
-        assert!(e.contains("already claims every one of its"), "{e}");
+        assert!(e.contains("already claims all"), "{e}");
     }
 
     /// Mutation: claim a physical page (write its content, header included)
