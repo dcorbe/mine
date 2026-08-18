@@ -815,6 +815,18 @@ pub fn dosallocseg(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi:
 /// has a real bug, and papering over it with `NO_ERROR` is the same
 /// fabricated-success shape this crate refuses everywhere else.
 ///
+/// **"Never allocated at all" includes the module's own code, stack, data
+/// and bridge selectors**, all of which are real, live entries in the same
+/// segment table [`dosallocseg`] pushes into and every one of which a
+/// module can trivially name (`MOV AX,SS` for its own stack). Those are
+/// not merely refused for tidiness: freeing the running module's own stack
+/// segment out from under it and then letting execution continue is a
+/// host-crashing bug, not a guest one -- see
+/// [`mbbs_machine::m16::Segments::free_segment`]'s own doc comment for the
+/// allowlist that makes it structurally unreachable, and
+/// `crates/mbbs/tests/dosfreeseg_stack_selector_guard.rs` for the
+/// regression test that goes through the real dispatch loop to prove it.
+///
 /// # Argument order and byte count
 ///
 /// Far pascal, callee cleans. `sel` is `SEL` (2 bytes) -- `Cleans::Callee(2)`.

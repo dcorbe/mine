@@ -5,6 +5,7 @@
 //! two, which is why `crates/mbbs` could only ever be handed a whole `Machine`
 //! to read one pointer through.
 
+use std::collections::HashSet;
 use std::io;
 
 use crate::m16::farptr::ldt_index;
@@ -35,6 +36,25 @@ pub struct Segments {
     /// The segment `DS` is loaded from: the scratch one until an NE image is
     /// loaded, and that image's `DGROUP` afterwards.
     pub(crate) data: u16,
+
+    /// Every selector [`Segments::alloc_segment`]/[`Segments::alloc_tiled`]
+    /// has minted and not yet freed -- the **allowlist**
+    /// [`Segments::free_segment`] checks before it lets anything go.
+    ///
+    /// An allowlist, not a denylist naming `code`/`stack`/`data`: this
+    /// crate already has a ruling on that exact shape
+    /// (`crates/dos/tests/independence.rs`'s own module comment) -- "a
+    /// denylist cannot fail safe, because the entry you did not write is
+    /// the one that lets a dependency in." The same failure mode applies
+    /// here in the opposite direction: `code`/`stack`/`data` are the three
+    /// selectors `Segments` itself can name, but `Machine::new` also
+    /// builds a fourth, `bridge` (the thunk-table segment), which
+    /// `Segments` cannot see at all -- a denylist keyed on the three
+    /// accessors this file has would have missed it silently. Tracking
+    /// what *was* issued, rather than guessing at what must not be freed,
+    /// cannot have that gap: anything not in this set was not this
+    /// allocator's to begin with, full stop.
+    allocator_issued: HashSet<u16>,
 }
 
 impl Segments {
@@ -51,6 +71,7 @@ impl Segments {
             code,
             stack,
             data,
+            allocator_issued: HashSet::new(),
         }
     }
 
@@ -83,6 +104,9 @@ impl Segments {
         let segment = Segment::new(len, false)?;
         let selector = segment.selector();
         self.segments.push(segment);
+        // Recorded so `free_segment` can tell this selector apart from
+        // `code`/`stack`/`data`/`bridge`, none of which came through here.
+        self.allocator_issued.insert(selector);
         Ok(selector)
     }
 
@@ -109,6 +133,15 @@ impl Segments {
     pub fn alloc_tiled(&mut self, qty: u16, size: u16) -> io::Result<FarPtr> {
         let tiles = Segment::tiled(qty, size)?;
         let selector = tiles[0].selector();
+        // Every tile individually, not just the first -- `ptrtile` hands a
+        // module a selector for tile `n` computed from the base by adding
+        // `n * SELECTOR_STEP` on its own (this file's own doc comment on
+        // `alloc_tiled`), so a module holding tile 3's selector genuinely
+        // holds a selector this allocator issued, not merely one that looks
+        // adjacent to one it did.
+        for tile in &tiles {
+            self.allocator_issued.insert(tile.selector());
+        }
         self.segments.extend(tiles);
         Ok(FarPtr {
             offset: 0,
@@ -166,24 +199,63 @@ impl Segments {
     }
 
     /// Release a segment [`Segments::alloc_segment`] (or, one tile at a time,
-    /// [`Segments::alloc_tiled`]) previously handed out. `selector` names
-    /// nothing afterward -- a later [`Segments::resolve`]/[`Segments::write`]
-    /// against it fails exactly the way it already does for any selector
-    /// this module never owned.
+    /// [`Segments::alloc_tiled`]) previously handed out.
     ///
-    /// This is not a bookkeeping-only removal: [`Segment`] already implements
-    /// [`Drop`] (`seg.rs`), which clears the LDT entry and, once nothing else
-    /// shares the underlying mapping, `munmap`s it -- `remove` here is what
-    /// runs that drop. No new teardown had to be written; this is the first
-    /// caller that reaches the existing one deliberately rather than only
-    /// incidentally, when a whole [`crate::m16::Machine`] is itself dropped.
+    /// # This checks an allowlist, not merely "does a segment exist here"
+    ///
+    /// `code`/`stack`/`data`/`bridge` (`Machine::new`) live in the same
+    /// `segments` vec every allocator-issued segment does -- lookup by LDT
+    /// entry alone cannot tell them apart, and a module trivially holds its
+    /// own stack selector (`MOV AX,SS`). Freeing one of those out from under
+    /// a running module does not merely corrupt module state: the very next
+    /// [`crate::m16::Machine`] dispatch that reaches [`Segments::stack`]
+    /// (`.expect("the stack segment is this machine's own")`) panics the
+    /// *host* process, not just the guest. [`Segments::allocator_issued`]
+    /// exists to make that structurally unreachable: only a selector this
+    /// allocator itself minted can be freed at all, so `selector` naming
+    /// `code`/`stack`/`data`/`bridge` -- or anything else this allocator
+    /// never handed out -- answers the identical error an unrecognised
+    /// selector already does, rather than ever reaching the removal below.
+    ///
+    /// # `selector` may be reused after this returns
+    ///
+    /// This does **not** mean `selector` is guaranteed to name nothing for
+    /// the rest of this module's life. `crate::ldt`'s free list is
+    /// first-fit-lowest-first (its own module comment: "a freed slot is
+    /// handed out again before a fresh one"), and
+    /// `an_ldt_slot_is_reused_once_its_segment_is_gone` (`seg.rs`) already
+    /// exercises exactly that reuse. So a stale far pointer built from a
+    /// selector this call freed can resolve *successfully* again, into
+    /// whatever a later [`Segments::alloc_segment`]/[`Segments::alloc_tiled`]
+    /// call is handed the same LDT entry for -- silently reading or writing
+    /// the wrong segment's memory, not failing loudly. Real OS/2 has the
+    /// identical hazard (`DosFreeSeg` says nothing about a selector's
+    /// lifetime beyond "no longer describes what it did"), so reproducing it
+    /// is not a bug to fix here; it is a real, load-bearing reason a module
+    /// must not keep a far pointer alive past freeing what it points into --
+    /// the same discipline `free()`/`malloc()` require in C.
+    ///
+    /// # Real reclamation, not bookkeeping alone
+    ///
+    /// [`Segment`] already implements [`Drop`] (`seg.rs`), which clears the
+    /// LDT entry and, once nothing else shares the underlying mapping,
+    /// `munmap`s it -- `remove` here is what runs that drop. No new teardown
+    /// had to be written; this is the first caller that reaches the existing
+    /// one deliberately rather than only incidentally, when a whole
+    /// [`crate::m16::Machine`] is itself dropped.
     ///
     /// # Errors
     ///
-    /// If `selector` names no segment of this module's -- including a
-    /// selector already freed, which is exactly that case, not a special
-    /// one.
+    /// If `selector` was never issued by [`Segments::alloc_segment`]/
+    /// [`Segments::alloc_tiled`] -- including a selector already freed
+    /// (removed from [`Segments::allocator_issued`] the instant it is, so a
+    /// double free is not a special case, only the same case again) and
+    /// including `code`/`stack`/`data`/`bridge`, which were never in that
+    /// set to begin with.
     pub fn free_segment(&mut self, selector: u16) -> Result<(), FarPtrError> {
+        if !self.allocator_issued.remove(&selector) {
+            return Err(FarPtrError::NoSuchSegment { selector });
+        }
         let index = ldt_index(selector)?;
         let pos = self
             .segments
