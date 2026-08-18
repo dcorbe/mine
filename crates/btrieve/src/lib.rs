@@ -2018,6 +2018,74 @@ impl<M: Mem> Block<M> {
         Ok(())
     }
 
+    /// A logical id as a v6 index page names it: the key's own tag byte in
+    /// the top eight bits, the id in the low twenty-four.
+    ///
+    /// Measured against genuine Btrieve 6.15 (`crtprobe.exe`, 2026-08-17) on a
+    /// two-key file: key 1's root page reads `0x8100000b` in its own header
+    /// and every child pointer inside it reads `0x81......`. Key 0's read
+    /// `0x80......`. The same encoding the file control record's `KEY_ROOT`
+    /// field uses ([`pages::fcr::ROOT_PAGE`]), which is why the mask is 24
+    /// bits and not 31.
+    fn v6_decorate(logical: u32, tag: [u8; 2]) -> u32 {
+        (u32::from(tag[1]) << 24) | (logical & pages::fcr::ROOT_PAGE)
+    }
+
+    /// The logical ids a key's index tree occupies today, **root first**, in
+    /// the order [`pages::number_pages`] hands page numbers out.
+    ///
+    /// v6's counterpart to the `pages::walk` call v5's [`Self::reindex`] makes,
+    /// and deliberately the *same traversal*: [`pages::walk_with`] does the
+    /// walking and this supplies only the one thing that differs, which is what
+    /// a child slot's number means. A v5 slot names a physical page; a v6 slot
+    /// names a logical id with the key's tag byte on top, resolved through the
+    /// `"PP"` allocation table. Writing a second traversal here would be one
+    /// more thing that could fall out of step with `number_pages`, and the
+    /// symptom of that is a rebuild silently moving every node to a different
+    /// page instead of being a no-op.
+    ///
+    /// # Errors
+    ///
+    /// If the allocation table cannot be read, if a child slot carries some
+    /// other key's tag byte, if an id the tree names is claimed by nothing, or
+    /// if any page of the tree does not decode.
+    fn v6_index_logicals(
+        file: &[u8],
+        page_size: u16,
+        root: u32,
+        tag: [u8; 2],
+        shape: pages::Shape,
+    ) -> Result<Vec<u32>, String> {
+        let map = v6::Map::read(file, page_size)?;
+        let page = usize::from(page_size);
+        let walked = pages::walk_with(Self::v6_decorate(root, tag), shape, |number| {
+            let top = (number >> 24) as u8;
+            if top != tag[1] {
+                return Err(format!(
+                    "a child slot reads {number:#010x}, whose top byte {top:#04x} is                      not this key's {:#04x} -- the page it names belongs to another                      key's tree",
+                    tag[1]
+                ));
+            }
+            let logical = number & pages::fcr::ROOT_PAGE;
+            let physical = map.physical(logical).ok_or_else(|| {
+                format!("logical page {logical} is claimed by nothing")
+            })? as usize;
+            file.get(physical * page..physical * page + page)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| {
+                    format!(
+                        "logical page {logical} resolves to physical {physical}, past                          the end of a {}-byte file",
+                        file.len()
+                    )
+                })
+        })?;
+        Ok(walked
+            .pages
+            .into_iter()
+            .map(|number| number & pages::fcr::ROOT_PAGE)
+            .collect())
+    }
+
     fn v6_reindex(
         &self,
         file: &mut Vec<u8>,
@@ -2030,7 +2098,18 @@ impl<M: Mem> Block<M> {
 
         struct Rebuilt {
             root: u32,
-            image: Vec<u8>,
+            /// The rebuilt tree, still unplaced: [`pages::number_pages`] turns
+            /// it into images once every node has a logical id.
+            index: pages::Built,
+            /// The logical ids the key's tree occupies **today**, root first,
+            /// in exactly the order [`pages::number_pages`] hands numbers out.
+            ///
+            /// Reused rather than re-claimed, for the same reason v5's
+            /// `Block::reindex` feeds `pages::walk`'s output back in: a rebuild
+            /// that claimed fresh ids would leak one allocation-table slot per
+            /// node per write, and a file whose index is a hundred pages would
+            /// exhaust the table in a few hundred inserts.
+            existing: Vec<u32>,
             count_at: usize,
             count: u32,
             /// The two-byte page type an index page of *this* key carries:
@@ -2119,14 +2198,6 @@ impl<M: Mem> Block<M> {
 
             let index = pages::build_index(layout, &entries, key.shape())
                 .map_err(|why| format!("key {}: {why}", key.number))?;
-            if index.nodes.len() != 1 {
-                return Err(format!(
-                    "key {}: {len} records need {} index pages, and this host \
-                     only maintains a v6 key whose whole index fits one",
-                    key.number,
-                    index.nodes.len()
-                ));
-            }
 
             let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
             let root_at = definition + pages::fcr::KEY_ROOT;
@@ -2152,36 +2223,73 @@ impl<M: Mem> Block<M> {
                         key.number
                     )
                 })?;
+            let root = raw_root & pages::fcr::ROOT_PAGE;
+            let tag = [0x00, tag_high];
+            let existing = Self::v6_index_logicals(file, page_size, root, tag, key.shape())
+                .map_err(|why| format!("key {}: walking its current index: {why}", key.number))?;
             built.push(Rebuilt {
-                root: raw_root & pages::fcr::ROOT_PAGE,
-                image: index.nodes[0].image.clone(),
+                root,
+                index,
+                existing,
                 count_at: definition + pages::fcr::KEY_RECORDS,
                 count: u32::try_from(len).expect("far fewer records than u32::MAX"),
-                tag: [0x00, tag_high],
+                tag,
             });
         }
 
-        // Every key's index fits. Now, and only now, anything is written.
+        // Every key's index built. Now, and only now, anything is written.
+        //
+        // Claiming a page is itself a write, so it happens here rather than in
+        // the loop above: a key that cannot be indexed at all must refuse
+        // before the file has been touched, not after two of its siblings have
+        // already been placed.
         let mut counts = Vec::with_capacity(built.len());
         for rebuilt in &built {
             counts.push((rebuilt.count_at, rebuilt.count));
 
-            // The map is re-read per key rather than once: each relocation
-            // rewrites the allocation table, so a map read before the loop
-            // would answer about the file as it was two keys ago.
-            let map = v6::Map::read(file, page_size)?;
-            let body = usize::from(pages::HEADER);
-            if let Some(physical) = map.physical(rebuilt.root) {
-                let at = usize::from(page_size) * physical as usize;
-                if file[at + body..at + usize::from(page_size)] == rebuilt.image[body..] {
-                    continue;
-                }
+            // The tree's own page numbers, root first and decorated with this
+            // key's number the way every v6 child pointer is. `existing` covers
+            // the nodes the tree already had; anything beyond that is a node
+            // this rebuild added and needs an allocation-table slot of its own.
+            //
+            // A tree that *shrank* leaves its surplus pages claimed and
+            // unreferenced, exactly as v5's `Block::reindex` does -- reclaiming
+            // them needs the v6 free-list representation `records::walk_v6`'s
+            // doc comment still lists as unestablished.
+            let mut numbers: Vec<u32> = rebuilt
+                .existing
+                .iter()
+                .map(|&logical| Self::v6_decorate(logical, rebuilt.tag))
+                .collect();
+            let blank = vec![0u8; usize::from(page_size)];
+            while numbers.len() < rebuilt.index.nodes.len() {
+                let logical = v6::Map::claim(file, page_size, &blank, rebuilt.tag)
+                    .map_err(|why| format!("claiming an index page: {why}"))?;
+                numbers.push(Self::v6_decorate(logical, rebuilt.tag));
             }
 
-            v6::Map::relocate(file, page_size, rebuilt.root, &rebuilt.image, rebuilt.tag)
-                .map_err(|why| {
-                    format!("relocating the index root at logical {}: {why}", rebuilt.root)
-                })?;
+            let placed = pages::number_pages(&rebuilt.index, &numbers)?;
+            for (number, image) in placed {
+                let logical = number & pages::fcr::ROOT_PAGE;
+
+                // The map is re-read per node rather than once: every
+                // relocation below rewrites the allocation table, so a map read
+                // before the loop would answer about the file as it was two
+                // nodes ago.
+                let map = v6::Map::read(file, page_size)?;
+                let body = usize::from(pages::HEADER);
+                if let Some(physical) = map.physical(logical) {
+                    let at = usize::from(page_size) * physical as usize;
+                    if file[at + body..at + usize::from(page_size)] == image[body..] {
+                        continue;
+                    }
+                }
+
+                v6::Map::relocate(file, page_size, logical, &image, rebuilt.tag)
+                    .map_err(|why| {
+                        format!("relocating an index page at logical {logical}: {why}")
+                    })?;
+            }
         }
 
         // Last, and after every index root has been placed: the chains join
@@ -5674,6 +5782,156 @@ mod tests {
         assert_eq!(mine.bytes, record, "byte for byte");
     }
 
+
+    /// A v6 key whose index spans more than one page is maintained, not
+    /// refused -- and the tree the engine built is *reused*, not replaced.
+    ///
+    /// `IDXPROBE.DAT` was created and filled by genuine Btrieve 6.15 under
+    /// Wine (`tools/btrieve-oracle/crtprobe.exe`, 2026-08-17): 512-byte pages,
+    /// `reclen` 16, two unique four-byte keys whose orders are deliberately
+    /// opposite (key 0 ascending 1..120, key 1 descending), and 120 records.
+    /// A four-byte unique key's entry is twelve bytes, so one 512-byte page
+    /// holds forty-one of them and 120 records cannot fit in one: the engine
+    /// gave **both** keys a two-level tree, a root over several leaves.
+    ///
+    /// That is the wall MajorMUD-NT's boot hit next, on a file that needs a
+    /// hundred index pages rather than five:
+    ///
+    /// ```text
+    /// WGSERVER.EXE.dfaupdatedup refused: WCCMP002.DAT: key 0: 26720 records
+    /// need 106 index pages, and this host only maintains a v6 key whose
+    /// whole index fits one
+    /// ```
+    ///
+    /// # Verified against the engine itself, not only against this crate
+    ///
+    /// The file this test writes was handed back to genuine Btrieve 6.15 under
+    /// Wine (`tools/btrieve-oracle/btrvprobe.exe`, 2026-08-17). All of its
+    /// checks pass on our output:
+    ///
+    /// ```text
+    /// stat      records 121, key 0 approx=121, key 1 approx=121
+    /// walk      walked 121, stat says 121, regressions 0   -> WALK OK
+    /// descend 0 descents 121, failures 0, wrong rec 0      -> DESCEND OK
+    /// descend 1 descents 121, failures 0, wrong rec 0      -> DESCEND OK
+    /// ```
+    ///
+    /// `descend` is the one that matters: it does a `GET_EQUAL` for every key
+    /// value, which forces the engine down its own root-to-leaf traversal of
+    /// the tree this host wrote -- through the interior node and into the right
+    /// leaf, 121 times per key. A tree with a wrong child pointer, a wrongly
+    /// tagged page or a mis-split node does not survive that.
+    ///
+    /// The reuse half is what this asserts hardest. `Self::v6_index_logicals`
+    /// walks the tree the file already has and hands those ids back to
+    /// `pages::number_pages`, so a rebuild lands on the pages it already
+    /// occupied. Claiming fresh ids instead would still produce a valid file
+    /// and pass every other assertion here -- while leaking one
+    /// allocation-table slot per node per write, which on a hundred-page index
+    /// exhausts the table in a few hundred inserts. The claim count is
+    /// therefore checked directly.
+    #[test]
+    fn a_v6_key_whose_index_needs_several_pages_is_maintained() {
+        let dir = crate::testing::scratch("v6-multi-page-index");
+        let path = dir.join("IDXPROBE.DAT");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/variable/IDXPROBE.DAT"),
+            &path,
+        )
+        .expect("the engine-built fixture copies into a scratch directory");
+
+        let mut block = block_from_file(path.clone(), "IDXPROBE.DAT");
+        assert_eq!(block.geometry.version, Version::V6);
+        assert_eq!(block.keys.len(), 2, "the engine built it with two keys");
+        let before = block.records().expect("the engine's own records read").len();
+        assert_eq!(before, 120);
+
+        // Both keys really do need more than one page -- otherwise this test
+        // would pass without ever leaving the single-page path.
+        let whole = std::fs::read(&path).expect("reads");
+        for key in &block.keys {
+            let definition =
+                pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+            let live = block.v6_live_fcr(&whole).expect("a live control record");
+            let raw = pages::long(&live[definition..definition + 4]);
+            let tag = [0x00, 0x80 | key.number as u8];
+            let nodes = Block::<Flat>::v6_index_logicals(
+                &whole,
+                block.geometry.page,
+                raw & pages::fcr::ROOT_PAGE,
+                tag,
+                key.shape(),
+            )
+            .expect("the engine's own tree walks");
+            assert!(
+                nodes.len() > 1,
+                "key {}'s index is {} page(s); this fixture exists to exercise more \
+                 than one",
+                key.number,
+                nodes.len()
+            );
+        }
+
+        let claimed_before = v6::Map::read(&whole, block.geometry.page)
+            .expect("resolves")
+            .entries()
+            .count();
+
+        let mut record = vec![0u8; usize::from(block.geometry.reclen)];
+        record[..4].copy_from_slice(&500u32.to_le_bytes());
+        record[4..8].copy_from_slice(&500u32.to_le_bytes());
+        block.insert(&record).expect("an insert into a multi-page index");
+
+        // Re-read from disk rather than trusting the in-memory model.
+        block.records = None;
+        let after = block.records().expect("a fresh read from disk");
+        assert_eq!(after.len(), before + 1, "the record went in");
+
+        let whole = std::fs::read(&path).expect("reads");
+        let claimed_after = v6::Map::read(&whole, block.geometry.page)
+            .expect("resolves")
+            .entries()
+            .count();
+        assert!(
+            claimed_after <= claimed_before + 2,
+            "one insert claimed {} new pages: the existing index tree is meant to be \
+             walked and reused, not re-claimed node by node",
+            claimed_after - claimed_before
+        );
+
+        // Every key's tree still walks, still belongs to that key, and still
+        // holds one entry per record.
+        for key in &block.keys {
+            let definition =
+                pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+            let live = block.v6_live_fcr(&whole).expect("a live control record");
+            let raw = pages::long(&live[definition..definition + 4]);
+            let tag = [0x00, 0x80 | key.number as u8];
+            let nodes = Block::<Flat>::v6_index_logicals(
+                &whole,
+                block.geometry.page,
+                raw & pages::fcr::ROOT_PAGE,
+                tag,
+                key.shape(),
+            )
+            .unwrap_or_else(|e| panic!("key {}: the rebuilt tree walks: {e}", key.number));
+            assert!(nodes.len() > 1, "key {} still spans several pages", key.number);
+
+            let map = v6::Map::read(&whole, block.geometry.page).expect("resolves");
+            let page = usize::from(block.geometry.page);
+            for logical in &nodes {
+                let physical = map.physical(*logical).expect("claimed") as usize;
+                let tag_read =
+                    u16::from_le_bytes([whole[physical * page], whole[physical * page + 1]]);
+                assert_eq!(
+                    tag_read,
+                    0x8000 | (key.number << 8),
+                    "logical {logical} is in key {}'s tree and must carry its tag",
+                    key.number
+                );
+            }
+        }
+    }
 
     /// Key **1**'s index pages are tagged `0x8100`, not key 0's `0x8000`.
     ///

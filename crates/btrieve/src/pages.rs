@@ -1092,6 +1092,38 @@ pub fn walk(
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    walk_with(root, shape, |number| {
+        if number == 0 || number >= layout.pages {
+            return Err(format!(
+                "page {number} is not inside a {}-page file",
+                layout.pages
+            ));
+        }
+        let mut bytes = vec![0u8; usize::from(layout.page)];
+        file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|e| format!("{}: page {number}: {e}", path.display()))?;
+        Ok(bytes)
+    })
+}
+
+/// [`walk`]'s traversal, over whatever `fetch` says a page number holds.
+///
+/// **One traversal, two addressing schemes.** A v5 child slot names a physical
+/// page and is read by seeking to it; a v6 child slot names a *logical* id with
+/// the key's own number in its top byte, resolved through
+/// [`super::v6::Map`] against a file already in memory. Everything else about
+/// walking a tree -- the leftmost-first descent, the rightmost slot standing in
+/// for the last entry's child, the cycle and depth guards, and above all the
+/// order pages are pushed in -- is identical, and that order is load-bearing:
+/// [`number_pages`] hands out numbers in exactly this sequence, and a second
+/// traversal written to match would be one more thing that could drift out of
+/// step with it. `fetch` owns the bounds check, because "inside the file" means
+/// different things to the two.
+pub fn walk_with<F>(root: u32, shape: Shape, mut fetch: F) -> Result<Walk, String>
+where
+    F: FnMut(u32) -> Result<Vec<u8>, String>,
+{
     let mut out = Walk {
         entries: Vec::new(),
         pages: Vec::new(),
@@ -1113,12 +1145,6 @@ pub fn walk(
     loop {
         // Descend as far left as this subtree goes.
         while let Some(number) = next.take() {
-            if number == 0 || number >= layout.pages {
-                return Err(format!(
-                    "page {number} is not inside a {}-page file",
-                    layout.pages
-                ));
-            }
             if !seen.insert(number) {
                 return Err(format!("page {number} appears twice in the tree"));
             }
@@ -1127,10 +1153,7 @@ pub fn walk(
             }
             out.pages.push(number);
 
-            let mut bytes = vec![0u8; usize::from(layout.page)];
-            file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
-                .and_then(|_| file.read_exact(&mut bytes))
-                .map_err(|e| format!("{}: page {number}: {e}", path.display()))?;
+            let bytes = fetch(number)?;
             let page = decode_index_page(&bytes, shape)
                 .map_err(|e| format!("page {number}: {e}"))?;
 
