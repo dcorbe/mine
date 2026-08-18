@@ -320,6 +320,22 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
     // before anything is written back: real Btrieve does not rewrite the
     // name it was asked to open, and the guest is entitled to read its own
     // buffer back unchanged.
+    // What the guest currently has in the first four bytes of its position
+    // block. Kept so it can be put back: those bytes are the guest's memory,
+    // and this host restoring its own handle over them on every call would be
+    // writing into a buffer the guest has evidently decided to use for
+    // something else. See `Process::btrieve_blocks`.
+    let guest_head: [u8; 4] = posblk[..4].try_into().expect("128 >= 4");
+
+    // Put Open's handle back before the engine looks at it. On a guest that
+    // never touches its position block this is a no-op -- `guest_head` already
+    // *is* the handle -- so nothing changes for the well-behaved case.
+    if op != 0
+        && let Some(handle) = process.btrieve_handle(posblk_at)
+    {
+        posblk[..4].copy_from_slice(&handle);
+    }
+
     let original_keybuf = (op == 0).then(|| keybuf.clone());
     // Set for a refused name (rejected syntax, a device name, or a symlink
     // escape): real Btrieve status 12, answered without ever calling
@@ -384,6 +400,20 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
         keybuf = original;
     }
 
+    // Remember what Open recorded, forget what Close released, and on every
+    // other operation hand the guest back its own four bytes rather than this
+    // host's handle.
+    if status == Status::OK {
+        match op {
+            0 => process.set_btrieve_handle(posblk_at, posblk[..4].try_into().expect("128 >= 4")),
+            1 => process.clear_btrieve_handle(posblk_at),
+            _ => {}
+        }
+    }
+    if op != 0 {
+        posblk[..4].copy_from_slice(&guest_head);
+    }
+
     // Write everything back: the position block, the data buffer and its
     // length, and the key buffer -- an operation may have changed any of
     // them (Open the position block, Get the data and key buffers and the
@@ -412,6 +442,51 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
 mod tests {
     use super::*;
     use mbbs_machine::m32::{Exit, Mapping};
+
+    /// The handle table is keyed by the block's **address**, which the guest
+    /// cannot corrupt -- unlike the four bytes inside the block, which it
+    /// demonstrably does.
+    #[test]
+    fn a_handle_is_remembered_against_the_blocks_address() {
+        let mut p = Process::new("X.EXE", &[]);
+        assert_eq!(p.btrieve_handle(0x1000), None, "nothing open yet");
+
+        p.set_btrieve_handle(0x1000, [1, 2, 3, 4]);
+        p.set_btrieve_handle(0x2000, [5, 6, 7, 8]);
+        assert_eq!(p.btrieve_handle(0x1000), Some([1, 2, 3, 4]));
+        assert_eq!(p.btrieve_handle(0x2000), Some([5, 6, 7, 8]));
+        assert_eq!(p.btrieve_handle(0x3000), None, "an address never opened");
+    }
+
+    /// A block reused for a second Open names the **new** file. Keeping the
+    /// first handle would silently redirect every later operation at a file
+    /// the guest stopped using.
+    #[test]
+    fn opening_into_the_same_block_replaces_the_handle() {
+        let mut p = Process::new("X.EXE", &[]);
+        p.set_btrieve_handle(0x1000, [1, 2, 3, 4]);
+        p.set_btrieve_handle(0x1000, [9, 9, 9, 9]);
+        assert_eq!(p.btrieve_handle(0x1000), Some([9, 9, 9, 9]));
+        assert_eq!(p.btrieve_blocks.len(), 1, "replaced, not appended");
+    }
+
+    /// Close forgets. Keeping a closed file's handle would let a later
+    /// operation on that block reach whatever the engine opens next.
+    #[test]
+    fn closing_forgets_the_block() {
+        let mut p = Process::new("X.EXE", &[]);
+        p.set_btrieve_handle(0x1000, [1, 2, 3, 4]);
+        p.set_btrieve_handle(0x2000, [5, 6, 7, 8]);
+        p.clear_btrieve_handle(0x1000);
+        assert_eq!(p.btrieve_handle(0x1000), None);
+        assert_eq!(
+            p.btrieve_handle(0x2000),
+            Some([5, 6, 7, 8]),
+            "the other block is untouched"
+        );
+        p.clear_btrieve_handle(0x9999);
+        assert_eq!(p.btrieve_blocks.len(), 1, "clearing an unknown block is a no-op");
+    }
 
     /// The seven stdcall arguments are read in Btrieve's own order, and the
     /// callee cleans all twenty-eight bytes of them.

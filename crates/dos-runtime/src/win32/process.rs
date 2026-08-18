@@ -253,6 +253,28 @@ pub struct Process {
     /// after a `None` to tell which one actually happened, and reports
     /// [`Outcome::BtrieveGap`] rather than [`Outcome::Unimplemented`] when it
     /// is set.
+    /// What Open wrote into each position block, keyed by the block's guest
+    /// **address**.
+    ///
+    /// **The engine identifies an open file by a pointer it stores inside the
+    /// guest's 128-byte position block** (`crates/btrieve/src/btrcall.rs`'s
+    /// `handle_of`), and that block is guest-writable memory. `wccmmutl.exe`
+    /// overwrites it: measured, it opens sixteen data files, closes none, and
+    /// by the time it issues a Step First against `WCCITOW2.DAT` the first
+    /// four bytes of that file's block hold `0x41000007` instead of the handle
+    /// Open put there. The engine then reports "is not an open Btrieve file"
+    /// for a file it has open.
+    ///
+    /// The guest is not doing anything a real board did not do, so real
+    /// Btrieve cannot be keying on those bytes -- it keys on the block itself.
+    /// This is that, at the only layer that can see it: the engine is handed a
+    /// 128-byte *copy* and never learns the address, but this edge marshalled
+    /// the call and knows it. Open records the handle here, and every later
+    /// operation puts it back into the copy before the engine sees it.
+    ///
+    /// A `Vec` rather than a map because a board opens on the order of sixteen
+    /// files at once and a linear scan of sixteen is cheaper than hashing.
+    pub btrieve_blocks: Vec<(u32, [u8; 4])>,
     pub btrieve_gap: Option<String>,
     /// Set when a shim has redirected the module rather than answering it --
     /// today only `KERNEL32!RtlUnwind`, which by contract never returns to
@@ -367,6 +389,7 @@ impl Process {
             objects: Vec::new(),
             btrieve: ::btrieve::Btrieve::default(),
             btrieve_heap: btrieve::Win32Heap::default(),
+            btrieve_blocks: Vec::new(),
             btrieve_gap: None,
             transfer: None,
             unwind_gap: None,
@@ -509,6 +532,31 @@ impl Process {
         let key = self.keys.as_mut()?.next_key(&screen)?;
         self.pending_keys.extend(key_bytes(key));
         self.pending_keys.pop_front()
+    }
+
+    /// The handle Open recorded for the position block at `at`.
+    pub fn btrieve_handle(&self, at: u32) -> Option<[u8; 4]> {
+        self.btrieve_blocks
+            .iter()
+            .find(|(block, _)| *block == at)
+            .map(|(_, handle)| *handle)
+    }
+
+    /// Record what Open wrote, replacing any earlier handle for the same
+    /// address -- a block reused for a second Open names the new file, not the
+    /// old one.
+    pub fn set_btrieve_handle(&mut self, at: u32, handle: [u8; 4]) {
+        match self.btrieve_blocks.iter_mut().find(|(b, _)| *b == at) {
+            Some(slot) => slot.1 = handle,
+            None => self.btrieve_blocks.push((at, handle)),
+        }
+    }
+
+    /// Forget a block, on Close. Keeping it would let a later operation on a
+    /// closed file be silently redirected at whatever the engine opens next
+    /// into the same slot.
+    pub fn clear_btrieve_handle(&mut self, at: u32) {
+        self.btrieve_blocks.retain(|(b, _)| *b != at);
     }
 
     /// Record an exit code. [`run`] stops as soon as one is set, which is what
@@ -960,6 +1008,89 @@ mod tests {
              and throws on it -- landing at the same register-setter wall \
              this test's own history already found by a different route; \
              see this test's comment"
+        );
+    }
+
+    /// **The position-block identity regression.**
+    ///
+    /// `wccmmutl.exe` opens sixteen data files, closes none, and then
+    /// overwrites the first four bytes of `WCCITOW2.DAT`'s position block
+    /// before issuing a Step First against it. Those four bytes are where the
+    /// engine keeps the only handle it has for that file
+    /// (`crates/btrieve/src/btrcall.rs`'s `handle_of`), so before
+    /// `Process::btrieve_blocks` existed the engine answered
+    /// `"... is not an open Btrieve file"` for a file it had open, and the run
+    /// stopped there.
+    ///
+    /// The assertion is deliberately about the *shape* of the failure rather
+    /// than a fixed frontier: what must never come back is a gap saying a
+    /// block this host opened is not open. Where the program gets to after
+    /// that is a moving target and is pinned by the acceptance run below.
+    ///
+    /// **`#[ignore]`d** for the same reason as that run: it needs
+    /// `/home/daniel/peepeebbs`, a real board outside the repo, and copies it.
+    /// Run with
+    /// `cargo test -p dos-runtime --lib win32::process::tests::a_scribbled_position_block_still_names_its_file -- --ignored`.
+    #[test]
+    #[ignore = "copies a real ~218 MB board; run explicitly"]
+    fn a_scribbled_position_block_still_names_its_file() {
+        let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
+        let mut loaded = crate::win32::load::load(&file).expect("loads");
+        loaded.machine.set_budget(std::time::Duration::from_secs(120));
+        let mut p = Process::new("C:\\WCCMMUTL.EXE", &[]);
+
+        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
+            .join("win32-posblk-identity");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("root dir");
+        let status = std::process::Command::new("cp")
+            .arg("-a")
+            .arg("/home/daniel/peepeebbs/.")
+            .arg(&dir)
+            .status()
+            .expect("cp runs");
+        assert!(status.success(), "copying the board failed");
+        let mcv = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/WCCMMUD.MCV"
+        ));
+        std::fs::copy(&mcv, dir.join("WCCMMUD.MCV")).expect("the message catalogue");
+
+        let fd = std::fs::File::open(&dir).expect("root fd");
+        p.streams = crate::win32::stream::Streams::new(Some(dos::files::Files::new(
+            fd.into(),
+            dir.clone(),
+        )));
+
+        let out = run(&mut loaded, &mut p, 20_000_000).expect("the machine runs");
+
+        if let Outcome::BtrieveGap { what } = &out {
+            assert!(
+                !what.contains("is not an open Btrieve file"),
+                "the engine lost a file this host opened -- the handle in the \
+                 guest's position block was overwritten and not restored: {what}"
+            );
+        }
+
+        // A liveness check, not a precise count: the program opens the
+        // board's files, closes a couple along the way, and the table holds
+        // whatever is still open -- 15, as measured. Asserted loosely because
+        // the exact number is a property of the program's menu path, which
+        // moves; what matters is that Opens were recorded at all, since a
+        // table that stayed empty would make the first assertion vacuous.
+        // Measured: seventeen Opens and two Closes, so fifteen blocks remain.
+        //
+        // The **upper** bound is the load-bearing half. Without it this test
+        // cannot fail when Close stops forgetting -- the table would simply
+        // grow to seventeen and every assertion above would still pass, which
+        // is a check that cannot catch the bug it guards. The lower bound is
+        // the liveness half: an empty table would make the gap assertion above
+        // vacuous.
+        let open = p.btrieve_blocks.len();
+        assert!(
+            (10..=15).contains(&open),
+            "expected the board's still-open files, 15 of them; got {open} -- \
+             above 15 means a Close did not forget its block"
         );
     }
 
