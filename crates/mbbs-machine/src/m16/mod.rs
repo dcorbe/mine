@@ -628,6 +628,18 @@ impl Machine {
         self.mem.alloc_segment(len)
     }
 
+    /// Release a segment [`Machine::alloc_segment`] previously handed out.
+    ///
+    /// # Errors
+    ///
+    /// If `selector` names no segment of this module's.
+    ///
+    /// Delegates to [`Segments::free_segment`]; kept on `Machine` for the
+    /// same reason [`Machine::alloc_segment`] is.
+    pub fn free_segment(&mut self, selector: u16) -> Result<(), FarPtrError> {
+        self.mem.free_segment(selector)
+    }
+
     /// One region of `qty * size` bytes, described by `qty` consecutive LDT
     /// entries of `size` bytes each.
     ///

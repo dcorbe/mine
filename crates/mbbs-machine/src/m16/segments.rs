@@ -165,6 +165,35 @@ impl Segments {
             .ok_or(FarPtrError::NoSuchSegment { selector })
     }
 
+    /// Release a segment [`Segments::alloc_segment`] (or, one tile at a time,
+    /// [`Segments::alloc_tiled`]) previously handed out. `selector` names
+    /// nothing afterward -- a later [`Segments::resolve`]/[`Segments::write`]
+    /// against it fails exactly the way it already does for any selector
+    /// this module never owned.
+    ///
+    /// This is not a bookkeeping-only removal: [`Segment`] already implements
+    /// [`Drop`] (`seg.rs`), which clears the LDT entry and, once nothing else
+    /// shares the underlying mapping, `munmap`s it -- `remove` here is what
+    /// runs that drop. No new teardown had to be written; this is the first
+    /// caller that reaches the existing one deliberately rather than only
+    /// incidentally, when a whole [`crate::m16::Machine`] is itself dropped.
+    ///
+    /// # Errors
+    ///
+    /// If `selector` names no segment of this module's -- including a
+    /// selector already freed, which is exactly that case, not a special
+    /// one.
+    pub fn free_segment(&mut self, selector: u16) -> Result<(), FarPtrError> {
+        let index = ldt_index(selector)?;
+        let pos = self
+            .segments
+            .iter()
+            .position(|s| s.entry() == u32::from(index))
+            .ok_or(FarPtrError::NoSuchSegment { selector })?;
+        self.segments.remove(pos);
+        Ok(())
+    }
+
     /// Borrow `len` bytes of module memory through a far pointer.
     ///
     /// This is the only correct way to follow a pointer a module gave you. The
