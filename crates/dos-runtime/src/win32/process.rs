@@ -207,7 +207,15 @@ pub struct Process {
     /// read reports nothing rather than blocking, which is what a batch run
     /// needs and what every test that does not care about input gets for free.
     pub keys: Option<Box<dyn crate::driver::Driver>>,
-    /// One keystroke `_kbhit` has looked at but `_getch` has not taken.
+    /// Keystrokes decoded but not yet handed to `_getch`.
+    ///
+    /// **A queue rather than one byte, because an extended key is two reads.**
+    /// DOS conio reports a function or arrow key by answering `0` and making
+    /// the *next* `getch` return the scan code, so one keypress becomes two
+    /// bytes and they must be delivered in order. Modelling it as a single
+    /// parked byte -- which this was -- makes every arrow key deliver a `0`
+    /// and then nothing, which is exactly how it failed: the menu could be
+    /// driven with Enter but not with the arrows.
     ///
     /// **`kbhit` must not consume.** It reports whether a key is waiting; a
     /// host that drew one from the driver and dropped it turns every "press any
@@ -215,7 +223,7 @@ pub struct Process {
     /// clears. A `Driver` has no peek, so the peek is built here: `_kbhit`
     /// draws at most one key and parks it, and `_getch` takes the parked one
     /// before asking for another.
-    pending_key: Option<u8>,
+    pending_keys: std::collections::VecDeque<u8>,
     /// `(caption, text)` of every `MessageBoxA` the program tried to show.
     ///
     /// There is no desktop here, so the box cannot appear -- but the text is
@@ -268,21 +276,21 @@ pub struct Process {
     pub unwind_gap: Option<String>,
 }
 
-/// A [`Key`](crate::driver::Key) as `getch` reports it.
+/// A [`Key`](crate::driver::Key) as `getch` reports it: one byte, or two.
 ///
-/// **An extended key is two reads, and this returns the first.** DOS conio
-/// signals a function or arrow key by answering `0` and making the *next*
-/// `getch` return the scan code. Collapsing an `Ext` to its bare scan code
-/// would hand the program a plain character it never pressed -- `Ext(0x48)`,
-/// the up arrow, would read as `H`.
+/// **An extended key is two reads, and both are returned here.** DOS conio
+/// signals a function or arrow key by answering `0` from one `getch` and the
+/// scan code from the *next* one. Returning only the scan code would hand the
+/// program a plain character nobody pressed -- the up arrow's `0x48` reads as
+/// `H` -- and returning only the `0` loses the key entirely, which is how the
+/// arrows used to fail.
 ///
-/// The second read is not yet modelled, because nothing measured has pressed
-/// one: this program's only conio use is a "press any key" prompt. When one is
-/// measured, the parked scan code belongs beside `pending_key`.
-fn key_byte(key: crate::driver::Key) -> u8 {
+/// The `0` goes first. A program distinguishes the two cases by testing the
+/// first byte, so the order is the whole signal.
+fn key_bytes(key: crate::driver::Key) -> Vec<u8> {
     match key {
-        crate::driver::Key::Char(b) => b,
-        crate::driver::Key::Ext(_) => 0,
+        crate::driver::Key::Char(b) => vec![b],
+        crate::driver::Key::Ext(scan) => vec![0, scan],
     }
 }
 
@@ -355,7 +363,7 @@ impl Process {
             exports: Vec::new(),
             messages: Vec::new(),
             keys: None,
-            pending_key: None,
+            pending_keys: std::collections::VecDeque::new(),
             objects: Vec::new(),
             btrieve: ::btrieve::Btrieve::default(),
             btrieve_heap: btrieve::Win32Heap::default(),
@@ -462,7 +470,7 @@ impl Process {
     /// is a repaint, not a read, and swallowing input here would lose
     /// keystrokes typed while the program was working.
     pub fn pump_display(&mut self) {
-        if self.pending_key.is_some() {
+        if !self.pending_keys.is_empty() {
             return;
         }
         let due = self.keys.as_ref().is_some_and(|d| d.poll_due());
@@ -470,32 +478,37 @@ impl Process {
             return;
         }
         let screen = self.screen();
-        if let Some(driver) = self.keys.as_mut() {
-            self.pending_key = driver.poll_key(&screen).map(key_byte);
+        if let Some(driver) = self.keys.as_mut()
+            && let Some(key) = driver.poll_key(&screen)
+        {
+            self.pending_keys.extend(key_bytes(key));
         }
     }
 
     /// Is a keystroke waiting? Does **not** consume it.
     pub fn key_waiting(&mut self) -> bool {
-        if self.pending_key.is_some() {
+        if !self.pending_keys.is_empty() {
             return true;
         }
         let screen = self.screen();
         let Some(driver) = self.keys.as_mut() else {
             return false;
         };
-        self.pending_key = driver.poll_key(&screen).map(key_byte);
-        self.pending_key.is_some()
+        if let Some(key) = driver.poll_key(&screen) {
+            self.pending_keys.extend(key_bytes(key));
+        }
+        !self.pending_keys.is_empty()
     }
 
     /// Take the next keystroke, or `None` when there is no more input.
     pub fn next_key(&mut self) -> Option<u8> {
-        if let Some(key) = self.pending_key.take() {
-            return Some(key);
+        if let Some(byte) = self.pending_keys.pop_front() {
+            return Some(byte);
         }
         let screen = self.screen();
-        let driver = self.keys.as_mut()?;
-        driver.next_key(&screen).map(key_byte)
+        let key = self.keys.as_mut()?.next_key(&screen)?;
+        self.pending_keys.extend(key_bytes(key));
+        self.pending_keys.pop_front()
     }
 
     /// Record an exit code. [`run`] stops as soon as one is set, which is what
@@ -1073,13 +1086,13 @@ mod tests {
 
     struct Spy {
         due: bool,
-        key: Option<u8>,
+        key: Option<crate::driver::Key>,
         state: std::rc::Rc<std::cell::RefCell<SpyState>>,
     }
 
     impl crate::driver::Driver for Spy {
         fn next_key(&mut self, _screen: &crate::screen::Screen) -> Option<crate::driver::Key> {
-            self.key.take().map(crate::driver::Key::Char)
+            self.key.take()
         }
         fn poll_due(&self) -> bool {
             self.due
@@ -1089,8 +1102,22 @@ mod tests {
             st.polls += 1;
             st.seen.push(screen.grid.line(0).trim_end().to_string());
             drop(st);
-            self.key.take().map(crate::driver::Key::Char)
+            self.key.take()
         }
+    }
+
+    /// A process whose driver offers exactly one key, of any kind.
+    fn with_spy_key(
+        key: crate::driver::Key,
+    ) -> (Process, std::rc::Rc<std::cell::RefCell<SpyState>>) {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(SpyState::default()));
+        let mut p = Process::new("X.EXE", &[]);
+        p.keys = Some(Box::new(Spy {
+            due: true,
+            key: Some(key),
+            state: std::rc::Rc::clone(&state),
+        }));
+        (p, state)
     }
 
     fn with_spy(
@@ -1101,7 +1128,7 @@ mod tests {
         let mut p = Process::new("X.EXE", &[]);
         p.keys = Some(Box::new(Spy {
             due,
-            key,
+            key: key.map(crate::driver::Key::Char),
             state: std::rc::Rc::clone(&state),
         }));
         (p, state)
@@ -1196,13 +1223,46 @@ mod tests {
         assert_eq!(screen.cursor, (2, 5), "Screen orders it (row, col)");
     }
 
-    /// An extended key reads as zero rather than as its scan code, because a
-    /// bare scan code is a character the user never pressed -- the up arrow's
-    /// `0x48` would arrive as `H`.
+    /// **An extended key is two reads: `0`, then the scan code.**
+    ///
+    /// Returning only the scan code hands the program a character nobody
+    /// pressed -- the up arrow's `0x48` reads as `H`. Returning only the `0`
+    /// loses the key, which is how the arrows actually failed: the menu could
+    /// be driven with Enter but not with the arrows, because every arrow
+    /// delivered a `0` and then nothing.
     #[test]
-    fn an_extended_key_does_not_arrive_as_a_character() {
-        assert_eq!(key_byte(crate::driver::Key::Char(b'A')), b'A');
-        assert_eq!(key_byte(crate::driver::Key::Ext(0x48)), 0, "not b'H'");
+    fn an_extended_key_is_a_zero_then_its_scan_code() {
+        assert_eq!(key_bytes(crate::driver::Key::Char(b'A')), vec![b'A']);
+        assert_eq!(
+            key_bytes(crate::driver::Key::Ext(0x48)),
+            vec![0, 0x48],
+            "the zero comes first -- it is what marks the key as extended"
+        );
+    }
+
+    /// The same thing end to end: two `getch` calls for one arrow press, in
+    /// order, and the second is not swallowed by the first.
+    #[test]
+    fn an_arrow_key_arrives_as_two_reads_in_order() {
+        let (mut p, _state) = with_spy_key(crate::driver::Key::Ext(0x48));
+        assert!(p.key_waiting(), "the arrow is waiting");
+        assert_eq!(p.next_key(), Some(0), "first read marks it extended");
+        assert!(
+            p.key_waiting(),
+            "the scan code is still waiting -- this is the half that was lost"
+        );
+        assert_eq!(p.next_key(), Some(0x48), "second read is the scan code");
+        assert!(!p.key_waiting());
+        assert_eq!(p.next_key(), None);
+    }
+
+    /// An ordinary character is still exactly one read -- the queue must not
+    /// turn every keypress into two.
+    #[test]
+    fn an_ordinary_key_is_still_one_read() {
+        let (mut p, _state) = with_spy_key(crate::driver::Key::Char(b'Q'));
+        assert_eq!(p.next_key(), Some(b'Q'));
+        assert_eq!(p.next_key(), None);
     }
 
     /// `ExitProcess` must end the run and carry its code out, not merely
