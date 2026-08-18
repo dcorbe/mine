@@ -223,7 +223,7 @@ pub fn crdusr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 pub fn addcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let keyuid = call.ptr();
     let tckstg = call.ptr();
-    let real = Into::<u32>::into(call.int()) != 0;
+    let real = super::gbool_arg::<A>(call.int());
 
     let online = posted_to::<A>(call, host, keyuid, tckstg)?;
 

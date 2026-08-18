@@ -475,7 +475,7 @@ const SUPIPG: u16 = 3;
 /// If `uid` cannot be read, or a channel's user/account record cannot be.
 pub fn onsysn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let uid = call.ptr();
-    let invis = Into::<u32>::into(call.int()) != 0;
+    let invis = super::gbool_arg::<A>(call.int());
     let uid = uid
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
@@ -1762,7 +1762,7 @@ const KEYSIZ: usize = 16;
 /// not fit in `KEYSIZ` bytes.
 pub fn swtcls<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let uacc = call.ptr();
-    let makprm = Into::<u32>::into(call.int()) != 0;
+    let makprm = super::gbool_arg::<A>(call.int());
     let clsnam = call.ptr();
     let _dest = call.int();
     let _days = call.int();
@@ -1947,7 +1947,7 @@ pub fn paccit<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
 pub fn samepatu<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let sau1 = call.ptr();
     let sau2 = call.ptr();
-    let exact = Into::<u32>::into(call.int()) != 0;
+    let exact = super::gbool_arg::<A>(call.int());
 
     let a = sau1
         .read_cstr(call.mem())

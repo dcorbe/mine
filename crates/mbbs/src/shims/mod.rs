@@ -1398,6 +1398,31 @@ pub(crate) fn sign_extend<A: Abi>(raw: u32) -> i32 {
     ((raw << bits) as i32) >> bits
 }
 
+/// Read a `GBOOL` argument -- **sixteen bits**, whatever `A::Int` is.
+///
+/// `GCTYPDEF.H:105` is `typedef short GBOOL;`, so a `GBOOL` parameter is two
+/// bytes on both ABIs. Under `Wg32` it still arrives in a four-byte stack
+/// slot, and the upper half of that slot belongs to whatever used the
+/// register last -- the vendor's own prologue reads the parameter with
+/// `movzx`/`movsx` and cannot see it.
+///
+/// Testing the whole slot against zero is therefore wrong in the quietest
+/// possible way: it does not refuse, fault, or produce an implausible
+/// number. It silently reports **true** for a `GBOOL` whose real value is
+/// `FALSE`, whenever any stale bit above bit 15 happens to be set. That
+/// turns a temporary class switch permanent (`swtcls`), a prefix match into
+/// an exact one (`samepatu`), and free credits into paid ones (`addcrd`).
+///
+/// This is the same defect `shims::memory`'s `ushort_arg` and
+/// `shims::btrieve`'s own `ushort_arg` exist for, in its boolean form; the
+/// loud version of it (`alcblok` asking for 1.15 TB) is what made the class
+/// visible at all. Under `Wg16` this is the identity, because `A::Int` is
+/// already `u16` -- so every use is a `Wg32` correction and changes nothing
+/// on the ABI that was already right.
+pub(crate) fn gbool_arg<A: Abi>(v: A::Int) -> bool {
+    (Into::<u32>::into(v) as u16) != 0
+}
+
 /// What the host knows about a symbol, for `A`.
 ///
 /// `symbol` is the C name when the export tables have one and `#<ordinal>` when
@@ -1505,6 +1530,37 @@ mod tests {
     use super::*;
     use crate::exports::GALGSBL;
     use crate::testing::Fixture;
+
+    /// A `GBOOL` is two bytes (`GCTYPDEF.H:105`), so a `Wg32` slot's upper
+    /// half is not part of it. `0x4052_0000` is a stale address of exactly
+    /// the shape MajorMUD-NT's own module init leaves behind, over a `GBOOL`
+    /// whose real value is `FALSE`: read whole it is true, which is the
+    /// silent half of this defect class.
+    #[test]
+    fn gbool_arg_reads_sixteen_bits_and_not_the_slot_above_them() {
+        assert!(
+            !gbool_arg::<crate::abi::Wg32>(0x4052_0000),
+            "FALSE with a stale address above it is still FALSE"
+        );
+        assert!(gbool_arg::<crate::abi::Wg32>(0x4052_0001), "TRUE is still TRUE");
+        assert!(!gbool_arg::<crate::abi::Wg32>(0));
+        assert!(gbool_arg::<crate::abi::Wg32>(1));
+
+        // Every bit of the low half counts, not just bit 0 -- C truthiness,
+        // and `-1` is the idiomatic TRUE in this vendor's own sources.
+        assert!(gbool_arg::<crate::abi::Wg32>(0x0000_8000));
+        assert!(gbool_arg::<crate::abi::Wg32>(0x0000_ffff));
+    }
+
+    /// Under `Wg16` there is no upper half, so this must be the identity --
+    /// the guard that keeps the fix a `Wg32` correction rather than a
+    /// behaviour change on the ABI that was already right.
+    #[test]
+    fn gbool_arg_is_the_identity_on_wg16() {
+        assert!(!gbool_arg::<Wg16>(0));
+        assert!(gbool_arg::<Wg16>(1));
+        assert!(gbool_arg::<Wg16>(u16::MAX));
+    }
 
     /// The whole point of [`sign_extend`]: a C `int` is signed at `A`'s own
     /// width, and the old `as i16` was `Wg16`'s answer hard-coded.
