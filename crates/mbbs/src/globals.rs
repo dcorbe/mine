@@ -521,6 +521,31 @@ pub const GLOBALS: &[Global] = &[
     // though the guide credits it too -- out of this task's scope; see
     // `btuict`'s own doc comment.
     s("ictact", 2),
+    // BRKTHU.H:214 -- `EXPGSBLV(volatile USHORT) ticker;`, with a
+    // one-line macro right below it (`:215`, `#define btuTicker() (ticker)`)
+    // that is the only way the guide's own text ever names this datum:
+    // a counter that goes up once a second, wraps from 65535 to 0, and whose difference between two readings is the elapsed seconds (GSBL Development Guide). A DATUM, not a
+    // routine -- a module addresses `ticker` directly, the same way it
+    // addresses `bturno`/`ictact`, and registering it in `shims::routines`
+    // instead would hand a caller a dispatch thunk's address where it
+    // expects a live counter. `volatile` in the vendor's own declaration is
+    // the same signal: nothing calls to change it, something external
+    // (GSBL's own real-time hook) updates it out from under the reader, and
+    // [`crate::Host::cycle`]'s existing once-per-elapsed-second loop is
+    // this host's equivalent -- see that loop's own comment for why it
+    // fires at exactly the guide's declared rate and not at `cycle`'s own,
+    // faster, poll cadence.
+    //
+    // `USHORT`, not `INT` -- `Width::Bytes(2)`, matching `ictact` just
+    // above for the same reason: a vendor-fixed width, not the compiler's.
+    //
+    // Placed at the tail alongside `ictact`/`_txtlen` rather than next to
+    // `bturno` (`BRKTHU.H:127`, declared earlier in the header): declaration
+    // order still holds -- `ticker` (`:214`) comes after `ictact` (`:105`)
+    // in the vendor's own header, so appending it here does not even bend
+    // that rule, and it is the same append-only convention `ictact`'s own
+    // comment already established.
+    s("ticker", 2),
 ];
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
@@ -1593,7 +1618,13 @@ mod tests {
         // beside `_txtlen` rather than beside `bturno` -- see that global's
         // own comment for why -- so it is the last addition rather than one
         // threaded into the middle of this chain: 4030 + 2 = 4032.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 4032);
+        //
+        // The corpus's last DOSCALLS/PHAPI/GALGSBL task then appended
+        // `ticker`, two bytes, at the tail beside `ictact` -- see that
+        // global's own comment for why (declaration order in `BRKTHU.H`
+        // still holds: `ticker` is after `ictact` there too). No new
+        // alignment byte: 2 is even -- 4032 + 2 = 4034.
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 4034);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as

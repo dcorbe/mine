@@ -3342,6 +3342,26 @@ impl<A: Abi> Host<A> {
         Ok(None)
     }
 
+    /// Advance the `ticker` global by one, wrapping the way its vendor-declared
+    /// `USHORT` does.
+    ///
+    /// One caller, [`Host::cycle`]'s per-elapsed-second loop -- **not**
+    /// [`Host::cycle`] itself, which runs far more often than once a second
+    /// (see that loop's own comment on why `syscyc` needed the identical
+    /// split). The GSBL Development Guide's own words for this datum are the difference between two readings is the seconds between them -- true only if the rate is
+    /// genuinely one per second of wall-clock time, not once per poll pass.
+    /// `globals.rs`'s own doc comment on the `ticker` entry in `GLOBALS`
+    /// gives the full citation (`BRKTHU.H:214`).
+    ///
+    /// # Errors
+    ///
+    /// If module memory cannot be reached to read or write the global.
+    fn tick_ticker(&mut self, machine: &mut A::Cpu) -> io::Result<()> {
+        let current = self.globals.word_mem(A::mem(machine), "ticker")?;
+        self.globals
+            .write_mem(A::mem(machine), "ticker", &current.wrapping_add(1).to_le_bytes())
+    }
+
     /// Call the `syscyc` vector once, if a module has installed one.
     ///
     /// Its own function because [`Host::cycle`] fires it from two places for
@@ -3851,6 +3871,14 @@ impl<A: Abi> Host<A> {
             while last < now {
                 last += 1;
                 rounds += 1;
+                // `ticker` (`GALGSBL`, `globals.rs`'s own doc comment on it
+                // names the guide's exact wording): one increment per
+                // elapsed real second, wrapping the way its `USHORT` does,
+                // driven by this loop's own "one round per second that
+                // genuinely passed" invariant rather than by `cycle`'s much
+                // faster poll cadence -- see `Host::tick_ticker`'s own doc
+                // comment for why that distinction matters.
+                self.tick_ticker(machine)?;
                 // **One `syscyc` per elapsed second, ahead of that second's
                 // kicks.** Firing it only once per `cycle` call above is not
                 // enough, and the shortfall is a lost second of the module's
@@ -7270,6 +7298,64 @@ mod tests {
             fired(4) - fired(1),
             3,
             "three extra seconds must buy three extra ticks, not nothing"
+        );
+    }
+
+    /// `ticker` (`globals.rs`'s own doc comment on the datum) advances once
+    /// per elapsed real second -- the same round `syscyc`/`prcrtk` already
+    /// fire in, driven by `cycle`'s own `tcklst` reconciliation -- and NOT
+    /// once per `cycle` call, which would make the module's own "difference
+    /// reflects elapsed time" arithmetic (the GSBL guide's own words for
+    /// this datum) wrong the moment a driver's poll cadence changed.
+    ///
+    /// Same two-call shape as `a_cycle_spanning_four_seconds_fires_syscyc_once_per_second`
+    /// just above: the first call only syncs `tcklst` (nothing has elapsed
+    /// yet within it), then the clock is moved by hand and a second call
+    /// owes the module everything that "elapsed" in between, in one go.
+    #[test]
+    fn ticker_advances_once_per_elapsed_second_not_once_per_cycle_call() {
+        let (mut f, module, _rou) = polling_fixture();
+
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.cycle(&mut f.machine, &module, 10).expect("first call syncs tcklst");
+        let before = f.host.globals().word(&f.machine, "ticker").expect("ticker is a placed global");
+
+        f.host.set_clock(Clock::pinned(1_135_952_405 + 4));
+        f.host.cycle(&mut f.machine, &module, 10).expect("second call owes four seconds");
+        let after = f.host.globals().word(&f.machine, "ticker").expect("read");
+
+        assert_eq!(
+            after.wrapping_sub(before),
+            4,
+            "four elapsed seconds must advance ticker by exactly four -- not by one \
+             (once per cycle call) and not by ten (once per poll pass, the cycle's own bound)"
+        );
+    }
+
+    /// The vendor's own contract: "after it reaches 65535, it goes back to 0
+    /// and starts over again" (GSBL Development Guide, quoted in
+    /// `globals.rs`'s own doc comment on `ticker`). A plain `+ 1` here would
+    /// panic on overflow in a debug build the moment this boundary was
+    /// crossed -- this seeds the global one below the wrap and proves the
+    /// landing value, not merely that nothing panicked.
+    #[test]
+    fn ticker_wraps_from_65535_to_zero_the_way_a_ushort_does() {
+        let (mut f, module, _rou) = polling_fixture();
+
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.cycle(&mut f.machine, &module, 10).expect("first call syncs tcklst");
+        f.host
+            .globals()
+            .write(&mut f.machine, "ticker", &65535u16.to_le_bytes())
+            .expect("ticker is a placed global");
+
+        f.host.set_clock(Clock::pinned(1_135_952_405 + 1));
+        f.host.cycle(&mut f.machine, &module, 10).expect("one more second elapses");
+
+        assert_eq!(
+            f.host.globals().word(&f.machine, "ticker").expect("read"),
+            0,
+            "65535 + 1 wraps to 0, not a panic and not 65536"
         );
     }
 

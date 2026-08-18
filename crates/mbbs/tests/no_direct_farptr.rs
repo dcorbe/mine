@@ -83,6 +83,19 @@ const ALLOWED: &[&str] = &[
     // `docs/plans/2026-08-12-abi-border-implementation.md`, beside `alctile`,
     // its one production caller. Permanent.
     "shims/memory.rs",
+    // `dosallocseg`/`dosfreeseg`/`dosgetsegdesc`: the same reason
+    // `shims/memory.rs` stays -- these genuinely need
+    // `mbbs_machine::m16`'s LDT-backed `Segments` (`Machine::alloc_segment`,
+    // `Machine::free_segment`, `Machine::resolve`), which is `Wg16::Cpu`'s
+    // own and has no flat-memory counterpart. `dosgetsegdesc` builds a
+    // `FarPtr { offset: 0, selector }` directly to resolve a selector's own
+    // base address; `dosallocseg`/`dosfreeseg` take `Call<Wg16>` concretely
+    // for the same structural reason `alctile`/`ptrtile` do. This file's
+    // other DOSCALLS/PHAPI routines (`dossetvec`, `dosgetmodhandle`, ...)
+    // stay `Shim<A>` generic and do not name `FarPtr` at all -- only these
+    // three, added the same task the corpus's last DOSCALLS/PHAPI gap
+    // closed. Permanent, for the identical reason `shims/memory.rs` is.
+    "shims/dosenv.rs",
     // The test fixture builder. Every fixture in this crate constructs a real
     // `mbbs_machine::m16::Machine`, so this names `FarPtr` by construction.
     //

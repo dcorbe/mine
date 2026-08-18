@@ -703,6 +703,29 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (DOSCALLS, "dossetvec", dosenv::dossetvec, Cleans::Callee(10), Evidence::Unclassified),
         (PHAPI, "doscreatedsalias", dosenv::doscreatedsalias, Cleans::Callee(6), Evidence::Unclassified),
         (GALME, "_oldsend", dosenv::oldsend, Cleans::Caller, Evidence::Unclassified),
+        // The corpus's last eight DOSCALLS/PHAPI/GALGSBL symbols (`ticker`
+        // is a datum, `globals.rs` -- the other seven are routines). Real
+        // prototypes exist for all seven, in Phar Lap's own `PHAPI.H`
+        // (`archive/galacticomm/extract/phar312/PHAPI.H`, not
+        // `re/wg33src/INC/` -- see `re/vendor_protos.py`'s own `SOURCES`
+        // list, extended this task to scan it), so every one of these
+        // carries `Evidence::VendorProto("phar312/PHAPI.H")` rather than
+        // `Unclassified` the way the three above still do; see
+        // `crates/mbbs/tests/evidence_manifest.rs`'s own `UNCONFIRMED`
+        // comment for why `Foreign`/`Guessed` were not needed either.
+        // `dosgetmodname`/`dosloadmodule` reuse [`dosenv::runtime_name`],
+        // the same registry `dosgetmodhandle`/`dosgetprocaddr` below use;
+        // `dosallocrealseg`/`dosrealintr` refuse -- see their own doc
+        // comments for the structural reason (`crates/mbbs` does not
+        // depend on `crates/dos`, where the real-mode CPU either would
+        // need lives). `dosallocseg`/`dosfreeseg`/`dosgetsegdesc` genuinely
+        // need `mbbs_machine::m16`'s LDT-backed segments, which have no
+        // `Wg32` counterpart, so they live in `WG16_ROUTINES` instead of
+        // here -- see that table.
+        (DOSCALLS, "dosgetmodname", dosenv::dosgetmodname, Cleans::Callee(8), Evidence::VendorProto("phar312/PHAPI.H")),
+        (DOSCALLS, "dosloadmodule", dosenv::dosloadmodule, Cleans::Callee(14), Evidence::VendorProto("phar312/PHAPI.H")),
+        (PHAPI, "dosallocrealseg", dosenv::dosallocrealseg, Cleans::Callee(12), Evidence::VendorProto("phar312/PHAPI.H")),
+        (PHAPI, "dosrealintr", dosenv::dosrealintr, Cleans::Caller, Evidence::VendorProto("phar312/PHAPI.H")),
         // `shims::gcsp`'s seven GCSPSRV routines. All twelve of their real
         // call sites are provably unreachable on a telnet host
         // (`docs/2026-08-14-gcsp-reachability.md`: the module's `struct
@@ -1179,6 +1202,19 @@ const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans, Evidence)] = &[
     (MAJORBBS, "explode", screen::explode, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "iniscn", screen::iniscn, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "extoff", user::extoff, Cleans::Caller, Evidence::Unclassified),
+    // `DosAllocSeg`/`DosFreeSeg`/`DosGetSegDesc`: genuinely need
+    // `mbbs_machine::m16`'s LDT-backed `Segments`, which is `Wg16::Cpu`'s
+    // own -- there is no flat-address-space counterpart the way
+    // `alcblok`/`ptrblok` above have a `Wg32` sibling registered
+    // elsewhere. Every corpus call site for all three is `NE` (16-bit)
+    // format anyway (`crates/mbbs/tests/data/corpus/HVSTW.tsv`), so a
+    // `Wg32` entry would never be reached even if one existed. See
+    // `dosenv::dosallocseg`'s own doc comment for why the other four
+    // DOSCALLS/PHAPI symbols this task adds are generic instead, in
+    // `routines()`.
+    (DOSCALLS, "dosallocseg", dosenv::dosallocseg, Cleans::Callee(8), Evidence::VendorProto("phar312/PHAPI.H")),
+    (DOSCALLS, "dosfreeseg", dosenv::dosfreeseg, Cleans::Callee(2), Evidence::VendorProto("phar312/PHAPI.H")),
+    (PHAPI, "dosgetsegdesc", dosenv::dosgetsegdesc, Cleans::Callee(6), Evidence::VendorProto("phar312/PHAPI.H")),
 ];
 
 /// [`Abi::native`]'s `Wg16` half: a lookup into [`WG16_ROUTINES`], the table
@@ -1932,6 +1968,19 @@ mod convention {
                 // this host will ever make -- see `shims::dosenv`.
                 ("dossetvec", Cleans::Callee(10)),
                 ("doscreatedsalias", Cleans::Callee(6)),
+                // The corpus's last DOSCALLS/PHAPI symbols, added the same
+                // task `phar312/PHAPI.H` became a real citeable source (see
+                // `shims::dosenv`). Far pascal like `dossetvec` above --
+                // `DosGetModName` takes `HMODULE`+`USHORT`+`PCHAR` (2+2+4);
+                // `DosLoadModule` takes two `PSZ`+`USHORT`+`PHMODULE`
+                // (4+2+4+4); `DosAllocRealSeg` (refused) takes
+                // `ULONG`+`PUSHORT`+`PSEL` (4+4+4). `dosrealintr` is NOT
+                // here: it is the one `_cdecl`, variadic exception in this
+                // whole family, `Cleans::Caller`, filtered out of this list
+                // like every other cdecl routine -- see its own doc comment.
+                ("dosgetmodname", Cleans::Callee(8)),
+                ("dosloadmodule", Cleans::Callee(14)),
+                ("dosallocrealseg", Cleans::Callee(12)),
                 ("getmodulehandlea", Cleans::Callee(4)),
                 ("getprocaddress", Cleans::Callee(8)),
                 // Runtime name resolution, added 2026-08-15 -- the same two
@@ -1956,6 +2005,16 @@ mod convention {
                 ("f_ludiv@", Cleans::Callee(runtime::OPERANDS)),
                 ("f_lumod@", Cleans::Callee(runtime::OPERANDS)),
                 ("f_scopy@", Cleans::Callee(runtime::POINTERS)),
+                // `WG16_ROUTINES`, not `routines()`: the three that
+                // genuinely need `mbbs_machine::m16`'s LDT-backed segments
+                // (see `dosenv::dosallocseg`'s own doc comment for why they
+                // could not join the generic table the way the three above
+                // did). `DosAllocSeg` takes `USHORT`+`PSEL`+`USHORT`
+                // (2+4+2); `DosFreeSeg` takes `SEL` alone (2);
+                // `DosGetSegDesc` takes `SEL`+`PDESC` (2+4).
+                ("dosallocseg", Cleans::Callee(8)),
+                ("dosfreeseg", Cleans::Callee(2)),
+                ("dosgetsegdesc", Cleans::Callee(6)),
             ]
         );
     }

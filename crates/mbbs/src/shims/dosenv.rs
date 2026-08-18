@@ -225,11 +225,12 @@
 //! contradicts it, only extends it with the reachability question it left
 //! open.
 
+use mbbs_machine::m16::FarPtr;
 use mbbs_machine::ptr::ModulePtr;
 
 use super::ShimError;
 use crate::Host;
-use crate::abi::{self, Abi, Call};
+use crate::abi::{self, Abi, Call, Wg16};
 use crate::shims::Entry;
 
 /// One resolver behind both ABI faces of runtime name resolution --
@@ -719,6 +720,439 @@ pub fn dosgetprocaddr<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result
     Ok(abi::Ret::Int(A::Int::from(ERROR_PROC_NOT_FOUND)))
 }
 
+/// OS/2's own `ERROR_INVALID_SELECTOR`, checked -- not merely "widely
+/// documented" the way [`ERROR_MOD_NOT_FOUND`]/[`ERROR_PROC_NOT_FOUND`]
+/// above were -- against a genuine copy of the standard error table this
+/// repo's own tree does not carry: OpenWatcom ships the real OS/2 Toolkit
+/// headers, and `/opt/watcom/h/os2/bseerr.h:571` on this box gives `490`.
+/// The same header's lines 144-145 give `126`/`127` for the two constants
+/// above, matching what this file already had -- independent, retroactive
+/// confirmation for both, not just a new value.
+///
+/// What [`dosfreeseg`] and [`dosgetsegdesc`] answer for a selector that
+/// names no segment of this module's.
+const ERROR_INVALID_SELECTOR: u16 = 490;
+
+/// `archive/galacticomm/extract/phar312/PHAPI.H:196` -- one of the four
+/// idealised segment-type constants [`dosgetsegdesc`]'s `attrib` field
+/// answers with. The two this host ever has occasion to write; see that
+/// function's own doc comment for why `CODE16_NOREAD`/`DATA16_NOWRITE`
+/// (`:197`/`:199`) do not appear here.
+const CODE16: u16 = 1;
+/// `PHAPI.H:197` -- see [`CODE16`].
+const DATA16: u16 = 2;
+
+/// `USHORT APIENTRY DosAllocSeg(USHORT size, PSEL selp, USHORT flags)` --
+/// `archive/galacticomm/extract/phar312/PHAPI.H:565` -- map `size` bytes of
+/// writable memory the module can address, and hand back the selector
+/// naming it.
+///
+/// [`mbbs_machine::m16::Machine::alloc_segment`] is this call, essentially
+/// as-is: length in, selector out, LDT-backed -- the same primitive
+/// [`crate::globals::Globals::new`] already uses to place the module's own
+/// globals. `HVSTW` and `HVSXROAD` each import it once (see
+/// `crates/mbbs/tests/data/corpus/HVSTW.tsv`/`HVSXROAD.tsv`), and `HVSTW`
+/// also imports [`dosfreeseg`] and [`dosgetsegdesc`], which strongly
+/// suggests the shape of the real call site: allocate, describe, free.
+///
+/// `flags` (`GSEL_*`-style sharing bits in the real API) is read and
+/// discarded: nothing in this host's segment table distinguishes a
+/// "giveable" segment from an ordinary one, and every segment this call
+/// makes is already private to this one module's own address space -- there
+/// is no second module here `flags` could ever hand it to.
+///
+/// # Argument order and byte count
+///
+/// Far pascal (`APIENTRY`), callee cleans. `size` is `USHORT` (2 bytes,
+/// `PHAPI.H:99`), `selp` is `PSEL` (far pointer, 4 bytes, `PHAPI.H:100`),
+/// `flags` is `USHORT` (2 bytes) -- 2 + 4 + 2 = 8 bytes, `Cleans::Callee(8)`.
+///
+/// # Errors
+///
+/// If `size` is zero or larger than a 16-bit segment can address, if the
+/// LDT has no free entry, or if `*selp` does not resolve.
+pub fn dosallocseg(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let size = call.int();
+    let selp = call.ptr();
+    let _flags = call.int();
+
+    let selector = call
+        .cpu
+        .alloc_segment(usize::from(size))
+        .map_err(|e| ShimError::Failed(format!("dosallocseg({size}): {e}")))?;
+
+    selp.write(call.mem(), &selector.to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    Ok(abi::Ret::Int(0u16))
+}
+
+/// `USHORT APIENTRY DosFreeSeg(SEL sel)` --
+/// `archive/galacticomm/extract/phar312/PHAPI.H:572` -- release a segment
+/// [`dosallocseg`] handed out.
+///
+/// # Real reclamation, not a documented no-op
+///
+/// Ruled out deliberately, unlike [`dossetvec`]/[`doscreatedsalias`]'s
+/// no-ops earlier in this file: `Segment` (`crates/mbbs-machine/src/m16/
+/// seg.rs`) already implements `Drop` -- clearing its LDT entry and, once
+/// nothing else shares the mapping, `munmap`-ing it -- so a real free is
+/// not new, untested machinery, it is one `Vec::remove` away from teardown
+/// this crate already had and already tests
+/// (`dropping_a_tiled_region_leaves_no_live_descriptor`). A no-op here
+/// would leak one LDT entry (of 8192) and one mapping for as long as the
+/// host process runs, for every call this single site makes, with nothing
+/// to reveal it wrong until a module that allocates in a loop finally
+/// exhausted the LDT -- exactly the failure mode "the byte count that
+/// corrupts the *next* call" warns about, at a longer time horizon. Real
+/// reclamation costs one function
+/// ([`mbbs_machine::m16::Segments::free_segment`]) and removes the
+/// question entirely.
+///
+/// A `sel` naming nothing this module ever allocated -- already freed, or
+/// never allocated at all -- answers [`ERROR_INVALID_SELECTOR`] rather than
+/// silently succeeding: a module that double-frees or frees a bad selector
+/// has a real bug, and papering over it with `NO_ERROR` is the same
+/// fabricated-success shape this crate refuses everywhere else.
+///
+/// # Argument order and byte count
+///
+/// Far pascal, callee cleans. `sel` is `SEL` (2 bytes) -- `Cleans::Callee(2)`.
+///
+/// # Errors
+///
+/// Never -- an invalid selector is a documented return code
+/// ([`ERROR_INVALID_SELECTOR`]), not a host failure.
+pub fn dosfreeseg(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let sel = call.int();
+    match call.cpu.free_segment(sel) {
+        Ok(()) => Ok(abi::Ret::Int(0u16)),
+        Err(_) => Ok(abi::Ret::Int(ERROR_INVALID_SELECTOR)),
+    }
+}
+
+/// `USHORT APIENTRY DosGetSegDesc(SEL sel, PDESC descp)` --
+/// `archive/galacticomm/extract/phar312/PHAPI.H:361` -- read back the
+/// idealised descriptor (`PHAPI.H:181-186`: `ULONG base; ULONG size;
+/// USHORT attrib;`) a selector names.
+///
+/// # What this host answers, and how each field is genuinely derived
+///
+/// `base` and `size` are read off the same machinery every other far
+/// pointer access already trusts, not invented: the mapping
+/// [`dosallocseg`] makes really does start at the linear address its own
+/// LDT descriptor's `base_addr` field carries
+/// (`crates/mbbs-machine/src/m16/seg.rs`'s own `describe`), so resolving
+/// one byte at offset 0 through [`mbbs_machine::m16::Machine::resolve`] and
+/// reading the returned slice's own pointer back gives that identical
+/// address -- there is no second, host-side copy of it that could drift.
+/// `size` is [`mbbs_machine::m16::Segments::region_len`], reached through
+/// [`mbbs_machine::m16::Machine::mem`].
+///
+/// `attrib` (`CODE16`/`DATA16`/..., `PHAPI.H:196-199`) answers from a
+/// narrower fact this host genuinely tracks: whether `sel` is the module's
+/// own scratch code selector
+/// ([`mbbs_machine::m16::Machine::code_selector`]) -- [`CODE16`] if so,
+/// [`DATA16`] otherwise. Every segment [`dosallocseg`] hands out is
+/// non-executable by construction (`Segment::new(len, false)`), so
+/// `DATA16` is exactly right for the pairing this routine's one real call
+/// site almost certainly makes (describe a segment just allocated,
+/// alongside `HVSTW`'s own `dosallocseg`/`dosfreeseg` imports); it is also
+/// right for the stack and `DGROUP` selectors. **The one case this cannot
+/// distinguish** is one of the loaded NE image's *other* code segments
+/// (34, in `WCCMMUD.DLL` alone) -- this host records no per-segment
+/// executable flag beyond the one scratch selector it names itself, so
+/// such a selector would answer `DATA16` where the true answer is
+/// `CODE16`. No corpus call site exercises that case (`dosgetsegdesc` has
+/// exactly one site, `HVSTW`), so this is recorded as a known narrowing,
+/// not chased further -- the honest alternative to guessing would be
+/// refusing every call, which is strictly worse for the one call site this
+/// host actually has to serve.
+///
+/// # Argument order and byte count
+///
+/// Far pascal, callee cleans. `sel` is `SEL` (2 bytes), `descp` is `PDESC`
+/// (far pointer, 4 bytes) -- 2 + 4 = 6 bytes, `Cleans::Callee(6)`.
+///
+/// # Errors
+///
+/// Never -- an invalid `sel` is a documented return code
+/// ([`ERROR_INVALID_SELECTOR`]) with a zeroed `*descp`, not a host failure.
+/// If `*descp` itself does not resolve, that still stops the module: there
+/// is nowhere to write the answer at all.
+pub fn dosgetsegdesc(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let sel = call.int();
+    let descp = call.ptr();
+    let at = FarPtr { offset: 0, selector: sel };
+
+    let base = match call.cpu.resolve(at, 1) {
+        Ok(bytes) => bytes.as_ptr() as usize as u32,
+        Err(_) => {
+            descp
+                .write(call.mem(), &[0u8; 10])
+                .map_err(|e| ShimError::Failed(e.to_string()))?;
+            return Ok(abi::Ret::Int(ERROR_INVALID_SELECTOR));
+        }
+    };
+    let size = call.cpu.mem().region_len(at).map_err(|e| {
+        ShimError::Failed(format!(
+            "dosgetsegdesc: sel {sel:#06x} resolved but region_len disagreed: {e}"
+        ))
+    })? as u32;
+    let attrib = if sel == call.cpu.code_selector() { CODE16 } else { DATA16 };
+
+    let mut desc = Vec::with_capacity(10);
+    desc.extend_from_slice(&base.to_le_bytes());
+    desc.extend_from_slice(&size.to_le_bytes());
+    desc.extend_from_slice(&attrib.to_le_bytes());
+    descp
+        .write(call.mem(), &desc)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    Ok(abi::Ret::Int(0u16))
+}
+
+/// `USHORT APIENTRY DosGetModName(HMODULE mhand, USHORT buffc, PCHAR buffp)`
+/// -- `archive/galacticomm/extract/phar312/PHAPI.H:589` -- the inverse of
+/// [`dosgetmodhandle`]: given a handle, answer the library's own name.
+///
+/// Reached through [`runtime_name::library_for`], the identical lookup
+/// [`dosgetprocaddr`] already uses to turn a handle back into a library
+/// name -- this is the first caller that hands the name itself back to the
+/// module, rather than using it only to look a routine up internally.
+///
+/// A recognised handle writes its canonical name into `buffp`, truncated to
+/// `buffc - 1` bytes if it does not fit, NUL-terminated, and answers
+/// `NO_ERROR`. `buffc == 0` writes nothing -- there is no room even for a
+/// terminator -- and still answers `NO_ERROR`, since the handle itself was
+/// genuinely found; a real `DosGetModName` has no separate "buffer too
+/// small" code in this API family to reach for instead
+/// (`archive/galacticomm/extract/phar312/PHAPI.H` names none). A handle
+/// this process never minted -- `0`, or anything [`runtime_name::handle_for`]
+/// did not hand out -- writes nothing and answers [`ERROR_MOD_NOT_FOUND`],
+/// the same sentinel [`dosgetmodhandle`] answers for the equivalent miss in
+/// the other direction.
+///
+/// # Argument order and byte count
+///
+/// Far pascal, callee cleans. `mhand` is `HMODULE` (`USHORT`, 2 bytes,
+/// `PHAPI.H:101`), `buffc` is `USHORT` (2 bytes), `buffp` is `PCHAR` (far
+/// pointer, 4 bytes) -- 2 + 2 + 4 = 8 bytes, `Cleans::Callee(8)`.
+///
+/// # Errors
+///
+/// If `buffc` is nonzero and `buffp` does not resolve.
+pub fn dosgetmodname<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let mhand: u32 = call.int().into();
+    let buffc: u32 = call.int().into();
+    let buffp = call.ptr();
+
+    let Some(dll) = runtime_name::library_for::<A>(mhand) else {
+        return Ok(abi::Ret::Int(A::Int::from(ERROR_MOD_NOT_FOUND)));
+    };
+
+    if buffc > 0 {
+        let room = usize::try_from(buffc).unwrap_or(0).saturating_sub(1);
+        let mut bytes = dll.as_bytes()[..dll.len().min(room)].to_vec();
+        bytes.push(0);
+        buffp
+            .write(call.mem(), &bytes)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+    }
+
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// `USHORT APIENTRY DosLoadModule(PSZ failp, USHORT failc, PSZ modnamep,
+/// PHMODULE mhandp)` --
+/// `archive/galacticomm/extract/phar312/PHAPI.H:594` -- load a named module
+/// and hand back its handle, or explain which name failed.
+///
+/// # The same registry as `DosGetModHandle`, and why that is honest here
+///
+/// A real `DosLoadModule` differs from [`dosgetmodhandle`] by *doing*
+/// something a not-yet-resident module needs before it can be found: it
+/// reads the module off disk. This host has no such step for anything
+/// `modnamep` could ever legitimately name -- every Worldgroup-family
+/// library it can answer for is either compiled into it and answers `true`
+/// through [`runtime_name::known_library`], or does not exist here at all,
+/// and there is no third state ("known, but not yet loaded") for this call
+/// to move a name through. So `DosLoadModule` and `DosGetModHandle` collapse
+/// to the identical "is this name known" question against
+/// [`runtime_name::handle_for`], which is what makes reusing that registry
+/// here honest rather than a shortcut: this host is not pretending to load
+/// anything, it is answering the one question it actually can.
+///
+/// What genuinely differs from [`dosgetmodhandle`] is what a miss writes:
+/// `DosLoadModule`'s contract gives it `failp`/`failc` specifically to name
+/// the module that could not be found, so a miss here writes the raw name
+/// the module asked for into `*failp` (truncated to fit, the same as
+/// [`dosgetmodname`]) rather than leaving it untouched.
+///
+/// # Argument order and byte count
+///
+/// Far pascal, callee cleans. `failp` is `PSZ` (far pointer, 4 bytes),
+/// `failc` is `USHORT` (2 bytes), `modnamep` is `PSZ` (4 bytes), `mhandp` is
+/// `PHMODULE` (far pointer, 4 bytes) -- 4 + 2 + 4 + 4 = 14 bytes,
+/// `Cleans::Callee(14)`.
+///
+/// # Errors
+///
+/// If `modnamep` does not resolve, or `*mhandp` does not resolve.
+pub fn dosloadmodule<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let failp = call.ptr();
+    let failc: u32 = call.int().into();
+    let modnamep = call.ptr();
+    let mhandp = call.ptr();
+
+    let name_bytes = modnamep
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let name = String::from_utf8_lossy(&name_bytes).into_owned();
+
+    let handle = runtime_name::handle_for::<A>(&name).unwrap_or(0);
+    mhandp
+        .write(call.mem(), &(handle as u16).to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    if handle == 0 {
+        if failc > 0 {
+            let room = usize::try_from(failc).unwrap_or(0).saturating_sub(1);
+            let mut bytes = name.as_bytes()[..name.len().min(room)].to_vec();
+            bytes.push(0);
+            failp
+                .write(call.mem(), &bytes)
+                .map_err(|e| ShimError::Failed(e.to_string()))?;
+        }
+        Ok(abi::Ret::Int(A::Int::from(ERROR_MOD_NOT_FOUND)))
+    } else {
+        Ok(abi::Ret::Int(A::Int::from(0u16)))
+    }
+}
+
+/// `USHORT APIENTRY DosAllocRealSeg(ULONG size, PUSHORT parap, PSEL selp)`
+/// -- `archive/galacticomm/extract/phar312/PHAPI.H:373` -- allocate
+/// conventional (real-mode-addressable, below 1 MiB) memory, and hand back
+/// both a real-mode paragraph number (`parap`) and a protected-mode
+/// selector (`selp`) aliasing the same physical bytes.
+///
+/// # Argued refusal: this host has no real-mode address space to alias
+///
+/// Every segment this host can make -- [`dosallocseg`]'s
+/// [`mbbs_machine::m16::Machine::alloc_segment`] among them -- is an
+/// anonymous `mmap(MAP_32BIT)` mapping (`crates/mbbs-machine/src/m16/
+/// seg.rs`'s own `Mapping::new`): real, addressable memory below 4 GiB, but
+/// with no promise of sitting below 1 MiB, and more fundamentally with no
+/// real-mode CPU on this host that could ever address it by paragraph
+/// number in the first place. `crates/dos` is where that CPU lives -- a KVM
+/// real-mode guest, built for exactly this (`crates/dos/src/lib.rs`'s own
+/// module doc: "a KVM real-mode runtime that serves DOS doors, and the MBBS
+/// host, whose 16-bit modules trap into DOS from protected mode") -- and
+/// `crates/mbbs/Cargo.toml` depends on exactly `btrieve`, `libc`,
+/// `mbbs-machine`. **No dependency on `crates/dos` exists, and this task
+/// does not add one or build a bridge to it.** One call site, in one module
+/// (`MBMGEMP`), is not the case that justifies wiring two crates together
+/// architecturally and unilaterally.
+///
+/// A fabricated `parap`/`selp` pair would be actively worse than refusing:
+/// `parap` is a real-mode segment paragraph a module may hand to `int 21h`
+/// or some other DOS service expecting to read conventional memory through
+/// it, and a value this host invented would name nothing there, or worse,
+/// something else entirely.
+///
+/// **What would unblock this**: `crates/mbbs` gaining a dependency on
+/// `crates/dos` and a bridge letting a shim allocate (or share) memory in
+/// the KVM guest's own low address space, then hand back a paragraph
+/// number that guest genuinely honours. Real, cross-crate work, deliberately
+/// out of scope here.
+///
+/// # Argument order and byte count
+///
+/// Far pascal, callee cleans. `size` is `ULONG` (4 bytes), `parap` is
+/// `PUSHORT` (far pointer, 4 bytes), `selp` is `PSEL` (far pointer, 4
+/// bytes) -- 4 + 4 + 4 = 12 bytes, `Cleans::Callee(12)`.
+///
+/// # Errors
+///
+/// Always. See above.
+pub fn dosallocrealseg<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let size = call.long();
+    let _parap = call.ptr();
+    let _selp = call.ptr();
+    Err(ShimError::Failed(format!(
+        "dosallocrealseg({size}): this host has no real-mode address space to alias -- \
+         crates/mbbs does not depend on crates/dos, where the one CPU that could ever \
+         honour a real-mode paragraph number lives, and one call site in one module does \
+         not justify wiring the two crates together unilaterally"
+    )))
+}
+
+/// `USHORT _far _cdecl DosRealIntr(USHORT int_no, PREGS regsp, REALPTR
+/// reserved, SHORT word_count, ...)` --
+/// `archive/galacticomm/extract/phar312/PHAPI.H:410` -- raise a real-mode
+/// interrupt with a caller-supplied register set, and copy the results
+/// back.
+///
+/// # Argued refusal, for the same structural reason as `DosAllocRealSeg`
+///
+/// This needs an actual real-mode CPU execution context to raise the
+/// interrupt against -- there is no "emulate one instruction's worth of
+/// real-mode effect" shortcut for an arbitrary `int_no`, since the whole
+/// point of the call is that the module does not know what the interrupt
+/// handler does. That CPU is `crates/dos`'s KVM guest, and
+/// [`dosallocrealseg`]'s own doc comment already gives the full accounting
+/// of why this crate does not reach it: no dependency, no bridge, one call
+/// site, deliberately out of scope. See that doc comment for what would
+/// unblock this too -- the same missing primitive serves both.
+///
+/// # Why `Cleans::Caller`, unlike every sibling in this file
+///
+/// Every other `DOSCALLS`/`PHAPI` routine here is `APIENTRY` (far pascal,
+/// callee-cleaned). `DosRealIntr` is declared `_far _cdecl` in the vendor's
+/// own header, not `APIENTRY` -- the one routine in this whole family that
+/// is not, because it is genuinely variadic (`word_count` extra words
+/// follow the four named arguments) and a callee cannot pop a caller-chosen
+/// number of bytes it was never told before the call. So this reads only
+/// its four fixed, named arguments and refuses without ever touching the
+/// variadic tail -- correctly: under `Cleans::Caller` the module cleans its
+/// own stack after the call returns regardless of how many of those words
+/// this shim read, the same as every `cdecl` routine on this host, so there
+/// is nothing to get wrong by not consuming them.
+///
+/// Since this always refuses, [`Host::run`]'s dispatch loop never reaches
+/// [`crate::abi::Abi::resume`] for this call at all (`ShimError` stops the
+/// module before any `Cleans` value is applied) -- so this fact is
+/// documentation of the real ABI, not a value load-bearing for stack
+/// correctness on this host today. It is still the honest one to write
+/// down: a future implementation that *did* answer would need to get this
+/// right from the start, and a table that already says `Caller` here saves
+/// that task from re-deriving it.
+///
+/// # Argument order and byte count
+///
+/// `int_no` is `USHORT` (2 bytes), `regsp` is `PREGS` (far pointer, 4
+/// bytes), `reserved` is `REALPTR` (`ULONG`, 4 bytes -- not a far pointer;
+/// `PHAPI.H:172`, `typedef unsigned long REALPTR`), `word_count` is `SHORT`
+/// (2 bytes) -- the four fixed arguments read here. `Cleans::Caller`, per
+/// above.
+///
+/// # Errors
+///
+/// Always. See above.
+pub fn dosrealintr<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let int_no: u32 = call.int().into();
+    let _regsp = call.ptr();
+    let _reserved = call.long();
+    let word_count: u32 = call.int().into();
+    Err(ShimError::Failed(format!(
+        "dosrealintr(int_no={int_no:#04x}, word_count={word_count}): this host has no \
+         real-mode CPU to raise the interrupt against -- crates/mbbs does not depend on \
+         crates/dos, where the one guest that could ever honour this call lives; see \
+         dosallocrealseg's own doc comment for the full accounting"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1042,6 +1476,310 @@ mod tests {
             f.machine.resolve(paddrp, 4).expect("paddrp resolves"),
             &FarPtr::NULL.to_bytes()[..],
             "NULL -- never a fabricated non-null pointer -- see this function's own doc comment"
+        );
+    }
+
+    // -- dosallocseg / dosfreeseg / dosgetsegdesc: real LDT segments --------
+
+    #[test]
+    fn dosallocseg_maps_real_writable_memory_and_returns_its_selector() {
+        let mut f = Fixture::new();
+        let selp = f.words(&[0xdead]);
+        let args = [64u16, selp.offset, selp.selector, 0u16];
+
+        let ret = f
+            .invoke(dosallocseg, &args)
+            .expect("dosallocseg never refuses for a valid size");
+        assert_eq!(ret, Ret::U16(0), "NO_ERROR");
+
+        let bytes = f.machine.resolve(selp, 2).expect("selp resolves");
+        let selector = u16::from_le_bytes([bytes[0], bytes[1]]);
+        assert_ne!(selector, 0xdead, "the shim must have written its own selector");
+        assert_ne!(selector, 0, "a real selector, not a null one");
+
+        // Prove it is genuinely writable memory, not merely a
+        // plausible-looking number: write through it and read the write back.
+        let at = FarPtr { offset: 0, selector };
+        f.machine
+            .write(at, &[0xaa; 4])
+            .expect("a freshly allocated segment must be writable");
+        assert_eq!(f.machine.resolve(at, 4).expect("resolves"), &[0xaa; 4]);
+    }
+
+    #[test]
+    fn dosallocseg_refuses_a_zero_byte_segment() {
+        let mut f = Fixture::new();
+        let selp = f.words(&[0]);
+        let args = [0u16, selp.offset, selp.selector, 0u16];
+        f.invoke(dosallocseg, &args)
+            .expect_err("a zero-byte segment is nothing to allocate");
+    }
+
+    /// The key claim of "real reclamation, not a documented no-op": a
+    /// no-op `dosfreeseg` would still resolve here, because it would never
+    /// have removed the segment from `Segments` in the first place. This is
+    /// the one assertion that distinguishes the two -- mutating the shim
+    /// back into `Ok(0)` without calling `free_segment` makes this `resolve`
+    /// keep succeeding, and only this assertion catches it.
+    #[test]
+    fn dosfreeseg_releases_a_real_selector_so_a_later_access_genuinely_fails() {
+        let mut f = Fixture::new();
+        let selp = f.words(&[0]);
+        f.invoke(dosallocseg, &[32u16, selp.offset, selp.selector, 0u16])
+            .expect("alloc");
+        let bytes = f.machine.resolve(selp, 2).expect("selp resolves");
+        let selector = u16::from_le_bytes([bytes[0], bytes[1]]);
+
+        let ret = f
+            .invoke(dosfreeseg, &[selector])
+            .expect("dosfreeseg never refuses for a real selector");
+        assert_eq!(ret, Ret::U16(0), "NO_ERROR");
+
+        let at = FarPtr { offset: 0, selector };
+        assert!(
+            f.machine.resolve(at, 1).is_err(),
+            "the segment must genuinely be gone -- a no-op would still resolve here"
+        );
+    }
+
+    #[test]
+    fn dosfreeseg_answers_error_invalid_selector_for_a_double_free() {
+        let mut f = Fixture::new();
+        let selp = f.words(&[0]);
+        f.invoke(dosallocseg, &[16u16, selp.offset, selp.selector, 0u16])
+            .expect("alloc");
+        let bytes = f.machine.resolve(selp, 2).expect("selp resolves");
+        let selector = u16::from_le_bytes([bytes[0], bytes[1]]);
+        f.invoke(dosfreeseg, &[selector]).expect("the first free succeeds");
+
+        let ret = f
+            .invoke(dosfreeseg, &[selector])
+            .expect("dosfreeseg never refuses, even for a bad selector");
+        assert_eq!(
+            ret,
+            Ret::U16(ERROR_INVALID_SELECTOR),
+            "freeing an already-freed selector is exactly the invalid case"
+        );
+    }
+
+    #[test]
+    fn dosgetsegdesc_answers_the_true_base_size_and_data_attrib_for_an_allocated_segment() {
+        let mut f = Fixture::new();
+        let selp = f.words(&[0]);
+        f.invoke(dosallocseg, &[100u16, selp.offset, selp.selector, 0u16])
+            .expect("alloc");
+        let bytes = f.machine.resolve(selp, 2).expect("selp resolves");
+        let selector = u16::from_le_bytes([bytes[0], bytes[1]]);
+
+        let at = FarPtr { offset: 0, selector };
+        let expected_base = f.machine.resolve(at, 1).expect("resolves").as_ptr() as usize as u32;
+
+        let descp = f.words(&[0xdead, 0xbeef, 0xdead, 0xbeef, 0xdead]);
+        let ret = f
+            .invoke(dosgetsegdesc, &[selector, descp.offset, descp.selector])
+            .expect("dosgetsegdesc never refuses for a real selector");
+        assert_eq!(ret, Ret::U16(0));
+
+        let desc = f.machine.resolve(descp, 10).expect("descp resolves");
+        let base = u32::from_le_bytes(desc[0..4].try_into().expect("4 bytes"));
+        let size = u32::from_le_bytes(desc[4..8].try_into().expect("4 bytes"));
+        let attrib = u16::from_le_bytes(desc[8..10].try_into().expect("2 bytes"));
+
+        assert_eq!(base, expected_base, "base must be the segment's true linear address");
+        assert_eq!(size, 100, "size must be exactly what dosallocseg was asked for");
+        assert_eq!(attrib, DATA16, "every segment dosallocseg hands out is non-executable");
+    }
+
+    #[test]
+    fn dosgetsegdesc_answers_code16_for_the_scratch_code_selector() {
+        let mut f = Fixture::new();
+        let code_sel = f.machine.code_selector();
+        let descp = f.words(&[0, 0, 0, 0, 0]);
+
+        f.invoke(dosgetsegdesc, &[code_sel, descp.offset, descp.selector])
+            .expect("the scratch code segment is a real selector");
+
+        let desc = f.machine.resolve(descp, 10).expect("resolves");
+        let attrib = u16::from_le_bytes(desc[8..10].try_into().expect("2 bytes"));
+        assert_eq!(attrib, CODE16, "the one selector this host knows is executable");
+    }
+
+    #[test]
+    fn dosgetsegdesc_answers_error_invalid_selector_and_zeroes_the_descriptor() {
+        let mut f = Fixture::new();
+        let selp = f.words(&[0]);
+        f.invoke(dosallocseg, &[16u16, selp.offset, selp.selector, 0u16])
+            .expect("alloc");
+        let bytes = f.machine.resolve(selp, 2).expect("selp resolves");
+        let selector = u16::from_le_bytes([bytes[0], bytes[1]]);
+        f.invoke(dosfreeseg, &[selector]).expect("free, so the selector is now invalid");
+
+        let descp = f.words(&[0xdead, 0xbeef, 0xdead, 0xbeef, 0xdead]);
+        let ret = f
+            .invoke(dosgetsegdesc, &[selector, descp.offset, descp.selector])
+            .expect("dosgetsegdesc never refuses, even for a bad selector");
+        assert_eq!(ret, Ret::U16(ERROR_INVALID_SELECTOR));
+        assert_eq!(
+            f.machine.resolve(descp, 10).expect("descp resolves"),
+            &[0u8; 10][..],
+            "zeroed, not the 0xdead/0xbeef it was seeded with"
+        );
+    }
+
+    // -- dosgetmodname / dosloadmodule: the same registry, two angles ------
+
+    #[test]
+    fn dosgetmodname_round_trips_the_name_dosgetmodhandle_minted_a_handle_for() {
+        let mut f = Fixture::new();
+        let name = f.text("MAJORBBS");
+        let mhandp = f.words(&[0]);
+        f.invoke(
+            dosgetmodhandle,
+            &[name.offset, name.selector, mhandp.offset, mhandp.selector],
+        )
+        .expect("dosgetmodhandle never refuses");
+        let bytes = f.machine.resolve(mhandp, 2).expect("mhandp resolves");
+        let handle = u16::from_le_bytes([bytes[0], bytes[1]]);
+        assert_ne!(handle, 0);
+
+        let buffp = f.buffer(16);
+        let ret = f
+            .invoke(dosgetmodname, &[handle, 16u16, buffp.offset, buffp.selector])
+            .expect("dosgetmodname never refuses for a real handle");
+        assert_eq!(ret, Ret::U16(0));
+        assert_eq!(f.read(buffp), "MAJORBBS");
+    }
+
+    #[test]
+    fn dosgetmodname_truncates_to_fit_a_small_buffer_and_still_terminates() {
+        let mut f = Fixture::new();
+        let name = f.text("MAJORBBS");
+        let mhandp = f.words(&[0]);
+        f.invoke(
+            dosgetmodhandle,
+            &[name.offset, name.selector, mhandp.offset, mhandp.selector],
+        )
+        .expect("mint a handle");
+        let bytes = f.machine.resolve(mhandp, 2).expect("resolves");
+        let handle = u16::from_le_bytes([bytes[0], bytes[1]]);
+
+        let buffp = f.buffer(4); // room for 3 characters plus the terminator
+        f.invoke(dosgetmodname, &[handle, 4u16, buffp.offset, buffp.selector])
+            .expect("never refuses");
+        assert_eq!(f.read(buffp), "MAJ", "truncated to buffc - 1 characters, still NUL-terminated");
+    }
+
+    #[test]
+    fn dosgetmodname_answers_error_mod_not_found_and_touches_nothing_for_an_unminted_handle() {
+        let mut f = Fixture::new();
+        let buffp = f.words(&[0x4141]);
+        let ret = f
+            .invoke(dosgetmodname, &[0u16, 2u16, buffp.offset, buffp.selector])
+            .expect("dosgetmodname never refuses");
+        assert_eq!(ret, Ret::U16(ERROR_MOD_NOT_FOUND));
+        assert_eq!(
+            f.machine.resolve(buffp, 2).expect("resolves"),
+            &0x4141u16.to_le_bytes()[..],
+            "a miss must not touch the buffer at all"
+        );
+    }
+
+    #[test]
+    fn dosloadmodule_finds_a_known_library_and_mints_the_same_handle_dosgetmodhandle_would() {
+        let mut f = Fixture::new();
+        let name = f.text("MAJORBBS");
+        let mhandp = f.words(&[0]);
+        f.invoke(
+            dosgetmodhandle,
+            &[name.offset, name.selector, mhandp.offset, mhandp.selector],
+        )
+        .expect("mint via DosGetModHandle");
+        let expected = u16::from_le_bytes(
+            f.machine.resolve(mhandp, 2).expect("resolves").try_into().expect("2 bytes"),
+        );
+
+        let failp = f.buffer(16);
+        let name2 = f.text("MAJORBBS");
+        let mhandp2 = f.words(&[0]);
+        let ret = f
+            .invoke(
+                dosloadmodule,
+                &[
+                    failp.offset,
+                    failp.selector,
+                    16u16,
+                    name2.offset,
+                    name2.selector,
+                    mhandp2.offset,
+                    mhandp2.selector,
+                ],
+            )
+            .expect("dosloadmodule never refuses for a known name");
+        assert_eq!(ret, Ret::U16(0));
+        let got = u16::from_le_bytes(
+            f.machine.resolve(mhandp2, 2).expect("resolves").try_into().expect("2 bytes"),
+        );
+        assert_eq!(got, expected, "the same registry, so the same handle");
+    }
+
+    #[test]
+    fn dosloadmodule_writes_the_failing_name_into_failp_for_an_unknown_library() {
+        let mut f = Fixture::new();
+        let failp = f.buffer(32);
+        let name = f.text("NOSUCHLIBRARY");
+        let mhandp = f.words(&[0xbeef]);
+        let ret = f
+            .invoke(
+                dosloadmodule,
+                &[failp.offset, failp.selector, 32u16, name.offset, name.selector, mhandp.offset, mhandp.selector],
+            )
+            .expect("dosloadmodule never refuses");
+        assert_eq!(ret, Ret::U16(ERROR_MOD_NOT_FOUND));
+        assert_eq!(
+            f.read(failp),
+            "NOSUCHLIBRARY",
+            "the diagnostic name must be the one that actually failed"
+        );
+        assert_eq!(
+            f.machine.resolve(mhandp, 2).expect("resolves"),
+            &0u16.to_le_bytes()[..],
+            "the documented zero sentinel"
+        );
+    }
+
+    // -- dosallocrealseg / dosrealintr: argued refusals ---------------------
+
+    #[test]
+    fn dosallocrealseg_never_answers_ok_and_names_the_missing_bridge() {
+        let mut f = Fixture::new();
+        let parap = f.words(&[0]);
+        let selp = f.words(&[0]);
+        let args = [16u16, 0u16, parap.offset, parap.selector, selp.offset, selp.selector];
+
+        let err = f
+            .invoke(dosallocrealseg, &args)
+            .expect_err("no real-mode address space exists to alias");
+        let text = err.to_string();
+        assert!(
+            text.contains("crates/dos"),
+            "the refusal should name what is actually missing, not just fail silently: {text}"
+        );
+    }
+
+    #[test]
+    fn dosrealintr_never_answers_ok_and_names_the_missing_bridge() {
+        let mut f = Fixture::new();
+        let regsp = f.words(&[0; 13]);
+        // int_no, regsp(offset,selector), reserved(lo,hi), word_count
+        let args = [0u16, regsp.offset, regsp.selector, 0u16, 0u16, 4u16];
+
+        let err = f
+            .invoke(dosrealintr, &args)
+            .expect_err("no real-mode CPU exists to raise the interrupt against");
+        let text = err.to_string();
+        assert!(
+            text.contains("crates/dos"),
+            "the refusal should name what is actually missing, not just fail silently: {text}"
         );
     }
 }
