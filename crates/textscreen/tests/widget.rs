@@ -24,11 +24,22 @@ fn a_widget_paints_only_inside_its_area() {
 }
 
 #[test]
-fn put_outside_the_grid_is_dropped_not_a_panic() {
+fn put_below_the_last_row_is_dropped_not_a_panic() {
     // A widget handed a bad area must not take the process down; a config
     // editor that panics mid-edit loses the sysop's work.
     let mut buf = Cells::blank(4, 2);
-    buf.put(99, 99, b'x', 7);
+    buf.put(2, 0, b'x', 7);
+    assert_eq!(buf.text().matches('x').count(), 0);
+}
+
+#[test]
+fn put_past_the_last_column_is_dropped_not_a_panic() {
+    // Deliberately a VALID row, so this exercises the column guard alone. The
+    // earlier single test used row 99 and column 99 together, and the row guard
+    // short-circuited before the column guard was ever reached -- so the column
+    // check was untested while the test's name claimed otherwise.
+    let mut buf = Cells::blank(4, 2);
+    buf.put(0, 4, b'x', 7);
     assert_eq!(buf.text().matches('x').count(), 0);
 }
 
