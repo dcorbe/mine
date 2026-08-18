@@ -38,25 +38,42 @@ use crate::shims::ShimError;
 //
 // `A::Int` is `u16` under `Wg16` and `u32` under `Wg32`, the same shape
 // `shims::gsbl` already audited in full
-// (`docs/2026-08-14-gsbl-width-audit.md`). This file has three buckets: a
-// byte count with nothing narrower behind it (`memcpy`, `memcmp`, `movmem`
-// and `setmem`'s `count` -- "genuinely wide", read whole with
-// [`count_arg`]); an element size [`alcblok32`]'s own per-glob math commits
-// to sixteen bits regardless of `A` ("16-bit host model", read with
-// [`heap_size_arg`], which refuses rather than truncates); and `setmem`'s
-// fill byte, "genuinely narrow" -- a `char` argument that only ever
-// contributes its low byte, exactly like `memset`'s own `c` parameter --
-// which needs no checked reader because every value of that byte is
-// already valid.
+// (`docs/2026-08-14-gsbl-width-audit.md`). This file has three buckets, and
+// which bucket a parameter is in is decided by **the width the vendor
+// declared it**, never by what this host would find convenient:
 //
-// `alcmem`/`alczer`'s own `size` used to be in the second bucket -- read
-// with `heap_size_arg`, refused past `u16::MAX` -- but that refusal was the
-// defect this crate's own heap ceiling leaked into: [`Heap::reserve`]
-// really is capped at sixteen bits on both ABIs (deliberately, see that
-// method's doc comment), but the *request* is not, on `Wg32`. Both readers
-// now take `A::Int` at full width and branch on the *value* into either
-// [`Heap::reserve`] or [`Heap::reserve_large`](crate::heap::Heap::reserve_large)
-// -- see their own doc comments.
+//  1. Declared `UINT`/`size_t` with nothing narrower behind it -- `memcpy`,
+//     `memcmp`, `movmem` and `setmem`'s `count`, and `alcmem`/`alczer`'s
+//     `size`. "Genuinely wide": read whole with [`count_arg`], never
+//     narrowed.
+//  2. Declared `USHORT` -- `alcblok`'s `qty`/`size` and `ptrblok`'s `idx`
+//     (`re/wg33src/INC/GCOMM.H:261-273`). Sixteen bits *in the 32-bit build
+//     too*: read with [`ushort_arg`], which masks, because the upper half of
+//     a `Wg32` stack slot holding a `USHORT` is not the caller's to promise.
+//  3. `setmem`'s fill byte, "genuinely narrow" -- a `char` argument that
+//     only ever contributes its low byte, exactly like `memset`'s own `c`
+//     parameter -- which needs no checked reader because every value of that
+//     byte is already valid.
+//
+// Two corrections this file has already had to make, both worth keeping
+// because both were the same mistake in opposite directions -- guessing the
+// width from what the host wanted instead of reading the declaration:
+//
+// `alcmem`/`alczer`'s `size` was once in bucket 2, refused past `u16::MAX`.
+// That refusal was this crate's own heap ceiling leaking into an argument
+// reader: [`Heap::reserve`] really is capped at sixteen bits on both ABIs
+// (deliberately, see that method's doc comment), but the *request* is not,
+// and `GCOMM.H` declares both `UINT`. They now read at full width and branch
+// on the *value* into either [`Heap::reserve`] or
+// [`Heap::reserve_large`](crate::heap::Heap::reserve_large).
+//
+// `alcblok`/`ptrblok` were once in bucket 1, read at `Wg32`'s full `u32`.
+// That one stopped MajorMUD-NT's module init dead -- see [`alcblok32`]'s own
+// doc comment for the measured frames. Note that `re/widthscan.py` passed
+// both the whole time and was right to: it checks that a `USHORT` parameter
+// consumes one `.int()` slot, which it does. **The slot is 32 bits wide on
+// `Wg32` and the argument in it is 16** -- what a shim does with the other
+// half is past where that scanner can see.
 
 /// Read a byte count at `A`'s own int width, never narrowed.
 ///
@@ -70,19 +87,35 @@ fn count_arg<A: Abi>(v: A::Int) -> usize {
     Into::<u32>::into(v) as usize
 }
 
-/// Read an [`alcblok32`] *element* size, refusing rather than truncating if
-/// it does not fit the `u16` [`rounded_blok_size`]/[`elements_per_glob`]
-/// commit to regardless of `A` -- one element must still fit inside one
-/// packed region ([`Heap::reserve`](crate::heap::Heap::reserve)'s own
-/// ceiling), independent of what `Wg32`'s `int` can carry, the same shape
-/// `shims::gsbl`'s `u16_arg` documents
-/// (`docs/2026-08-14-gsbl-width-audit.md`).
+/// Read an argument the vendor declared `USHORT`, at the sixteen bits the
+/// declaration gives it and no more.
 ///
-/// **Not** used for `alcmem`/`alczer`'s `size` any more -- see this file's
-/// own "Argument width" note above for why that call site moved off this
-/// reader.
-fn heap_size_arg<A: Abi>(v: A::Int) -> Option<u16> {
-    u16::try_from(Into::<u32>::into(v)).ok()
+/// # Why this masks where [`gsbl::u16_arg`](crate::shims::gsbl) refuses
+///
+/// The two look alike and are answering opposite questions.
+///
+/// `gsbl`'s reader is a **domain** check: `BRKTHU.H` declares those
+/// parameters `INT` -- a full thirty-two bits under `Wg32` -- and the shim
+/// narrows them because the *field behind* them is narrower. A caller that
+/// passes 70,000 there has genuinely said something out of range, and
+/// refusing (`docs/2026-08-14-gsbl-width-audit.md`) is right.
+///
+/// This reader is an **ABI** fact: `alcblok`/`ptrblok` are declared
+/// `USHORT` (`re/wg33src/INC/GCOMM.H:261-273`), so the parameter *is*
+/// sixteen bits wide. A 32-bit stack slot holding one carries sixteen bits
+/// of argument and sixteen bits that belong to whatever used the register
+/// last; the vendor's own compiled prologue reads it with `movzx` and
+/// cannot see the upper half at all. There is no value here to call out of
+/// range, because the upper half was never part of the value -- refusing it
+/// rejects calls the real host answers, which is exactly the defect
+/// `alcblok32`'s own doc comment records. Masking is not a lossy shortcut
+/// here; it is what the declaration says.
+///
+/// The distinction is the declared width, not the shim's convenience:
+/// `alcmem`/`alczer` take `UINT` in the same header and are read at full
+/// width by [`alcmem`] accordingly.
+fn ushort_arg<A: Abi>(v: A::Int) -> u16 {
+    Into::<u32>::into(v) as u16
 }
 
 /// `VOID *alcmem(UINT size)` -- `GCOMM.H:256-258` -- reserve memory the
@@ -102,8 +135,10 @@ fn heap_size_arg<A: Abi>(v: A::Int) -> Option<u16> {
 ///
 /// # Width: packed for a small `size`, its own region for a large one
 ///
-/// `size` is read at `A::Int`'s own full width, not narrowed the way this
-/// used to read it through `heap_size_arg` -- `Heap::reserve`'s `u16`
+/// `size` is read at `A::Int`'s own full width, which is what `UINT size`
+/// in `GCOMM.H:256-258` says, and not narrowed the way this used to read it
+/// through a since-deleted `heap_size_arg` reader (this file's "Argument
+/// width" note has the whole correction) -- `Heap::reserve`'s `u16`
 /// ceiling is a real property of this crate's packed-region heap, not of
 /// what a `Wg32` module may ask `alcmem` for. So `size` is checked against
 /// `u16::MAX` here, at the *value*, not assumed from `A`: fits, and this
@@ -764,8 +799,8 @@ pub fn freblok(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
     Ok(abi::Ret::Void)
 }
 
-/// `void *alcblok(unsigned qty, unsigned size)` -- `GCOMM.H:485`, `Wg32`
-/// side -- `ALCBLOK.C`'s non-`GCDOS` (`GCWINNT`) branch:
+/// `VOID *alcblok(USHORT qty, USHORT size)` -- `re/wg33src/INC/GCOMM.H:261`,
+/// `Wg32` side -- `ALCBLOK.C`'s non-`GCDOS` (`GCWINNT`) branch:
 ///
 ///
 /// One allocation, no chaining, no bounds record -- a flat 32-bit
@@ -798,11 +833,50 @@ pub fn freblok(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 /// thirty times over. A survey finding no evidence of something was never
 /// proof it cannot happen -- only that this track had not yet met the
 /// module that does.
+///
+/// # `qty` and `size` are sixteen bits, and reading the other sixteen cost a boot
+///
+/// This shim's citation used to be `GCOMM.H:485`, which is
+/// `archive/galacticomm/extract/wg1/GALDSRC/SRC/GCOMM.H` --
+/// `void *alcblok(unsigned qty, unsigned size)`, from the 16-bit tree, where
+/// `unsigned` *is* sixteen bits. Under `Wg32` that citation reads as a
+/// 32-bit parameter and it is the wrong header: the 32-bit Worldgroup tree
+/// declares the same routine `USHORT qty, USHORT size`
+/// (`re/wg33src/INC/GCOMM.H:261-264`, and identically in the WG v10 module
+/// SDK). **The C type widened with the compiler; the vendor's declaration
+/// deliberately did not** -- `ALCBLOK.C`'s own `alczer(((ULONG)qty*size)+8)`
+/// casts to `ULONG` at the multiply for exactly that reason, a cast that
+/// would be pointless if the operands were already 32-bit.
+///
+/// So the upper half of each slot belongs to whatever used the register
+/// last. MajorMUD-NT's fourth module-init call is `alcblok(751, 1072)` --
+/// 805,080 bytes -- and it arrives with a stale address in `qty`'s top half.
+/// Three otherwise identical boots of
+/// `mbbs-server --module32 wccmmud.dll --root32 ~/peepeebbs`:
+///
+/// | run | `qty` slot | low 16 | read whole, as bytes |
+/// |---|---|---|---|
+/// | 1 | `0x405202ef` | 751 | 1,156,812,916,952 |
+/// | 2 | `0x417202ef` | 751 | 1,177,046,239,448 |
+/// | 3 | `0x409202ef` | 751 | 1,161,309,210,840 |
+///
+/// The low half never moves; the high half does, and every value of it lands
+/// in this host's own m32 arena range, which itself moves per run because
+/// `Memory::alloc`'s mapping is not `MAP_FIXED`. That is a `mov ax, [...]`
+/// into an `eax` still holding a pointer, then `push eax` -- ordinary
+/// codegen for a 16-bit argument, and invisible to the vendor's `movzx`.
+///
+/// Read whole, it stopped module init outright with
+/// `alcblok: 1156812916952 bytes does not fit a 32-bit region length`.
+/// The first three calls (`1501x1544`, `2001x400`, `301x756`) all happened
+/// to arrive with clean upper halves, which is why this survived as long as
+/// it did. Both parameters now read through [`ushort_arg`];
+/// `crates/mbbs/tests/wg32_abi.rs` holds the measured frame.
 pub fn alcblok32(call: &mut Call<Wg32>, host: &mut Host<Wg32>) -> Result<abi::Ret<Wg32>, ShimError> {
-    let qty = count_arg::<Wg32>(call.int());
-    let raw_size = heap_size_arg::<Wg32>(call.int()).ok_or_else(|| {
-        ShimError::Failed("alcblok: element size does not fit this heap's u16 block size".to_owned())
-    })?;
+    // Both USHORT -- see `ushort_arg`, and this function's own doc comment
+    // for the boot this cost when `qty` was read thirty-two bits wide.
+    let qty = usize::from(ushort_arg::<Wg32>(call.int()));
+    let raw_size = ushort_arg::<Wg32>(call.int());
 
     if qty == 0 {
         return Err(ShimError::Failed("alcblok: 0 elements".to_owned()));
@@ -861,7 +935,10 @@ pub fn alcblok32(call: &mut Call<Wg32>, host: &mut Host<Wg32>) -> Result<abi::Re
 /// `bigptr` still answers `NULL`, the same as [`ptrblok`]'s own `Wg16` side.
 pub fn ptrblok32(call: &mut Call<Wg32>, _: &mut Host<Wg32>) -> Result<abi::Ret<Wg32>, ShimError> {
     let bigptr = call.ptr();
-    let idx = count_arg::<Wg32>(call.int());
+    // `USHORT idx` -- see `ushort_arg`. Unmasked, a stale high half does not
+    // fault here; it fails the `idx >= qty` bound below and returns a NULL
+    // the vendor's own flat body cannot produce.
+    let idx = usize::from(ushort_arg::<Wg32>(call.int()));
 
     if bigptr == Wg32::null_ptr() {
         return Ok(abi::Ret::Ptr(Wg32::null_ptr()));
@@ -1072,16 +1149,31 @@ mod tests {
         assert_eq!(count_arg::<Wg16>(u16::MAX), usize::from(u16::MAX));
     }
 
-    /// `heap_size_arg` refuses a size `Heap::reserve`'s own `u16` cannot
-    /// hold, rather than silently allocating a block far smaller than the
-    /// module asked for -- the truncation this task exists to close, one
-    /// call site earlier than `count_arg`'s (there is a narrower field
-    /// behind this one: `Heap::reserve(size: u16)`, unlike `memcpy` et al).
+    /// `ushort_arg` takes the low sixteen bits of a `USHORT` argument and
+    /// discards the rest of the slot, because the rest of the slot is not
+    /// part of the argument -- see the function's own doc comment for why
+    /// this masks where `gsbl`'s lookalike refuses.
+    ///
+    /// `0x4052_02ef` is not an invented constant: it is the literal `qty`
+    /// slot MajorMUD-NT's fourth module-init `alcblok` produced, upper half
+    /// and all (`alcblok32`'s doc comment has all three measured runs).
+    /// Reading it whole is a 1.15-terabyte allocation request.
     #[test]
-    fn heap_size_arg_refuses_a_size_that_does_not_fit_the_heaps_u16_block() {
-        assert_eq!(heap_size_arg::<Wg32>(70_000), None);
-        assert_eq!(heap_size_arg::<Wg32>(4096), Some(4096));
-        assert_eq!(heap_size_arg::<Wg16>(u16::from(u8::MAX)), Some(255));
+    fn ushort_arg_masks_a_wg32_slots_upper_half_away() {
+        assert_eq!(ushort_arg::<Wg32>(0x4052_02ef), 751);
+        assert_eq!(ushort_arg::<Wg32>(70_000), 4464); // 70_000 - 65_536
+        assert_eq!(ushort_arg::<Wg32>(4096), 4096);
+    }
+
+    /// Under `Wg16` there is no upper half to mask: `A::Int` is itself
+    /// `u16`, so this reader must be the identity there. The regression
+    /// guard that keeps the fix a `Wg32` correction rather than a behaviour
+    /// change on an ABI that was already right.
+    #[test]
+    fn ushort_arg_is_the_identity_on_wg16() {
+        assert_eq!(ushort_arg::<Wg16>(0), 0);
+        assert_eq!(ushort_arg::<Wg16>(u16::MAX), u16::MAX);
+        assert_eq!(ushort_arg::<Wg16>(751), 751);
     }
 
     fn far(at: FarPtr) -> [u16; 2] {

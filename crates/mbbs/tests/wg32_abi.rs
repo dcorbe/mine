@@ -529,6 +529,167 @@ fn alcblok32_answers_majormud_nts_own_call_and_frees_cleanly() {
         .expect("freblok32 frees the dedicated region back");
 }
 
+/// `alcblok`'s `qty` and `size` are `USHORT` -- **sixteen bits, in the
+/// 32-bit build too** -- so the upper half of each 32-bit stack slot is not
+/// the caller's to promise, and this host must not read it.
+///
+/// `re/wg33src/INC/GCOMM.H:261-264` declares
+/// `alcblok(USHORT qty, USHORT size)`, and `ALCBLOK.C`'s own flat branch
+/// casts *once it has them* -- `alczer(((ULONG)qty*size)+8)` -- a cast that
+/// exists precisely because the two operands are sixteen bits each. The
+/// vendor's compiled prologue reads them with `movzx`; it cannot see the
+/// high half and neither may we. (`archive/.../wg1/GALDSRC/SRC/GCOMM.H:485`
+/// spells the same pair `unsigned`, which *was* sixteen bits under the
+/// 16-bit compiler this shim's own doc comment used to cite -- the type
+/// widened with the compiler, the vendor's declaration deliberately did
+/// not.)
+///
+/// # The live frame, measured three times
+///
+/// MajorMUD-NT's fourth module-init `alcblok` is `alcblok(751, 1072)`, and
+/// the module leaves a stale pointer in the top half of `qty`'s slot --
+/// `mov ax, [...]` into an `eax` that still held an address, then
+/// `push eax`. Three otherwise identical boots of
+/// `mbbs-server --module32 wccmmud.dll` put `0x405202ef`, `0x417202ef` and
+/// `0x409202ef` in that slot: the low sixteen bits are `0x02ef` (751) every
+/// time, and the varying halves are all inside this host's own m32 arena
+/// range, which moves per run because `Memory::alloc`'s mapping is not
+/// `MAP_FIXED`.
+///
+/// Reading all thirty-two bits turned an 805,080-byte request into
+/// 1,156,812,916,952 bytes and stopped module init outright:
+///
+/// ```text
+/// WGSERVER.EXE.alcblok refused: alcblok: 1156812916952 bytes does not fit
+/// a 32-bit region length
+/// ```
+///
+/// This test uses that exact frame. It is `0x405202ef` rather than a tidy
+/// `0xdead02ef` on purpose: an invented constant would prove the masking
+/// and lose the evidence that the garbage is a real address this host
+/// itself handed the module.
+#[test]
+fn alcblok32_reads_a_ushort_qty_and_ignores_the_callers_stale_high_half() {
+    let file = minimal_with_one_section();
+    let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
+    let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
+    let mem = mbbs_machine::m32::Memory::new(image, 4 * 1024 * 1024).expect("arena mapping");
+    let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
+    let mut cpu = Wg32Cpu::new(machine, mem);
+
+    let mut host = mbbs::Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), mbbs::Terms::new(1))
+        .expect("host builds against the placeholder memory");
+
+    // The measured frame: qty's slot carries a leftover address in its top
+    // half, size's slot happens to be clean. Both are USHORT, so both are
+    // masked -- size's clean slot must not be what makes this pass, so the
+    // sibling assertion below dirties it too.
+    let mut frame = Vec::new();
+    frame.extend(0x4052_02efu32.to_le_bytes());
+    frame.extend(0x0000_0430u32.to_le_bytes());
+    let mut call = Call::<Wg32>::new(&mut cpu, &frame);
+    let Ret::Ptr(block) = mbbs::shims::memory::alcblok32(&mut call, &mut host).expect(
+        "alcblok(751, 1072) is an 805,080-byte request; reading qty's high half asks for \
+         1,156,812,916,952 bytes and refuses",
+    ) else {
+        panic!("alcblok32 returns a pointer")
+    };
+
+    // The block is exactly 751 * 1072 + 8 bytes and every one of them
+    // resolves -- a shim that masked qty to some *other* narrow width, or
+    // that clamped rather than masked, lands here with a block too short to
+    // write. `size` is `1072`, already even, so `rounded_blok_size` leaves
+    // it alone and this is the vendor's own `((ULONG)qty*size)+8`.
+    let full = vec![0xABu8; 751 * 1072 + 8];
+    mbbs_machine::ptr::ModulePtr::write(&block, &mut cpu.mem, &full)
+        .expect("the whole 805,080-byte block must be writable");
+
+    let free_frame = <Wg32 as Abi>::ptr_to_bytes(block);
+    let mut call = Call::<Wg32>::new(&mut cpu, &free_frame);
+    mbbs::shims::memory::freblok32(&mut call, &mut host).expect("freblok32 frees it back");
+
+    // `size`'s own slot, dirtied the same way. Nothing in the live trace
+    // dirtied it, but the parameter is the same USHORT and a host that
+    // masked only `qty` would be correct by accident on this module and
+    // wrong on the next one. Before the fix this did not merely mis-size
+    // the block -- `heap_size_arg` REFUSED it outright, so the failure is a
+    // different one from `qty`'s and needs its own assertion.
+    let mut frame = Vec::new();
+    frame.extend(0x4052_02efu32.to_le_bytes());
+    frame.extend(0x417f_0430u32.to_le_bytes());
+    let mut call = Call::<Wg32>::new(&mut cpu, &frame);
+    let Ret::Ptr(block) = mbbs::shims::memory::alcblok32(&mut call, &mut host)
+        .expect("size is USHORT too: its stale high half must be masked, not refused")
+    else {
+        panic!("alcblok32 returns a pointer")
+    };
+    let full = vec![0xCDu8; 751 * 1072 + 8];
+    mbbs_machine::ptr::ModulePtr::write(&block, &mut cpu.mem, &full)
+        .expect("masking size must give the same 805,080-byte block, not a larger one");
+}
+
+/// `ptrblok(VOID *bigptr, USHORT idx)` -- `GCOMM.H:270-273` -- has the same
+/// sixteen-bit parameter as its `alcblok` sibling, and the same stale high
+/// half would be fatal in a quieter way: `idx` is bounds-checked against the
+/// block's `qty`, so an unmasked `0x4052_0005` is not a wild pointer but a
+/// **NULL return**, which the vendor's own flat `ptrblok` can never produce
+/// (its body is unconditional pointer arithmetic). The module would
+/// dereference that NULL somewhere else entirely -- the exact shape
+/// `shims::memory::alcmem`'s own doc comment records costing eighteen calls
+/// to diagnose.
+///
+/// Not reached in a live boot yet, because `alcblok` refused first. That is
+/// the reason to hold it here rather than wait for it.
+#[test]
+fn ptrblok32_reads_a_ushort_idx_and_ignores_the_callers_stale_high_half() {
+    let file = minimal_with_one_section();
+    let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
+    let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
+    let mem = mbbs_machine::m32::Memory::new(image, 4 * 1024 * 1024).expect("arena mapping");
+    let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
+    let mut cpu = Wg32Cpu::new(machine, mem);
+
+    let mut host = mbbs::Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), mbbs::Terms::new(1))
+        .expect("host builds against the placeholder memory");
+
+    let mut frame = Vec::new();
+    frame.extend(751u32.to_le_bytes());
+    frame.extend(1072u32.to_le_bytes());
+    let mut call = Call::<Wg32>::new(&mut cpu, &frame);
+    let Ret::Ptr(block) = mbbs::shims::memory::alcblok32(&mut call, &mut host)
+        .expect("a clean alcblok(751, 1072) to index into")
+    else {
+        panic!("alcblok32 returns a pointer")
+    };
+
+    // Element 5 of 751, asked for with a stale address in the top half of
+    // `idx`'s slot -- the same `0x4052` this file's alcblok test measured.
+    let mut frame = <Wg32 as Abi>::ptr_to_bytes(block);
+    frame.extend(0x4052_0005u32.to_le_bytes());
+    let mut call = Call::<Wg32>::new(&mut cpu, &frame);
+    let Ret::Ptr(elem) = mbbs::shims::memory::ptrblok32(&mut call, &mut host)
+        .expect("ptrblok32 answers")
+    else {
+        panic!("ptrblok32 returns a pointer")
+    };
+    assert_ne!(
+        elem,
+        <Wg32 as Abi>::null_ptr(),
+        "element 5 is in range: reading idx's high half puts it past qty and returns NULL, \
+         which the vendor's own flat ptrblok cannot do"
+    );
+
+    // And it is the RIGHT element, not merely non-NULL: `bigptr + 8 +
+    // size*idx`, the vendor's own arithmetic. A shim that masked `idx` to
+    // zero would also pass the assertion above.
+    let expect = <Wg32 as Abi>::ptr_checked_add(block, 8 + 1072 * 5)
+        .expect("element 5 is inside the block");
+    assert_eq!(
+        elem, expect,
+        "ptrblok must land on element 5, at bigptr + 8 + 1072*5"
+    );
+}
+
 /// A live `mbbs-server` bug, reproduced twice against a real board: booting
 /// `LUNATIX.DLL` faulted --
 /// `module faulted with signal 11 at 0x413de00d` (and, a second run under a
