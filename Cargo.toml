@@ -12,6 +12,7 @@ members = [
     "crates/mud-client",
     "crates/dos",
     "crates/dos-runtime",
+    "crates/textscreen",
 ]
 
 [workspace.package]
