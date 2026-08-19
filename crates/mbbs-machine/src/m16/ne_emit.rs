@@ -31,18 +31,29 @@
 //! thunk -- reusing the loader's existing `Target::Import` path rather than
 //! inventing new trapping machinery.
 //!
-//! ## The circularity this would create, and the rule that avoids it
+//! ## The chain this could create, and the rule that avoids it
 //!
-//! **A forwarder that imports from its own library name would resolve to
-//! itself once a resolver ever prefers an already-loaded module's exports
-//! over the host's own tables, and loop.** The rule: *the synthesised
-//! image itself must always be loaded with the unflipped resolver* --
-//! host tables first, exactly as every other load today -- so its imports
-//! bind to host shims/thunks rather than back into the image that is still
-//! being loaded. Precedence-flipping (preferring an already-loaded module
-//! over the host tables) is a decision for *other* modules loaded
-//! afterwards to opt into, per load, never a global default and never
-//! something the forwarder's own load may use.
+//! This image imports each of its own exports back from a module of its own
+//! name, so a resolver that prefers an already-loaded module's exports over
+//! the host's own tables is a hazard worth naming.
+//!
+//! **It is not, however, self-resolution during this image's own load.** That
+//! was the original claim here and it was measured to be wrong: `Host::load`
+//! registers a module in `loaded_modules` only *after* the load returns, and
+//! the resolver borrows that map before it, so an image is never present
+//! under its own name while its own imports are being resolved. Loading this
+//! image with the flip on for its own library resolves exactly as with the
+//! flip off -- the lookup simply misses and falls through to the host tables.
+//!
+//! The real hazard needs a *second* load: if some earlier load already
+//! registered a module under this library's name, a forwarder that named its
+//! own library in `prefer` would bind its self-import to that earlier
+//! module's export instead of a host thunk -- and that export may itself be
+//! nothing but another forwarder, extending the chain rather than ever
+//! reaching a host routine. The rule: *the synthesised image itself is always
+//! loaded with the unflipped resolver* -- host tables first, exactly as every
+//! other load today. Precedence-flipping is a decision for *other* modules
+//! loaded afterwards to opt into, per load, never a global default.
 //!
 //! # The spec is our own reader
 //!

@@ -2920,6 +2920,41 @@ impl<A: Abi> Host<A> {
     }
 
     pub fn load(&mut self, cpu: &mut A::Cpu, file: &[u8]) -> Result<A::Module, LoadError> {
+        self.load_with_precedence(cpu, file, &[])
+    }
+
+    /// [`Host::load`], with `prefer` naming libraries whose already-loaded
+    /// module wins over this host's own tables when this one load's own
+    /// imports are resolved -- the opposite of [`Resolver::resolve`]'s
+    /// ordinary "host tables first" order. [`Host::load`] itself is
+    /// `self.load_with_precedence(cpu, file, &[])`, so the default is no
+    /// flip and every existing caller is unaffected.
+    ///
+    /// **Per load, never global, and never for the library being loaded right
+    /// now.** A synthesised forwarder (`mbbs_machine::m16::emit`) imports
+    /// each of its own exports back from a module of its own name -- see that
+    /// function's own doc comment, "The circularity this would create, and
+    /// the rule that avoids it". If a forwarder's own load named its own
+    /// library in `prefer` and some earlier load had already registered a
+    /// module under that same name in [`Host::loaded_modules`], the
+    /// forwarder's self-import would resolve to that earlier module's export
+    /// instead of a real host thunk -- which may itself be nothing but
+    /// another forwarder, extending the chain rather than ever reaching a
+    /// host routine. The rule that avoids it: **a forwarder's own load always
+    /// calls plain [`Host::load`]**, never this method with its own library
+    /// named in `prefer`. Only a *module* loaded afterwards, wanting its
+    /// import of that library routed through the forwarder rather than
+    /// straight to the host, opts in here.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Host::load`].
+    pub fn load_with_precedence(
+        &mut self,
+        cpu: &mut A::Cpu,
+        file: &[u8],
+        prefer: &[&str],
+    ) -> Result<A::Module, LoadError> {
         let image = NeImage::parse(file).ok();
         let reach = image
             .as_ref()
@@ -2972,6 +3007,7 @@ impl<A: Abi> Host<A> {
             exports: &self.exports,
             globals: &self.globals,
             loaded: &self.loaded_modules,
+            prefer,
             reach,
             missing: std::cell::RefCell::new(Vec::new()),
         };
@@ -5029,8 +5065,18 @@ struct Resolver<'a, A: Abi> {
     /// exporting a same-named symbol -- `shims::entry` is asked first every
     /// time, and this map is only ever reached when that answered
     /// [`Entry::Unimplemented`]. See [`Resolver::resolve`]'s own doc
-    /// comment for the rest of the design.
+    /// comment for the rest of the design, and [`Resolver::prefer`] for the
+    /// one case where a library named there is consulted *before* host
+    /// tables instead.
     loaded: &'a HashMap<String, A::Module>,
+
+    /// Libraries this one load prefers an already-[`loaded`](Self::loaded)
+    /// module's export over this host's own tables for -- see
+    /// [`Host::load_with_precedence`]'s own doc comment for what this is for
+    /// and the circularity it must never be used to create. Empty for every
+    /// ordinary [`Host::load`] call, which is what keeps this a per-load
+    /// opt-in rather than a change to `Resolver::resolve`'s default order.
+    prefer: &'a [&'a str],
 
     /// How far into each data-addressed symbol this module's own
     /// relocations reach -- see [`addressed_as_data`]'s own doc comment.
@@ -5063,6 +5109,20 @@ impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
     /// [`Entry::Routine`] before this method has any chance to notice that
     /// some other loaded module also happens to be named `MAJORBBS` and also
     /// happens to export something called `spr`.
+    ///
+    /// **Unless `module` is named in [`Resolver::prefer`]**, opted into per
+    /// load through [`Host::load_with_precedence`] and empty for every
+    /// ordinary [`Host::load`]. For a `prefer`-listed library, [`loaded`]
+    /// is consulted *first*: if it names a module under that library and
+    /// that module exports the requested symbol, its address is what this
+    /// method answers, before `shims::entry` is ever asked. A `prefer` hit
+    /// that finds no such module, or a loaded module that does not export
+    /// the symbol, falls straight through to the ordinary order below rather
+    /// than recording a miss of its own -- `prefer` names a library this
+    /// load *wants* routed through a loaded module, not one it requires to
+    /// be; declining silently and asking the host tables is the same
+    /// graceful degradation an unheard-of module name already gets, not a
+    /// new failure mode.
     ///
     /// A registry hit resolves to [`Import::Data`] -- not [`Import::Routine`]
     /// -- because it is not a host thunk: `Abi::export_address` hands back
@@ -5105,6 +5165,20 @@ impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
         // either way, and the miss-detection side gets a real symbol string
         // to report instead of silently skipping an ordinal it cannot name.
         let name = symbol_name(self.exports, module, symbol);
+
+        // The precedence flip: only for a library this one load named in
+        // `prefer` (see `Resolver::prefer`'s and this method's own doc
+        // comments), and only when a module is actually loaded under that
+        // name and actually exports the symbol -- otherwise this falls
+        // through to the ordinary host-tables-first order below exactly as
+        // if `prefer` had never named it.
+        if self.prefer.contains(&module)
+            && let Some(loaded) = self.loaded.get(module)
+            && let Some(ptr) = A::export_address(loaded, symbol)
+        {
+            return Some(mbbs_machine::module::Import::Data(ptr));
+        }
+
         let entry = shims::entry::<A>(module, &name);
 
         // Cross-module: host tables answered first, above, and only once
