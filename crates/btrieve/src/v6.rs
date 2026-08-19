@@ -82,17 +82,23 @@
 
 use std::collections::HashMap;
 
-/// How many times [`Map::read`] has walked a file's allocation table.
-///
-/// Test-only, and it exists because the cost it counts is invisible to every
-/// other kind of check. Reading the map walks every allocation-table block in
-/// the file; `Block::v6_reindex` used to ask for one per index node, which
-/// on a 13,713-page `WCCMP002.DAT` was 109 walks for a single-record update.
-/// Nothing about the file that results is different, so no correctness test
-/// can tell 2 walks from 109 -- only a counter can.
 #[cfg(test)]
-pub(crate) static READS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// How many times [`Map::read`] has walked a file's allocation table.
+    ///
+    /// Test-only, and it exists because the cost it counts is invisible to
+    /// every other kind of check. Reading the map walks every
+    /// allocation-table block in the file; `Block::v6_reindex` used to ask
+    /// for one per index node, which on a 13,713-page `WCCMP002.DAT` was 109
+    /// walks for a single-record update. Nothing about the file that results
+    /// is different, so no correctness test can tell 2 walks from 109 -- only
+    /// a counter can.
+    ///
+    /// Thread-local, not a `static`: the suite runs in parallel, and a
+    /// process-wide counter reported 113 walks for the one update this
+    /// measures because eight other tests were walking maps at the time.
+    pub(crate) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Magic bytes opening an allocation-table page.
 const MAGIC: &[u8; 2] = b"PP";
@@ -199,7 +205,7 @@ impl Map {
     ///   a wrong pick would be worse than stopping.
     pub fn read(file: &[u8], page_size: u16) -> Result<Self, String> {
         #[cfg(test)]
-        READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        READS.with(|reads| reads.set(reads.get() + 1));
         let page_size = usize::from(page_size);
         // `ENTRIES + ENTRY`, not `ENTRIES`: a page long enough to reach the
         // entry array but too short to hold one whole entry would divide out

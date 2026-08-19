@@ -995,6 +995,17 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Bytes [`Block::write_changed_pages`] has put on the disk.
+    ///
+    /// Thread-local rather than read out of `/proc/self/io`, which is
+    /// process-wide: `cargo test` runs the suite in parallel, so the kernel's
+    /// counters include every other test's I/O and the measurement test
+    /// failed whenever it was not run alone.
+    pub(crate) static WROTE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 fn stop_here(at: Stop) -> Result<(), String> {
     if STOP_AT.with(std::cell::Cell::get) == Some(at) {
         return Err(format!("{at:?}: a staged interruption, standing in for a crash"));
@@ -1445,6 +1456,8 @@ impl<M: Mem> Block<M> {
             .map_err(|e| fail(format!("{}: {e}", self.path.display())))?;
 
         let put = |out: &mut std::fs::File, at: u64, bytes: &[u8]| -> Result<(), BtvError> {
+            #[cfg(test)]
+            WROTE.with(|wrote| wrote.set(wrote.get() + bytes.len()));
             out.seek(SeekFrom::Start(at))
                 .and_then(|_| out.write_all(bytes))
                 .map_err(|e| fail(format!("{}: writing at {at}: {e}", self.path.display())))
@@ -6332,13 +6345,15 @@ mod tests {
         block.update(position, &bytes).expect("a warm-up update");
 
         let before = std::fs::read(&block.path).expect("the file reads");
-        crate::v6::READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::v6::READS.with(|reads| reads.set(0));
+        WROTE.with(|wrote| wrote.set(0));
         let (read_before, wrote_before) = io();
         let start = std::time::Instant::now();
         block.update(position, &bytes).expect("a no-op update of record 0");
         let took = start.elapsed();
         let (read_after, wrote_after) = io();
-        let map_reads = crate::v6::READS.load(std::sync::atomic::Ordering::Relaxed);
+        let map_reads = crate::v6::READS.with(std::cell::Cell::get);
+        let wrote = WROTE.with(std::cell::Cell::get);
 
         let after = std::fs::read(&block.path).expect("the file reads back");
         let common = before.len().min(after.len()) / page;
@@ -6346,11 +6361,13 @@ mod tests {
             .filter(|n| before[n * page..(n + 1) * page] != after[n * page..(n + 1) * page])
             .collect();
 
-        let (read, wrote) = (read_after - read_before, wrote_after - wrote_before);
+        // `/proc/self/io` is process-wide and only used for the printout;
+        // every assertion below is on this write path's own counter.
+        let (read, kernel_wrote) = (read_after - read_before, wrote_after - wrote_before);
         eprintln!(
-            "one update: {took:?}, read {} MB, wrote {} MB (file is {} MB)",
+            "one update: {took:?}, read {} MB, this write put down {wrote} bytes \
+             (the process wrote {kernel_wrote}; the file is {} MB)",
             read / 1_048_576,
-            wrote / 1_048_576,
             before.len() / 1_048_576
         );
         eprintln!("{} of {common} pages differ: {differing:?}", differing.len());
@@ -6370,7 +6387,7 @@ mod tests {
         // back.
         let expected = differing.len() * page;
         assert!(
-            (wrote as usize) <= expected + page,
+            wrote <= expected + page,
             "wrote {wrote} bytes to change {expected}"
         );
 
