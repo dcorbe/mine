@@ -82,6 +82,19 @@ fn main() -> io::Result<()> {
                 match services.service(vector, &mut vm) {
                     Some(Serviced::Continue) => {}
                     Some(Serviced::Terminate(c)) => break i32::from(c),
+                    // This probe loads one `.COM` and has no concept of a
+                    // second program to hand the resident block to -- that is
+                    // `runexe`'s `--tsr`, not this file's job. The honest
+                    // outcome here is to end the run and say so, not to
+                    // invent a place for a program that was never given one.
+                    Some(Serviced::StayResident { code, paragraphs }) => {
+                        eprintln!(
+                            "guest asked to stay resident (code {code}, {paragraphs} \
+                             paragraphs); this probe runs one program and has nothing \
+                             to load after it"
+                        );
+                        break -6;
+                    }
                     Some(Serviced::Fault(f)) => {
                         eprintln!("guest handed over a bad pointer: {f:?}");
                         break -1;

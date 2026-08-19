@@ -25,7 +25,7 @@ use std::rc::Rc;
 use clap::Parser;
 
 use dos::count::{Counters, Counting};
-use dos::service::{Serviced, Services};
+use dos::service::{Service, Serviced, Services};
 use dos_runtime::bios::{Bios, Keyboard, Video, int16, int16_implemented, missing};
 use dos_runtime::dos::is_implemented;
 use dos_runtime::guest::{Guest, Ptr};
@@ -128,6 +128,39 @@ const _: () = assert!(
 /// Stop rather than spin if the program loops on a call we keep refusing.
 const MAX_CALLS: u32 = 2000;
 
+/// Conventional memory's ceiling: the same 640 KiB boundary `dos::kernel::
+/// Arena` builds its free list up to (its own `CONV_TOP`, private to that
+/// crate) and the same value `mz::load` already burns into every PSP it
+/// builds, at offset 0x02, as "top of memory". Restated here rather than
+/// imported because neither crate exports it -- the value is fixed by the
+/// real-mode DOS memory map, not by either crate's own choices.
+const CONV_TOP: u16 = 0xa000;
+
+/// `seg + len` paragraphs, checked against [`CONV_TOP`] rather than left to
+/// wrap.
+///
+/// `--tsr` needs this twice: once for the resident block a TSR leaves behind
+/// (`tsr_psp + paragraphs`, where `paragraphs` is a guest-controlled value
+/// straight out of `AH=31h`), and once for the main program's own footprint
+/// once it loads on top of that block (`main_psp + paragraphs()`). Both are
+/// `u16` segment sums that a bare `+` would silently wrap on for a bad or
+/// merely large value, landing the next program somewhere inside memory it
+/// does not own. Widened `u32` arithmetic, checked against the real ceiling,
+/// is the same shape the environment-block-vs-`HEAP_SEG` assertion above
+/// already uses, and for the same reason: this workspace sets no
+/// `overflow-checks` override, so a release build of a wrapped `u16` sum
+/// would silently keep going.
+fn checked_seg_add(seg: u16, len: u32, what: &str) -> Result<u16, String> {
+    let end = u32::from(seg) + len;
+    if end > u32::from(CONV_TOP) {
+        return Err(format!(
+            "{what} at {seg:#06x} plus {len:#06x} paragraphs would end at \
+             {end:#08x}, past conventional memory's ceiling at {CONV_TOP:#06x}"
+        ));
+    }
+    Ok(end as u16)
+}
+
 /// CPU this process has burned, and how long it has been alive.
 ///
 /// Reported at exit because "what did the CPU look like?" is otherwise
@@ -170,6 +203,20 @@ fn parse_addr(s: &str) -> Result<u32, String> {
 /// clap already validated shape for.
 fn parse_bturno_arg(s: &str) -> Result<String, String> {
     dos_runtime::host_library::parse_bturno(s).map(str::to_owned)
+}
+
+/// Split a `--tsr` value into the program to load and its own command tail.
+///
+/// DOS 8.3 filenames never contain whitespace, so the first run of it
+/// unambiguously separates the program from everything meant for it -- the
+/// same distinction the positional `program`/`tail` pair already makes for
+/// the main program, just folded into one flag's value instead of clap's own
+/// positional-then-trailing-args split.
+fn split_tsr_arg(s: &str) -> (String, String) {
+    match s.split_once(char::is_whitespace) {
+        Some((prog, rest)) => (prog.to_string(), rest.trim_start().to_string()),
+        None => (s.to_string(), String::new()),
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -280,6 +327,19 @@ struct Cli {
     /// the honest outcome for a run that did not name a real one.
     #[arg(long, value_name = "DIGITS", default_value = "00000000", value_parser = parse_bturno_arg)]
     bturno: String,
+
+    /// Load a resident (TSR) program before `program`, so DOS calls the main
+    /// program makes reach the TSR's own handler first -- e.g. a real vendor
+    /// Btrieve engine answering `int 7Bh` instead of this host's Rust one.
+    ///
+    /// The value may carry a command tail after the first whitespace, e.g.
+    /// `--tsr "BTRIEVE.EXE /P:2048"`. DOS 8.3 names never contain spaces, so
+    /// splitting on the first whitespace is unambiguous. No stand-down step
+    /// is needed when the TSR hooks a vector our own stub already claimed:
+    /// `AH=25h` writes the IVT directly, so the TSR's hook simply replaces
+    /// ours in guest memory.
+    #[arg(long, value_name = "PROGRAM")]
+    tsr: Option<String>,
 
     /// Command tail handed to the program, exactly as DOS would.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "TAIL")]
@@ -509,6 +569,34 @@ fn report_diagnostics(process: &win32::process::Process) {
     }
 }
 
+/// A `Dos` kernel shared with the run loop through interior mutability.
+///
+/// `Services` only exposes what it composes through `&dyn Service<G>`
+/// (`claiming`) and `&dyn Any` (`as_any`) -- both immutable -- so once a
+/// service is composed in, nothing outside `Services` can reach back into
+/// it. `--tsr` needs exactly that: when a resident program hands room back
+/// for the main program (the `StayResident` arm below), the loop has to
+/// update the *same* `Dos` the composed services are already dispatching
+/// through (`state.psp_seg`, `state.mem`), not a copy nothing reads.
+/// Wrapping it in `Rc<RefCell<_>>` and keeping a clone of the handle outside
+/// `services` is what makes that possible without adding a mutable-access API
+/// to the `dos` crate.
+struct SharedDos(Rc<RefCell<dos_runtime::dos::Dos>>);
+
+impl Service<VmGuest> for SharedDos {
+    fn claims(&self) -> &[u8] {
+        &[0x21]
+    }
+
+    fn service(&mut self, vector: u8, g: &mut VmGuest) -> Serviced {
+        self.0.borrow_mut().service(vector, g)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 fn main() -> io::Result<()> {
     let started = std::time::Instant::now();
     let cli = Cli::parse();
@@ -534,6 +622,7 @@ fn main() -> io::Result<()> {
     let scan: Vec<u16> = cli.scan_u16;
     let family = cli.family;
     let bturno = cli.bturno;
+    let tsr = cli.tsr;
 
     // Somebody is on the other end. Every guard in here exists to rescue an
     // *unattended* probe from a guest that will not stop, and every one has now
@@ -552,6 +641,14 @@ fn main() -> io::Result<()> {
     // real-mode path and is unchanged; a PE32 leaves here instead.
     match format_of(&data) {
         Format::Pe32 => {
+            if tsr.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--tsr requires the real-mode guest; the memory map and \
+                     loader it relies on (PSP_SEG, mz::load, the Arena) have \
+                     no PE32 counterpart, and the program here is PE32",
+                ));
+            }
             return run_pe32(
                 &path,
                 &data,
@@ -631,7 +728,38 @@ fn main() -> io::Result<()> {
     );
     vm.load(ENV_SEG as usize * 16, &env)?;
 
-    let at = mz::load(&mut vm, &img, PSP_SEG, ENV_SEG, tail.as_bytes())?;
+    // `--tsr` swaps which program boots first: a resident program, not the
+    // one actually named on the command line. `boot_img`/`boot_tail` are
+    // whichever one loads and runs now; `main_program`, when `Some`, is the
+    // real target -- parsed already, but not loaded until the resident
+    // program hands back room for it (the `StayResident` arm in the loop
+    // below).
+    let (boot_img, boot_tail, tsr_name, mut main_program): (
+        MzImage,
+        String,
+        Option<String>,
+        Option<(MzImage, String)>,
+    ) = if let Some(spec) = &tsr {
+        let (tsr_prog, tsr_tail) = split_tsr_arg(spec);
+        let tsr_data = std::fs::read(&tsr_prog)?;
+        let tsr_img = MzImage::parse(&tsr_data)?;
+        println!(
+            "{tsr_prog}: {} byte image, {} relocations, entry {:#06x}:{:#06x}, \
+             stack {:#06x}:{:#06x}, needs {} paragraphs (resident)",
+            tsr_img.bytes.len(),
+            tsr_img.relocs.len(),
+            tsr_img.cs,
+            tsr_img.ip,
+            tsr_img.ss,
+            tsr_img.sp,
+            tsr_img.paragraphs(),
+        );
+        (tsr_img, tsr_tail, Some(tsr_prog), Some((img, tail.clone())))
+    } else {
+        (img, tail.clone(), None, None)
+    };
+
+    let at = mz::load(&mut vm, &boot_img, PSP_SEG, ENV_SEG, boot_tail.as_bytes())?;
     println!(
         "loaded: psp {:#06x}, image {:#06x}, entering {:#06x}:{:#06x} sp {:#06x}:{:#06x}",
         at.psp_seg, at.image_seg, at.cs, at.ip, at.ss, at.sp
@@ -684,13 +812,23 @@ fn main() -> io::Result<()> {
     // The real segment the loader built this program's PSP at, so AH=62h
     // answers with the program's own PSP rather than failing outright.
     kernel.state.psp_seg = Some(at.psp_seg);
-    // `img.paragraphs()` already totals PSP + image + the header's declared
-    // `min_alloc` -- the same figure DOS itself would use to size the block
-    // it hands this process before any AH=4Ah shrinks it. Everything above
-    // that, up to conventional memory's own ceiling, starts out free; see
-    // `dos::kernel::Arena::new` for why this exact number is the boundary.
-    let first_free = at.psp_seg + img.paragraphs() as u16;
+    // `boot_img.paragraphs()` already totals PSP + image + the header's
+    // declared `min_alloc` -- the same figure DOS itself would use to size
+    // the block it hands this process before any AH=4Ah shrinks it.
+    // Everything above that, up to conventional memory's own ceiling, starts
+    // out free; see `dos::kernel::Arena::new` for why this exact number is
+    // the boundary. `boot_img` is the *loaded* program -- the TSR when
+    // `--tsr` named one, or the main program otherwise -- never the pending
+    // `main_program` still waiting for room.
+    let first_free = at.psp_seg + boot_img.paragraphs() as u16;
     kernel.state.mem = Some(dos_runtime::dos::Arena::new(at.psp_seg, first_free));
+    // Shared with the run loop through interior mutability: once `kernel` is
+    // composed into `services` below, nothing outside it can reach `state`
+    // any more -- see `SharedDos`'s own doc comment. `--tsr`'s `StayResident`
+    // arm needs to update `state.psp_seg`/`state.mem` for the main program
+    // after the resident program hands back room for it, so this clone is
+    // kept outside `services` for exactly that.
+    let kernel = Rc::new(RefCell::new(kernel));
     let mut keyboard = Keyboard::default();
     keyboard.feed(&keys);
     let mut driver: Option<Box<dyn Driver>> = if interactive {
@@ -727,7 +865,7 @@ fn main() -> io::Result<()> {
     let btrieve_heap = dos_runtime::btrieve::DosHeap::new(Ptr::new(HEAP_SEG, 0), HEAP_CAPACITY)
         .expect("HEAP_SEG/HEAP_CAPACITY are checked at compile time to fit their segment");
     let mut services: Services<VmGuest> = Services::new()
-        .with(Counting::new(kernel))
+        .with(Counting::new(SharedDos(Rc::clone(&kernel))))
         .with(Counting::new(Bios { video: Rc::clone(&video) }))
         .with(Counting::new(dos_runtime::btrieve::Btrieve::new(
             btrieve_heap,
@@ -977,6 +1115,85 @@ fn main() -> io::Result<()> {
                     Some(Serviced::Terminate(code)) => {
                         break format!("exited with code {code}");
                     }
+                    // `AH=31h`: the program just run asked to go resident
+                    // instead of exiting. No stand-down step is needed for
+                    // whatever vector it hooked -- `AH=25h` writes the IVT
+                    // directly, so its handler already sits in the vector
+                    // table by the time this arm runs.
+                    Some(Serviced::StayResident { code, paragraphs }) => {
+                        let tsr_psp = kernel
+                            .borrow()
+                            .state
+                            .psp_seg
+                            .expect("a program that just answered AH=31h was loaded with a PSP segment");
+                        match main_program.take() {
+                            Some((main_img, main_tail)) => {
+                                let main_psp = match checked_seg_add(
+                                    tsr_psp,
+                                    u32::from(paragraphs),
+                                    "the resident block",
+                                ) {
+                                    Ok(seg) => seg,
+                                    Err(msg) => break msg,
+                                };
+                                let main_at = match mz::load(
+                                    &mut vm,
+                                    &main_img,
+                                    main_psp,
+                                    ENV_SEG,
+                                    main_tail.as_bytes(),
+                                ) {
+                                    Ok(at) => at,
+                                    Err(e) => {
+                                        break format!(
+                                            "loading {path} on top of the resident block failed: {e}"
+                                        );
+                                    }
+                                };
+                                if let Err(e) = vm.enter(
+                                    main_at.cs,
+                                    main_at.ip,
+                                    main_at.ss,
+                                    main_at.sp,
+                                    main_at.psp_seg,
+                                    main_at.psp_seg,
+                                ) {
+                                    break format!(
+                                        "entering {path} after the resident program failed: {e}"
+                                    );
+                                }
+                                let main_first_free = match checked_seg_add(
+                                    main_psp,
+                                    main_img.paragraphs() as u32,
+                                    "the main program's own image",
+                                ) {
+                                    Ok(seg) => seg,
+                                    Err(msg) => break msg,
+                                };
+                                {
+                                    let mut d = kernel.borrow_mut();
+                                    d.state.psp_seg = Some(main_psp);
+                                    d.state.mem = Some(dos_runtime::dos::Arena::new(
+                                        main_psp,
+                                        main_first_free,
+                                    ));
+                                }
+                                println!(
+                                    "resident: {} stayed resident (code {code}, {paragraphs} \
+                                     paragraphs); loading {path} at {main_psp:#06x}",
+                                    tsr_name.as_deref().unwrap_or("the program")
+                                );
+                                continue;
+                            }
+                            None => {
+                                break format!(
+                                    "{} went resident (code {code}, kept {paragraphs} \
+                                     paragraphs) with no main program queued behind it",
+                                    tsr_name.as_deref().unwrap_or(&path)
+                                );
+                            }
+                        }
+                    }
                     Some(Serviced::Fault(f)) => {
                         break match vector {
                             0x14 => format!("bad guest pointer in int 14h: {f:?}"),
@@ -1153,11 +1370,10 @@ fn main() -> io::Result<()> {
     // which own it now that they have been composed (Step 4). `counters()` is
     // enough for anything `Counting` tracks generically; `DosState`'s own
     // fields (`files`, `out`) are not counting state, so reading them back
-    // needs the concrete type, via `as_any`.
-    let kernel_dos: Option<&dos_runtime::dos::Dos> = services
-        .claiming(0x21)
-        .and_then(|s| s.as_any().downcast_ref::<Counting<dos_runtime::dos::Dos>>())
-        .map(Counting::inner);
+    // needs the concrete type -- which, since `--tsr` needed the kernel
+    // shared through `Rc<RefCell<_>>` (see `SharedDos`), is a borrow of that
+    // same handle rather than a downcast through `services`.
+    let kernel_dos = kernel.borrow();
 
     // The program painted straight into the text buffer, which is just guest
     // memory -- so the screen can be read back out without the guest's help.
@@ -1215,7 +1431,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    if let Some(files) = kernel_dos.and_then(|d| d.state.files.as_ref()) {
+    if let Some(files) = kernel_dos.state.files.as_ref() {
         if !files.ambiguous.is_empty() {
             println!("--- names the host cannot uniquely resolve ---");
             for note in &files.ambiguous {
@@ -1243,7 +1459,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let dos_out = kernel_dos.map_or(&[][..], |d| d.state.out.as_slice());
+    let dos_out = kernel_dos.state.out.as_slice();
     if !dos_out.is_empty() {
         println!("--- program output ---");
         println!("{}", String::from_utf8_lossy(dos_out));
@@ -1432,8 +1648,74 @@ mod tests {
         assert!(!super::anything_drawn(&spaces));
     }
 
-    use super::{Cli, Format, dropfile_baud, format_of};
+    use super::{Cli, Format, checked_seg_add, dropfile_baud, format_of, split_tsr_arg};
     use clap::Parser;
+
+    /// The ordinary case: a program name and a tail, separated by the first
+    /// run of whitespace, as `--tsr "BTRIEVE.EXE /P:2048"` documents.
+    #[test]
+    fn tsr_arg_splits_the_program_from_its_tail() {
+        let (prog, tail) = split_tsr_arg("BTRIEVE.EXE /P:2048");
+        assert_eq!(prog, "BTRIEVE.EXE");
+        assert_eq!(tail, "/P:2048");
+    }
+
+    /// No whitespace at all -- a bare program name -- must not lose its last
+    /// character to a `split_once` that found nothing and mishandled it, and
+    /// must come back with an empty tail rather than `None`.
+    #[test]
+    fn tsr_arg_with_no_tail_has_an_empty_tail() {
+        let (prog, tail) = split_tsr_arg("BTRIEVE.EXE");
+        assert_eq!(prog, "BTRIEVE.EXE");
+        assert_eq!(tail, "");
+    }
+
+    /// Extra whitespace between the program and its tail is not part of the
+    /// tail DOS would see -- the same trimming a hand-typed door invocation
+    /// already gets from `--keys`/positional args elsewhere in this file.
+    #[test]
+    fn tsr_arg_extra_leading_whitespace_before_the_tail_is_trimmed() {
+        let (prog, tail) = split_tsr_arg("BTRIEVE.EXE   /P:2048");
+        assert_eq!(prog, "BTRIEVE.EXE");
+        assert_eq!(tail, "/P:2048");
+    }
+
+    /// A block that fits comfortably under the ceiling is accepted, and the
+    /// answer is the true sum, not merely "did not error".
+    #[test]
+    fn resident_block_end_is_accepted_when_it_fits_under_conventional_memory() {
+        assert_eq!(checked_seg_add(0x1000, 0x10, "resident block").unwrap(), 0x1010);
+    }
+
+    /// The exact boundary: ending precisely at the ceiling is still valid
+    /// memory (an `Arena` seeded there just starts with no free space above
+    /// it), so this must not be refused off by one.
+    #[test]
+    fn resident_block_end_exactly_at_the_ceiling_is_accepted() {
+        assert_eq!(
+            checked_seg_add(0x9ff0, 0x10, "resident block").unwrap(),
+            super::CONV_TOP
+        );
+    }
+
+    /// The case this function exists for: `0xfff0 + 0x0020` overflows a bare
+    /// `u16` add and wraps to `0x0010`, which reads as a tiny, obviously
+    /// in-bounds segment instead of the nonsense request it actually is.
+    /// Checked, widened arithmetic must refuse this rather than wrap.
+    #[test]
+    fn resident_block_end_refuses_rather_than_wrapping_past_conventional_memory() {
+        let err = checked_seg_add(0xfff0, 0x0020, "resident block")
+            .expect_err("0xfff0 + 0x0020 must not silently wrap to 0x0010");
+        assert!(err.contains("resident block"), "the message must name what overflowed: {err}");
+    }
+
+    /// One paragraph past the ceiling is refused too -- the boundary test
+    /// above proves the edge is inclusive; this proves the very next value
+    /// is not.
+    #[test]
+    fn resident_block_end_one_paragraph_past_the_ceiling_is_refused() {
+        assert!(checked_seg_add(0x9ff0, 0x11, "resident block").is_err());
+    }
 
     /// The format sniff must read the signature bytes, not merely validate
     /// `e_lfanew`. All fifteen extracted DOS `WCCMMUTL.EXE` builds carry
@@ -1559,6 +1841,32 @@ mod tests {
         let cli = Cli::try_parse_from(["runexe", "--root", ".", "--scan-u16", "1,22,333", "A.EXE"])
             .expect("comma separated list");
         assert_eq!(cli.scan_u16, vec![1, 22, 333]);
+    }
+
+    /// `--tsr` takes one value, quoted so its own command tail survives
+    /// clap's tokenizing -- exactly the shape the brief's own example uses.
+    #[test]
+    fn tsr_flag_carries_its_program_and_tail_as_one_value() {
+        let cli = Cli::try_parse_from([
+            "runexe",
+            "--root",
+            ".",
+            "--tsr",
+            "BTRIEVE.EXE /P:2048",
+            "WCCMMUTL.EXE",
+        ])
+        .expect("--tsr takes one value");
+        assert_eq!(cli.tsr.as_deref(), Some("BTRIEVE.EXE /P:2048"));
+        assert_eq!(cli.program, "WCCMMUTL.EXE");
+    }
+
+    /// No `--tsr` at all -- the overwhelming majority of invocations -- must
+    /// still parse, with the flag reading `None` rather than an empty string.
+    #[test]
+    fn no_tsr_flag_is_none() {
+        let cli = Cli::try_parse_from(["runexe", "--root", ".", "A.EXE"])
+            .expect("--tsr is optional");
+        assert_eq!(cli.tsr, None);
     }
 
     fn drop_with(connect: &str, dte: &str) -> String {
