@@ -62,9 +62,355 @@ pub fn parse_tail(tail: &[u8]) -> Option<OptionType> {
     }
 }
 
+use mbbs::msg::{MsgError, MsgFile};
+
+/// A byte range in the original file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// One configurable option, and where in the file it lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionSpec {
+    /// The message number. What `stgopt(N)` indexes by.
+    pub index: usize,
+    pub name: Vec<u8>,
+    pub kind: OptionType,
+    pub hinge: Option<crate::hinge::Hinge>,
+    /// The comment paragraph above the option, as the editor shows it.
+    pub help: Vec<u8>,
+    /// The bytes between `{` and its matching `}`.
+    pub value: Span,
+    /// Name through the end of the type tail.
+    pub whole: Span,
+}
+
+/// Why a file could not be read as an option set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecError {
+    /// The underlying message reader refused.
+    Message(MsgError),
+    /// An option's `{` has no matching `}`.
+    Unterminated { name: Vec<u8>, at: usize },
+}
+
+/// One `.MSG` file: its bytes, its messages, and its options.
+#[derive(Debug)]
+pub struct SpecFile {
+    name: String,
+    source: Vec<u8>,
+    messages: MsgFile,
+    options: Vec<OptionSpec>,
+}
+
+impl SpecFile {
+    pub fn parse(name: &str, source: &[u8]) -> Result<Self, SpecError> {
+        let messages = MsgFile::parse(name, source).map_err(SpecError::Message)?;
+        let options = scan(source, &messages)?;
+        Ok(Self {
+            name: name.to_string(),
+            source: source.to_vec(),
+            messages,
+            options,
+        })
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &[u8] {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn messages(&self) -> &MsgFile {
+        &self.messages
+    }
+
+    #[must_use]
+    pub fn options(&self) -> &[OptionSpec] {
+        &self.options
+    }
+}
+
+/// The option name that declares the file's language rather than a message.
+/// Mirrors `msg.rs`'s own `LANGUAGE` constant, which it does not export.
+const LANGUAGE: &[u8] = b"LANGUAGE";
+
+/// The longest an option name can be. `MSGRDR.H`'s `OPTLEN`.
+const MOPTLEN: usize = 8;
+
+/// Characters an option name is made of. Mirrors `msg.rs`'s `is_name`, which
+/// it does not export: digits and *upper-case* letters only, so comment prose
+/// (ordinary sentences) does not start a name by accident.
+fn is_name(byte: u8) -> bool {
+    byte.is_ascii_digit() || byte.is_ascii_uppercase()
+}
+
+/// The byte offset of the next `\n` at or after `pos`, or `source.len()` if
+/// there is none.
+fn find_line_end(source: &[u8], pos: usize) -> usize {
+    source[pos..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(source.len(), |i| pos + i)
+}
+
+/// Drop one trailing `\r`, if present. A `.MSG` is CRLF; this is applied
+/// wherever a line's content is read for comparison rather than spliced back
+/// into a raw span.
+fn strip_cr(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
+}
+
+/// Where the next *confirmed* option name is, searching from `start`.
+///
+/// A name is confirmed only once a `{` is found immediately after it (past
+/// any intervening non-name bytes). Until then it is a candidate: if another
+/// name-shaped run turns up before the `{`, the old candidate is abandoned
+/// and the new run replaces it -- mirroring `msg.rs`'s `PostName` exactly
+/// ("what looked like a name was prose; whatever starts here is the real
+/// candidate"). That is what stops a stray all-caps word in ordinary comment
+/// prose (rare, but not impossible) from being mistaken for a name.
+///
+/// Returns `(name_start, name_end, brace_pos)`, or `None` if no more names
+/// are confirmed before the end of the file.
+fn find_next_name(source: &[u8], start: usize) -> Option<(usize, usize, usize)> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum St {
+        /// No candidate yet.
+        Pre,
+        /// A candidate is actively growing.
+        Name,
+        /// Past the candidate's last name byte, watching for `{`.
+        Post,
+    }
+
+    let mut state = St::Pre;
+    let mut name_start = 0usize;
+    let mut name_end = 0usize;
+    let mut i = start;
+    while i < source.len() {
+        let byte = source[i];
+        match state {
+            St::Pre => {
+                if is_name(byte) {
+                    state = St::Name;
+                    name_start = i;
+                    name_end = i + 1;
+                }
+            }
+            St::Name => {
+                if is_name(byte) && name_end - name_start < MOPTLEN {
+                    name_end = i + 1;
+                } else if byte == b'{' {
+                    return Some((name_start, name_end, i));
+                } else if is_name(byte) {
+                    // MOPTLEN cap reached and this byte would extend it
+                    // further: it begins a fresh candidate instead.
+                    name_start = i;
+                    name_end = i + 1;
+                } else {
+                    state = St::Post;
+                }
+            }
+            St::Post => {
+                if byte == b'{' {
+                    return Some((name_start, name_end, i));
+                } else if is_name(byte) {
+                    // What looked like a name was prose. Whatever starts
+                    // here is the real candidate.
+                    state = St::Name;
+                    name_start = i;
+                    name_end = i + 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The last comment paragraph in `source[start..end]` -- the region between
+/// the end of the previous construct and the start of the next confirmed
+/// name. Paragraphs are separated by blank lines; a single leading space per
+/// line is stripped (the `MSGRDR` convention for indenting comment prose).
+/// Everything else in the region (earlier paragraphs, abandoned name
+/// candidates swept up as prose) is discarded -- only the paragraph
+/// *immediately* above the option becomes its help.
+fn last_paragraph(source: &[u8], start: usize, end: usize) -> Vec<u8> {
+    let region = &source[start..end];
+    let mut paragraphs: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    while pos < region.len() {
+        let line_end = region[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(region.len(), |i| pos + i);
+        let content = strip_cr(&region[pos..line_end]);
+        if content.is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(std::mem::take(&mut current));
+            }
+        } else {
+            let text = content.strip_prefix(b" ").unwrap_or(content);
+            if !current.is_empty() {
+                current.push(b' ');
+            }
+            current.extend_from_slice(text);
+        }
+        pos = if line_end < region.len() { line_end + 1 } else { region.len() };
+    }
+    if !current.is_empty() {
+        paragraphs.push(current);
+    }
+    paragraphs.pop().unwrap_or_default()
+}
+
+/// Scan `source` for options, left to right, cross-checked against the
+/// messages `MsgFile` already counted.
+fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError> {
+    let mut options = Vec::new();
+    let mut index = 0usize;
+    let mut prev_end = 0usize;
+    let mut pos = 0usize;
+
+    while let Some((name_start, name_end, brace_pos)) = find_next_name(source, pos) {
+        let name = source[name_start..name_end].to_vec();
+        let help = last_paragraph(source, prev_end, name_start);
+
+        let value_start = brace_pos + 1;
+        let mut close = value_start;
+        loop {
+            match source.get(close) {
+                Some(b'}') => break,
+                Some(_) => close += 1,
+                None => return Err(SpecError::Unterminated { name, at: value_start }),
+            }
+        }
+
+        let tail_start = close + 1;
+        let tail_line_end = find_line_end(source, tail_start);
+        let tail = strip_cr(&source[tail_start..tail_line_end]);
+        let kind = parse_tail(tail);
+
+        if name != LANGUAGE {
+            if let Some(kind) = kind {
+                options.push(OptionSpec {
+                    index,
+                    name,
+                    kind,
+                    hinge: None,
+                    help,
+                    value: Span { start: value_start, end: close },
+                    whole: Span { start: name_start, end: tail_line_end },
+                });
+            }
+            index += 1;
+        }
+
+        prev_end = tail_line_end;
+        pos = tail_line_end;
+    }
+
+    assert_eq!(
+        index,
+        messages.len(),
+        "cnf::spec::scan counted {index} messages but MsgFile counted {}; \
+         the two parsers over one grammar have drifted",
+        messages.len()
+    );
+
+    Ok(options)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SAMPLE: &[u8] = b"LANGUAGE {English}\r\n\
+LEVEL0 {}\r\n\
+\r\n\
+ This is the number of credits.\r\n\
+\r\n\
+GAMCRD {Credits per minute 60} N 0 32767\r\n\
+\r\n\
+ACTIVATE {DEMO} S 30 Enter your activation code\r\n";
+
+    #[test]
+    fn options_are_found_with_their_type_and_name() {
+        let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
+        let names: Vec<&[u8]> = f.options().iter().map(|o| o.name.as_slice()).collect();
+        assert_eq!(names, vec![&b"GAMCRD"[..], &b"ACTIVATE"[..]]);
+        assert_eq!(
+            f.options()[0].kind,
+            OptionType::Number { floor: 0, ceiling: 32767 }
+        );
+    }
+
+    #[test]
+    fn the_value_span_covers_exactly_what_is_between_the_braces() {
+        let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
+        let v = f.options()[0].value;
+        assert_eq!(&SAMPLE[v.start..v.end], b"Credits per minute 60");
+        let v = f.options()[1].value;
+        assert_eq!(&SAMPLE[v.start..v.end], b"DEMO");
+    }
+
+    #[test]
+    fn the_index_is_the_message_number_not_the_option_number() {
+        // LEVEL0 is a numbered message and is not an option. GAMCRD is the
+        // second message and the first option. Confusing the two shifts every
+        // stgopt(N) in the module.
+        let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
+        assert_eq!(f.options()[0].index, 1, "GAMCRD is message 1");
+        assert_eq!(f.options()[1].index, 2, "ACTIVATE is message 2");
+    }
+
+    #[test]
+    fn the_comment_paragraph_above_an_option_becomes_its_help() {
+        let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
+        assert_eq!(f.options()[0].help, b"This is the number of credits.".to_vec());
+        assert!(f.options()[1].help.is_empty(), "ACTIVATE has no comment above it");
+    }
+
+    #[test]
+    fn every_option_index_addresses_a_real_message() {
+        // The cross-check that makes the rest safe. Note what it does NOT
+        // assert: that the raw span equals the message. It cannot. `MsgFile`
+        // stores DECODED text -- `~}` collapsed to `}`, `\r` dropped, and `\n`
+        // rewritten to `\r` by `line_endings` for hard breaks -- while the span
+        // is raw source, which is what the writer must splice. The two are
+        // equal only for a single-line value with no escapes.
+        let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
+        for opt in f.options() {
+            let message = f.messages().get(opt.index).expect("option index addresses a real message");
+            let raw = &f.source()[opt.value.start..opt.value.end];
+            let simple = !raw.contains(&b'~') && !raw.contains(&b'\r') && !raw.contains(&b'\n');
+            if simple {
+                assert_eq!(message, raw, "option {:?} points at the wrong message", opt.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_option_count_never_exceeds_the_message_count() {
+        // Options are a subset of messages: every option is a message, but most
+        // messages are plain text. If `scan` ever finds more options than
+        // `MsgFile` found messages, the two parsers have diverged and every
+        // index below is suspect.
+        let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
+        assert!(f.options().len() <= f.messages().len());
+        for opt in f.options() {
+            assert!(opt.index < f.messages().len(), "index {} out of range", opt.index);
+        }
+    }
 
     #[test]
     fn a_number_carries_its_floor_and_ceiling() {
