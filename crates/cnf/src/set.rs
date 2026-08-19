@@ -88,6 +88,18 @@ impl OptionSet {
         Ok(Self { files })
     }
 
+    /// A one-file set from bytes already in memory, rather than a path on
+    /// disk. For tests: real callers always go through [`Self::open`].
+    ///
+    /// # Errors
+    ///
+    /// If `source` does not parse as a `.MSG` -- see [`SpecFile::parse`].
+    pub fn from_source(name: &str, source: &[u8]) -> Result<Self, io::Error> {
+        let file = SpecFile::parse(name, source)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{name}: {e:?}")))?;
+        Ok(Self { files: vec![file] })
+    }
+
     #[must_use]
     pub fn files(&self) -> &[SpecFile] {
         &self.files
