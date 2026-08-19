@@ -47,7 +47,14 @@ const STUB_STRIDE: u16 = 4;
 const BTRIEVE_VECTOR: u8 = 0x7b;
 
 /// The offset `DFAAPI.C:925` requires `int 7Bh` to read back as.
-const BTRIEVE_STUB_OFFSET: u16 = 0x33;
+///
+/// Library data, not trap-machinery data -- moved onto Btrieve's own
+/// `mbbs_machine::library::LIBRARIES` entry (`Naming::Interrupt`), which is
+/// where the `0x33` literal and the reasoning above now live. Read through
+/// `btrieve_stub_offset()` (a `const fn`, since [`STUB_TABLE_BYTES`] below
+/// needs this at compile time and so cannot go through the runtime
+/// [`mbbs_machine::library::library`] lookup) rather than duplicated here.
+const BTRIEVE_STUB_OFFSET: u16 = mbbs_machine::library::btrieve_stub_offset();
 
 /// One past the last byte of the `0x7B` stub -- the reserved window no other
 /// vector's stub may occupy.

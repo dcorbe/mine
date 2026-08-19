@@ -425,6 +425,7 @@ pub const DOSCALLS_TABLES: &[&OrdinalTable] = &[&DOSCALLS_PHARLAP31];
 /// module chose to bind to it. GALGSBL has one, and is reached by name from a
 /// 32-bit Worldgroup module and by ordinal from a 16-bit one. A by-name import
 /// simply never consults a table.
+#[derive(Debug)]
 pub enum Naming {
     /// The library has an ordinal space, and these tables number it.
     Ordinals(&'static [&'static OrdinalTable]),
@@ -464,6 +465,7 @@ pub const GALME: &str = "GALME";
 pub const PHAPI: &str = "PHAPI";
 pub const DOSCALLS: &str = "DOSCALLS";
 pub const CW3220MT: &str = "CW3220MT";
+pub const BTRIEVE: &str = "BTRIEVE";
 
 pub const LIBRARIES: &[Library] = &[
     Library {
@@ -553,7 +555,44 @@ pub const LIBRARIES: &[Library] = &[
         naming: Naming::Ordinals(WGSERVER_TABLES),
         authentic: Eligibility::Loadable,
     },
+    Library {
+        name: BTRIEVE,
+        // Btrieve's DOS edge is reached by `int 7Bh`, not by name or ordinal
+        // -- there is nothing a guest imports, so no alias applies.
+        aliases: &[],
+        // `re/wg33src/SRC/api/gcommlib/DFAAPI.C:921-931`:
+        //   regs.x.ax=0x357B;
+        //   int86x(0x21,&regs,&regs,&sregs);
+        //   if (regs.x.bx != 0x33) {
+        //        catastro("BTRIEVE must be running before this program can run!");
+        //   }
+        // That is `int 21h AH=35h` (get interrupt vector) for vector `0x7B`,
+        // and it requires the returned offset (`BX`) to be `0x33`: the real
+        // Btrieve TSR's signature. This used to be `dos-runtime`'s own
+        // `BTRIEVE_STUB_OFFSET`, hardcoded in otherwise format-neutral trap
+        // stub machinery -- library-specific data sitting in generic code.
+        naming: Naming::Interrupt { vector: 0x7b, stub_offset: Some(0x33) },
+        authentic: Eligibility::NotLoadable(
+            "a real Btrieve TSR is not something this host loads",
+        ),
+    },
 ];
+
+/// Where Btrieve's `int 7Bh` trap stub must sit, read from its library entry
+/// above instead of duplicated as a literal in `dos-runtime`. A `const fn`
+/// because `dos-runtime` computes its stub layout at compile time (see
+/// `kvm.rs`'s `STUB_TABLE_BYTES`), which rules out a runtime lookup through
+/// [`library`].
+pub const fn btrieve_stub_offset() -> u16 {
+    let mut i = 0;
+    while i < LIBRARIES.len() {
+        if let Naming::Interrupt { stub_offset: Some(off), .. } = &LIBRARIES[i].naming {
+            return *off;
+        }
+        i += 1;
+    }
+    panic!("no library in LIBRARIES carries an interrupt stub_offset")
+}
 
 /// The library a spelling names, canonical or aliased.
 pub fn library(spelling: &str) -> Option<&'static Library> {
@@ -945,6 +984,22 @@ mod tests {
     fn phapi_has_no_ordinal_space_but_galgsbl_does() {
         assert!(matches!(library("PHAPI").expect("phapi").naming, Naming::NamesOnly));
         assert!(matches!(library("GALGSBL").expect("galgsbl").naming, Naming::Ordinals(_)));
+    }
+
+    /// Btrieve's DOS edge is reached by interrupt, not by symbol, and its stub
+    /// must sit at a fixed offset because Galacticomm's own presence check
+    /// demands the `int 7Bh` handler's offset be `0x33` -- the real TSR's
+    /// signature. That constant lived in `kvm.rs`'s format-neutral trap
+    /// machinery as a library-specific carve-out.
+    #[test]
+    fn btrieve_is_named_by_an_interrupt_with_a_fixed_stub_offset() {
+        match library("BTRIEVE").expect("btrieve").naming {
+            Naming::Interrupt { vector, stub_offset } => {
+                assert_eq!(vector, 0x7b);
+                assert_eq!(stub_offset, Some(0x33));
+            }
+            ref other => panic!("Btrieve is reached by interrupt, got {other:?}"),
+        }
     }
 
     /// An authentic MAJORBBS.EXE cannot be loaded even when present: it is NE
