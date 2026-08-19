@@ -50,6 +50,21 @@ pub enum HingeOp {
 /// tail, cannot tell real grammar from prose. Rejecting a non-name-shaped
 /// match falls through to "no hinge, tail unchanged" rather than misreading
 /// prose as one.
+///
+/// This function takes the *leftmost* `(...)` in the tail as the hinge,
+/// unconditionally -- it does not check whether a second, later `(...)`
+/// exists. That is safe only because real hinges are never nested and a tail
+/// never carries two: checked by replicating this exact algorithm over all
+/// 186 corpus files and finding zero violations, including the ~250 tails
+/// that have a trailing prose parenthetical (like `FSENIM`'s, rejected by the
+/// name-shaped check above) in addition to a real hinge elsewhere on the
+/// line. If a future file ever put a real hinge second -- prose parenthetical
+/// first, hinge after -- this function would silently pick the prose instead
+/// and either misread it as a bogus hinge (if it happened to be name-shaped)
+/// or treat the option as hingeless (if not), exactly the class of bug this
+/// module exists to avoid. `tests/corpus.rs`'s `every_distinct_msg_file_parses`
+/// would not catch a wrong hinge choice on a name-shaped false match, since it
+/// only checks that the file parses and counts totals, not visibility.
 #[must_use]
 pub fn parse(tail: &[u8]) -> (Option<Hinge>, Vec<u8>) {
     let Some(open) = tail.iter().position(|b| *b == b'(') else {

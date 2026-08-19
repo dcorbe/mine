@@ -400,6 +400,35 @@ ACTIVATE {DEMO} S 30 Enter your activation code\r\n";
     }
 
     #[test]
+    fn a_before_position_hinge_wires_through_scan_with_the_type_intact() {
+        // The bug tests/corpus.rs caught: a hinge written before the type
+        // letter (the corpus's actual convention for =/# hinges -- see
+        // hinge::parse's doc comment) used to have its splice truncate the
+        // tail at the hinge, discarding the type letter and everything after
+        // it, so the option vanished from `options()` entirely rather than
+        // mis-parsing. The corpus test caught the aggregate effect (13
+        // hinges found across 4 files against a measured 76-of-186); this
+        // localises the same wiring to `scan`, in isolation, so a future
+        // regression there does not need a 186-file run to be caught.
+        let src = b"APPRUSER {Sysop} (NEEDAPPR=YES) S 18 Userid to receive new description email?\r\n";
+        let f = SpecFile::parse("T.MSG", src).expect("parses");
+        assert_eq!(f.options().len(), 1, "the option must not vanish");
+        let opt = &f.options()[0];
+        assert_eq!(
+            opt.kind,
+            OptionType::Str {
+                maxlen: 18,
+                prompt: b"Userid to receive new description email?".to_vec(),
+            },
+            "the type letter and its arguments must survive the hinge splice"
+        );
+        let hinge = opt.hinge.as_ref().expect("the before-position hinge must be attached");
+        assert_eq!(hinge.on, b"NEEDAPPR");
+        assert_eq!(hinge.op, crate::hinge::HingeOp::Eq);
+        assert_eq!(hinge.values, vec![b"YES".to_vec()]);
+    }
+
+    #[test]
     fn the_value_span_covers_exactly_what_is_between_the_braces() {
         let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
         let v = f.options()[0].value;
