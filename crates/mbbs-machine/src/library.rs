@@ -227,6 +227,7 @@ pub struct Library {
     pub authentic: Eligibility,
 }
 
+pub const GALME: &str = "GALME";
 pub const PHAPI: &str = "PHAPI";
 pub const DOSCALLS: &str = "DOSCALLS";
 
@@ -247,6 +248,21 @@ pub const LIBRARIES: &[Library] = &[
         name: GALGSBL,
         aliases: &["GALGSBL.dll"],
         naming: Naming::Ordinals(GALGSBL_TABLES),
+        authentic: Eligibility::Loadable,
+    },
+    Library {
+        name: GALME,
+        // A 32-bit module spells it `GALME.dll` while this host registers
+        // GALME's routines under the bare `GALME` an NE segment is named --
+        // the same shape as `GALGSBL.dll` one library over. Without this
+        // alias `simpsnd` misses a routine that exists.
+        aliases: &["GALME.dll"],
+        // GALME does have an ordinal space -- the shipped WG 1.01 DLL exports
+        // 208 -- but that table still lives in `crates/mbbs` and has not been
+        // harvested into the registry yet. An empty slice says "has ordinals,
+        // none recorded here", which is the truth; `NamesOnly` would claim it
+        // has no ordinal space at all, which is false.
+        naming: Naming::Ordinals(&[]),
         authentic: Eligibility::Loadable,
     },
     Library {
