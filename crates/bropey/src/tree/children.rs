@@ -21,6 +21,9 @@ impl Children {
     }
 
     /// A node over exactly two children of equal height.
+    // Consumed when the root grows a level in `insert` (Task 7) and in
+    // `append` (Task 8); the attribute comes off then.
+    #[allow(dead_code)]
     pub(crate) fn from_pair(left: Arc<Node>, right: Arc<Node>) -> Children {
         debug_assert_eq!(left.height(), right.height(), "pair must be level");
         Children {
@@ -42,6 +45,11 @@ impl Children {
         self.sizes.iter().sum()
     }
 
+    // No task in the current plan (checked through Task 12) calls this
+    // outside `#[cfg(test)]` code (the invariant checker and this module's
+    // own tests). Kept per Task 2's declared interface; allowed until a real
+    // production consumer shows up or this is deliberately removed.
+    #[allow(dead_code)]
     pub(crate) fn size(&self, i: usize) -> usize {
         self.sizes[i]
     }
@@ -56,6 +64,9 @@ impl Children {
         self.nodes.push(node);
     }
 
+    // Consumed by `insert` in Task 7 and `append` in Task 8; the attribute
+    // comes off then.
+    #[allow(dead_code)]
     pub(crate) fn insert_at(&mut self, i: usize, node: Arc<Node>) {
         debug_assert_eq!(node.height() + 1, self.height, "child must be one level down");
         self.sizes.insert(i, node.byte_len());
@@ -63,6 +74,9 @@ impl Children {
     }
 
     /// Split children `i..` off into a new node, keeping `0..i` here.
+    // Consumed by `insert`'s node split in Task 7; the attribute comes off
+    // then.
+    #[allow(dead_code)]
     pub(crate) fn split_off(&mut self, i: usize) -> Children {
         Children {
             height: self.height,
@@ -78,6 +92,9 @@ impl Children {
     /// would silently corrupt every other handle sharing the node; forgetting
     /// the size writeback would desynchronise the monoid. Neither is
     /// expressible through this API.
+    // Consumed by `insert` in Task 7 and `append` in Task 8; the attribute
+    // comes off then.
+    #[allow(dead_code)]
     pub(crate) fn with_child_mut<R>(&mut self, i: usize, f: impl FnOnce(&mut Node) -> R) -> R {
         let out = f(Arc::make_mut(&mut self.nodes[i]));
         self.sizes[i] = self.nodes[i].byte_len();
@@ -104,6 +121,9 @@ impl Children {
     ///
     /// Biases *right* at a child boundary: byte `n` of a child of size `n`
     /// belongs to the next child. Panics if `offset >= self.total()`.
+    // Consumed by `ByteSource::chunk_at` for `Rope` in Task 5; the attribute
+    // comes off then.
+    #[allow(dead_code)]
     pub(crate) fn locate_read(&self, offset: usize) -> (usize, usize) {
         let mut acc = 0;
         for (i, &size) in self.sizes.iter().enumerate() {
@@ -121,6 +141,9 @@ impl Children {
     /// Biases *left* at a child boundary, so inserting at a child's end
     /// appends into that child rather than prepending to the next. Panics if
     /// `offset > self.total()`.
+    // Consumed by `insert` in Task 7 and `split_off` in Task 9; the
+    // attribute comes off then.
+    #[allow(dead_code)]
     pub(crate) fn locate_insert(&self, offset: usize) -> (usize, usize) {
         let mut acc = 0;
         for (i, &size) in self.sizes.iter().enumerate() {
