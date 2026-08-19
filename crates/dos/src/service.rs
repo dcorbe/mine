@@ -29,6 +29,25 @@ pub enum Serviced {
     /// The program asked to exit, with this return code.
     Terminate(u8),
 
+    /// `AH=31h` -- the program asked to go resident instead of exiting.
+    /// `code` is the same AL return code `Terminate` carries; `paragraphs` is
+    /// how much of its own image, counted from its PSP segment, must stay
+    /// allocated.
+    ///
+    /// A distinct variant rather than a flag on `Terminate`, on purpose: a
+    /// caller that treats this as plain termination frees the resident block
+    /// and loads the next program on top of a live interrupt handler --
+    /// silent corruption of exactly the kind this crate's `Fault` variant
+    /// above refuses to launder. Matching exhaustively on `Serviced` turns
+    /// that mistake into a compile error.
+    ///
+    /// No memory-arena side effect happens where this is produced. The
+    /// kernel that answers `AH=31h` does not know where the next program will
+    /// be loaded; only the runtime that owns placement (`runexe`, or
+    /// whatever plays its role for a given caller) can shrink the resident
+    /// block and decide what goes above it.
+    StayResident { code: u8, paragraphs: u16 },
+
     /// A function this service does not model. Registers are untouched and the
     /// caller should record it as a gap.
     ///

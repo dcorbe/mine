@@ -288,6 +288,24 @@ pub enum Outcome {
     Continue,
     /// The program asked to exit, with this return code.
     Terminate(u8),
+    /// `AH=31h` -- the program asked to go resident instead of exiting.
+    /// `code` is the same AL return code `Terminate` carries; `paragraphs` is
+    /// how much of its own image, counted from its PSP segment, has to stay
+    /// allocated.
+    ///
+    /// A distinct variant rather than a flag on `Terminate`, on purpose: a
+    /// caller that folded this into "the program exited" would free the
+    /// resident block and load the next program on top of a live interrupt
+    /// handler -- silent corruption of exactly the kind this project refuses
+    /// to launder everywhere else. Matching exhaustively on `Outcome` is what
+    /// makes that mistake a compile error instead of a field a caller forgot
+    /// to check.
+    ///
+    /// No `Arena` bookkeeping happens here. This handler does not know where
+    /// the next program will be loaded, only how much of *this* one to keep;
+    /// shrinking the block and deciding what goes above it is `runexe`'s job,
+    /// the same caller that already owns memory placement for `AH=4Ah`.
+    StayResident { code: u8, paragraphs: u16 },
     /// The program handed over a pointer that does not name memory.
     ///
     /// Deliberately *not* laundered into a DOS error code. Real DOS would have
@@ -375,9 +393,9 @@ fn fail<G: Guest>(g: &mut G, mut regs: Regs, code: u16) -> Outcome {
 pub fn is_implemented(ah: u8) -> bool {
     matches!(
         ah,
-        0x02 | 0x09 | 0x0e | 0x19 | 0x1a | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x2f | 0x30 | 0x35
-            | 0x3c | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x48 | 0x49 | 0x4a
-            | 0x4c | 0x4e | 0x4f | 0x56 | 0x58 | 0x5c | 0x62 | 0x67
+        0x02 | 0x09 | 0x0e | 0x19 | 0x1a | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x2f | 0x30 | 0x31
+            | 0x35 | 0x3c | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x48 | 0x49
+            | 0x4a | 0x4c | 0x4e | 0x4f | 0x56 | 0x58 | 0x5c | 0x62 | 0x67
     )
 }
 
@@ -484,6 +502,9 @@ impl<G: crate::guest::Guest> crate::service::Service<G> for Dos {
         match dispatch(g, &mut self.state) {
             Outcome::Continue => Serviced::Continue,
             Outcome::Terminate(code) => Serviced::Terminate(code),
+            Outcome::StayResident { code, paragraphs } => {
+                Serviced::StayResident { code, paragraphs }
+            }
             Outcome::Fault(f) => Serviced::Fault(f),
         }
     }
@@ -939,6 +960,13 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
         // 4Ch -- terminate with the return code in AL.
         0x4c => Outcome::Terminate(regs.al()),
 
+        // 31h -- terminate and stay resident. AL is the same return code
+        // AH=4Ch takes; DX is paragraphs to keep, counted from the PSP
+        // segment, not bytes and not counted from wherever this program's
+        // break happens to sit. Unlike 4Ch, the memory above DX becomes free
+        // but the memory *below* it does not -- see `Outcome::StayResident`.
+        0x31 => Outcome::StayResident { code: regs.al(), paragraphs: regs.dx },
+
         // 4Eh -- find first matching DS:DX, which may end in a wildcarded
         // NAME.EXT; CX is the search attribute mask. Writes the 43-byte find
         // record described at `find_record` into the DTA.
@@ -1158,6 +1186,21 @@ mod tests {
         g.call_with(regs);
 
         assert_eq!(dispatch(&mut g, &mut dos), Outcome::Terminate(3));
+    }
+
+    #[test]
+    fn stay_resident_carries_the_code_out_of_al_and_the_paragraphs_out_of_dx() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState::default();
+        let mut regs = Regs::default();
+        regs.ax = 0x3100 | 3;
+        regs.dx = 0x0200;
+        g.call_with(regs);
+
+        assert_eq!(
+            dispatch(&mut g, &mut dos),
+            Outcome::StayResident { code: 3, paragraphs: 0x0200 }
+        );
     }
 
     #[test]
