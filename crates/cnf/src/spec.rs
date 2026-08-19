@@ -94,6 +94,9 @@ pub enum SpecError {
     Message(MsgError),
     /// An option's `{` has no matching `}`.
     Unterminated { name: Vec<u8>, at: usize },
+    /// `scan` and `MsgFile` disagree on how many messages the file holds. The
+    /// two parsers have drifted, and every index below is suspect.
+    CountMismatch { scanned: usize, counted: usize },
 }
 
 /// One `.MSG` file: its bytes, its messages, and its options.
@@ -141,9 +144,6 @@ impl SpecFile {
 /// The option name that declares the file's language rather than a message.
 /// Mirrors `msg.rs`'s own `LANGUAGE` constant, which it does not export.
 const LANGUAGE: &[u8] = b"LANGUAGE";
-
-/// The longest an option name can be. `MSGRDR.H`'s `OPTLEN`.
-const MOPTLEN: usize = 8;
 
 /// Characters an option name is made of. Mirrors `msg.rs`'s `is_name`, which
 /// it does not export: digits and *upper-case* letters only, so comment prose
@@ -206,15 +206,10 @@ fn find_next_name(source: &[u8], start: usize) -> Option<(usize, usize, usize)> 
                 }
             }
             St::Name => {
-                if is_name(byte) && name_end - name_start < MOPTLEN {
+                if is_name(byte) {
                     name_end = i + 1;
                 } else if byte == b'{' {
                     return Some((name_start, name_end, i));
-                } else if is_name(byte) {
-                    // MOPTLEN cap reached and this byte would extend it
-                    // further: it begins a fresh candidate instead.
-                    name_start = i;
-                    name_end = i + 1;
                 } else {
                     state = St::Post;
                 }
@@ -331,13 +326,9 @@ fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError>
         pos = tail_line_end;
     }
 
-    assert_eq!(
-        index,
-        messages.len(),
-        "cnf::spec::scan counted {index} messages but MsgFile counted {}; \
-         the two parsers over one grammar have drifted",
-        messages.len()
-    );
+    if index != messages.len() {
+        return Err(SpecError::CountMismatch { scanned: index, counted: messages.len() });
+    }
 
     Ok(options)
 }
@@ -349,7 +340,7 @@ mod tests {
     const SAMPLE: &[u8] = b"LANGUAGE {English}\r\n\
 LEVEL0 {}\r\n\
 \r\n\
- This is the number of credits.\r\n\
+\x20This is the number of credits.\r\n\
 \r\n\
 GAMCRD {Credits per minute 60} N 0 32767\r\n\
 \r\n\
@@ -380,6 +371,12 @@ ACTIVATE {DEMO} S 30 Enter your activation code\r\n";
         // LEVEL0 is a numbered message and is not an option. GAMCRD is the
         // second message and the first option. Confusing the two shifts every
         // stgopt(N) in the module.
+        //
+        // SAMPLE's leading LANGUAGE line is deliberate, not incidental: this
+        // assertion is what guards LANGUAGE's exclusion from the numbering.
+        // If `scan` ever counted it, GAMCRD's index would come out as 2
+        // instead of 1 -- and it does when tested by mutation (see
+        // task-2-4-report.md).
         let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
         assert_eq!(f.options()[0].index, 1, "GAMCRD is message 1");
         assert_eq!(f.options()[1].index, 2, "ACTIVATE is message 2");
@@ -425,7 +422,9 @@ ACTIVATE {DEMO} S 30 Enter your activation code\r\n";
     }
 
     #[test]
-    fn a_value_closes_on_the_first_unescaped_brace() {
+    fn a_plain_value_closes_at_its_brace() {
+        // A baseline: no escaping in play at all. Kept separate from the two
+        // tests below that actually discriminate on tilde handling.
         let src = b"OPT {plain} S 10 p
 ";
         let f = SpecFile::parse("T.MSG", src).expect("parses");
@@ -484,6 +483,21 @@ AFK v%s.
         assert_eq!(f.options().len(), 1);
         let v = f.options()[0].value;
         assert_eq!(&src[v.start..v.end], b"a~~");
+    }
+
+    #[test]
+    fn a_name_longer_than_optlen_is_read_in_full() {
+        // MSGRDR.H documents OPTLEN as 8, but msg.rs's own reader enforces no
+        // such cap -- State::Name accumulates every is_name byte until a
+        // non-name byte or `{`, with no length bound anywhere in its logic.
+        // scan must agree with msg.rs, not with the header comment: it is
+        // the authority. No name in the recovered corpus is actually this
+        // long, but the two parsers must not diverge on the day one is.
+        let src = b"ABCDEFGHI {x} S 1 p
+";
+        let f = SpecFile::parse("T.MSG", src).expect("parses");
+        assert_eq!(f.options()[0].name, b"ABCDEFGHI".to_vec());
+        assert_eq!(f.messages().len(), 1, "scan and MsgFile must agree on the message count");
     }
 
     #[test]
