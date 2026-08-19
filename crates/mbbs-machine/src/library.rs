@@ -29,6 +29,7 @@ pub enum SourceKind {
 }
 
 /// One library's ordinal numbering for one generation.
+#[derive(Debug, PartialEq, Eq)]
 pub struct OrdinalTable {
     /// Canonical library name, matching a [`Library::name`].
     pub library: &'static str,
@@ -544,6 +545,159 @@ pub fn library(spelling: &str) -> Option<&'static Library> {
     })
 }
 
+/// One coherent generation across every library.
+///
+/// The unit of selection. Choosing a table per library independently is what
+/// manufactures a mixed generation -- GALGSBL from MBBS 6.25 alongside
+/// MAJORBBS from WG 1.01, a configuration nobody ever shipped or tested.
+pub struct Profile {
+    /// The generation tag, matching the `generation` of every table it offers
+    /// (except DOSCALLS -- see [`DOSCALLS_PHARLAP31`]).
+    pub name: &'static str,
+    pub tables: &'static [&'static OrdinalTable],
+}
+
+impl Profile {
+    /// This profile's table for `library`, if it has one.
+    pub fn table(&self, library: &str) -> Option<&'static OrdinalTable> {
+        self.tables.iter().copied().find(|t| t.library.eq_ignore_ascii_case(library))
+    }
+}
+
+/// The profile used when several are admissible and agree on everything
+/// demanded. Declared rather than emergent: which one wins must be a recorded
+/// decision, not an accident of array order. `wg101` is the generation this
+/// host was built against.
+pub const ANCHOR: &str = "wg101";
+
+pub const PROFILES: &[Profile] = &[
+    Profile {
+        name: "mbbs625",
+        tables: &[&MAJORBBS_MBBS625, &GALGSBL_MBBS625, &DOSCALLS_PHARLAP31],
+    },
+    Profile {
+        name: "wg101",
+        tables: &[
+            &MAJORBBS_WG101,
+            &GALGSBL_WG101,
+            &GALME_WG101,
+            &GALMSG_WG101,
+            &GALFIL_WG101,
+            &GALETL_WG101,
+            &DOSCALLS_PHARLAP31,
+        ],
+    },
+    Profile {
+        name: "wg2",
+        tables: &[&GALGSBL_WG2, &DOSCALLS_PHARLAP31],
+    },
+    Profile {
+        name: "wg3-16",
+        tables: &[&GALGSBL_WG3_16, &DOSCALLS_PHARLAP31],
+    },
+    Profile {
+        name: "layout-c",
+        tables: &[&GALGSBL_LAYOUT_C],
+    },
+];
+
+/// The profile with this generation tag.
+pub fn profile(name: &str) -> Option<&'static Profile> {
+    PROFILES.iter().find(|p| p.name == name)
+}
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Which ordinals the loaded modules ask of each library.
+///
+/// Keyed by canonical library name, so a 32-bit module's `GALGSBL.dll` and a
+/// 16-bit module's `GALGSBL` land in one bucket. Built by the caller from a
+/// module's own import records -- this module never parses an image.
+#[derive(Debug, Default)]
+pub struct Demand {
+    by_library: BTreeMap<&'static str, BTreeSet<u16>>,
+}
+
+impl Demand {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `spelling` was asked for `ordinal`.
+    ///
+    /// A spelling no [`Library`] claims is dropped: there is no table for it,
+    /// so it cannot discriminate between profiles, and recording it would make
+    /// every profile permanently `Unevidenced`.
+    pub fn add(&mut self, spelling: &str, ordinal: u16) {
+        if let Some(lib) = library(spelling) {
+            self.by_library.entry(lib.name).or_default().insert(ordinal);
+        }
+    }
+
+    pub fn libraries(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.by_library.keys().copied()
+    }
+
+    pub fn ordinals(&self, library: &str) -> Option<&BTreeSet<u16>> {
+        self.by_library
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(library))
+            .map(|(_, ords)| ords)
+    }
+}
+
+/// Where a profile stands against a demand.
+#[derive(Debug)]
+pub enum Standing {
+    /// A table for every demanded library, naming every demanded ordinal.
+    Admissible,
+    /// A table this profile *does* have fails to name an ordinal that was
+    /// demanded of it. One counterexample is enough and no other table need
+    /// exist, which is why a profile can be ruled out long before it is
+    /// complete.
+    Excluded {
+        uncovered: Vec<(&'static str, Vec<u16>)>,
+    },
+    /// Not excluded, but missing a table for a library the modules demand, so
+    /// it cannot be *selected* -- only reported. Reported rather than ignored,
+    /// so the gap is visible and can be closed by measurement.
+    Unevidenced {
+        missing: Vec<&'static str>,
+    },
+}
+
+/// Where `profile` stands against `demand`.
+pub fn standing(profile: &Profile, demand: &Demand) -> Standing {
+    let mut uncovered: Vec<(&'static str, Vec<u16>)> = Vec::new();
+    let mut missing: Vec<&'static str> = Vec::new();
+
+    for lib in demand.libraries() {
+        let Some(wanted) = demand.ordinals(lib) else {
+            continue;
+        };
+        match profile.table(lib) {
+            Some(table) => {
+                let names = table.names();
+                let gaps: Vec<u16> = wanted.iter().copied().filter(|o| !names.contains_key(o)).collect();
+                if !gaps.is_empty() {
+                    uncovered.push((lib, gaps));
+                }
+            }
+            None => missing.push(lib),
+        }
+    }
+
+    // Exclusion first: one uncovered ordinal settles it regardless of what
+    // else is missing.
+    if !uncovered.is_empty() {
+        return Standing::Excluded { uncovered };
+    }
+    if !missing.is_empty() {
+        return Standing::Unevidenced { missing };
+    }
+    Standing::Admissible
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,5 +782,159 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A profile is one coherent generation across every library. Selecting a
+    /// table per library independently is what manufactures a mixed
+    /// generation, which is the failure `Exports::wg300`'s own doc comment
+    /// records as having contaminated `isv_union_symbols.tsv`.
+    #[test]
+    fn a_profile_offers_at_most_one_table_per_library() {
+        for p in PROFILES {
+            let mut seen: Vec<&str> = Vec::new();
+            for t in p.tables {
+                assert!(!seen.contains(&t.library), "{} offers two {} tables", p.name, t.library);
+                seen.push(t.library);
+            }
+        }
+    }
+
+    /// Every table a profile offers must belong to that profile's generation,
+    /// except DOSCALLS, which is keyed to the extender release rather than the
+    /// host release and is the same table in every profile.
+    #[test]
+    fn a_profiles_tables_are_all_its_own_generation_except_doscalls() {
+        for p in PROFILES {
+            for t in p.tables {
+                if t.library == DOSCALLS {
+                    continue;
+                }
+                assert_eq!(t.generation, p.name, "{} offers a {} table", p.name, t.generation);
+            }
+        }
+    }
+
+    #[test]
+    fn a_profile_finds_its_table_for_a_library_and_none_for_one_it_lacks() {
+        let wg101 = profile("wg101").expect("wg101 exists");
+        assert_eq!(wg101.table(GALGSBL).map(|t| t.generation), Some("wg101"));
+        assert_eq!(wg101.table("NOSUCHLIB"), None);
+        let mbbs625 = profile("mbbs625").expect("mbbs625 exists");
+        assert_eq!(mbbs625.table(MAJORBBS).map(|t| t.generation), Some("mbbs625"));
+        assert_eq!(mbbs625.table(GALME), None, "no GALME table for MBBS 6.25 was recovered");
+    }
+
+    /// The anchor is declared, not emergent. Which profile wins when several
+    /// agree must be a recorded decision rather than an accident of table
+    /// sizes or array order.
+    #[test]
+    fn the_anchor_names_a_real_profile() {
+        assert_eq!(ANCHOR, "wg101");
+        assert!(profile(ANCHOR).is_some(), "the anchor must name a profile that exists");
+    }
+
+    fn board_demand() -> Demand {
+        // Measured from WCCMMUD.DLL and WCCMMPLS.DLL's own relocation records.
+        let mut d = Demand::new();
+        for o in [6, 7, 11, 19, 21, 26, 30, 37, 49, 53, 56, 58, 59, 60, 72, 87] {
+            d.add("GALGSBL", o);
+        }
+        // The three MAJORBBS ordinals that matter: 474 is prf, 1191 is the
+        // highest the board demands, and 1101 is one of the sixteen MBBS 6.25
+        // never had.
+        for o in [474, 1101, 1191] {
+            d.add("MAJORBBS", o);
+        }
+        d
+    }
+
+    /// A PE spelling must land in the same bucket as the NE one, or a 32-bit
+    /// module's demand would be invisible to a profile check.
+    #[test]
+    fn demand_is_keyed_by_canonical_library_not_by_spelling() {
+        let mut d = Demand::new();
+        d.add("GALGSBL.dll", 72);
+        d.add("GALGSBL", 87);
+        assert_eq!(d.ordinals(GALGSBL).map(BTreeSet::len), Some(2));
+    }
+
+    /// An unknown library has no table to check against, so it cannot
+    /// discriminate between profiles and is not recorded.
+    #[test]
+    fn an_unknown_library_is_not_recorded_as_demand() {
+        let mut d = Demand::new();
+        d.add("NOSUCHLIB", 1);
+        assert_eq!(d.libraries().count(), 0);
+    }
+
+    /// **The regression test for this design's own first mistake.** Looking at
+    /// GALGSBL alone, mbbs625 covers every ordinal the board demands and is
+    /// indistinguishable from wg101. It is still not admissible, because the
+    /// same modules demand MAJORBBS ordinals MBBS 6.25 never had. A rule that
+    /// selected per library rather than per profile passes every GALGSBL-only
+    /// assertion and fails this one.
+    #[test]
+    fn mbbs625_is_excluded_by_majorbbs_though_its_galgsbl_table_would_admit_it() {
+        let d = board_demand();
+        let mbbs625 = profile("mbbs625").expect("mbbs625");
+
+        // GALGSBL alone: fully covered.
+        let g = mbbs625.table(GALGSBL).expect("galgsbl table").names();
+        for o in d.ordinals(GALGSBL).expect("galgsbl demand") {
+            assert!(g.contains_key(o), "mbbs625's GALGSBL table covers ordinal {o}");
+        }
+
+        // As a profile: excluded, and the evidence names MAJORBBS.
+        match standing(mbbs625, &d) {
+            Standing::Excluded { uncovered } => {
+                let libs: Vec<_> = uncovered.iter().map(|(l, _)| *l).collect();
+                assert!(libs.contains(&MAJORBBS), "excluded by MAJORBBS, got {libs:?}");
+            }
+            other => panic!("mbbs625 must be excluded, got {other:?}"),
+        }
+    }
+
+    /// The precedence rule itself: exclusion is checked **before** completeness.
+    ///
+    /// `board_demand` cannot test this. It demands only GALGSBL and MAJORBBS,
+    /// and `mbbs625` has a table for both, so `missing` is empty there and the
+    /// check order is inert -- a `standing` that tested `missing` first would
+    /// pass every assertion in
+    /// [`mbbs625_is_excluded_by_majorbbs_though_its_galgsbl_table_would_admit_it`].
+    /// Adding a library `mbbs625` has no table for at all makes both lists
+    /// non-empty at once, which is the only shape where the ordering is
+    /// observable. Found by mutation: the ordering mutation this design's plan
+    /// listed against that test did not discriminate.
+    #[test]
+    fn an_uncovered_ordinal_excludes_even_when_a_table_is_also_missing() {
+        let mut d = board_demand();
+        // mbbs625 has no GALME table at all, so `missing` is non-empty...
+        d.add("GALME", 30);
+        // ...while MAJORBBS 1101 and 1191 keep `uncovered` non-empty.
+        match standing(profile("mbbs625").expect("mbbs625"), &d) {
+            Standing::Excluded { uncovered } => {
+                let libs: Vec<_> = uncovered.iter().map(|(l, _)| *l).collect();
+                assert!(libs.contains(&MAJORBBS), "excluded by MAJORBBS, got {libs:?}");
+            }
+            other => panic!("an uncovered ordinal must win over a missing table, got {other:?}"),
+        }
+    }
+
+    /// Exclusion needs one counterexample and no other table; selection needs a
+    /// table for every demanded library. That asymmetry is what makes the
+    /// registry useful before every generation's tables exist.
+    #[test]
+    fn a_profile_missing_a_table_is_unevidenced_not_admissible() {
+        let d = board_demand();
+        // wg2 has a GALGSBL table and no MAJORBBS one.
+        match standing(profile("wg2").expect("wg2"), &d) {
+            Standing::Unevidenced { missing } => assert!(missing.contains(&MAJORBBS)),
+            other => panic!("wg2 must be unevidenced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wg101_is_admissible_for_this_board() {
+        assert!(matches!(standing(profile("wg101").expect("wg101"), &board_demand()), Standing::Admissible));
     }
 }
