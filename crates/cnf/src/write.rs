@@ -18,13 +18,14 @@ pub enum WriteError {
     /// As of this writing, only reachable by breaking the implementation
     /// itself (mutation testing `rewrite`'s edit ordering catches it -- see
     /// `crates/cnf/tests/write.rs`'s TDD evidence in the fix report), not by
-    /// any request a caller can currently construct: `escape` proves each
-    /// edit's own span decodes back exactly to what went in (see `escape`'s
-    /// doc), a non-duplicate edit's splice cannot touch anything past its
-    /// own span, and `DuplicateEdit` refuses the one shape that could reach
-    /// past it. Kept for the same reason as `UneditedMessageChanged`: cheap
-    /// insurance against a future regression in either of those guarantees,
-    /// not a defence against anything reachable today.
+    /// any request a caller can currently construct: `escape` never emits an
+    /// unescaped `}` (see its own doc), so a spliced-in value cannot open or
+    /// close a brace boundary it should not; a non-duplicate edit's splice
+    /// cannot touch anything past its own span; and `DuplicateEdit` refuses
+    /// the one shape that could reach past it. Kept for the same reason as
+    /// `UneditedMessageChanged`: cheap insurance against a future regression
+    /// in either of those guarantees, not a defence against anything
+    /// reachable today.
     CountChanged { was: usize, now: usize },
     /// A message nobody edited came back different.
     ///
