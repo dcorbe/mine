@@ -251,7 +251,6 @@ impl Map {
         // physical 2 mislabelled block 7 becomes a lone unpaired copy that
         // is automatically live, since a single copy never reaches the
         // generation-tie check.
-        let entries_per_page = (page_size - ENTRIES) / ENTRY;
 
         // Where each allocation-table block lives is a *formula*, not something
         // to scan for -- the engine fetches block `k` by page number
@@ -278,14 +277,14 @@ impl Map {
         // 20/21, `wccnt7pv/wccmp002.vir` at 10056/10057, and so on), always
         // near the end of the file and never at a position this formula names.
         // The engine cannot see them, and neither can this now.
-        let stride = entries_per_page + 2;
+        let entries_per_page = Self::entries_per_block(page_size);
         let mut blocks: HashMap<u16, Vec<(usize, u16)>> = HashMap::new();
         for index in 1u16.. {
-            let first = 2 + (usize::from(index) - 1) * stride;
-            if first + 1 >= pages {
+            let (first, second) = Self::pair_position(page_size, usize::from(index));
+            if second >= pages {
                 break;
             }
-            let copies: Vec<(usize, u16)> = [first, first + 1]
+            let copies: Vec<(usize, u16)> = [first, second]
                 .into_iter()
                 .filter(|&page| magic(page))
                 .map(|page| (page, word(page, GENERATION)))
@@ -479,14 +478,69 @@ impl Map {
     /// carries the magic, if a copy calls itself some other block, or if the
     /// two generations tie -- the same refusals [`Self::read`] makes, so a
     /// file this can write is a file that can be read back.
+    /// Where allocation-table block `index` (1-based) keeps its shadow pair,
+    /// as physical page numbers -- position only, with no claim that a block
+    /// is actually there.
+    ///
+    /// The formula this module's doc comment establishes, in one place: three
+    /// callers need it ([`Self::read`] to walk the blocks, [`Self::pair_of`]
+    /// to resolve one, and [`Self::table_pages`] to say which pages of a file are
+    /// table rather than content), and three copies of an arithmetic that
+    /// decides where a file's structure lives is three chances to disagree.
+    fn pair_position(page_size: usize, index: usize) -> (usize, usize) {
+        let stride = Self::entries_per_block(page_size) + 2;
+        let first = 2 + (index - 1) * stride;
+        (first, first + 1)
+    }
+
+    /// Every physical page this file's allocation table occupies.
+    ///
+    /// Both halves of every block's shadow pair, in ascending order. A page
+    /// in this set is *structure*: it is what decides which physical page a
+    /// logical one currently means, so a writer that puts pages down in
+    /// crash-safe order has to write it after the content it comes to
+    /// describe, never before.
+    ///
+    /// Position **and** magic, not either alone. Position alone would call a
+    /// data page that happens to sit at a formula position part of the table;
+    /// magic alone would sweep up the abandoned `"PP"` pages this module's
+    /// doc comment measures in thirteen real files, which carry the magic, a
+    /// block index and a higher generation than the live table, at positions
+    /// no block ever lives at.
+    ///
+    /// Walking stops at the first position where neither copy carries the
+    /// magic -- the rule [`Self::read`] already stops by, so the two agree on
+    /// how many blocks a file has.
+    pub(crate) fn table_pages(file: &[u8], page_size: u16) -> Vec<usize> {
+        let page_size = usize::from(page_size);
+        if page_size == 0 || file.len() < page_size {
+            return Vec::new();
+        }
+        let pages = file.len() / page_size;
+        let magic = |page: usize| file[page * page_size..][..2] == *MAGIC;
+
+        let mut found = Vec::new();
+        for index in 1usize.. {
+            let (first, second) = Self::pair_position(page_size, index);
+            if second >= pages {
+                break;
+            }
+            if !magic(first) && !magic(second) {
+                break;
+            }
+            found.push(first);
+            found.push(second);
+        }
+        found
+    }
+
     fn pair_of(
         file: &[u8],
         page_size: usize,
         index: usize,
     ) -> Result<(usize, usize), String> {
         let pages = file.len() / page_size;
-        let stride = Self::entries_per_block(page_size) + 2;
-        let first = 2 + (index - 1) * stride;
+        let (first, _) = Self::pair_position(page_size, index);
         if first + 1 >= pages {
             return Err(format!(
                 "allocation-table block {index} would have its shadow pair at \
@@ -1004,6 +1058,60 @@ mod tests {
         }
 
         out
+    }
+
+    /// `PP2BLOCK.DAT` keeps two allocation-table blocks, at the two positions
+    /// the formula names for 512-byte pages, and [`Map::table_pages`] finds
+    /// both pairs and nothing else.
+    #[test]
+    fn table_pages_finds_every_block_pair_and_stops_after_the_last() {
+        let file = fixture("PP2BLOCK.DAT");
+        assert_eq!(Map::table_pages(&file, 512), vec![2, 3, 130, 131]);
+    }
+
+    /// The walk stops where the blocks stop, not where the file does.
+    ///
+    /// `PP2BLOCK.DAT` is 156 pages and block 3 would live at physical 258, so
+    /// the real fixture never reaches the magic check -- the bounds check ends
+    /// the walk first, and a version of this that dropped the magic rule
+    /// entirely passed against it. Growing the file past 258 is what makes the
+    /// rule load-bearing: those pages are blank, and without the check they
+    /// would be reported as an allocation-table block.
+    #[test]
+    fn table_pages_stops_where_the_blocks_stop_not_where_the_file_does() {
+        const PAGE: usize = 512;
+        let mut file = fixture("PP2BLOCK.DAT");
+        assert_eq!(file.len() / PAGE, 156, "the fixture is 156 pages");
+        file.resize(PAGE * 300, 0);
+        assert_eq!(Map::table_pages(&file, 512), vec![2, 3, 130, 131]);
+    }
+
+    /// An abandoned page carrying the `"PP"` magic is not part of the table.
+    ///
+    /// Thirteen real files in `archive/modules/majormud-nt` have them -- magic,
+    /// a block index, and a *higher* generation than the live table, at
+    /// positions no block lives at. A writer that treated one as structure
+    /// would order a content page into the wrong phase; one that missed a real
+    /// block would flip the table before the pages it describes are durable.
+    /// Position and magic together are what separate the two.
+    #[test]
+    fn table_pages_ignores_an_abandoned_page_that_still_carries_the_magic() {
+        const PAGE: usize = 512;
+        let mut file = fixture("PP2BLOCK.DAT");
+        let stray = 6;
+        assert!(
+            file.len() > (stray + 1) * PAGE,
+            "the fixture is long enough to hold a stray page at {stray}"
+        );
+        file[stray * PAGE..stray * PAGE + 2].copy_from_slice(MAGIC);
+        file[stray * PAGE + BLOCK..][..2].copy_from_slice(&1u16.to_le_bytes());
+        file[stray * PAGE + GENERATION..][..2].copy_from_slice(&0xffffu16.to_le_bytes());
+
+        assert_eq!(
+            Map::table_pages(&file, 512),
+            vec![2, 3, 130, 131],
+            "physical {stray} carries the magic but is not where a block lives"
+        );
     }
 
     /// Relocating never writes over a page the allocation table still claims.

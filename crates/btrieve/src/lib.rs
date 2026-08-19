@@ -960,6 +960,54 @@ fn index_entries(
     (entries, groups)
 }
 
+/// The phase boundaries of a v6 commit, where a test can stand in for a crash.
+///
+/// [`Block::write_changed_pages`] promises that the file on disk always reads
+/// as either its old self or its new self, whatever moment it is interrupted
+/// at. A promise about crashes is worth what can be checked, and a SIGKILL
+/// cannot be staged from a test -- so the interruption is staged at the
+/// boundaries the promise is actually made about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "the shared prefix is the meaning: each names a moment *after* a               phase, which is where an interruption is staged"
+)]
+pub(crate) enum Stop {
+    /// Content pages are down and flushed; nothing live points at them.
+    AfterContent = 1,
+    /// Structural bodies are down, still carrying losing generations.
+    AfterBodies = 2,
+    /// The control record has flipped and the allocation table has not --
+    /// the one window the design does not close, kept pointing the safe way.
+    AfterFirstFlip = 3,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Which [`Stop`] to fail at, or `None` for the only value production has.
+    ///
+    /// Thread-local, not a global: `cargo test` runs this crate's tests in
+    /// parallel inside one process, and a staged interruption that leaked
+    /// across threads failed four unrelated v6 writes the first time this
+    /// was a `static`.
+    pub(crate) static STOP_AT: std::cell::Cell<Option<Stop>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn stop_here(at: Stop) -> Result<(), String> {
+    if STOP_AT.with(std::cell::Cell::get) == Some(at) {
+        return Err(format!("{at:?}: a staged interruption, standing in for a crash"));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[expect(clippy::unnecessary_wraps, reason = "the test build of this can fail")]
+fn stop_here(_at: Stop) -> Result<(), String> {
+    Ok(())
+}
+
 impl<M: Mem> Block<M> {
     /// What the module named this file.
     pub fn name(&self) -> &str {
@@ -1053,13 +1101,36 @@ impl<M: Mem> Block<M> {
             file: self.name.clone(),
             why: format!("{}: reading a transaction pre-image: {e}", self.path.display()),
         })?;
+        self.capture_pre_image(bytes);
+        Ok(())
+    }
+
+    /// The same snapshot, from bytes the caller already has.
+    ///
+    /// Every v6 write path holds the file as it was -- it reads the whole
+    /// thing, mutates a copy, and needs the original again at commit time to
+    /// work out which pages changed. Those are exactly the bytes
+    /// [`Self::capture_for_journal`] would go back to the disk for, so inside
+    /// a transaction it used to read `WCCMP002.DAT`'s 53 MB a second time to
+    /// fetch a buffer already in memory a few frames up.
+    ///
+    /// v5 has no such buffer -- it seeks and writes one record without ever
+    /// holding the file -- which is why the reading entry point stays.
+    fn capture_for_journal_from(&mut self, before: &[u8]) {
+        if !self.txn_active || self.pre_image.is_some() {
+            return;
+        }
+        self.capture_pre_image(before.to_vec());
+    }
+
+    /// Build the pre-image. One authority, two ways in.
+    fn capture_pre_image(&mut self, bytes: Vec<u8>) {
         self.pre_image = Some(PreImage {
             bytes,
             records: self.records.clone(),
             geometry: self.geometry,
             dirty: self.dirty,
         });
-        Ok(())
     }
 
     /// The `struct btvblk` the module holds.
@@ -1140,80 +1211,285 @@ impl<M: Mem> Block<M> {
         }
     }
 
-    /// Replace this file's whole contents, atomically.
+    /// Write the pages a v6 write changed, and nothing else.
     ///
-    /// Every v6 write is a read-modify-write of the entire file
-    /// ([`Self::insert_v6`]'s doc comment says why: claiming, relocating and
-    /// the control record are each an append-elsewhere-and-flip, not an
-    /// in-place edit). A plain `std::fs::write` truncates the target and then
-    /// refills it, so for as long as that takes there is no complete file on
-    /// disk -- and if the process stops in that window, what is left is a
-    /// prefix whose control record describes a file much larger than the bytes
-    /// that remain.
+    /// # Why this is not a whole-file write
     ///
-    /// That is not hypothetical. Killing `mbbs-server` during a
-    /// `WCCMP002.DAT` write left 7,168 pages on disk under a control record
-    /// still claiming 13,572, and the next open refused it:
+    /// It used to be. Every v6 write reads the file into memory, mutates that
+    /// copy, and hands the result here; this replaced the file wholesale
+    /// through a flushed temporary and a rename. On `WCCMP002.DAT` -- 53 MB,
+    /// 13,713 pages, which MajorMUD-NT updates on every kick sweep -- one
+    /// record update changes **three** of those pages and rewrote all 53 MB
+    /// anyway, `sync_all`ing the lot before the rename. About 4,500x more
+    /// I/O than the change needed, and the measurement is kept honest by
+    /// `tests::v6_update_writes_only_the_pages_it_changed` and written up in
+    /// `docs/2026-08-18-v6-write-amplification.md`.
+    ///
+    /// # What the rename was protecting, and how this keeps it
+    ///
+    /// A plain `std::fs::write` truncates its target and then refills it, so
+    /// for as long as that takes there is no complete file on disk. That is
+    /// not hypothetical: killing `mbbs-server` mid-write left 7,168 pages
+    /// under a control record still claiming 13,572, and the next open
+    /// refused the file outright. The rename made the switch atomic.
+    ///
+    /// Writing pages in place cannot borrow that trick, so it has to earn the
+    /// same property from the format. A v6 file is shadow-paged: the file
+    /// control record lives in **both** physical pages 0 and 1, each
+    /// allocation-table block lives in both halves of its own pair, and in
+    /// each case the copy with the higher generation counter at
+    /// [`at::GENERATION`] is the live one. Everything else -- data pages,
+    /// index pages -- is reached only *through* the allocation table, so a
+    /// page the live table does not name cannot be seen at all.
+    ///
+    /// That gives three phases, and the invariant that the file on disk
+    /// always reads as either its old self or its new self:
+    ///
+    /// 1. **Content.** Every changed data and index page, plus any pages the
+    ///    file grew by. All of them are pages the live table does not name
+    ///    yet, so writing them changes nothing a reader can see.
+    /// 2. **Structure, with the generations held down.** The new control
+    ///    record and allocation-table images, written to the halves that are
+    ///    *stale* in `before`, each carrying that half's own old generation
+    ///    rather than its new one. Still invisible: the halves that were live
+    ///    stay live, and are never written at all.
+    /// 3. **The flip.** Two bytes per page -- the generation words, control
+    ///    record first, then the allocation table.
+    ///
+    /// Each phase is flushed before the next begins.
+    ///
+    /// ## Why the generations are held back
+    ///
+    /// Without phase 3 a structural page would go down complete, generation
+    /// and all, in one write. A torn write of that page makes a half-written
+    /// image live, which is worse than anything the whole-file rename could
+    /// do. Holding the generation means every structural body is durable
+    /// before any of them counts, and the only writes that can decide
+    /// anything are two bytes wide.
+    ///
+    /// ## Why one flip per pair, never two
+    ///
+    /// A single write can relocate the same page more than once -- the first
+    /// update of a freshly opened `WCCMP002.DAT` performs 107 relocations --
+    /// and each relocation flips a shadow pair. Replaying those flips one for
+    /// one would write the half that is live in `before`, destroying the old
+    /// state that phases 1 and 2 exist to preserve. So a pair that ended up
+    /// back on the half it started on is **canonicalised**: the final image
+    /// is written to the half that was stale in `before`, with a generation
+    /// one above the half that was live. The end state is identical and it
+    /// takes one flip to get there.
+    ///
+    /// The finished file never shows the difference, which is why
+    /// `tests::a_v6_write_that_flips_a_pair_twice_is_still_undone_by_an_interruption`
+    /// stops one of those writes half way and reopens it.
+    ///
+    /// ## The window in phase 3, and which way it fails
+    ///
+    /// The control record and the allocation table are separate shadow pairs
+    /// and cannot flip as one, so a crash between them is possible. This is
+    /// the one window the design does not close, and the order is chosen for
+    /// how it fails rather than for tidiness.
+    ///
+    /// **Control record first.** What survives is a file whose header claims
+    /// one more record than its pages hold, and `records::read` refuses it by
+    /// name:
     ///
     /// ```text
-    /// allocation-table block 1 claims physical page 13603, and the file has
-    /// only 7168 pages
+    /// the header says 121 records and walking the pages found 120
     /// ```
     ///
-    /// 55 MB is a wide window, and MajorMUD-NT rewrites that file on every
-    /// update. So the new bytes go to a sibling temporary file, are flushed to
-    /// the platter, and are then moved over the original with a rename --
-    /// atomic on any single filesystem, which a Btrieve file and its own
-    /// directory always share. A reader either sees all of the old file or all
-    /// of the new one, never a prefix of either.
+    /// That is a refusal, not a repair -- the file needs one, exactly as it
+    /// would after any interrupted write. It is nonetheless the better of the
+    /// two failures, because the other one is silent: with the table flipped
+    /// first the pages would hold 121 records under a header still saying
+    /// 120, `records::walk_v6` stops after `geometry.records` of them, and
+    /// the count then *matches*, so nothing refuses anything and one record
+    /// -- whichever falls last in logical order, not necessarily the new one
+    /// -- is simply gone.
     ///
-    /// The temporary is named from the target so two processes writing
-    /// different files never collide, and it is removed if anything fails.
+    /// Note what this window is not. The whole-file rename it replaces had a
+    /// window too, and a far wider one: 53 MB of writing and flushing, some
+    /// six hundred milliseconds per update, during which a kill left a file
+    /// that also refused to open. This window is the gap between two
+    /// two-byte writes.
     ///
     /// # Errors
     ///
-    /// If the temporary cannot be written, flushed, or renamed over the
-    /// target. The original is left untouched in every one of those cases.
-    fn write_whole(&self, file: &[u8]) -> Result<(), BtvError> {
+    /// If either image is not a whole number of pages, if the file shrank
+    /// (v6 writes only ever grow it), or if any page cannot be written or
+    /// flushed.
+    fn write_changed_pages(&self, before: &[u8], after: &[u8]) -> Result<(), BtvError> {
+        use std::io::{Seek, SeekFrom, Write};
+
         let fail = |why: String| BtvError {
             file: self.name.clone(),
             why,
         };
-        // The suffix is *appended* to the whole file name rather than
-        // replacing its extension: `with_extension` would turn both `FOO.DAT`
-        // and `FOO.IX` into the same `FOO.btv-tmp-N`, and two writes racing
-        // through one temporary is the corruption this function exists to
-        // stop, reintroduced by its own scratch file.
-        let mut name = self
-            .path
-            .file_name()
-            .ok_or_else(|| fail(format!("{}: has no file name", self.path.display())))?
-            .to_owned();
-        name.push(format!(".btv-tmp-{}", std::process::id()));
-        let temp = self.path.with_file_name(name);
+        let page = usize::from(self.geometry.page);
+        if page == 0 || !before.len().is_multiple_of(page) || !after.len().is_multiple_of(page) {
+            return Err(fail(format!(
+                "{} before and {} after is not a whole number of {page}-byte \
+                 pages",
+                before.len(),
+                after.len()
+            )));
+        }
+        if after.len() < before.len() {
+            return Err(fail(format!(
+                "a v6 write shrank the file from {} to {} bytes, which no \
+                 write path does -- refusing rather than truncating",
+                before.len(),
+                after.len()
+            )));
+        }
 
-        let write = || -> std::io::Result<()> {
-            use std::io::Write;
-            let mut out = std::fs::File::create(&temp)?;
-            out.write_all(file)?;
-            // Flushed before the rename, not after: a rename that beats its
-            // own data to the platter is exactly the corruption this exists to
-            // prevent, just with a smaller window.
-            out.sync_all()?;
-            drop(out);
-            // The original's permissions, not the umask's -- a data file that
-            // silently became mode 600 on its first write would be a fine way
-            // to break a board that runs as more than one user.
-            if let Ok(meta) = std::fs::metadata(&self.path) {
-                let _ = std::fs::set_permissions(&temp, meta.permissions());
+        let generation = |image: &[u8], number: usize| -> u16 {
+            let at = number * page + at::GENERATION;
+            u16::from_le_bytes([image[at], image[at + 1]])
+        };
+        fn body(image: &[u8], page: usize, number: usize) -> &[u8] {
+            &image[number * page..][..page]
+        }
+
+        // The shadow pairs, control record first -- the order phase 3 flips
+        // them in, and the whole reason that order is written down here
+        // rather than left to whatever `table_pages` happens to return.
+        let mut pairs = vec![(0usize, 1usize)];
+        let table = v6::Map::table_pages(after, self.geometry.page);
+        pairs.extend(table.chunks_exact(2).map(|pair| (pair[0], pair[1])));
+
+        // Phase 2's writes, canonicalised to one flip each: the final image,
+        // the half of the pair it goes on, and the generation phase 3 will
+        // give it.
+        struct Flip {
+            page: usize,
+            image: Vec<u8>,
+            generation: u16,
+        }
+        let mut flips: Vec<Flip> = Vec::new();
+        let old_pages = before.len() / page;
+
+        for &(first, second) in &pairs {
+            // A pair the file grew into is not a flip at all: neither half
+            // existed before, so nothing of it is live and phase 1 puts both
+            // halves down with everything else new.
+            if second >= old_pages {
+                continue;
             }
-            std::fs::rename(&temp, &self.path)
+            // A pair neither half of which moved is not part of this write at
+            // all. Without this the canonicalisation below "flips" every
+            // untouched allocation-table block to its other half with a
+            // bumped generation -- the same content, written for nothing. On
+            // `WCCMP002.DAT`, whose table runs to fourteen blocks, that was
+            // 13 spurious page writes out of 16.
+            if body(before, page, first) == body(after, page, first)
+                && body(before, page, second) == body(after, page, second)
+            {
+                continue;
+            }
+            let (live_before, stale_before) =
+                if generation(before, first) > generation(before, second) {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+            let live_after = if generation(after, first) > generation(after, second) {
+                first
+            } else {
+                second
+            };
+
+            let wanted = if live_after == stale_before {
+                // One flip, or an odd number of them: the winning image is
+                // already on the half that was stale, and its own generation
+                // already beats the half that was live.
+                generation(after, live_after)
+            } else {
+                // An even number of flips landed the winner back on the half
+                // that started live. Move it across and give it the smallest
+                // generation that still wins, so the live half is never
+                // written.
+                generation(before, live_before).wrapping_add(1)
+            };
+
+            let mut image = body(after, page, live_after).to_vec();
+            image[at::GENERATION..at::GENERATION + 2].copy_from_slice(&wanted.to_le_bytes());
+            if image == body(before, page, stale_before) {
+                continue;
+            }
+            flips.push(Flip {
+                page: stale_before,
+                image,
+                generation: wanted,
+            });
+        }
+
+        // Everything else that changed. **Both** halves of every shadow pair
+        // are excluded, not just the halves phase 2 writes: canonicalising a
+        // double flip deliberately leaves the old live half alone, so its
+        // bytes differ between `before` and `after` and it must not be
+        // mistaken for content. Leaving it is the point -- it becomes the
+        // pair's stale copy, which is exactly what a stale copy is for.
+        let structural: std::collections::HashSet<usize> = pairs
+            .iter()
+            .flat_map(|&(first, second)| [first, second])
+            .collect();
+        let content: Vec<usize> = (0..old_pages)
+            .filter(|number| !structural.contains(number))
+            .filter(|number| body(before, page, *number) != body(after, page, *number))
+            .collect();
+
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| fail(format!("{}: {e}", self.path.display())))?;
+
+        let put = |out: &mut std::fs::File, at: u64, bytes: &[u8]| -> Result<(), BtvError> {
+            out.seek(SeekFrom::Start(at))
+                .and_then(|_| out.write_all(bytes))
+                .map_err(|e| fail(format!("{}: writing at {at}: {e}", self.path.display())))
+        };
+        let flush = |out: &std::fs::File| -> Result<(), BtvError> {
+            out.sync_all()
+                .map_err(|e| fail(format!("{}: flushing: {e}", self.path.display())))
         };
 
-        write().map_err(|e| {
-            let _ = std::fs::remove_file(&temp);
-            fail(format!("{}: writing the file: {e}", self.path.display()))
-        })
+        // Phase 1 -- content, and the tail the file grew by.
+        for number in &content {
+            put(&mut out, (number * page) as u64, body(after, page, *number))?;
+        }
+        if after.len() > before.len() {
+            put(&mut out, before.len() as u64, &after[before.len()..])?;
+        }
+        flush(&out)?;
+        stop_here(Stop::AfterContent).map_err(&fail)?;
+
+        // Phase 2 -- structural bodies, each still carrying the generation
+        // that loses to the half currently live.
+        for flip in &flips {
+            let mut held = flip.image.clone();
+            let losing = generation(before, flip.page);
+            held[at::GENERATION..at::GENERATION + 2].copy_from_slice(&losing.to_le_bytes());
+            put(&mut out, (flip.page * page) as u64, &held)?;
+        }
+        flush(&out)?;
+        stop_here(Stop::AfterBodies).map_err(&fail)?;
+
+        // Phase 3 -- the flip. Control record first; see the doc comment.
+        for (done, flip) in flips.iter().enumerate() {
+            put(
+                &mut out,
+                (flip.page * page + at::GENERATION) as u64,
+                &flip.generation.to_le_bytes(),
+            )?;
+            if done == 0 {
+                flush(&out)?;
+                stop_here(Stop::AfterFirstFlip).map_err(&fail)?;
+            }
+        }
+        flush(&out)?;
+
+        Ok(())
     }
 
     /// Insert a record into a v6 file.
@@ -1307,6 +1583,9 @@ impl<M: Mem> Block<M> {
         let mut file = std::fs::read(&self.path).map_err(|e| {
             fail(format!("{}: {e}", self.path.display()))
         })?;
+        // The file as it was, kept so the commit can write only the pages
+        // that end up different -- see `Self::write_changed_pages`.
+        let before = file.clone();
 
         let layout = pages::Layout {
             page: page_size,
@@ -1393,9 +1672,9 @@ impl<M: Mem> Block<M> {
         // The last point before this write actually changes anything on
         // disk -- see `Self::capture_for_journal`'s doc comment for why it
         // is taken here rather than at the top of the function.
-        self.capture_for_journal()?;
+        self.capture_for_journal_from(&before);
 
-        self.write_whole(&file)?;
+        self.write_changed_pages(&before, &file)?;
 
         self.records = Some(records_clone);
         self.geometry.records = total_records;
@@ -1745,6 +2024,9 @@ impl<M: Mem> Block<M> {
             physical,
             within,
         } = self.v6_slot(position, layout).map_err(&fail)?;
+        // See `Self::write_changed_pages`: the commit needs the file as it
+        // was to know which pages it has to put down.
+        let before = file.clone();
 
         let mut records_clone = self
             .records
@@ -1785,8 +2067,8 @@ impl<M: Mem> Block<M> {
         v6::write_fcr(&mut file, page_size, total_records, &key_record_counts, None, None)
             .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
-        self.capture_for_journal()?;
-        self.write_whole(&file)?;
+        self.capture_for_journal_from(&before);
+        self.write_changed_pages(&before, &file)?;
 
         self.records = Some(records_clone);
         self.geometry.pages = u32::try_from(file.len())
@@ -1848,6 +2130,9 @@ impl<M: Mem> Block<M> {
             physical,
             within,
         } = self.v6_slot(position, layout).map_err(&fail)?;
+        // See `Self::write_changed_pages`: the commit needs the file as it
+        // was to know which pages it has to put down.
+        let before = file.clone();
 
         let mut records_clone = self
             .records
@@ -1893,8 +2178,8 @@ impl<M: Mem> Block<M> {
         )
         .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
-        self.capture_for_journal()?;
-        self.write_whole(&file)?;
+        self.capture_for_journal_from(&before);
+        self.write_changed_pages(&before, &file)?;
 
         self.records = Some(records_clone);
         self.geometry.records = total_records;
@@ -5814,47 +6099,154 @@ mod tests {
         }
     }
 
-    /// What one v6 record update actually costs on a real 53 MB file, and how
-    /// little of that file it actually changes.
+    /// A run of real writes against a real 53 MB file still reads back.
     ///
-    /// Measured 2026-08-18 on `WCCMP002.DAT` (4096-byte pages, 13,607 pages,
-    /// 26,720 records), release build, warm page cache:
+    /// The small committed fixtures exercise the ordinary path -- one flip
+    /// per shadow pair -- against files of a few pages. This runs updates and
+    /// inserts against a file genuine Btrieve built, reopening it from disk
+    /// every round rather than trusting the model the write just updated,
+    /// because the model is the half a bad write would leave looking right.
+    ///
+    /// Ignored: needs a real `WCCMP002.DAT`, named by `$WCCMP002`.
+    #[test]
+    #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+    fn a_run_of_v6_writes_on_a_real_file_reads_back_every_time() {
+        let Ok(source) = std::env::var("WCCMP002") else {
+            eprintln!("set WCCMP002=/path/to/WCCMP002.DAT to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v6-real-write-run");
+        let path = dir.join("WCCMP002.DAT");
+        std::fs::copy(&source, &path).expect("the file copies into scratch");
+
+        let mut block = block_from_file(path.clone(), "WCCMP002.DAT");
+        let mut expected = block.records().expect("the records read").len();
+        let reclen = usize::from(block.geometry.reclen);
+
+        for round in 0..6u8 {
+            // The record's *own* bytes with a trailing byte changed: key 0 is
+            // not modifiable on this file, so an update carrying some other
+            // record's key is refused before it ever reaches the writer this
+            // is testing.
+            let (target, mut bytes) = {
+                let records = block.records().expect("the records read");
+                let found = records
+                    .physical(usize::from(round) % 8)
+                    .expect("a record in the first few");
+                (found.position, found.bytes.to_vec())
+            };
+            bytes.resize(reclen, 0);
+            let last = bytes.len() - 1;
+            bytes[last] = round;
+            block.update(target, &bytes).expect("an update");
+
+            let mut record = vec![0u8; reclen];
+            record[..4].copy_from_slice(&(900_000u32 + u32::from(round)).to_le_bytes());
+            block.insert(&record).expect("an insert");
+            expected += 1;
+
+            // Reopened from disk every round: a write that corrupted the file
+            // and left the model intact would otherwise sail through.
+            let mut fresh = block_from_file(path.clone(), "WCCMP002.DAT");
+            let count = fresh
+                .records()
+                .unwrap_or_else(|e| panic!("round {round}: the file no longer reads: {e}"))
+                .len();
+            assert_eq!(count, expected, "round {round}: record count on disk");
+        }
+    }
+
+    /// A write that relocates the same pair twice, interrupted, is still the
+    /// old file.
+    ///
+    /// This is the case canonicalisation exists for, and the only one that
+    /// can catch its absence. A shadow pair flipped an even number of times
+    /// ends up back on the half it started on, so replaying those flips would
+    /// write the half that is still live -- destroying the old state that
+    /// phases 1 and 2 are supposed to preserve, in a way the *finished* file
+    /// never shows, because by the end both halves are correct.
+    ///
+    /// `WCCMP002.DAT`'s first update after opening performs 107 relocations,
+    /// so it is the fixture that has the shape.
+    ///
+    /// Ignored: needs a real `WCCMP002.DAT`, named by `$WCCMP002`.
+    #[test]
+    #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+    fn a_v6_write_that_flips_a_pair_twice_is_still_undone_by_an_interruption() {
+        let Ok(source) = std::env::var("WCCMP002") else {
+            eprintln!("set WCCMP002=/path/to/WCCMP002.DAT to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v6-double-flip-stop");
+        let path = dir.join("WCCMP002.DAT");
+        std::fs::copy(&source, &path).expect("the file copies into scratch");
+
+        let mut block = block_from_file(path.clone(), "WCCMP002.DAT");
+        let was = block.records().expect("the records read").len();
+        let found = block
+            .records()
+            .expect("the records read")
+            .physical(0)
+            .expect("a first record");
+        let (position, bytes) = (found.position, found.bytes.to_vec());
+
+        // The *first* update of a freshly opened file, which is the one that
+        // relocates in bulk.
+        STOP_AT.with(|at| at.set(Some(Stop::AfterBodies)));
+        let refused = block.update(position, &bytes);
+        STOP_AT.with(|at| at.set(None));
+        assert!(refused.is_err(), "the write could not have succeeded");
+
+        let mut fresh = block_from_file(path, "WCCMP002.DAT");
+        let now = fresh
+            .records()
+            .expect("an interrupted write left the file readable")
+            .len();
+        assert_eq!(now, was, "the file no longer holds what it did");
+    }
+
+    /// What one v6 record update costs on a real 53 MB file.
+    ///
+    /// Measured on `WCCMP002.DAT` (4096-byte pages, 13,713 pages, 26,720
+    /// records), release build, warm page cache:
     ///
     /// ```text
-    /// one update: 617ms, read 53 MB, wrote 53 MB (file is 53 MB)
-    /// 3 of 13713 pages differ: [1, 2, 8]
+    /// one update: 135ms, read 53 MB, wrote 0 MB (file is 53 MB)
+    /// 3 of 13713 pages differ: [1, 3, 8]
+    /// wrote 12292 bytes; allocation map walked 4 times
     /// ```
     ///
-    /// Those three are the stale half of the file control record's shadow pair
-    /// (0/1, tagged `"FC"`), the stale half of allocation-table block 0's
-    /// (2/3, tagged `"PP"`), and the data page the record lives on. Which half
-    /// of each pair moves alternates with every write, and a run that also
-    /// relocates the data page to its twin touches six rather than three --
-    /// either way it is **12-24 KB of a 53 MB file, rewritten in full: a write
-    /// amplification of two to four thousand**, and the whole 53 MB is
-    /// `sync_all`'d before the rename.
+    /// Three pages change and **12,292 bytes are written** -- the three pages
+    /// themselves plus the two two-byte generation words that flip them. The
+    /// three are the stale half of the file control record's shadow pair
+    /// (0/1, tagged `"FC"`), the stale half of the owning allocation-table
+    /// block's (2/3, tagged `"PP"`), and the data page the record lives on.
     ///
-    /// The shape of those three is the whole argument for a paged writer: they
-    /// are shadow pairs, so the format already defines a crash-safe order --
-    /// put the new data page down, flush, then flip the table and control
-    /// record whose generation counters decide which copy is live.
+    /// It used to write all 53 MB and `sync_all` the lot: 617 ms, and a write
+    /// amplification of about 4,500x. See
+    /// `docs/2026-08-18-v6-write-amplification.md`, and
+    /// [`Block::write_changed_pages`] for why writing three pages is as safe
+    /// as replacing the file was.
+    ///
+    /// The 53 MB still *read* is the remaining half, and a separate decision:
+    /// removing it means caching the page image on the `Block`, which costs
+    /// 53 MB of memory per open file.
     ///
     /// The first update of a freshly opened file is not representative -- it
     /// claims 106 shadow twins that every later update then reuses -- so this
     /// warms up once and measures the second.
     ///
-    /// Ignored because it needs a `WCCMP002.DAT`, which is not in the repo
-    /// ([[capture-files-never-committed]] applies to board data too). Run it
-    /// with:
+    /// Ignored because it needs a `WCCMP002.DAT`, which is not in the repo.
+    /// Run it with:
     ///
     /// ```text
-    /// WCCMP002=/path/to/WCCMP002.DAT \
-    ///   cargo test --release -p btrieve --lib -- --ignored --nocapture \
-    ///   v6_update_rewrites_the_whole_file_to_change_six_pages
+    /// WCCMP002=/path/to/WCCMP002.DAT \\
+    ///   cargo test --release -p btrieve --lib -- --ignored --nocapture \\
+    ///   v6_update_writes_only_the_pages_it_changed
     /// ```
     #[test]
     #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
-    fn v6_update_rewrites_the_whole_file_to_change_six_pages() {
+    fn v6_update_writes_only_the_pages_it_changed() {
         let Ok(source) = std::env::var("WCCMP002") else {
             eprintln!("set WCCMP002=/path/to/WCCMP002.DAT to run this");
             return;
@@ -5912,11 +6304,26 @@ mod tests {
             wrote / 1_048_576,
             before.len() / 1_048_576
         );
-        eprintln!(
-            "{} of {common} pages differ: {differing:?}",
+        eprintln!("{} of {common} pages differ: {differing:?}", differing.len());
+        eprintln!("wrote {wrote} bytes; allocation map walked {map_reads} times");
+
+        assert!(
+            differing.len() * page < before.len() / 100,
+            "an update changed {} pages of {common} -- more than 1% of the \\
+             file, so writing only the changed pages has stopped being the \\
+             thing worth doing",
             differing.len()
         );
-        eprintln!("allocation map walked {map_reads} times");
+
+        // The bound that matters: what reaches the disk is the pages that
+        // changed, plus the two-byte generation word that flips each shadow
+        // pair. Anything materially above that is the whole-file write coming
+        // back.
+        let expected = differing.len() * page;
+        assert!(
+            (wrote as usize) <= expected + page,
+            "wrote {wrote} bytes to change {expected}"
+        );
 
         // Walking the allocation table is O(the file), and `v6_reindex` used
         // to do it once per index node. Nothing about the resulting file
@@ -5925,24 +6332,6 @@ mod tests {
         assert!(
             map_reads < 20,
             "the allocation table was walked {map_reads} times for one update"
-        );
-
-        // The measurement this test exists to hold: a single-record update
-        // changes a handful of pages. If a paged writer ever lands, `wrote`
-        // drops to roughly `differing.len() * page` and this assertion is the
-        // one that says so.
-        assert!(
-            differing.len() * page < before.len() / 100,
-            "an update changed {} pages of {common} -- more than 1% of the file, \
-             so the premise that a paged write would help no longer holds",
-            differing.len()
-        );
-        assert!(
-            wrote as usize >= before.len(),
-            "the whole file is still being rewritten ({wrote} bytes for {} bytes \
-             of real change); if this now fails, the paged writer landed and this \
-             test should assert the new bound instead",
-            differing.len() * page
         );
     }
 
@@ -6002,64 +6391,114 @@ mod tests {
     }
 
 
-    /// A v6 write that fails partway leaves the original file whole.
+    /// A v6 write interrupted before its flip leaves every record readable.
     ///
-    /// Every v6 write replaces the entire file, and `std::fs::write` truncates
-    /// its target before refilling it. Killing `mbbs-server` inside that window
-    /// on `WCCMP002.DAT` left 7,168 pages under a control record still claiming
-    /// 13,572, and the next open refused the file outright. 55 MB is a wide
-    /// window and MajorMUD-NT rewrites that file on every update, so
-    /// [`Block::write_whole`] renames a fully-flushed temporary over the target
-    /// instead.
+    /// This is the property [`Block::write_changed_pages`] replaced the
+    /// whole-file rename with. The rename made the switch atomic by never
+    /// touching the original until the new file was complete; writing pages
+    /// in place has to get the same result out of the format's own shadow
+    /// paging, by putting every page down before anything makes it live.
     ///
-    /// A SIGKILL cannot be staged from a test, so the failure is staged where
-    /// it can be: a **directory** sitting on the temporary's own path makes
-    /// `File::create` fail, which stands in for any interruption before the
-    /// rename. What is asserted is the property that matters either way --
-    /// the original file is still there, still its original length, still
-    /// byte-for-byte what it was, and still readable.
+    /// Both boundaries before the flip are checked, because they hold for
+    /// different reasons: after phase 1 the new content is on the disk but
+    /// unreferenced, and after phase 2 the new control record and allocation
+    /// table are on the disk too, still carrying generations that lose to the
+    /// halves they will replace. Neither may be visible.
+    ///
+    /// A SIGKILL cannot be staged from a test, so [`STOP_AT`] stages the
+    /// interruption instead -- see [`Stop`].
     #[test]
-    fn a_failed_v6_write_leaves_the_original_file_untouched() {
-        let dir = crate::testing::scratch("v6-atomic-write");
+    fn a_v6_write_stopped_before_the_flip_leaves_every_record_readable() {
+        for stop in [Stop::AfterContent, Stop::AfterBodies] {
+            let dir = crate::testing::scratch(&format!("v6-stop-{stop:?}"));
+            let path = dir.join("IDXPROBE.DAT");
+            std::fs::copy(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/variable/IDXPROBE.DAT"),
+                &path,
+            )
+            .expect("the engine-built fixture copies into a scratch directory");
+
+            let mut block = block_from_file(path.clone(), "IDXPROBE.DAT");
+            let was: Vec<Vec<u8>> = {
+                let records = block.records().expect("records read");
+                (0..records.len())
+                    .map(|at| records.physical(at).expect("in range").bytes.to_vec())
+                    .collect()
+            };
+
+            let mut record = vec![0u8; usize::from(block.geometry.reclen)];
+            record[..4].copy_from_slice(&777u32.to_le_bytes());
+            record[4..8].copy_from_slice(&777u32.to_le_bytes());
+
+            STOP_AT.with(|at| at.set(Some(stop)));
+            let refused = block.insert(&record);
+            STOP_AT.with(|at| at.set(None));
+            assert!(refused.is_err(), "{stop:?}: the write could not have succeeded");
+
+            // Re-read from disk, not from the model: the model is what a
+            // crash would have thrown away.
+            let mut fresh = block_from_file(path, "IDXPROBE.DAT");
+            let now: Vec<Vec<u8>> = {
+                let records = fresh
+                    .records()
+                    .unwrap_or_else(|e| panic!("{stop:?}: the file still opens and reads: {e}"));
+                (0..records.len())
+                    .map(|at| records.physical(at).expect("in range").bytes.to_vec())
+                    .collect()
+            };
+            assert_eq!(now, was, "{stop:?}: the file no longer reads as it did");
+        }
+    }
+
+    /// The one window the design leaves open refuses loudly rather than
+    /// dropping a record quietly.
+    ///
+    /// A crash between the two flips leaves the new record count committed and
+    /// the allocation table still naming the old pages, so the header and the
+    /// pages disagree by one and `records::read` says so and stops. The file
+    /// needs a repair, which is the honest outcome of an interrupted write.
+    ///
+    /// The reverse order is what this test exists to prevent. With the table
+    /// flipped first the pages would hold the new record under a header still
+    /// carrying the old count, `records::walk_v6` stops after
+    /// `geometry.records` records, the count then matches, and one record --
+    /// whichever falls last in logical order -- is silently gone. A refusal
+    /// that names the problem beats a file that quietly reads short, so if
+    /// someone reorders those two loops, this fails.
+    #[test]
+    fn a_v6_write_stopped_between_the_two_flips_refuses_rather_than_losing_one() {
+        let dir = crate::testing::scratch("v6-stop-between-flips");
         let path = dir.join("IDXPROBE.DAT");
         std::fs::copy(
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/variable/IDXPROBE.DAT"),
             &path,
         )
         .expect("the engine-built fixture copies into a scratch directory");
-        let original = std::fs::read(&path).expect("reads");
 
         let mut block = block_from_file(path.clone(), "IDXPROBE.DAT");
-        let before = block.records().expect("records read").len();
-
-        // Occupy the temporary's path with a directory, which cannot be
-        // opened as a file.
-        let mut temp_name = path.file_name().expect("a file name").to_owned();
-        temp_name.push(format!(".btv-tmp-{}", std::process::id()));
-        let temp = path.with_file_name(temp_name);
-        std::fs::create_dir(&temp).expect("the temporary's path is taken");
+        let was = block.records().expect("records read").len();
 
         let mut record = vec![0u8; usize::from(block.geometry.reclen)];
-        record[..4].copy_from_slice(&777u32.to_le_bytes());
-        record[4..8].copy_from_slice(&777u32.to_le_bytes());
+        record[..4].copy_from_slice(&778u32.to_le_bytes());
+        record[4..8].copy_from_slice(&778u32.to_le_bytes());
+
+        STOP_AT.with(|at| at.set(Some(Stop::AfterFirstFlip)));
         let refused = block.insert(&record);
+        STOP_AT.with(|at| at.set(None));
         assert!(refused.is_err(), "the write could not have succeeded");
 
-        let after = std::fs::read(&path).expect("the original is still there");
+        let mut fresh = block_from_file(path, "IDXPROBE.DAT");
+        let why = fresh
+            .records()
+            .expect_err("the header and the pages disagree, so this must refuse")
+            .why;
         assert_eq!(
-            after.len(),
-            original.len(),
-            "the original was truncated by a write that never completed"
-        );
-        assert_eq!(after, original, "the original changed despite a failed write");
-
-        // And it still opens and reads, which a truncated file does not.
-        std::fs::remove_dir(&temp).expect("cleanup");
-        let mut reopened = block_from_file(path, "IDXPROBE.DAT");
-        assert_eq!(
-            reopened.records().expect("still readable").len(),
-            before,
-            "every record survived"
+            why,
+            format!(
+                "the header says {} records and walking the pages found {was}",
+                was + 1
+            ),
+            "the refusal did not name the count the interrupted write committed"
         );
     }
 
