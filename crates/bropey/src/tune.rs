@@ -39,14 +39,16 @@ pub(crate) const MIN_CHILDREN: usize = min_children(MAX_CHILDREN);
 /// bulk-built and spliced. Separate from `MAX_BYTES` because it answers a
 /// different question — API routing, not leaf capacity — and will want
 /// independent tuning.
-///
-/// Unused until a later task wires up the bulk-build insert path; the allow
-/// is scoped to this one constant so unrelated dead code still warns.
-#[allow(dead_code)]
 pub(crate) const BULK_THRESHOLD: usize = MAX_BYTES;
 
 const _: () = assert!(MIN_BYTES >= 1);
 const _: () = assert!(MIN_CHILDREN >= 2);
+// `Node::insert` only debug_asserts its `bytes.len() <= MAX_BYTES`
+// precondition, so in a release build a caller that violates it would
+// silently produce an oversized leaf instead of panicking. The direct-insert
+// route is only ever called with inputs bounded by BULK_THRESHOLD, so this
+// keeps that safety a build-time guarantee rather than a debug-only one.
+const _: () = assert!(BULK_THRESHOLD <= MAX_BYTES);
 // Cover both regimes explicitly: the const fns make this possible regardless
 // of which regime (`cfg(test)` or not) is active in this build.
 const _: () = assert!(2 * min_bytes(1024) <= 1024);

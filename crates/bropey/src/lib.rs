@@ -15,6 +15,7 @@ mod tune;
 pub use iter::Chunks;
 pub use source::ByteSource;
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::tree::Node;
@@ -62,7 +63,67 @@ impl Rope {
         if bytes.is_empty() {
             return;
         }
-        tree::insert_into(&mut self.root, offset, bytes);
+        if bytes.len() <= tune::BULK_THRESHOLD {
+            // One descent. Routing this through split/append would be several
+            // times slower on the common case.
+            tree::insert_into(&mut self.root, offset, bytes);
+        } else {
+            // Bulk-build in O(m) and splice, rather than shattering one leaf
+            // into thousands and cascading a split per leaf.
+            self.insert_rope(offset, &Rope::from_bytes(bytes));
+        }
+    }
+
+    /// Insert `other` at `offset`, sharing its structure rather than copying
+    /// its bytes. A multi-megabyte splice is pointer work.
+    ///
+    /// Panics if `offset > self.len()`.
+    pub fn insert_rope(&mut self, offset: usize, other: &Rope) {
+        let len = self.len();
+        assert!(offset <= len, "insert offset {offset} exceeds rope length {len}");
+        if other.is_empty() {
+            return;
+        }
+        let (left, right) = tree::split(&self.root, offset);
+        let joined = tree::append(left, Arc::clone(&other.root));
+        self.root = tree::append(joined, right);
+    }
+
+    /// Remove `range`.
+    ///
+    /// Panics if `range.start > range.end` or `range.end > self.len()`.
+    pub fn remove(&mut self, range: Range<usize>) {
+        let len = self.len();
+        assert!(
+            range.start <= range.end,
+            "invalid range {}..{}",
+            range.start,
+            range.end
+        );
+        assert!(range.end <= len, "range end {} exceeds rope length {len}", range.end);
+        if range.start == range.end {
+            return;
+        }
+        let (head, rest) = tree::split(&self.root, range.start);
+        let (_removed, tail) = tree::split(&rest, range.end - range.start);
+        self.root = tree::append(head, tail);
+    }
+
+    /// The sub-rope over `range`, sharing structure with this one.
+    ///
+    /// Panics if `range.start > range.end` or `range.end > self.len()`.
+    pub fn slice(&self, range: Range<usize>) -> Rope {
+        let len = self.len();
+        assert!(
+            range.start <= range.end,
+            "invalid range {}..{}",
+            range.start,
+            range.end
+        );
+        assert!(range.end <= len, "range end {} exceeds rope length {len}", range.end);
+        let (_head, rest) = tree::split(&self.root, range.start);
+        let (middle, _tail) = tree::split(&rest, range.end - range.start);
+        Rope { root: middle }
     }
 
     /// Append `other` to the end of this rope.
@@ -219,5 +280,108 @@ mod split_api_tests {
     fn split_off_past_the_end_panics() {
         let mut rope = Rope::from_bytes(b"abc");
         let _ = rope.split_off(4);
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+    use crate::tune::BULK_THRESHOLD;
+    use crate::ByteSource;
+
+    fn seq(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn remove_every_range_of_a_multi_level_rope() {
+        let bytes = seq(200);
+        for start in (0..=200).step_by(7) {
+            for end in (start..=200).step_by(11) {
+                let mut rope = Rope::from_bytes(&bytes);
+                rope.remove(start..end);
+                rope.check();
+                let mut expect = bytes.clone();
+                expect.drain(start..end);
+                assert_eq!(rope.to_vec(), expect, "differs removing {start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_single_byte_removals_keep_the_tree_legal() {
+        // The degeneration case: remove is split-then-append, so if small
+        // pieces were joined rather than absorbed this collapses into a tree
+        // of one-byte leaves and the invariant check fires.
+        let mut rope = Rope::from_bytes(&seq(300));
+        for _ in 0..250 {
+            let at = rope.len() / 2;
+            rope.remove(at..at + 1);
+            rope.check();
+        }
+        assert_eq!(rope.len(), 50);
+    }
+
+    #[test]
+    fn slice_every_range_and_leave_the_source_alone() {
+        let bytes = seq(200);
+        let rope = Rope::from_bytes(&bytes);
+        for start in (0..=200).step_by(13) {
+            for end in (start..=200).step_by(17) {
+                let piece = rope.slice(start..end);
+                piece.check();
+                assert_eq!(piece.to_vec(), &bytes[start..end], "differs slicing {start}..{end}");
+            }
+        }
+        assert_eq!(rope.to_vec(), bytes, "slicing must not mutate the source");
+    }
+
+    #[test]
+    fn insert_rope_splices_without_copying_bytes() {
+        let base = seq(200);
+        let inserted = seq(150);
+        for at in [0usize, 1, 99, 200] {
+            let mut rope = Rope::from_bytes(&base);
+            rope.insert_rope(at, &Rope::from_bytes(&inserted));
+            rope.check();
+            let mut expect = base.clone();
+            expect.splice(at..at, inserted.iter().copied());
+            assert_eq!(rope.to_vec(), expect, "differs splicing at {at}");
+        }
+    }
+
+    #[test]
+    fn a_large_insert_takes_the_bulk_route_and_agrees_with_the_direct_one() {
+        let base = seq(100);
+        let big = seq(BULK_THRESHOLD * 4);
+        assert!(big.len() > BULK_THRESHOLD, "must exceed the routing threshold");
+        let mut rope = Rope::from_bytes(&base);
+        rope.insert(50, &big);
+        rope.check();
+        let mut expect = base.clone();
+        expect.splice(50..50, big.iter().copied());
+        assert_eq!(rope.to_vec(), expect);
+    }
+
+    #[test]
+    fn an_empty_range_is_a_no_op() {
+        let mut rope = Rope::from_bytes(b"abc");
+        rope.remove(1..1);
+        assert_eq!(rope.to_vec(), b"abc");
+        assert_eq!(rope.slice(1..1).len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds rope length")]
+    fn remove_past_the_end_panics() {
+        let mut rope = Rope::from_bytes(b"abc");
+        rope.remove(1..4);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid range")]
+    fn a_backwards_range_panics() {
+        let mut rope = Rope::from_bytes(b"abc");
+        rope.remove(2..1);
     }
 }

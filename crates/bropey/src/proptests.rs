@@ -7,8 +7,16 @@
 
 use proptest::prelude::*;
 
-use crate::tune::MAX_BYTES;
+use crate::tune::{BULK_THRESHOLD, MAX_BYTES};
 use crate::{ByteSource, Rope};
+
+/// Well past `BULK_THRESHOLD` so `Insert` drives both routes of
+/// `Rope::insert`: at or below the threshold it descends directly, above it
+/// the bulk-build-and-splice path runs. Bounding this at `MAX_BYTES`, as
+/// Task 7 did before this routing existed, would give the bulk route zero
+/// coverage from this harness.
+const MAX_INSERT_LEN: usize = MAX_BYTES * 4;
+const _: () = assert!(MAX_INSERT_LEN > BULK_THRESHOLD);
 
 /// One operation applied to both the rope and the model.
 ///
@@ -21,22 +29,29 @@ enum Op {
     Insert { at: u16, bytes: Vec<u8> },
     Append { bytes: Vec<u8> },
     SplitOff { at: u16 },
+    Remove { at: u16, len: u16 },
+    Slice { at: u16, len: u16 },
+    InsertRope { at: u16, bytes: Vec<u8> },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         proptest::collection::vec(any::<u8>(), 0..80).prop_map(|bytes| Op::FromBytes { bytes }),
         Just(Op::Snapshot),
-        // Bounded by MAX_BYTES, not an arbitrary literal: the direct-insert
-        // path this exercises accepts at most MAX_BYTES per call (larger
-        // inputs route through the bulk path added in Task 10), and under
-        // cfg(test) MAX_BYTES shrinks to a value smaller than a fixed literal
-        // like 20 would respect.
-        (any::<u16>(), proptest::collection::vec(any::<u8>(), 0..=MAX_BYTES))
+        // Bounded by MAX_INSERT_LEN, not an arbitrary literal: it must clear
+        // BULK_THRESHOLD so both of Rope::insert's routes (direct descent at
+        // or below the threshold, bulk-build-and-splice above it) actually
+        // get driven by this harness, and under cfg(test) MAX_BYTES shrinks
+        // to a value smaller than a fixed literal like 20 would respect.
+        (any::<u16>(), proptest::collection::vec(any::<u8>(), 0..=MAX_INSERT_LEN))
             .prop_map(|(at, bytes)| Op::Insert { at, bytes }),
         proptest::collection::vec(any::<u8>(), 0..60)
             .prop_map(|bytes| Op::Append { bytes }),
         any::<u16>().prop_map(|at| Op::SplitOff { at }),
+        (any::<u16>(), any::<u16>()).prop_map(|(at, len)| Op::Remove { at, len }),
+        (any::<u16>(), any::<u16>()).prop_map(|(at, len)| Op::Slice { at, len }),
+        (any::<u16>(), proptest::collection::vec(any::<u8>(), 0..90))
+            .prop_map(|(at, bytes)| Op::InsertRope { at, bytes }),
     ]
 }
 
@@ -85,6 +100,24 @@ fn run(ops: Vec<Op>) {
                 let expected_tail = model.split_off(at);
                 tail.check();
                 assert_eq!(tail.to_vec(), expected_tail, "split tail diverged");
+            }
+            Op::Remove { at, len } => {
+                let start = clamp(*at, model.len());
+                let end = start + clamp(*len, model.len() - start);
+                rope.remove(start..end);
+                model.drain(start..end);
+            }
+            Op::Slice { at, len } => {
+                let start = clamp(*at, model.len());
+                let end = start + clamp(*len, model.len() - start);
+                let piece = rope.slice(start..end);
+                piece.check();
+                assert_eq!(piece.to_vec(), &model[start..end], "slice diverged");
+            }
+            Op::InsertRope { at, bytes } => {
+                let at = clamp(*at, model.len());
+                rope.insert_rope(at, &Rope::from_bytes(bytes));
+                model.splice(at..at, bytes.iter().copied());
             }
         }
 
