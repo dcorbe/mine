@@ -6,10 +6,12 @@
 //! and leaves every other handle untouched.
 
 mod iter;
+mod source;
 mod tree;
 mod tune;
 
 pub use iter::Chunks;
+pub use source::ByteSource;
 
 use std::sync::Arc;
 

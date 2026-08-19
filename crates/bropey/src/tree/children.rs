@@ -121,9 +121,6 @@ impl Children {
     ///
     /// Biases *right* at a child boundary: byte `n` of a child of size `n`
     /// belongs to the next child. Panics if `offset >= self.total()`.
-    // Consumed by `ByteSource::chunk_at` for `Rope` in Task 5; the attribute
-    // comes off then.
-    #[allow(dead_code)]
     pub(crate) fn locate_read(&self, offset: usize) -> (usize, usize) {
         let mut acc = 0;
         for (i, &size) in self.sizes.iter().enumerate() {
