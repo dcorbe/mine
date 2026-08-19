@@ -5,7 +5,7 @@
 //! nothing errors -- not at read time, not at write time, not at use time. So
 //! every rewrite ends by re-reading its own output and proving it did not.
 
-use crate::spec::{SpecError, SpecFile};
+use crate::spec::{OptionType, SpecError, SpecFile};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteError {
@@ -17,6 +17,9 @@ pub enum WriteError {
     UneditedMessageChanged { index: usize },
     /// An edit named an option that does not exist.
     NoSuchOption { at: usize },
+    /// The module `prf`s this text against a fixed argument list. Changing the
+    /// conversions makes it read the wrong stack slot.
+    SpecifiersChanged { was: Vec<Vec<u8>>, now: Vec<Vec<u8>> },
 }
 
 /// Splice new values into a file's bytes.
@@ -81,6 +84,54 @@ fn verify(before: &SpecFile, after: &[u8], edited: &[usize]) -> Result<(), Write
         if before.messages().get(n) != reparsed.messages().get(n) {
             return Err(WriteError::UneditedMessageChanged { index: n });
         }
+    }
+    Ok(())
+}
+
+/// Every printf conversion in `text`, in order.
+///
+/// `%%` is an escaped percent, not a conversion.
+#[must_use]
+pub fn specifiers(text: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if text.get(i + 1) == Some(&b'%') {
+            i += 2;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < text.len() && !text[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        if i < text.len() {
+            i += 1;
+            out.push(text[start..i].to_vec());
+        }
+    }
+    out
+}
+
+/// Can this value replace that one?
+///
+/// For `T`, an edit is refused if it drops or reorders a `printf` conversion,
+/// because that is checked here rather than at save time: a sysop who learns
+/// at save time has already lost the edit. No other type is checked -- a
+/// string option's value is not a format string.
+pub fn check_edit(kind: &OptionType, old: &[u8], new: &[u8]) -> Result<(), WriteError> {
+    if *kind != OptionType::Text {
+        return Ok(());
+    }
+
+    let was = specifiers(old);
+    let now = specifiers(new);
+    if was != now {
+        return Err(WriteError::SpecifiersChanged { was, now });
     }
     Ok(())
 }

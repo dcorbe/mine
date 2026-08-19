@@ -1,5 +1,5 @@
-use cnf::spec::SpecFile;
-use cnf::write::{escape, rewrite, WriteError};
+use cnf::spec::{OptionType, SpecFile};
+use cnf::write::{check_edit, escape, rewrite, specifiers, WriteError};
 
 const SAMPLE: &[u8] = b"LEVEL0 {}\r\n\
 \r\n\
@@ -104,4 +104,54 @@ fn an_edit_that_would_change_the_message_count_is_refused() {
         Err(WriteError::CountChanged { was: 2, now: 1 }),
         "a rewrite that merges two messages into one must be refused via the count check"
     );
+}
+
+#[test]
+fn specifiers_are_extracted_in_order_and_doubled_percent_is_not_one() {
+    assert_eq!(
+        specifiers(b"Hello %s, you have %d left. 100%% done."),
+        vec![b"%s".to_vec(), b"%d".to_vec()]
+    );
+    assert!(specifiers(b"no specifiers here").is_empty());
+}
+
+#[test]
+fn a_text_edit_that_drops_a_specifier_is_refused() {
+    let old = b"AFK v%s. Type %s ? for help.";
+    let new = b"AFK. Type %s ? for help.";
+    assert!(matches!(
+        check_edit(&OptionType::Text, old, new),
+        Err(WriteError::SpecifiersChanged { .. })
+    ));
+}
+
+#[test]
+fn a_text_edit_that_reorders_specifiers_is_refused() {
+    let old = b"%s has %d coins";
+    let new = b"%d coins belong to %s";
+    assert!(matches!(
+        check_edit(&OptionType::Text, old, new),
+        Err(WriteError::SpecifiersChanged { .. })
+    ));
+}
+
+#[test]
+fn a_text_edit_that_keeps_the_specifiers_is_allowed() {
+    let old = b"%s has %d coins";
+    let new = b"The mighty %s is carrying %d gold pieces";
+    assert!(check_edit(&OptionType::Text, old, new).is_ok());
+}
+
+#[test]
+fn a_brace_anywhere_is_accepted_because_the_writer_escapes_it() {
+    // Both of these were refused by an earlier draft. Both are representable.
+    let old = b"line one";
+    assert!(check_edit(&OptionType::Text, old, b"a } mid-line brace").is_ok());
+    assert!(check_edit(&OptionType::Text, old, b"line one\r\n} at a line start").is_ok());
+}
+
+#[test]
+fn specifier_checking_does_not_apply_to_scalar_types() {
+    // A string option's value is not a format string.
+    assert!(check_edit(&OptionType::Char, b"%s", b"x").is_ok());
 }
