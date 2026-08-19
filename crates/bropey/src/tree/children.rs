@@ -78,11 +78,16 @@ impl Children {
 
     /// Mutate child `i` and refresh its cached size.
     ///
-    /// This is the only way to mutate a child, and it is why two of the
-    /// crate's likeliest bugs cannot be written. Forgetting `Arc::make_mut`
-    /// would silently corrupt every other handle sharing the node; forgetting
-    /// the size writeback would desynchronise the monoid. Neither is
-    /// expressible through this API.
+    /// Fusing the mutation and the size writeback into one call keeps the
+    /// two writes together and makes the correct call the convenient one.
+    /// The two mistakes this rules out have different failure modes.
+    /// Omitting the `sizes[i]` writeback is a real silent bug: it
+    /// desynchronises the monoid with no panic at the point of error,
+    /// caught only later by `check_invariants`. Omitting `Arc::make_mut` is
+    /// not silently expressible: with zero `unsafe` and no interior
+    /// mutability, a shared `Arc<Node>` cannot be mutated in place at all —
+    /// the only alternative, `Arc::get_mut`, returns `Option` and forces a
+    /// loud panic on the aliasing case.
     pub(crate) fn with_child_mut<R>(&mut self, i: usize, f: impl FnOnce(&mut Node) -> R) -> R {
         let out = f(Arc::make_mut(&mut self.nodes[i]));
         self.sizes[i] = self.nodes[i].byte_len();
