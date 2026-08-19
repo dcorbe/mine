@@ -116,7 +116,11 @@ const GALETL_WG300: &str = include_str!("../data/galetl_wg300.tsv");
 /// its own binary's export table for the numbering.
 const WGSERVER_WG300: &str = include_str!("../data/wgserver_wg300.tsv");
 const WGSERVER_WG312: &str = include_str!("../data/wgserver_wg312.tsv");
-const GALGSBL_WG101: &str = include_str!("../data/galgsbl_wg101.tsv");
+
+// GALGSBL's tables live in `mbbs_machine::library` now, so that
+// `crates/dos-runtime` can reach them without depending on this crate. The
+// provenance that justified this table moved with it.
+use mbbs_machine::library::GALGSBL_WG101;
 
 /// `GALME.DLL`'s own name table, read out of the shipped WG 1.01 binary.
 ///
@@ -158,7 +162,7 @@ impl Exports {
         TABLE.get_or_init(|| Exports {
             by_dll: [
                 (MAJORBBS, parse(MAJORBBS_WG101)),
-                (GALGSBL, parse(GALGSBL_WG101)),
+                (GALGSBL, GALGSBL_WG101.names()),
                 (GALME, parse(GALME_WG101)),
                 (DOSCALLS, parse(DOSCALLS_PHARLAP31)),
                 (GALMSG, parse(GALMSG_WG101)),
@@ -414,6 +418,21 @@ mod tests {
     fn an_ordinal_the_host_does_not_export_has_no_name() {
         // The gaps are real: 1,210 entries over ordinals 1 to 1,323.
         assert_eq!(Exports::wg101().name(MAJORBBS, 9999), None);
+    }
+
+    /// Pinned before the registry refactor so the move cannot change an
+    /// answer. Every one of these is a symbol the host resolves today.
+    #[test]
+    fn the_registry_move_changes_no_answer() {
+        let wg101 = Exports::wg101();
+        assert_eq!(wg101.name(GALGSBL, 72), Some("bturno"));
+        assert_eq!(wg101.name(GALGSBL, 87), Some("btuica"));
+        assert_eq!(wg101.name(GALGSBL, 101), Some("btuicx"));
+        assert_eq!(wg101.name(GALGSBL, 102), None, "wg101 stops at 101");
+        assert_eq!(wg101.name(MAJORBBS, 474), Some("prf"));
+        assert_eq!(wg101.name(MAJORBBS, 1191).is_some(), true, "the board's highest demand");
+        assert_eq!(wg101.name("PHAPI", 1), None);
+        assert_eq!(wg101.len(GALGSBL), 101);
     }
 
     #[test]
