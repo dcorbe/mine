@@ -90,6 +90,43 @@ pub struct Arena {
     free: Vec<(u16, u16)>,
 }
 
+/// Which free block `AH=48h` takes, as `AH=58h`'s strategy word chooses it.
+///
+/// An enum rather than the raw strategy word threaded down into
+/// [`Arena::alloc`], because only three values name a policy and every other
+/// bit pattern has to collapse onto one of them somewhere. Doing that once,
+/// here, is what keeps `alloc` from carrying a fallback arm that silently
+/// means "first fit" for a word the caller believed meant something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// Lowest-addressed block that fits, carved from its bottom.
+    First,
+    /// Smallest block that fits, carved from its bottom.
+    Best,
+    /// Highest-addressed block that fits, carved from its *top*.
+    Last,
+}
+
+impl Fit {
+    /// The policy `AH=58h`'s strategy word names.
+    ///
+    /// Bits 6 and 7 select the upper-memory arena (UMB first, UMB only).
+    /// This arena models conventional memory and has no UMB chain to link,
+    /// so they are masked off rather than rejected: a program that asks for
+    /// high memory on a machine with none gets conventional memory, which is
+    /// what DOS itself answers when `AH=5803h` has never linked the chain.
+    /// Only the low two bits name the fit, and `3` is not a value DOS
+    /// defines -- it falls to `First`, the strategy a freshly booted DOS
+    /// starts in.
+    pub fn from_strategy(strategy: u16) -> Self {
+        match strategy & 0x3 {
+            1 => Fit::Best,
+            2 => Fit::Last,
+            _ => Fit::First,
+        }
+    }
+}
+
 impl Arena {
     /// `owner_seg` is the segment `AH=62h` reports as this program's PSP; its
     /// block starts out owning every paragraph up to `first_free`.
@@ -134,29 +171,60 @@ impl Arena {
         self.free = merged;
     }
 
-    /// `AH=48h` -- take the first free block with room for `want` paragraphs,
-    /// address order low to high (first-fit; see `AH=58h`'s doc comment for
-    /// why nothing here honours a program's chosen strategy beyond accepting
-    /// it). `Err` carries [`Arena::largest_free`], per `48h`'s own contract.
+    /// `AH=48h` -- take `want` paragraphs from whichever free block `fit`
+    /// names. `Err` carries [`Arena::largest_free`], per `48h`'s own
+    /// contract.
     ///
     /// `want` is floored to [`MIN_BLOCK`] before the search -- see that
     /// constant's doc comment for why a zero-paragraph request still has to
     /// consume real space.
-    pub fn alloc(&mut self, want: u16) -> Result<u16, u16> {
+    ///
+    /// Last fit carves the *top* of the block it picks; the other two carve
+    /// the bottom. That is not a cosmetic difference. A Borland C0 startup
+    /// sets last fit for exactly one call -- a one-paragraph probe -- purely
+    /// to be told the highest paragraph conventional memory holds, records
+    /// that as the ceiling of its far heap, frees the probe and restores
+    /// first fit. A last fit that answered with its block's *base* would
+    /// hand back the same segment first fit already gives, the program would
+    /// read its far heap as ending where its own image ends, and the first
+    /// `farmalloc` would fail with hundreds of kilobytes free
+    /// (`docs/2026-08-18-wccmmutl16-lastfit.md`).
+    pub fn alloc(&mut self, want: u16, fit: Fit) -> Result<u16, u16> {
         let want = want.max(MIN_BLOCK);
-        match self.free.iter().position(|&(_, size)| size >= want) {
-            Some(i) => {
-                let (seg, size) = self.free[i];
-                if size == want {
-                    self.free.remove(i);
-                } else {
-                    self.free[i] = (seg + want, size - want);
-                }
-                self.allocated.insert(seg, want);
-                Ok(seg)
-            }
-            None => Err(self.largest_free()),
+        // `free` is kept sorted by segment, so "first" is the first index
+        // that fits and "last" is the last one; `min_by_key` returns the
+        // earliest of equal minima, which makes best fit break size ties
+        // toward low memory the way a scan from the bottom of the MCB chain
+        // does.
+        let chosen = match fit {
+            Fit::First => self.free.iter().position(|&(_, size)| size >= want),
+            Fit::Best => self
+                .free
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(_, size))| size >= want)
+                .min_by_key(|&(_, &(_, size))| size)
+                .map(|(i, _)| i),
+            Fit::Last => self.free.iter().rposition(|&(_, size)| size >= want),
+        };
+        let Some(i) = chosen else {
+            return Err(self.largest_free());
+        };
+        let (fseg, fsize) = self.free[i];
+        let seg = match fit {
+            Fit::Last => fseg + fsize - want,
+            Fit::First | Fit::Best => fseg,
+        };
+        if fsize == want {
+            self.free.remove(i);
+        } else {
+            self.free[i] = match fit {
+                Fit::Last => (fseg, fsize - want),
+                Fit::First | Fit::Best => (fseg + want, fsize - want),
+            };
         }
+        self.allocated.insert(seg, want);
+        Ok(seg)
     }
 
     /// `AH=49h` -- free the block at `seg`. `Err` means nothing is allocated
@@ -263,10 +331,8 @@ pub struct DosState {
     /// `AH=48h`/`49h`/`4Ah` must fail cleanly against that rather than panic.
     pub mem: Option<Arena>,
     /// The value last set by `AH=58h` (AL=1), and reported back by AL=0.
-    /// Stored so the call round-trips truthfully; nothing here reads it,
-    /// because nothing here allocates any way other than first-fit -- see
-    /// the `AH=58h` arm in `dispatch` for why that is not the same claim as
-    /// "the strategy was honoured".
+    /// Read by the `AH=48h` arm through [`Fit::from_strategy`], so setting
+    /// it steers the next allocation rather than merely round-tripping.
     pub alloc_strategy: u16,
 }
 
@@ -718,8 +784,9 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
 
         // 48h -- allocate BX paragraphs, answered as a segment in AX.
         0x48 => {
+            let fit = Fit::from_strategy(dos.alloc_strategy);
             let result = match dos.mem.as_mut() {
-                Some(arena) => arena.alloc(regs.bx),
+                Some(arena) => arena.alloc(regs.bx, fit),
                 // No program means no arena at all: every request is over
                 // an empty pool, so the largest available is truthfully 0.
                 None => Err(0),
@@ -772,14 +839,14 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
         // 58h -- get (AL=0) or set (AL=1) the memory allocation strategy.
         //
         // Real DOS's strategy (first fit / best fit / last fit) picks which
-        // free block a `48h` prefers when more than one would fit. This
-        // arena has exactly one allocation policy -- `Arena::alloc`'s
-        // first-fit scan -- so a program that sets a strategy is answered
-        // truthfully on the round trip (AL=0 reports back whatever AL=1
-        // last stored) without that value ever steering `alloc`. That is a
-        // real gap, not a deliberate choice to honour first-fit specifically:
-        // nothing measured so far sets anything but the default, so there is
-        // no evidence yet that a second policy is worth building.
+        // free block a `48h` prefers when more than one would fit, and
+        // [`Fit::from_strategy`] is where the word stored here becomes that
+        // choice. It used to be stored and ignored, on the reasoning that
+        // nothing measured had set anything but the default; the 16-bit
+        // `WCCMMUTL.EXE` disproved that on its seventh DOS call, and the
+        // cost of ignoring it was not a slightly different address but a
+        // far heap of zero bytes and an `abort()` before `main`
+        // (`docs/2026-08-18-wccmmutl16-lastfit.md`).
         0x58 => {
             if regs.al() == 1 {
                 dos.alloc_strategy = regs.bx;
@@ -1342,6 +1409,150 @@ mod tests {
             0xa000 - 0x1010,
             "BX must be the exact largest block, not merely non-zero"
         );
+    }
+
+    /// The whole reason `AH=58h` had to stop being a no-op.
+    ///
+    /// A Borland C0 startup sets last fit, allocates one paragraph, and
+    /// treats `segment + 1` as the ceiling of its far heap. Answering that
+    /// probe with the arena's *base* -- which is what first fit does, and
+    /// what this host did before -- tells the program its far heap ends
+    /// where its own image ends. The assertion is the exact top paragraph,
+    /// not merely "high": a last fit that carved the bottom of the highest
+    /// block would still be the bug, and only the exact address rules it out.
+    #[test]
+    fn last_fit_answers_with_the_top_paragraph_of_conventional_memory() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x58, 0, 2, 1); // strategy = last fit
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+
+        call_ah(&mut g, 0x48, 0, 1, 0); // the one-paragraph probe
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(
+            g.regs().ax,
+            0xa000 - 1,
+            "last fit must carve the top of the highest free block, not its base"
+        );
+    }
+
+    /// The probe is freed immediately, and the far heap then grows into the
+    /// space it briefly held. A last fit that removed the whole block from
+    /// the free list, or that left the remainder recorded at the wrong
+    /// segment, would show up here as a shortfall rather than as a wrong
+    /// address.
+    #[test]
+    fn last_fit_leaves_the_space_below_it_free_and_gives_it_all_back() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x58, 0, 2, 1);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        call_ah(&mut g, 0x48, 0, 1, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        let probe = g.regs().ax;
+
+        // Everything below the probe is still one free block, so first fit
+        // hands out the arena's base while the probe is still held.
+        call_ah(&mut g, 0x58, 0, 0, 1); // back to first fit, as C0 does
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        call_ah(&mut g, 0x48, 0, 4, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert_eq!(g.regs().ax, 0x1010, "the space below the probe must stay usable");
+
+        call_ah(&mut g, 0x49, probe, 0, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry(), "freeing the probe must succeed at the segment 48h returned");
+
+        // With the probe gone the tail is contiguous to CONV_TOP again.
+        call_ah(&mut g, 0x48, 0, 0xffff, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(
+            g.regs().bx,
+            0xa000 - 0x1014,
+            "the freed probe must coalesce back into the tail, not leave a one-paragraph island"
+        );
+    }
+
+    /// Last fit must pick the highest block that fits, not merely the top of
+    /// whichever block a scan reaches first. With holes punched below it the
+    /// two are different answers, and a single-free-block arena cannot tell
+    /// them apart -- which is why this test exists alongside the C0 probe one.
+    #[test]
+    fn last_fit_picks_the_highest_fitting_block_not_the_first_one() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        // Carve and free a block low down, leaving a hole below the tail.
+        call_ah(&mut g, 0x48, 0, 8, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        let low = g.regs().ax;
+        call_ah(&mut g, 0x48, 0, 4, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        call_ah(&mut g, 0x49, low, 0, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+
+        call_ah(&mut g, 0x58, 0, 2, 1); // strategy = last fit
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        call_ah(&mut g, 0x48, 0, 4, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(
+            g.regs().ax,
+            0xa000 - 4,
+            "the 8-paragraph hole at {low:#06x} fits too, and last fit must skip past it"
+        );
+    }
+
+    /// Best fit is the third value the strategy word can hold, and it is not
+    /// first fit: the smallest hole that fits wins even when a lower,
+    /// roomier one is available.
+    #[test]
+    fn best_fit_takes_the_smallest_hole_that_fits() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        // Carve four blocks, then free the first and the third to leave a
+        // 20-paragraph hole low and an 8-paragraph hole above it.
+        let mut segs = Vec::new();
+        for want in [20u16, 4, 8, 4] {
+            call_ah(&mut g, 0x48, 0, want, 0);
+            assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+            segs.push(g.regs().ax);
+        }
+        for i in [0usize, 2] {
+            call_ah(&mut g, 0x49, segs[i], 0, 0);
+            assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+            assert!(!g.carry());
+        }
+
+        call_ah(&mut g, 0x58, 0, 1, 1); // strategy = best fit
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        call_ah(&mut g, 0x48, 0, 6, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(
+            g.regs().ax, segs[2],
+            "best fit must take the 8-paragraph hole, not the 20-paragraph one first fit would"
+        );
+    }
+
+    /// Bits 6 and 7 name the upper-memory arena, which this host does not
+    /// model; masking them off has to leave the fit intact rather than
+    /// falling through to first fit, or a program that asks for high memory
+    /// silently loses its last fit as well.
+    #[test]
+    fn the_upper_memory_bits_do_not_cost_a_program_its_fit() {
+        assert_eq!(Fit::from_strategy(0), Fit::First);
+        assert_eq!(Fit::from_strategy(1), Fit::Best);
+        assert_eq!(Fit::from_strategy(2), Fit::Last);
+        assert_eq!(Fit::from_strategy(0x42), Fit::Last, "UMB-first last fit is still last fit");
+        assert_eq!(Fit::from_strategy(0x82), Fit::Last, "UMB-only last fit is still last fit");
+        assert_eq!(Fit::from_strategy(3), Fit::First, "3 names no DOS strategy");
     }
 
     #[test]
