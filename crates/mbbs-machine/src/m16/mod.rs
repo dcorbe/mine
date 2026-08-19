@@ -101,6 +101,7 @@ mod asm;
 mod farptr;
 mod fault;
 mod ne;
+mod ne_emit;
 mod seg;
 mod segments;
 mod watchdog;
@@ -114,6 +115,7 @@ pub use ne::{
     EntryPoint, Import, ImportResolver, ImportSite, Module, NeError, NeImage, Relocation,
     SegmentEntry, Source, Symbol, Target,
 };
+pub use ne_emit::emit;
 use seg::Segment;
 pub use segments::Segments;
 use watchdog::Watched;
