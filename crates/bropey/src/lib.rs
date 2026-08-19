@@ -6,6 +6,8 @@
 //! and leaves every other handle untouched.
 
 mod iter;
+#[cfg(test)]
+mod proptests;
 mod source;
 mod tree;
 mod tune;
@@ -53,10 +55,7 @@ impl Rope {
 
     /// Assert every structural invariant. Test-only; call at operation
     /// boundaries.
-    // Consumed by the differential property harness in Task 6; the
-    // attribute comes off then.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn check(&self) {
         tree::check_invariants(&self.root);
     }
