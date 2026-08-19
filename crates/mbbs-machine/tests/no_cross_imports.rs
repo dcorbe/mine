@@ -178,6 +178,7 @@ fn the_shared_modules_name_neither_machine() {
         root.join("fault.rs"),
         root.join("ldt.rs"),
         root.join("module.rs"),
+        root.join("library.rs"),
     ];
 
     let leaks = offending_in_files(&shared, &["m16", "m32"]);

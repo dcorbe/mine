@@ -12,6 +12,7 @@ pub mod m16;
 pub mod m32;
 pub mod module;
 pub mod ptr;
+pub mod library;
 
 pub(crate) mod fault;
 pub(crate) mod ldt;
