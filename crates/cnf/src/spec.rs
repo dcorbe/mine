@@ -321,6 +321,7 @@ fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError>
         let tail_start = close + 1;
         let tail_line_end = find_line_end(source, tail_start);
         let tail = strip_cr(&source[tail_start..tail_line_end]);
+        let (hinge, tail) = crate::hinge::parse(tail);
         let kind = parse_tail(tail);
 
         if name != LANGUAGE {
@@ -329,7 +330,7 @@ fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError>
                     index,
                     name,
                     kind,
-                    hinge: None,
+                    hinge,
                     help,
                     value: Span { start: value_start, end: close },
                     whole: Span { start: name_start, end: tail_line_end },
