@@ -93,6 +93,18 @@ pub enum SpecError {
     /// The underlying message reader refused.
     Message(MsgError),
     /// An option's `{` has no matching `}`.
+    ///
+    /// `msg.rs` does not refuse this: its `State::Value` simply runs to
+    /// end of file with no closing `}`, the loop ends still inside
+    /// `Value`, and the pending message is never pushed -- it is silently
+    /// dropped, undercounting by one, and `MsgFile::parse` still returns
+    /// `Ok`. `scan` refuses instead. This is a deliberate divergence from
+    /// the authority, not an oversight: this layer exists to write a
+    /// `.MSG` back out, and opening a file whose message count we have
+    /// already silently changed would shift every `stgopt(N)` after the
+    /// dropped message on the next save. A refused open is recoverable --
+    /// the sysop sees an error and nothing is written. A save built on an
+    /// undercount is not.
     Unterminated { name: Vec<u8>, at: usize },
     /// `scan` and `MsgFile` disagree on how many messages the file holds. The
     /// two parsers have drifted, and every index below is suspect.
@@ -291,6 +303,10 @@ fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError>
         let mut previous = 0u8;
         let close = loop {
             let Some(&byte) = source.get(at) else {
+                // Refuse rather than mirror msg.rs's silent drop-and-undercount
+                // here -- see SpecError::Unterminated's doc for why. This is
+                // the one place scan's grammar is deliberately stricter than
+                // the authority it otherwise mirrors exactly.
                 return Err(SpecError::Unterminated { name, at: value_start });
             };
             match byte {
