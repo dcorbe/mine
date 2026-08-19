@@ -20,10 +20,20 @@ pub(crate) const MAX_BYTES: usize = 15;
 #[cfg(test)]
 pub(crate) const MAX_CHILDREN: usize = 5;
 
-/// Deliberately below half of `MAX_BYTES`. The slack stops an insert/remove
+/// Deliberately below half of `max`. The slack stops an insert/remove
 /// alternation at a chunk boundary from thrashing split and join.
-pub(crate) const MIN_BYTES: usize = (MAX_BYTES / 2) - (MAX_BYTES / 32);
-pub(crate) const MIN_CHILDREN: usize = MAX_CHILDREN.div_ceil(2) - 1;
+const fn min_bytes(max: usize) -> usize {
+    (max / 2) - (max / 32)
+}
+
+/// Deliberately below half of `max`, mirroring `min_bytes`'s slack for the
+/// same anti-thrash reason, one level up the tree.
+const fn min_children(max: usize) -> usize {
+    max.div_ceil(2) - 1
+}
+
+pub(crate) const MIN_BYTES: usize = min_bytes(MAX_BYTES);
+pub(crate) const MIN_CHILDREN: usize = min_children(MAX_CHILDREN);
 
 /// Inserts at or below this size take the direct descent path; larger ones are
 /// bulk-built and spliced. Separate from `MAX_BYTES` because it answers a
@@ -37,8 +47,12 @@ pub(crate) const BULK_THRESHOLD: usize = MAX_BYTES;
 
 const _: () = assert!(MIN_BYTES >= 1);
 const _: () = assert!(MIN_CHILDREN >= 2);
-const _: () = assert!(2 * MIN_BYTES <= MAX_BYTES);
-const _: () = assert!(2 * MIN_CHILDREN <= MAX_CHILDREN);
+// Cover both regimes explicitly: the const fns make this possible regardless
+// of which regime (`cfg(test)` or not) is active in this build.
+const _: () = assert!(2 * min_bytes(1024) <= 1024);
+const _: () = assert!(2 * min_children(16) <= 16);
+const _: () = assert!(2 * min_bytes(15) <= 15);
+const _: () = assert!(2 * min_children(5) <= 5);
 
 #[cfg(test)]
 mod tests {
@@ -56,17 +70,14 @@ mod tests {
     #[test]
     fn minimums_are_derived_not_transcribed() {
         // The formulas must reproduce ropey's measured constants at both
-        // regimes, so that moving the knob cannot desynchronise them.
-        assert_eq!((1024 / 2) - (1024 / 32), 480);
-        assert_eq!((15 / 2) - (15 / 32), 7);
-        assert_eq!(16usize.div_ceil(2) - 1, 7);
-        assert_eq!(5usize.div_ceil(2) - 1, 2);
-    }
-
-    #[test]
-    fn a_split_of_two_minimal_nodes_always_fits() {
-        // Guarantees a single split is enough whenever an insert overflows.
-        assert!(2 * MIN_BYTES <= MAX_BYTES);
-        assert!(2 * MIN_CHILDREN <= MAX_CHILDREN);
+        // regimes, so that moving the knob cannot desynchronise them. Pin
+        // both regimes through the const fns directly, then tie the live
+        // constants to the same formula so editing it fails this test.
+        assert_eq!(min_bytes(1024), 480);
+        assert_eq!(min_children(16), 7);
+        assert_eq!(min_bytes(15), 7);
+        assert_eq!(min_children(5), 2);
+        assert_eq!(MIN_BYTES, min_bytes(MAX_BYTES));
+        assert_eq!(MIN_CHILDREN, min_children(MAX_CHILDREN));
     }
 }
