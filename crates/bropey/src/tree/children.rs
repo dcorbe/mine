@@ -45,11 +45,11 @@ impl Children {
         self.sizes.iter().sum()
     }
 
-    // No task in the current plan (checked through Task 12) calls this
-    // outside `#[cfg(test)]` code (the invariant checker and this module's
-    // own tests). Kept per Task 2's declared interface; allowed until a real
-    // production consumer shows up or this is deliberately removed.
-    #[allow(dead_code)]
+    /// Byte length of the subtree at `i`.
+    ///
+    /// Only the invariant checker and this module's tests read this; the tree's
+    /// own operations index `self.sizes` directly.
+    #[cfg(test)]
     pub(crate) fn size(&self, i: usize) -> usize {
         self.sizes[i]
     }
