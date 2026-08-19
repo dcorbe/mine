@@ -1394,24 +1394,7 @@ const ABSOLUTES: &[(&str, &str, u16)] = &[(
 /// Case-insensitive because PE import directory names are conventionally
 /// upper-cased but nothing in the format requires it.
 fn canonical_dll(dll: &str) -> &str {
-    const ALIASES: &[(&str, &str)] = &[
-        ("WGSERVER.EXE", MAJORBBS),
-        ("cw3220mt.DLL", MAJORBBS),
-        ("GALGSBL.dll", GALGSBL),
-        // Same situation as `GALGSBL.dll` directly above, one library over,
-        // found 2026-08-15. Both 32-bit builds import `GALME.dll!_simpsnd`
-        // while this host registers GALME's routines under the bare
-        // `"GALME"` an NE segment is named -- so without this alias the
-        // lookup misses a routine that exists, exactly as it did for
-        // `hrtval` under GALGSBL. Nothing else is currently imported from
-        // GALME by a PE build, but `_oldsend` would have the same problem
-        // the moment one did.
-        ("GALME.dll", GALME),
-    ];
-    ALIASES
-        .iter()
-        .find(|(from, _)| dll.eq_ignore_ascii_case(from))
-        .map_or(dll, |(_, to)| to)
+    mbbs_machine::library::library(dll).map_or(dll, |lib| lib.name)
 }
 
 /// A C `int` argument, sign-extended from `A`'s own width to `i32`.
