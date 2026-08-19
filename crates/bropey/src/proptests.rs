@@ -47,8 +47,13 @@ fn run(ops: Vec<Op>) {
     let mut rope = Rope::new();
     let mut model: Vec<u8> = Vec::new();
     // Live clones taken along the way, each with the bytes it must still hold.
-    // A missing `Arc::make_mut` produces no panic and no invariant violation —
-    // it silently corrupts other handles — so nothing but this can catch it.
+    // This is not a live detector: the crate has zero `unsafe` and no
+    // interior mutability, so a shared `Arc<Node>` cannot be mutated in
+    // place at all — `Arc::make_mut` clones it, `Arc::get_mut` refuses it,
+    // and there is no third path. It is the type system, not this
+    // assertion, that rules out silent aliasing corruption today. The check
+    // is kept as a regression guard: it goes live only if the crate's
+    // zero-`unsafe` invariant is ever weakened.
     let mut snapshots: Vec<(Rope, Vec<u8>)> = Vec::new();
 
     for op in ops {

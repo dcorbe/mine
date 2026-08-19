@@ -98,9 +98,18 @@ mod insert_api_tests {
     }
 
     #[test]
-    fn inserting_nothing_is_a_no_op() {
+    fn inserting_nothing_takes_the_fast_path_without_touching_the_root() {
+        // Content equality alone can't discriminate this: `Vec::splice` with
+        // an empty iterator is already a no-op, so removing the fast path
+        // in `Rope::insert` would still leave `to_vec()` unchanged. Pin the
+        // fast path itself by holding a shared root (via clone) and
+        // checking identity: without the fast path, `insert_into` would
+        // `Arc::make_mut` a shared root, which clones it and changes the
+        // pointer even though the bytes end up equal.
         let mut rope = Rope::from_bytes(b"abc");
+        let shared = rope.clone();
         rope.insert(1, &[]);
+        assert!(Arc::ptr_eq(&rope.root, &shared.root), "empty insert touched the root");
         assert_eq!(rope.to_vec(), b"abc");
     }
 
