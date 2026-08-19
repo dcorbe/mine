@@ -337,7 +337,7 @@ mod composition_tests {
     }
 
     #[test]
-    fn insert_rope_splices_without_copying_bytes() {
+    fn insert_rope_splices_at_every_offset() {
         let base = seq(200);
         let inserted = seq(150);
         for at in [0usize, 1, 99, 200] {
@@ -348,6 +348,37 @@ mod composition_tests {
             expect.splice(at..at, inserted.iter().copied());
             assert_eq!(rope.to_vec(), expect, "differs splicing at {at}");
         }
+    }
+
+    #[test]
+    fn insert_rope_shares_structure_instead_of_copying() {
+        // Content equality alone can't discriminate "shared the subtree" from
+        // "copied its bytes into a fresh leaf" -- both produce the same
+        // to_vec(). Arc::strong_count on `other`'s root does discriminate, at
+        // an offset chosen so neither side of the self-split is small enough
+        // for `append` to absorb it byte-by-byte (that absorption is by
+        // design for remainders below MIN_BYTES -- see append.rs -- and it
+        // legitimately path-copies the just-cloned Arc away, so this check
+        // is offset-sensitive and only meaningful away from that boundary).
+        //
+        // `inserted` must clear MIN_BYTES for the same reason: append routes
+        // anything smaller through insert's byte copy by design.
+        let base = seq(200);
+        let inserted = seq(150);
+        let other = Rope::from_bytes(&inserted);
+        let before = Arc::strong_count(&other.root);
+
+        let mut rope = Rope::from_bytes(&base);
+        rope.insert_rope(100, &other);
+
+        assert!(
+            Arc::strong_count(&other.root) > before,
+            "insert_rope copied instead of sharing structure",
+        );
+        rope.check();
+        let mut expect = base.clone();
+        expect.splice(100..100, inserted.iter().copied());
+        assert_eq!(rope.to_vec(), expect);
     }
 
     #[test]
@@ -380,6 +411,7 @@ mod composition_tests {
 
     #[test]
     #[should_panic(expected = "invalid range")]
+    #[allow(clippy::reversed_empty_ranges)] // the inverted range is the input under test
     fn a_backwards_range_panics() {
         let mut rope = Rope::from_bytes(b"abc");
         rope.remove(2..1);

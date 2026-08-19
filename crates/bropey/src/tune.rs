@@ -56,18 +56,19 @@ const _: () = assert!(2 * min_children(16) <= 16);
 const _: () = assert!(2 * min_bytes(15) <= 15);
 const _: () = assert!(2 * min_children(5) <= 5);
 
+// If these grow, unit tests stop exercising the tree and start exercising a
+// single root leaf. That would make the whole suite undiscriminating without
+// failing anything. `#[cfg(test)]` is essential here: without it these
+// compile in a normal build too, where MAX_BYTES is 1024 and MAX_CHILDREN is
+// 16, and the crate would stop building.
+#[cfg(test)]
+const _: () = assert!(MAX_BYTES <= 16, "test MAX_BYTES must stay tiny");
+#[cfg(test)]
+const _: () = assert!(MAX_CHILDREN <= 5, "test MAX_CHILDREN must stay tiny");
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_regime_is_small_enough_to_build_a_real_tree() {
-        // If these grow, unit tests stop exercising the tree and start
-        // exercising a single root leaf. That would make the whole suite
-        // undiscriminating without failing anything.
-        assert!(MAX_BYTES <= 16, "test MAX_BYTES must stay tiny, got {MAX_BYTES}");
-        assert!(MAX_CHILDREN <= 5, "test MAX_CHILDREN must stay tiny, got {MAX_CHILDREN}");
-    }
 
     #[test]
     fn minimums_are_derived_not_transcribed() {

@@ -162,7 +162,8 @@ mod insert_tests {
         // full insert. One split must always be enough, and both halves must
         // clear MIN_BYTES.
         let mut node = Node::Leaf(vec![1u8; MAX_BYTES]);
-        let split = node.insert(0, &vec![2u8; MAX_BYTES]);
+        let bytes = vec![2u8; MAX_BYTES];
+        let split = node.insert(0, &bytes);
         let rhs = split.expect("must split");
         assert!(node.byte_len() <= MAX_BYTES, "left half is oversized");
         assert!(rhs.byte_len() <= MAX_BYTES, "right half is oversized");
