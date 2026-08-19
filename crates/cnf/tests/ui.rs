@@ -68,6 +68,12 @@ fn the_list_shows_only_visible_options() {
     e.edit(b"LITE".to_vec()).expect("valid");
     let mut buf = Cells::blank(80, 5);
     OptionList(&e).render(Rect { col: 0, row: 0, cols: 80, rows: 5 }, &mut buf);
+    // Positive first: a no-op render leaves this blank buffer with neither
+    // row drawn, so asserting the rows that SHOULD show fails immediately --
+    // it does not fall through to the absence check below to pass by doing
+    // nothing at all.
+    assert!(buf.contains("MODE"), "the still-visible rows must be drawn: got {:?}", buf.text());
+    assert!(buf.contains("ALWAYS"), "the still-visible rows must be drawn: got {:?}", buf.text());
     assert!(!buf.contains("EXTRA"), "hinged out, must not be drawn");
 }
 
@@ -84,6 +90,15 @@ fn the_help_pane_wraps_rather_than_truncating_mid_word() {
     let e = editor_with_long_help();
     let mut buf = Cells::blank(20, 3);
     HelpPane(&e).render(Rect { col: 0, row: 0, cols: 20, rows: 3 }, &mut buf);
+    // Positive: line 0 must actually hold the first word, not merely fail to
+    // end in 'c' -- an untouched blank buffer would satisfy that check too
+    // without ever having wrapped anything.
+    assert_eq!(
+        buf.line(0).trim_end(),
+        "AAAAAAAAAAAAAAAAAA",
+        "line 0 must hold the wrapped first word, got {:?}",
+        buf.line(0)
+    );
     assert!(!buf.line(0).ends_with('c'), "wrapped mid-word: {:?}", buf.line(0));
 }
 
@@ -135,6 +150,35 @@ fn the_text_editor_warns_when_an_edit_would_change_the_specifiers() {
         t.key(Key::Backspace);
     }
     assert!(t.warning().is_some(), "dropping %s must warn while typing");
+}
+
+#[test]
+fn the_text_editor_warning_clears_once_the_specifier_is_retyped() {
+    // A warning that latches on and never clears would be worse than no
+    // warning at all -- `warning()` has to be re-derived from the current
+    // value on every call, not remembered from an earlier keystroke.
+    let mut t = TextEditor::new(b"hello %s".to_vec());
+    t.key(Key::End);
+    t.key(Key::Backspace);
+    t.key(Key::Backspace);
+    assert!(t.warning().is_some(), "dropping %s must warn");
+    t.key(Key::Char(b'%'));
+    t.key(Key::Char(b's'));
+    assert!(t.warning().is_none(), "retyping %s must clear the warning, got {:?}", t.warning());
+}
+
+#[test]
+fn a_pending_edit_reaches_the_rendered_list_row() {
+    // `FieldEditor` covers editing and `option_at` covers effective-value
+    // semantics at the model level, but neither proves a pending edit
+    // actually reaches what a sysop looks at: the rendered row.
+    let mut e = editor_with_three();
+    e.select(2); // ALWAYS, on-disk value "2"
+    e.edit(b"7".to_vec()).expect("7 is in range");
+    let mut buf = Cells::blank(80, 5);
+    OptionList(&e).render(Rect { col: 0, row: 0, cols: 80, rows: 5 }, &mut buf);
+    assert!(buf.line(2).contains("7"), "the pending edit must reach the row: got {:?}", buf.line(2));
+    assert!(!buf.line(2).contains('2'), "not the stale on-disk value: got {:?}", buf.line(2));
 }
 
 #[test]
