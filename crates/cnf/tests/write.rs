@@ -83,26 +83,51 @@ fn escaping_is_the_inverse_of_the_readers_decoding() {
 }
 
 #[test]
-fn an_edit_that_would_change_the_message_count_is_refused() {
+fn duplicate_edit_indices_are_refused() {
     // Two edits at the SAME option index -- not something a well-behaved
-    // caller does, but `rewrite`'s type signature does not forbid it, and
-    // `verify` exists to catch a rewrite that "goes wrong some other way"
-    // rather than just the escaping cases the tests above invent. The second
-    // splice reuses the first edit's ORIGINAL (now-stale) span coordinates
-    // against an already-mutated buffer, so it deletes bytes it should not:
-    // the first option's own closing brace, and everything up to the next
-    // unescaped `}` in the file -- which happens to be the SECOND option's.
-    // The result still parses (both braces it needed are still balanced
-    // elsewhere), but the two messages the file used to hold have become
-    // one. This is refused, not silently written.
-    let src = b"AAAA {0123456789} S 5 p\r\nBBBB {Z} S 1 q\r\n";
+    // caller does, but a first draft of `rewrite`'s type signature did not
+    // forbid it. Reviewer-found shape: the first edit's escaped value is
+    // LONGER than the option's original span, so the second edit's stale
+    // (pre-splice) coordinates land entirely INSIDE what the first edit just
+    // inserted. No brace crosses a boundary, the message count does not
+    // move, and the corrupted index is "touched" -- so a `verify` that only
+    // checked count and untouched messages would return `Ok` with an option
+    // holding neither of the two requested values. There is no well-defined
+    // "the" requested value for a duplicate index, so `rewrite` refuses it
+    // up front, before any splicing happens at all.
+    let src = b"OPT {01} S 2 p\r\n";
     let f = SpecFile::parse("T.MSG", src).expect("parses");
-    assert_eq!(f.messages().len(), 2, "fixture sanity: two messages before the rewrite");
-    let out = rewrite(&f, &[(0, b"Q".to_vec()), (0, Vec::new())]);
+    let out = rewrite(&f, &[(0, b"ABCDEFGHIJ".to_vec()), (0, b"Z".to_vec())]);
     assert_eq!(
         out,
-        Err(WriteError::CountChanged { was: 2, now: 1 }),
-        "a rewrite that merges two messages into one must be refused via the count check"
+        Err(WriteError::DuplicateEdit { at: 0 }),
+        "two edits naming the same option index must be refused, not silently blended"
+    );
+}
+
+#[test]
+fn an_edit_containing_a_raw_cr_comes_back_without_it() {
+    // Organic evidence for EditedMessageWrong: no mutation and no duplicate
+    // index needed, just a value a real caller could plausibly submit. A
+    // literal `\r` is not one of the two bytes `escape` treats specially --
+    // it isn't supposed to be, since `msg.rs`'s decoder drops every `\r`
+    // inside a value unconditionally, by the format's own rules, not by any
+    // bug here. So a value containing `\r\n` (as a naive caller relaying a
+    // CRLF text box would) is spliced in unchanged by `escape`, and comes
+    // back out of a reparse with the `\r` gone -- a real, reachable case
+    // where an edited message does not equal what was asked for, entirely
+    // apart from anything `escape` or `verify` got wrong.
+    let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
+    let wanted = b"line1\r\nline2".to_vec();
+    let out = rewrite(&f, &[(1, wanted.clone())]);
+    assert_eq!(
+        out,
+        Err(WriteError::EditedMessageWrong {
+            index: 2,
+            wanted,
+            got: b"line1\nline2".to_vec(),
+        }),
+        "a raw CR the format silently drops must be caught, not written and forgotten"
     );
 }
 
