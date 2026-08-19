@@ -157,6 +157,23 @@ impl Exports {
     fn len(&self, dll: &str) -> usize {
         self.by_dll.get(dll).map_or(0, HashMap::len)
     }
+
+    /// The tables one profile offers, as an `Exports`.
+    ///
+    /// Built rather than `&'static` because a profile is chosen per run from
+    /// the modules' own demand. A library the profile has no table for is
+    /// simply absent, so its ordinals report as bare numbers -- never
+    /// borrowed from another generation.
+    #[must_use]
+    pub fn for_profile(profile: &'static mbbs_machine::library::Profile) -> Self {
+        Exports {
+            by_dll: profile
+                .tables
+                .iter()
+                .map(|t| (t.library, t.names()))
+                .collect(),
+        }
+    }
 }
 
 pub use mbbs_machine::library::c_name;

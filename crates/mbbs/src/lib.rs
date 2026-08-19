@@ -695,6 +695,16 @@ pub enum LoadError {
     /// Refused rather than silently written as if it were data or a thunk --
     /// both would compile and both would be wrong.
     Absolute { module: String, symbol: String },
+
+    /// Two or more generations are admissible and disagree about a symbol the
+    /// modules actually import. Refused rather than picked: a bare ordinal is
+    /// reported, a wrong name is believed.
+    AmbiguousProfile(Vec<mbbs_machine::library::Discriminator>),
+    /// No generation covers everything the modules demand.
+    NoProfile {
+        excluded: Vec<(&'static str, Vec<(&'static str, Vec<u16>)>)>,
+        unevidenced: Vec<&'static str>,
+    },
 }
 
 impl std::fmt::Display for LoadError {
@@ -714,6 +724,27 @@ impl std::fmt::Display for LoadError {
                  cannot bind (a PE fixup writes a whole address-sized IAT slot, never an \
                  instruction's immediate field)"
             ),
+            Self::AmbiguousProfile(discriminating) => {
+                writeln!(f, "more than one host generation fits, and they disagree:")?;
+                for d in discriminating {
+                    let names: Vec<String> =
+                        d.names.iter().map(|(p, n)| format!("{p} calls it {n}")).collect();
+                    writeln!(f, "  {}.{} -- {}", d.library, d.ordinal, names.join(", "))?;
+                }
+                write!(f, "refusing rather than guessing which one this module was built against")
+            }
+            Self::NoProfile { excluded, unevidenced } => {
+                writeln!(f, "no host generation covers what these modules import:")?;
+                for (profile, uncovered) in excluded {
+                    for (library, ordinals) in uncovered {
+                        writeln!(f, "  {profile} has no {library} ordinal {ordinals:?}")?;
+                    }
+                }
+                if !unevidenced.is_empty() {
+                    writeln!(f, "  no table at all for: {}", unevidenced.join(", "))?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -866,7 +897,27 @@ impl Default for Display {
 }
 
 pub struct Host<A: Abi> {
-    exports: &'static Exports,
+    exports: Exports,
+
+    /// Every ordinal every loaded module has imported so far, across every
+    /// [`Host::load`] call in this life -- accumulated, never rebuilt. A
+    /// later module can narrow the admissible set of profiles, but must never
+    /// be able to change what an ordinal an earlier module already resolved
+    /// was taken to mean. See [`mbbs_machine::library::detect`].
+    demand: mbbs_machine::library::Demand,
+
+    /// The set of profile names `detect` reported as agreeing on everything
+    /// demanded so far, the last time it ran -- empty until the first
+    /// [`Host::load`]. Reported rather than silently swallowed, so the host
+    /// never claims to have identified the generation when it has only
+    /// picked the anchor among several indistinguishable candidates.
+    indistinguishable: Vec<&'static str>,
+
+    /// The profile `detect` settled on, kept alongside the [`Exports`] derived
+    /// from it because a report has to name the generation, not just resolve
+    /// through it. Starts at the anchor for the same reason `exports` does.
+    profile: &'static mbbs_machine::library::Profile,
+
     globals: Globals<A>,
 
     /// Where the module's own files are: its `.MDF`, its `.MSG` files, and
@@ -1654,7 +1705,20 @@ impl<A: Abi> Host<A> {
         })?);
 
         let mut host = Self {
-            exports: Exports::wg101(),
+            // The anchor, not a hardcoded answer: before any module has been
+            // loaded there is no demand to detect against, and this is
+            // exactly what `detect` on an empty `Demand` would report --
+            // every profile agrees vacuously, so the anchor is chosen. The
+            // first `Host::load` call replaces this with a real, evidenced
+            // answer.
+            exports: Exports::for_profile(
+                mbbs_machine::library::profile(mbbs_machine::library::ANCHOR)
+                    .expect("the anchor names a real profile"),
+            ),
+            demand: mbbs_machine::library::Demand::new(),
+            indistinguishable: Vec::new(),
+            profile: mbbs_machine::library::profile(mbbs_machine::library::ANCHOR)
+                .expect("the anchor names a real profile"),
             globals,
             root: root.into(),
             spr: A::ptr_offset(base, 0),
@@ -2704,7 +2768,7 @@ impl<A: Abi> Host<A> {
     /// The C name of an imported symbol, or something that identifies it when
     /// the host has no name for it.
     fn symbol_name(&self, from: &str, symbol: &Symbol) -> String {
-        symbol_name(self.exports, from, symbol)
+        symbol_name(&self.exports, from, symbol)
     }
 
     /// Which loaded module `index` -- a thunk index off a live [`Exit::Call`]
@@ -2827,6 +2891,34 @@ impl<A: Abi> Host<A> {
     /// If `file` is not a well-formed module for `A`, or the module
     /// addresses a global this host cannot honestly provide -- see
     /// [`LoadError`].
+    /// Which generation was chosen and how each library it names is served.
+    ///
+    /// The report is part of the feature rather than decoration: a board that
+    /// silently switched a library to vendor code would be indistinguishable
+    /// from one that did not, right up until it behaved differently. Before
+    /// the first [`Host::load`] it reports the anchor against an empty demand,
+    /// which is the truth -- nothing has been asked for yet.
+    #[must_use]
+    pub fn provision_report(&self) -> Vec<String> {
+        // Nothing is served from an authentic binary yet. Selecting one is
+        // designed (`Provision::Authentic`, `Eligibility`), but *executing*
+        // vendor code needs plumbing this host does not have -- the UART
+        // bridging and channel-state ownership that GALGSBL's real code
+        // implies. This predicate is the seam that changes when it does.
+        let present = |_: &str| false;
+        let mut out = vec![format!("profile: {}", self.profile.name)];
+        if !self.indistinguishable.is_empty() {
+            out.push(format!(
+                "  indistinguishable from {} -- the modules loaded so far cannot tell them apart",
+                self.indistinguishable.join(", ")
+            ));
+        }
+        for row in mbbs_machine::library::provision(&self.demand, self.profile, &present) {
+            out.push(format!("  {}", row.render()));
+        }
+        out
+    }
+
     pub fn load(&mut self, cpu: &mut A::Cpu, file: &[u8]) -> Result<A::Module, LoadError> {
         let image = NeImage::parse(file).ok();
         let reach = image
@@ -2845,8 +2937,39 @@ impl<A: Abi> Host<A> {
         let precheck: HashSet<(String, Symbol)> =
             image.as_ref().map(imported_symbols).unwrap_or_default();
 
+        // The modules' own imports are the only evidence always present -- a
+        // real board directory holds no vendor host binaries at all, so
+        // fingerprinting one is not an option. See the design's "Detection".
+        //
+        // Accumulated on `self`, NOT rebuilt per load: detection is over the
+        // union of every module loaded so far. Loading a second module can
+        // narrow the admissible set, and must never be able to change what an
+        // ordinal an earlier module already resolved was taken to mean.
+        for (from, symbol) in &precheck {
+            if let Symbol::Ordinal(n) = symbol {
+                self.demand.add(from, *n);
+            }
+        }
+        match mbbs_machine::library::detect(&self.demand) {
+            mbbs_machine::library::Outcome::Unique(p) => {
+                self.profile = p;
+                self.exports = Exports::for_profile(p);
+            }
+            mbbs_machine::library::Outcome::Unobservable { chosen, agreeing } => {
+                self.indistinguishable = agreeing;
+                self.profile = chosen;
+                self.exports = Exports::for_profile(chosen);
+            }
+            mbbs_machine::library::Outcome::Ambiguous { discriminating } => {
+                return Err(LoadError::AmbiguousProfile(discriminating));
+            }
+            mbbs_machine::library::Outcome::NoneAdmissible { excluded, unevidenced } => {
+                return Err(LoadError::NoProfile { excluded, unevidenced });
+            }
+        }
+
         let resolver = Resolver {
-            exports: self.exports,
+            exports: &self.exports,
             globals: &self.globals,
             loaded: &self.loaded_modules,
             reach,
@@ -4894,7 +5017,7 @@ fn symbol_name(exports: &Exports, from: &str, symbol: &Symbol) -> String {
 /// one arm (`reach`) that is NE-specific mechanism reused generically rather
 /// than NE-specific *policy*.
 struct Resolver<'a, A: Abi> {
-    exports: &'static Exports,
+    exports: &'a Exports,
     globals: &'a Globals<A>,
 
     /// Every module [`Host::load`] has already loaded in this life, by its
