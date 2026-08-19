@@ -73,7 +73,11 @@ impl Editor {
     /// needs to react to a `MODE` edit the sysop has typed but not yet
     /// saved, not just what is on disk.
     fn value_of(&self, name: &[u8]) -> Option<Vec<u8>> {
-        let at = (0..self.set.len()).find(|&n| self.set.at(n).1.name == name)?;
+        // `OptionSet::index_of` is the one first-match-wins walk across
+        // files; this used to re-implement it inline, agreeing with
+        // `OptionSet::value_of`'s own walk only because both happened to
+        // visit `files` then `options()` in the same order.
+        let at = self.set.index_of(name)?;
         self.pending.get(&at).cloned().or_else(|| self.set.value_of(name))
     }
 

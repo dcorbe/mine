@@ -134,6 +134,19 @@ impl OptionSet {
         panic!("option index {n} out of range for a set of {} options", self.len());
     }
 
+    /// The flat index of the first option in the set named `name`, in file
+    /// order. `None` if no file in the set declares it.
+    ///
+    /// The one first-match-wins walk across `files` -- [`Self::value_of`]
+    /// and [`crate::model::Editor::value_of`] both key off this rather than
+    /// each re-implementing the same walk, which used to agree only by
+    /// coincidence (both happened to walk `files` then `options()` in the
+    /// same order, with nothing enforcing that they stayed in step).
+    #[must_use]
+    pub fn index_of(&self, name: &[u8]) -> Option<usize> {
+        (0..self.len()).find(|&n| self.at(n).1.name == name)
+    }
+
     /// The current value of the option named `name`, wherever in the set it
     /// lives. `None` if no file in the set declares it.
     ///
@@ -141,14 +154,9 @@ impl OptionSet {
     /// name, not by file, so evaluating it needs to search the whole set.
     #[must_use]
     pub fn value_of(&self, name: &[u8]) -> Option<Vec<u8>> {
-        for file in &self.files {
-            for opt in file.options() {
-                if opt.name == name {
-                    return file.messages().get(opt.index).map(<[u8]>::to_vec);
-                }
-            }
-        }
-        None
+        let at = self.index_of(name)?;
+        let (file_index, opt) = self.at(at);
+        self.files[file_index].messages().get(opt.index).map(<[u8]>::to_vec)
     }
 }
 

@@ -352,6 +352,41 @@ fn plan_save_attributes_a_flat_index_across_a_file_boundary() {
 }
 
 #[test]
+fn a_hinge_in_one_file_can_react_to_an_option_in_a_sibling_file() {
+    // A `FILE0n` sibling exists for exactly one reason (`set.rs`'s own
+    // module doc): so a hinge in one file can react to an option's value in
+    // another. Nothing exercised that cross-file path before this --
+    // `hinge.rs`'s own tests feed `visible` synthetic name/value pairs
+    // directly, never through a real `OptionSet`, and `model.rs`'s hinge
+    // tests are all single-file. This is the first test to go through
+    // `Editor::value_of` -> `OptionSet::index_of` across a real file
+    // boundary, including a *pending* (not yet saved) edit to the option
+    // the hinge depends on -- the case `Editor::value_of`'s own doc says a
+    // hinge must see.
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("cnf_cross_file_hinge_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let a_path = dir.join("A.MSG");
+    let b_path = dir.join("B.MSG");
+    std::fs::write(&a_path, b"HINGED {A} (BOPT=YES) E A,B\r\n").expect("write A.MSG");
+    std::fs::write(&b_path, b"BOPT {YES} E YES,NO\r\n").expect("write B.MSG");
+
+    let set = OptionSet::open(&[a_path, b_path]).expect("open");
+    let mut editor = Editor::new(set);
+    assert_eq!(editor.visible(), &[0, 1], "BOPT (index 1, in B.MSG) starts YES, so HINGED (index 0, in A.MSG) starts visible");
+
+    editor.select(1); // BOPT, in B.MSG
+    editor.edit(b"NO".to_vec()).expect("NO is a listed choice");
+    assert_eq!(
+        editor.visible(),
+        &[1],
+        "HINGED in A.MSG must hide once BOPT in B.MSG -- still only a pending edit, not yet saved -- reads NO"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn attempt_save_shows_the_saved_value_not_the_value_from_before_the_save() {
     // Batch G review, Critical: `attempt_save` used to rebuild `editor`
     // from the `OptionSet` it read BEFORE writing the files -- the same
