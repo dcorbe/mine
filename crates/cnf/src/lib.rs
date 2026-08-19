@@ -1,0 +1,3 @@
+//! An editor for the sysop-configurable options in a `.MSG` file.
+
+pub mod spec;
