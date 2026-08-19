@@ -186,6 +186,92 @@ pub const GALGSBL_TABLES: &[&OrdinalTable] = &[
 
 pub const MAJORBBS_TABLES: &[&OrdinalTable] = &[&MAJORBBS_MBBS625];
 
+/// How a library's symbols are named.
+///
+/// This describes whether the library *has* an ordinal space, not how a given
+/// module chose to bind to it. GALGSBL has one, and is reached by name from a
+/// 32-bit Worldgroup module and by ordinal from a 16-bit one. A by-name import
+/// simply never consults a table.
+pub enum Naming {
+    /// The library has an ordinal space, and these tables number it.
+    Ordinals(&'static [&'static OrdinalTable]),
+    /// The library has no ordinal space at all. `PHAPI`: every entry in
+    /// `PHAPI.LIB` is a by-name IMPDEF record and the shipped `PHAPI.DLL`
+    /// exports nothing, so a linker had no ordinal to use.
+    NamesOnly,
+    /// Not reached by symbol at all. Btrieve's DOS edge is an interrupt.
+    Interrupt {
+        vector: u8,
+        /// Where the trap stub must sit inside its segment, when a guest
+        /// probes for it. Btrieve's presence check demands the `int 7Bh`
+        /// handler's offset be `0x33`, which is the real TSR's signature.
+        stub_offset: Option<u16>,
+    },
+}
+
+/// Whether an authentic binary could ever serve this library here.
+pub enum Eligibility {
+    /// A plain NE or PE image this host can load.
+    Loadable,
+    /// Present as a file but not runnable here, and why.
+    NotLoadable(&'static str),
+}
+
+/// One external library a guest can ask for.
+pub struct Library {
+    /// The canonical name every dispatcher keys on.
+    pub name: &'static str,
+    /// Other spellings that mean this library, matched case-insensitively.
+    pub aliases: &'static [&'static str],
+    pub naming: Naming,
+    pub authentic: Eligibility,
+}
+
+pub const PHAPI: &str = "PHAPI";
+pub const DOSCALLS: &str = "DOSCALLS";
+
+pub const LIBRARIES: &[Library] = &[
+    Library {
+        name: MAJORBBS,
+        // `WGSERVER.EXE` is the 32-bit host's own exports and `cw3220mt.DLL`
+        // is the Borland C runtime. They are aliased here because that is
+        // where the host registers their routines today; splitting them into
+        // libraries of their own is a later change with its own measurement.
+        aliases: &["WGSERVER.EXE", "cw3220mt.DLL"],
+        naming: Naming::Ordinals(MAJORBBS_TABLES),
+        authentic: Eligibility::NotLoadable(
+            "MAJORBBS.EXE is NE plus a Phar Lap 286 extender; neither host can run it",
+        ),
+    },
+    Library {
+        name: GALGSBL,
+        aliases: &["GALGSBL.dll"],
+        naming: Naming::Ordinals(GALGSBL_TABLES),
+        authentic: Eligibility::Loadable,
+    },
+    Library {
+        name: PHAPI,
+        aliases: &[],
+        naming: Naming::NamesOnly,
+        authentic: Eligibility::NotLoadable("the shipped PHAPI.DLL exports nothing"),
+    },
+    Library {
+        name: DOSCALLS,
+        aliases: &[],
+        // Keyed to the extender release, not the host release.
+        naming: Naming::Ordinals(&[]),
+        authentic: Eligibility::NotLoadable("provided by the extender bound into MAJORBBS.EXE"),
+    },
+];
+
+/// The library a spelling names, canonical or aliased.
+pub fn library(spelling: &str) -> Option<&'static Library> {
+    LIBRARIES.iter().find(|lib| {
+        lib.name.eq_ignore_ascii_case(spelling)
+            || lib.aliases.iter().any(|a| a.eq_ignore_ascii_case(spelling))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +310,51 @@ mod tests {
         assert_eq!(names.get(&1).map(AsRef::as_ref), Some("btubse"));
         assert_eq!(names.get(&72).map(AsRef::as_ref), Some("bturno"));
         assert_eq!(names.get(&3), None, "an absent ordinal is None, never invented");
+    }
+
+    /// `canonical_dll` in `crates/mbbs` folds `cw3220mt.DLL` and
+    /// `WGSERVER.EXE` onto `MAJORBBS`, so the Borland C runtime, the 32-bit
+    /// host's exports and the game API share one namespace. Aliases here keep
+    /// the identity while still resolving.
+    #[test]
+    fn an_alias_finds_its_library_without_losing_its_own_name() {
+        let found = library("GALGSBL.dll").expect("alias resolves");
+        assert_eq!(found.name, GALGSBL);
+        assert_eq!(library("GALGSBL").expect("canonical resolves").name, GALGSBL);
+        assert!(library("NOSUCHLIB").is_none(), "an unknown spelling is None, not a guess");
+    }
+
+    /// PHAPI has no ordinal space at all: every entry in `PHAPI.LIB` is a
+    /// by-name IMPDEF and the shipped DLL exports nothing. That is different
+    /// from a library which has ordinals that a given module chose not to use.
+    #[test]
+    fn phapi_has_no_ordinal_space_but_galgsbl_does() {
+        assert!(matches!(library("PHAPI").expect("phapi").naming, Naming::NamesOnly));
+        assert!(matches!(library("GALGSBL").expect("galgsbl").naming, Naming::Ordinals(_)));
+    }
+
+    /// An authentic MAJORBBS.EXE cannot be loaded even when present: it is NE
+    /// plus a Phar Lap 286 extender. Recording the reason is what stops the
+    /// file being silently ignored.
+    #[test]
+    fn majorbbs_is_ineligible_for_authentic_loading_with_a_stated_reason() {
+        match library("MAJORBBS").expect("majorbbs").authentic {
+            Eligibility::NotLoadable(why) => assert!(why.contains("Phar Lap"), "{why}"),
+            Eligibility::Loadable => panic!("MAJORBBS.EXE cannot be loaded by this host"),
+        }
+        assert!(matches!(library("GALGSBL").expect("galgsbl").authentic, Eligibility::Loadable));
+    }
+
+    /// Every table a library offers must belong to that library, or a lookup
+    /// would answer with another library's ordinal space.
+    #[test]
+    fn no_library_offers_another_librarys_table() {
+        for lib in LIBRARIES {
+            if let Naming::Ordinals(tables) = lib.naming {
+                for t in tables {
+                    assert_eq!(t.library, lib.name, "{} offers {}'s table", lib.name, t.library);
+                }
+            }
+        }
     }
 }
