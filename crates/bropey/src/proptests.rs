@@ -20,6 +20,7 @@ enum Op {
     Snapshot,
     Insert { at: u16, bytes: Vec<u8> },
     Append { bytes: Vec<u8> },
+    SplitOff { at: u16 },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -35,6 +36,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
             .prop_map(|(at, bytes)| Op::Insert { at, bytes }),
         proptest::collection::vec(any::<u8>(), 0..60)
             .prop_map(|bytes| Op::Append { bytes }),
+        any::<u16>().prop_map(|at| Op::SplitOff { at }),
     ]
 }
 
@@ -76,6 +78,13 @@ fn run(ops: Vec<Op>) {
             Op::Append { bytes } => {
                 rope.append(Rope::from_bytes(bytes));
                 model.extend_from_slice(bytes);
+            }
+            Op::SplitOff { at } => {
+                let at = clamp(*at, model.len());
+                let tail = rope.split_off(at);
+                let expected_tail = model.split_off(at);
+                tail.check();
+                assert_eq!(tail.to_vec(), expected_tail, "split tail diverged");
             }
         }
 

@@ -71,6 +71,17 @@ impl Rope {
         self.root = tree::append(root, other.root);
     }
 
+    /// Split the rope at `at`, keeping `..at` and returning `at..`.
+    ///
+    /// Panics if `at > self.len()`.
+    pub fn split_off(&mut self, at: usize) -> Rope {
+        let len = self.len();
+        assert!(at <= len, "split offset {at} exceeds rope length {len}");
+        let (left, right) = tree::split(&self.root, at);
+        self.root = left;
+        Rope { root: right }
+    }
+
     /// Assert every structural invariant. Test-only; call at operation
     /// boundaries.
     #[cfg(test)]
@@ -166,5 +177,47 @@ mod append_api_tests {
         expect.extend_from_slice(b"tail");
         assert_eq!(joined.to_vec(), expect);
         assert_eq!(snapshot.to_vec(), before, "the snapshot was mutated");
+    }
+}
+
+#[cfg(test)]
+mod split_api_tests {
+    use super::*;
+    use crate::ByteSource;
+
+    #[test]
+    fn split_off_partitions_and_leaves_clones_alone() {
+        let bytes: Vec<u8> = (0..300).map(|i| (i % 251) as u8).collect();
+        let original = Rope::from_bytes(&bytes);
+        let snapshot = original.clone();
+
+        let mut left = original;
+        let right = left.split_off(137);
+        left.check();
+        right.check();
+
+        assert_eq!(left.to_vec(), &bytes[..137]);
+        assert_eq!(right.to_vec(), &bytes[137..]);
+        assert_eq!(snapshot.to_vec(), bytes, "the snapshot was mutated");
+    }
+
+    #[test]
+    fn split_off_at_the_ends_is_legal() {
+        let mut rope = Rope::from_bytes(b"abc");
+        let tail = rope.split_off(3);
+        assert!(tail.is_empty());
+        assert_eq!(rope.to_vec(), b"abc");
+
+        let mut rope = Rope::from_bytes(b"abc");
+        let tail = rope.split_off(0);
+        assert!(rope.is_empty());
+        assert_eq!(tail.to_vec(), b"abc");
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds rope length")]
+    fn split_off_past_the_end_panics() {
+        let mut rope = Rope::from_bytes(b"abc");
+        let _ = rope.split_off(4);
     }
 }

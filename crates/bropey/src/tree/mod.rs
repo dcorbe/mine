@@ -5,12 +5,14 @@ mod build;
 mod children;
 #[cfg(test)]
 mod invariants;
+mod split;
 
 pub(crate) use append::append;
 pub(crate) use build::build;
 pub(crate) use children::Children;
 #[cfg(test)]
 pub(crate) use invariants::check_invariants;
+pub(crate) use split::split;
 
 use std::sync::Arc;
 
