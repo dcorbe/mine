@@ -6,3 +6,8 @@
 //! and leaves every other handle untouched.
 
 mod tune;
+
+// Unused until a later task builds `Rope` on top and reaches it from the
+// crate root. Scoped to the module so unrelated dead code still warns.
+#[allow(dead_code)]
+mod tree;
