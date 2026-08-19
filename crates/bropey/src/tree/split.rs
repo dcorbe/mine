@@ -17,9 +17,14 @@ pub(crate) fn split(root: &Arc<Node>, at: usize) -> (Arc<Node>, Arc<Node>) {
 /// order.
 ///
 /// Each piece is a complete, well-formed subtree — never a node stripped of
-/// children — which is why no node in this crate ever underflows. Pieces come
-/// out in descending height order, so folding them left to right attaches
-/// smaller trees onto larger ones.
+/// children — which is why no node in this crate ever underflows. At most one
+/// piece per side can be underfull: the boundary piece bordering `at`. It
+/// lands last in `left`, where `append`'s final fold step sees it as a small
+/// right operand and absorbs it via insert-at-end; it lands first in `right`,
+/// where the first fold step (against an empty accumulator, which `append`
+/// short-circuits to a plain assignment) leaves it as the left operand of the
+/// *second* step, absorbed via insert-at-front. Either way `append`'s
+/// small-piece route handles it, which is why no seam repair is needed.
 fn collect(
     node: &Arc<Node>,
     at: usize,
