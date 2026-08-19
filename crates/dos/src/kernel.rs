@@ -352,6 +352,12 @@ pub struct DosState {
     /// Read by the `AH=48h` arm through [`Fit::from_strategy`], so setting
     /// it steers the next allocation rather than merely round-tripping.
     pub alloc_strategy: u16,
+    /// Where the runtime placed the InDOS flag byte, answered by `AH=34h` as
+    /// `ES:BX`. `None` is the same "no runtime behind it" case `psp_seg`
+    /// already documents -- every unit test in this file constructs a
+    /// `DosState` with nowhere for `AH=34h` to point, and that has to fail
+    /// cleanly rather than invent an address backed by nothing.
+    pub indos: Option<Ptr>,
 }
 
 impl Default for DosState {
@@ -366,6 +372,7 @@ impl Default for DosState {
             dta: None,
             mem: None,
             alloc_strategy: 0,
+            indos: None,
         }
     }
 }
@@ -394,8 +401,8 @@ pub fn is_implemented(ah: u8) -> bool {
     matches!(
         ah,
         0x02 | 0x09 | 0x0e | 0x19 | 0x1a | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x2f | 0x30 | 0x31
-            | 0x35 | 0x3c | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x48 | 0x49
-            | 0x4a | 0x4c | 0x4e | 0x4f | 0x56 | 0x58 | 0x5c | 0x62 | 0x67
+            | 0x34 | 0x35 | 0x3c | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x48
+            | 0x49 | 0x4a | 0x4c | 0x4e | 0x4f | 0x56 | 0x58 | 0x5c | 0x62 | 0x67
     )
 }
 
@@ -617,6 +624,26 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
             regs.set_ah(minor);
             regs.bx = 0;
             regs.cx = 0;
+            ok(g, regs)
+        }
+
+        // 34h -- get the address of the InDOS flag, answered in ES:BX.
+        //
+        // A TSR polls this byte before popping up, to avoid interrupting DOS
+        // mid-call; real DOS increments it on entry to a DOS call and
+        // decrements it on the way out. The address itself is genuine --
+        // it names wherever the runtime told us to put the flag,
+        // [`DosState::indos`] -- but the *byte at that address* is this
+        // host's own responsibility to maintain, not this call's: `34h`
+        // only ever hands back the pointer. See `runexe.rs`'s InDOS segment
+        // for why that byte is written once, as zero, and never touched
+        // again.
+        0x34 => {
+            let Some(at) = dos.indos else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            regs.es = at.seg;
+            regs.bx = at.off;
             ok(g, regs)
         }
 
@@ -1249,6 +1276,42 @@ mod tests {
 
         assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
         assert!(g.carry(), "no program means no real segment to report");
+        assert_eq!(g.regs().ax, ERR_INVALID_FUNCTION);
+    }
+
+    // -- AH=34h: get InDOS flag address --
+
+    #[test]
+    fn get_indos_reports_es_bx_from_the_stored_pointer_not_ds_dx() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState {
+            indos: Some(Ptr::new(0x0234, 0x0056)),
+            ..DosState::default()
+        };
+        let mut regs = Regs::default();
+        regs.set_ah(0x34);
+        // DS:DX carries a different, distinguishable value, so answering
+        // from DS:DX instead of the stored pointer would be caught here.
+        regs.ds = 0x9999;
+        regs.dx = 0x1111;
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(g.regs().es, 0x0234, "ES carries the segment");
+        assert_eq!(g.regs().bx, 0x0056, "BX carries the offset");
+    }
+
+    #[test]
+    fn get_indos_without_a_runtime_pointer_fails_rather_than_inventing_an_address() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState::default(); // indos: None
+        let mut regs = Regs::default();
+        regs.set_ah(0x34);
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry(), "no runtime pointer means nothing truthful to report");
         assert_eq!(g.regs().ax, ERR_INVALID_FUNCTION);
     }
 

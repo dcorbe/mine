@@ -125,6 +125,69 @@ const _: () = assert!(
      could run into a heap that starts at or before it"
 );
 
+/// Where the InDOS flag byte lives -- the address `AH=34h` answers with, in
+/// `dos::kernel::DosState::indos`. One paragraph, sharing the same
+/// environment-block-to-`HEAP_SEG` gap the Btrieve heap claims part of,
+/// placed immediately below `HEAP_SEG` so it is the *first* thing a runaway
+/// environment block would run into -- and so the runtime check that used to
+/// guard only `HEAP_SEG` (next to `main`'s `vm.load(ENV_SEG...)`) is moved to
+/// name this segment instead, tightening rather than loosening what it
+/// already checked.
+const INDOS_SEG: u16 = HEAP_SEG - 1;
+
+/// Same discipline as `HEAP_SEG`'s own first assertion: must not land inside
+/// the stub table `hook_all` fills.
+const _: () = assert!(
+    (INDOS_SEG as u32) * 16 >= (STUB_SEG as u32) * 16 + dos_runtime::kvm::STUB_TABLE_BYTES as u32,
+    "INDOS_SEG must start at or after the stub table hook_all fills"
+);
+/// The InDOS flag's one paragraph must end at or before `HEAP_SEG`, the same
+/// "does the window fit before the next thing" shape `HEAP_CAPACITY`'s own
+/// assertion uses against `PSP_SEG`.
+const _: () = assert!(
+    (INDOS_SEG as u32) * 16 + 16 <= (HEAP_SEG as u32) * 16,
+    "the InDOS flag's one paragraph must fit entirely below HEAP_SEG"
+);
+/// And it must start strictly after `ENV_SEG`, for the same reason `HEAP_SEG`
+/// itself has to -- otherwise nothing here rules out the environment block
+/// landing on top of it before the runtime check below ever runs.
+const _: () = assert!(
+    (INDOS_SEG as u32) * 16 > (ENV_SEG as u32) * 16,
+    "INDOS_SEG must start strictly after ENV_SEG, or the environment block \
+     could run into the InDOS flag that starts at or before it"
+);
+
+/// An `--unhook` value: one interrupt vector, hex (`0x7b`) or decimal.
+///
+/// Refuses anything past 255 rather than truncating, because a truncated
+/// vector names a real but *different* interrupt, and silently unhooking the
+/// wrong one would show up as a TSR that mysteriously never gets called.
+fn parse_vector(s: &str) -> Result<u8, String> {
+    let t = s.trim();
+    let (digits, radix) = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None => (t, 10),
+    };
+    u16::from_str_radix(digits, radix)
+        .ok()
+        .filter(|v| *v <= u16::from(u8::MAX))
+        .map(|v| v as u8)
+        .ok_or_else(|| format!("`{s}` is not an interrupt vector in 0..=0xff"))
+}
+
+/// Zero the IVT entry for each vector, handing it back to the guest.
+///
+/// A function rather than a loop inlined in `main` so the test below drives
+/// the same code `main` does. A test that reproduces the write instead of
+/// calling it passes against a `main` that never writes at all -- that exact
+/// gap was found and closed in this file's InDOS flag earlier the same day.
+fn unhook_vectors(vm: &mut dos_runtime::kvm::VmGuest, vectors: &[u8]) -> io::Result<()> {
+    for vector in vectors {
+        vm.load(usize::from(*vector) * 4, &[0u8; 4])?;
+    }
+    Ok(())
+}
+
 /// Stop rather than spin if the program loops on a call we keep refusing.
 const MAX_CALLS: u32 = 2000;
 
@@ -159,6 +222,39 @@ fn checked_seg_add(seg: u16, len: u32, what: &str) -> Result<u16, String> {
         ));
     }
     Ok(end as u16)
+}
+
+/// Write the InDOS flag byte `AH=34h` answers with, and hand back the
+/// pointer [`dos_runtime::dos::DosState::indos`] should be set to.
+///
+/// Factored out of `main` on purpose: a test that reproduced this write
+/// instead of calling it would keep passing even if `main`'s own call to it
+/// were deleted, mutated, or never wired to `indos` at all -- it would only
+/// be proving the copy correct, not the code that actually runs.
+/// `AH=34h`'s dispatch code in
+/// `dos::kernel` only ever hands back a pointer -- it never touches the byte
+/// at it -- so a test that calls `main`'s logic through anything less than
+/// this exact function would still pass with the byte left unwritten, or
+/// written non-zero, or never wired to `indos` at all. Sharing the function
+/// itself, rather than a copy of what it does, is what makes a mutation to
+/// this line something the test below actually has to fail against.
+///
+/// Written once, here, as zero -- and left that way for the rest of the run.
+/// Real DOS increments this byte on entry to a DOS call and decrements it on
+/// the way out, so a TSR polling it (as `AH=34h`'s caller always does; see
+/// `dos::kernel::dispatch`'s own doc comment on the arm) knows not to pop up
+/// mid-call. This host has no window where that matters: `int 21h` is
+/// serviced synchronously, to completion, on the same call stack that
+/// trapped it -- there is no interrupt-handler re-entry into a DOS call in
+/// flight for a TSR to be unsafe during, so zero is the truthful answer, not
+/// merely a convenient one. That stops being true the moment this host gains
+/// re-entrant DOS servicing (a real hardware interrupt handled *while* an
+/// `int 21h` is being serviced, the way a real BIOS timer tick can be) --
+/// from then on this byte has to be incremented and decremented around that
+/// window like real DOS does, not pinned at zero.
+fn write_indos_flag(vm: &mut dos_runtime::kvm::VmGuest) -> io::Result<Ptr> {
+    vm.load(INDOS_SEG as usize * 16, &[0u8])?;
+    Ok(Ptr::new(INDOS_SEG, 0))
 }
 
 /// CPU this process has burned, and how long it has been alive.
@@ -334,12 +430,29 @@ struct Cli {
     ///
     /// The value may carry a command tail after the first whitespace, e.g.
     /// `--tsr "BTRIEVE.EXE /P:2048"`. DOS 8.3 names never contain spaces, so
-    /// splitting on the first whitespace is unambiguous. No stand-down step
-    /// is needed when the TSR hooks a vector our own stub already claimed:
-    /// `AH=25h` writes the IVT directly, so the TSR's hook simply replaces
-    /// ours in guest memory.
+    /// splitting on the first whitespace is unambiguous.
+    ///
+    /// A TSR that means to own a vector this host also stubs needs
+    /// [`Cli::unhook`] as well. This comment used to claim no stand-down step
+    /// was needed, on the reasoning that `AH=25h` writes the IVT directly so
+    /// the TSR's hook would simply replace ours. Running it disproved that:
+    /// the real Btrieve 5.00c manager reads vector `0x7B` back first
+    /// (`AH=35h`), sees our stub's `0x33` -- the very offset we copy from it
+    /// to satisfy `DFAAPI`'s probe -- concludes it is already resident,
+    /// prints "Program already loaded" and exits 1. It never reaches its own
+    /// `AH=25h` at all. A stub faithful enough to answer a probe is faithful
+    /// enough to fool the program it imitates.
     #[arg(long, value_name = "PROGRAM")]
     tsr: Option<String>,
+
+    /// Leave this interrupt vector unhooked, so a `--tsr` program can claim
+    /// it and be *called* rather than merely resident.
+    ///
+    /// `hook_all` stubs all 256 vectors, so without this every vector reads
+    /// back as taken and any TSR that probes before installing will decline.
+    /// Repeatable; hex (`0x7b`) or decimal.
+    #[arg(long, value_name = "VECTOR", value_parser = parse_vector)]
+    unhook: Vec<u8>,
 
     /// Command tail handed to the program, exactly as DOS would.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "TAIL")]
@@ -689,6 +802,15 @@ fn main() -> io::Result<()> {
 
     let mut vm = VmGuest::new(MEM)?;
     vm.hook_all(STUB_SEG)?;
+    // Hand a vector back to the guest. `hook_all` stubs all 256, which is
+    // what makes every one of them trap out to us -- and also what makes
+    // every one of them read back as already claimed. A TSR that probes
+    // before installing (Btrieve does, via `AH=35h`) then declines to load,
+    // so the only way for it to own a vector is for us not to own it first.
+    // Zeroed rather than pointed at an IRET: the guest is about to write its
+    // own handler here, and a vector nobody has claimed pointing nowhere is
+    // the honest intermediate state.
+    unhook_vectors(&mut vm, &cli.unhook)?;
 
     // The program's own path, which a DOS program reads back as ParamStr(0)
     // and routinely uses to find its home directory. Hardcoding a name here
@@ -703,17 +825,21 @@ fn main() -> io::Result<()> {
         &["PATH=C:\\", "COMSPEC=C:\\COMMAND.COM"],
         &format!("C:\\{program}"),
     );
-    // The compile-time assertions above `HEAP_SEG` only check the *fixed*
-    // ends of the gap it lives in; the environment block's own length
-    // depends on the program's own filename, which is runtime data. This is
-    // the check that closes the loop: it is what would actually catch a
-    // program whose name is long enough to run the environment block into
-    // the heap, rather than leaving that to be discovered as silent
-    // corruption the way the old `ENV_SEG` bug was.
+    // The compile-time assertions above `HEAP_SEG`/`INDOS_SEG` only check the
+    // *fixed* ends of the gap they live in; the environment block's own
+    // length depends on the program's own filename, which is runtime data.
+    // This is the check that closes the loop: it is what would actually
+    // catch a program whose name is long enough to run the environment
+    // block into the InDOS flag or the heap behind it, rather than leaving
+    // that to be discovered as silent corruption the way the old `ENV_SEG`
+    // bug was. Checked against `INDOS_SEG` rather than `HEAP_SEG` because
+    // `INDOS_SEG` is the *closer* boundary -- see its own doc comment --
+    // and a bound against the nearer edge of the gap is automatically a
+    // bound against the farther one too.
     //
     // Compared as widened sums, never as a subtraction of the two segments.
-    // `HEAP_SEG - ENV_SEG` on plain `u16`s would be correct only as long as
-    // `HEAP_SEG > ENV_SEG` holds -- which the compile-time assert above this
+    // `INDOS_SEG - ENV_SEG` on plain `u16`s would be correct only as long as
+    // `INDOS_SEG > ENV_SEG` holds -- which the compile-time assert above this
     // function does pin today, but this expression has no way to *know*
     // that, and this workspace's `Cargo.toml` sets no `overflow-checks`
     // override, so a release build of a subtraction that went negative would
@@ -722,11 +848,16 @@ fn main() -> io::Result<()> {
     // underflow the same way, so there is nothing here for a future change
     // to silently get wrong.
     assert!(
-        u32::from(ENV_SEG) * 16 + env.len() as u32 <= u32::from(HEAP_SEG) * 16,
-        "the DOS environment block ({} bytes) would run into the Btrieve heap at {HEAP_SEG:#06x}",
+        u32::from(ENV_SEG) * 16 + env.len() as u32 <= u32::from(INDOS_SEG) * 16,
+        "the DOS environment block ({} bytes) would run into the InDOS flag at {INDOS_SEG:#06x}",
         env.len()
     );
     vm.load(ENV_SEG as usize * 16, &env)?;
+
+    // The InDOS flag byte itself, written once, before the guest ever runs.
+    // See [`write_indos_flag`] for why it stays zero for the rest of the
+    // run, and the condition under which that would stop being true.
+    let indos_at = write_indos_flag(&mut vm)?;
 
     // `--tsr` swaps which program boots first: a resident program, not the
     // one actually named on the command line. `boot_img`/`boot_tail` are
@@ -822,6 +953,12 @@ fn main() -> io::Result<()> {
     // `main_program` still waiting for room.
     let first_free = at.psp_seg + boot_img.paragraphs() as u16;
     kernel.state.mem = Some(dos_runtime::dos::Arena::new(at.psp_seg, first_free));
+    // The pointer `write_indos_flag` already zeroed above, before this
+    // program (or the TSR ahead of it) ever ran. Unlike `psp_seg`/`mem`,
+    // this is not re-set when `--tsr` hands room to the main program below:
+    // it is one fixed paragraph outside the region either program owns, so
+    // it stays valid across that handoff.
+    kernel.state.indos = Some(indos_at);
     // Shared with the run loop through interior mutability: once `kernel` is
     // composed into `services` below, nothing outside it can reach `state`
     // any more -- see `SharedDos`'s own doc comment. `--tsr`'s `StayResident`
@@ -1954,6 +2091,53 @@ mod tests {
     /// memory of a manual edit. (Confirmed separately, by hand: restoring
     /// `const ENV_SEG: u16 = 0x00a0;` does not compile --
     /// `error[E0080]: evaluation panicked: ENV_SEG must start at or after
+    /// A vector is named as hex or decimal, and anything past 255 is refused
+    /// rather than truncated -- a truncated vector names a real but different
+    /// interrupt, so the mistake would surface as a TSR that mysteriously
+    /// never gets called rather than as an error.
+    #[test]
+    fn a_vector_is_hex_or_decimal_and_never_truncates() {
+        assert_eq!(super::parse_vector("0x7b"), Ok(0x7b));
+        assert_eq!(super::parse_vector("0X7B"), Ok(0x7b));
+        assert_eq!(super::parse_vector("123"), Ok(123));
+        assert_eq!(super::parse_vector(" 0x7b "), Ok(0x7b));
+        assert!(super::parse_vector("0x100").is_err(), "256 is not a vector");
+        assert!(super::parse_vector("300").is_err(), "300 is not a vector");
+        assert!(super::parse_vector("").is_err());
+        assert!(super::parse_vector("nonsense").is_err());
+    }
+
+    /// `--unhook` hands one vector back and leaves every other stub alone.
+    ///
+    /// Both halves matter. Without the first, a TSR that probes before
+    /// installing declines -- measured: real Btrieve 5.00c reads vector
+    /// `0x7B`, sees our stub, prints "Program already loaded" and exits 1.
+    /// Without the second, unhooking one vector could quietly disarm the
+    /// host's whole trap table and every DOS call would stop being serviced.
+    #[test]
+    fn unhooking_a_vector_clears_only_that_ones_ivt_entry() {
+        use dos_runtime::guest::{Guest, Ptr};
+        use dos_runtime::kvm::VmGuest;
+
+        let mut vm = VmGuest::new(super::MEM).expect("open /dev/kvm and map guest memory");
+        vm.hook_all(super::STUB_SEG).expect("hook every vector");
+        let before_21 = vm.read(Ptr::new(0, 0x21 * 4), 4).expect("read int 21h vector").to_vec();
+        assert_ne!(before_21, [0u8; 4], "int 21h must be hooked before the test means anything");
+
+        super::unhook_vectors(&mut vm, &[0x7b]).expect("unhook");
+
+        assert_eq!(
+            vm.read(Ptr::new(0, 0x7b * 4), 4).expect("read int 7Bh vector"),
+            &[0u8; 4],
+            "the unhooked vector must be handed back to the guest"
+        );
+        assert_eq!(
+            vm.read(Ptr::new(0, 0x21 * 4), 4).expect("read int 21h vector"),
+            &before_21[..],
+            "no other vector may be disturbed"
+        );
+    }
+
     /// the stub table hook_all fills`.)
     #[test]
     fn the_old_env_seg_would_have_clobbered_the_last_stub() {
@@ -1988,6 +2172,70 @@ mod tests {
              the packing changed, this test and the const assert above ENV_SEG need to move \
              together"
         );
+    }
+
+    /// `AH=34h`'s whole contract in one run: [`write_indos_flag`] zeroes
+    /// `INDOS_SEG` before the guest ever executes, and that same pointer is
+    /// handed to `DosState::indos`, so a program asking `AH=34h` gets back an
+    /// address whose byte reads zero. This drives the same `Dos` service
+    /// through a real KVM vCPU, the way `main`'s own loop does, and checks
+    /// the byte through guest memory rather than trusting that a correct
+    /// pointer implies a correct byte -- `kernel.rs`'s own dispatch code
+    /// cannot get this byte wrong (it never touches it), but this binary's
+    /// wiring can: a `write_indos_flag` that wrote the wrong byte, or a
+    /// `main` that never called it or never assigned `kernel.state.indos`,
+    /// would all leave the byte unspecified while `AH=34h` still answers
+    /// *some* address. Calls [`write_indos_flag`] itself, not a copy of what
+    /// it does -- see that function's own doc comment for why.
+    #[test]
+    fn the_indos_byte_this_binary_writes_reads_back_zero_through_ah_34h() {
+        use dos::service::{Serviced, Services};
+        use dos_runtime::guest::{Guest, Ptr};
+        use dos_runtime::kvm::{Stop, VmGuest};
+
+        const STUB: u16 = 0x0060;
+        const CODE_SEG: u16 = 0x2000;
+        const CODE_OFF: u16 = 0x0100;
+
+        let mut vm = VmGuest::new(super::MEM).expect("open /dev/kvm and map guest memory");
+        vm.hook(0x21, STUB).expect("hook int 21h");
+
+        // mov ah, 0x34 ; int 21h ; mov ax, 0x4C00 ; int 21h
+        let program: [u8; 9] = [0xb4, 0x34, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21];
+        vm.load(CODE_SEG as usize * 16 + CODE_OFF as usize, &program)
+            .expect("load the program");
+        vm.start(CODE_SEG, CODE_OFF, CODE_SEG, 0xfffe).expect("enter real mode");
+
+        // `main`'s own call, not a copy of what it does -- see
+        // `write_indos_flag`'s own doc comment for why that distinction is
+        // the whole point of this test.
+        let indos_at = super::write_indos_flag(&mut vm).expect("zero the InDOS flag");
+
+        let mut kernel = dos_runtime::dos::Dos::default();
+        kernel.state.indos = Some(indos_at);
+        let mut services: Services<VmGuest> = Services::new().with(kernel);
+
+        let mut answered_at = None;
+        loop {
+            match vm.run().expect("KVM run") {
+                Stop::Trap(vector) => match services.service(vector, &mut vm) {
+                    Some(Serviced::Continue) => {
+                        if answered_at.is_none() {
+                            let r = vm.regs();
+                            answered_at = Some(Ptr::new(r.es, r.bx));
+                        }
+                    }
+                    Some(Serviced::Terminate(_)) => break,
+                    other => panic!("unexpected: {other:?}"),
+                },
+                other => panic!("unexpected guest stop: {other:?}"),
+            }
+        }
+
+        let at = answered_at.expect("AH=34h must answer before the program terminates");
+        assert_eq!(at, indos_at, "AH=34h must answer with the same pointer write_indos_flag returned");
+        let byte = vm.read(at, 1).expect("the InDOS address must be mapped memory")[0];
+        assert_eq!(byte, 0, "the InDOS flag byte must read back zero");
     }
 }
 
