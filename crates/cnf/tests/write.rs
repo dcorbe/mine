@@ -180,3 +180,51 @@ fn specifier_checking_does_not_apply_to_scalar_types() {
     // A string option's value is not a format string.
     assert!(check_edit(&OptionType::Char, b"%s", b"x").is_ok());
 }
+
+#[test]
+fn a_recompiled_mcv_differs_only_where_the_edit_was() {
+    use cnf::write::{recompile, rewrite};
+
+    let f = SpecFile::parse("T.MSG", SAMPLE).expect("parses");
+    let before = recompile(SAMPLE, "T.MSG").expect("compiles");
+    let edited = rewrite(&f, &[(1, b"LIVE".to_vec())]).expect("rewrite");
+    let after = recompile(&edited, "T.MSG").expect("compiles");
+
+    assert_ne!(before, after, "the edit must reach the .MCV");
+    assert!(
+        before.windows(4).any(|w| w == b"DEMO"),
+        "sanity: the old value is in the old .MCV"
+    );
+    assert!(
+        !after.windows(4).any(|w| w == b"DEMO"),
+        "the old value must be gone from the new .MCV"
+    );
+    assert!(after.windows(4).any(|w| w == b"LIVE"));
+}
+
+#[test]
+fn a_declared_language_reaches_the_mcv() {
+    // SAMPLE has no LANGUAGE line, so the test above cannot tell a real
+    // implementation from one that silently drops the language: both would
+    // compile the same bytes either way. This is the one that can tell them
+    // apart.
+    use cnf::write::recompile;
+
+    const WITH_LANGUAGE: &[u8] = b"LANGUAGE {Espanol}\r\nACTIVATE {DEMO} S 30 p\r\n";
+    let out = recompile(WITH_LANGUAGE, "T.MSG").expect("compiles");
+    assert!(
+        out.windows(b"Espanol".len()).any(|w| w == b"Espanol"),
+        "the declared language must be in the compiled .MCV, not silently dropped"
+    );
+}
+
+#[test]
+fn an_undeclared_language_still_compiles_to_the_hosts_default() {
+    // MsgFile::language's own doc: every archived .MCV records English/ANSI
+    // even when the .MSG has no LANGUAGE line at all. An empty language here
+    // would be a silent divergence from what the real compiler wrote.
+    use cnf::write::recompile;
+
+    let out = recompile(SAMPLE, "T.MSG").expect("compiles");
+    assert!(out.windows(4).any(|w| w == b"ANSI"), "no LANGUAGE line must still compile to English/ANSI");
+}

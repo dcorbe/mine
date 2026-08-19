@@ -7,6 +7,9 @@
 
 use std::collections::HashSet;
 
+use mbbs::mcv;
+use mbbs::msg::MsgFile;
+
 use crate::spec::{OptionType, SpecError, SpecFile};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,4 +226,23 @@ pub fn check_edit(kind: &OptionType, old: &[u8], new: &[u8]) -> Result<(), Write
         return Err(WriteError::SpecifiersChanged { was, now });
     }
     Ok(())
+}
+
+/// Compile a `.MSG`'s bytes to the `.MCV` the host reads.
+///
+/// Goes through `MsgFile` rather than the spec layer so the compiled form is
+/// produced by exactly the reader the host uses. Two paths to a `.MCV` would
+/// be two things to keep in step.
+///
+/// # Errors
+///
+/// [`WriteError::Reparse`] if `msg` does not parse as a `.MSG`.
+pub fn recompile(msg: &[u8], name: &str) -> Result<Vec<u8>, WriteError> {
+    let parsed = MsgFile::parse(name, msg).map_err(|e| WriteError::Reparse(SpecError::Message(e)))?;
+    // `MsgFile::language`'s own doc: `None` is ordinary -- every archived
+    // `.MCV` still records `English/ANSI` for a `.MSG` with no `LANGUAGE`
+    // line, so an empty language here would be a silent divergence from what
+    // the real compiler wrote, not merely an absent field.
+    let language = parsed.language().unwrap_or(mcv::DEFAULT_LANGUAGE);
+    Ok(mcv::compile(parsed.messages(), language))
 }
