@@ -194,7 +194,15 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     script: Option<String>,
 
-    /// Log every DOS call as it happens.
+    /// Log every DOS and BIOS call as it happens, on stderr.
+    ///
+    /// Written to stderr, not stdout, so a trace can be captured
+    /// (`2>trace.log`) while the report still reads normally on stdout. A
+    /// live screen and a trace cannot share one terminal, so this stays
+    /// silent under `--interactive` *when stderr is that terminal* -- the
+    /// case that wrecks a program's paint. Redirect stderr and an
+    /// interactive run traces like any other, rather than the flag silently
+    /// doing nothing in a mode it was asked for.
     #[arg(long)]
     trace: bool,
 
@@ -480,6 +488,8 @@ fn main() -> io::Result<()> {
     let keys = cli.keys;
     let script_path = cli.script;
     let trace = cli.trace;
+    // SAFETY: `isatty` only inspects the descriptor; it mutates nothing.
+    let trace_to_screen = unsafe { libc::isatty(libc::STDERR_FILENO) } == 1;
     let strict = cli.strict;
     let max_calls = cli.max_calls;
     let interactive = cli.interactive;
@@ -888,6 +898,17 @@ fn main() -> io::Result<()> {
                 }
             }
             Stop::Trap(vector) => {
+                // The per-call trace `--trace` promises. Like the vector
+                // report just below it, this has to read the registers
+                // *before* the call is routed: a service's registers on the
+                // way out are its answer, not the request.
+                if trace && !(interactive && trace_to_screen) {
+                    let r = vm.regs();
+                    eprintln!(
+                        "[int {vector:02x}h] ah={:02x} al={:02x} bx={:04x} cx={:04x} dx={:04x} si={:04x} di={:04x} ds={:04x} es={:04x}",
+                        r.ah(), r.al(), r.bx, r.cx, r.dx, r.si, r.di, r.ds, r.es
+                    );
+                }
                 // A report, not dispatch: which vectors the program hooks or
                 // saves via AH=25h/35h. Must run before the call is routed,
                 // since a service's registers on the way out are not the
