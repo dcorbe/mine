@@ -82,6 +82,18 @@
 
 use std::collections::HashMap;
 
+/// How many times [`Map::read`] has walked a file's allocation table.
+///
+/// Test-only, and it exists because the cost it counts is invisible to every
+/// other kind of check. Reading the map walks every allocation-table block in
+/// the file; `Block::v6_reindex` used to ask for one per index node, which
+/// on a 13,713-page `WCCMP002.DAT` was 109 walks for a single-record update.
+/// Nothing about the file that results is different, so no correctness test
+/// can tell 2 walks from 109 -- only a counter can.
+#[cfg(test)]
+pub(crate) static READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Magic bytes opening an allocation-table page.
 const MAGIC: &[u8; 2] = b"PP";
 
@@ -186,6 +198,8 @@ impl Map {
     ///   3a measured zero of these across all eight committed fixtures), so
     ///   a wrong pick would be worse than stopping.
     pub fn read(file: &[u8], page_size: u16) -> Result<Self, String> {
+        #[cfg(test)]
+        READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let page_size = usize::from(page_size);
         // `ENTRIES + ENTRY`, not `ENTRIES`: a page long enough to reach the
         // entry array but too short to hold one whole entry would divide out

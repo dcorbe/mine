@@ -2315,6 +2315,17 @@ impl<M: Mem> Block<M> {
         // the loop above: a key that cannot be indexed at all must refuse
         // before the file has been touched, not after two of its siblings have
         // already been placed.
+        // [`v6::Map::read`] walks every allocation-table block in the file,
+        // and this loop used to ask for one per index node -- 109 walks for a
+        // single-record update on a 13,713-page `WCCMP002.DAT`, almost all of
+        // them answering a question nothing had changed since. The map only
+        // goes stale when a page actually moves, so it is re-read after a
+        // `claim` or a `relocate` and not otherwise. Lazily, at the point of
+        // use, so the last relocate of a write does not pay for a walk whose
+        // answer is then thrown away.
+        let mut map = v6::Map::read(file, page_size)?;
+        let mut map_is_stale = false;
+
         let mut counts = Vec::with_capacity(built.len());
         for rebuilt in &built {
             counts.push((rebuilt.count_at, rebuilt.count));
@@ -2337,6 +2348,7 @@ impl<M: Mem> Block<M> {
             while numbers.len() < rebuilt.index.nodes.len() {
                 let logical = v6::Map::claim(file, page_size, &blank, rebuilt.tag)
                     .map_err(|why| format!("claiming an index page: {why}"))?;
+                map_is_stale = true;
                 numbers.push(Self::v6_decorate(logical, rebuilt.tag));
             }
 
@@ -2344,11 +2356,13 @@ impl<M: Mem> Block<M> {
             for (number, image) in placed {
                 let logical = number & pages::fcr::ROOT_PAGE;
 
-                // The map is re-read per node rather than once: every
-                // relocation below rewrites the allocation table, so a map read
-                // before the loop would answer about the file as it was two
-                // nodes ago.
-                let map = v6::Map::read(file, page_size)?;
+                // Every claim and every relocation rewrites the allocation
+                // table, so a map read from before one of those would answer
+                // about the file as it was two nodes ago.
+                if map_is_stale {
+                    map = v6::Map::read(file, page_size)?;
+                    map_is_stale = false;
+                }
                 let body = usize::from(pages::HEADER);
                 if let Some(physical) = map.physical(logical) {
                     let at = usize::from(page_size) * physical as usize;
@@ -2361,6 +2375,7 @@ impl<M: Mem> Block<M> {
                     .map_err(|why| {
                         format!("relocating an index page at logical {logical}: {why}")
                     })?;
+                map_is_stale = true;
             }
         }
 
@@ -5876,11 +5891,13 @@ mod tests {
         block.update(position, &bytes).expect("a warm-up update");
 
         let before = std::fs::read(&block.path).expect("the file reads");
+        crate::v6::READS.store(0, std::sync::atomic::Ordering::Relaxed);
         let (read_before, wrote_before) = io();
         let start = std::time::Instant::now();
         block.update(position, &bytes).expect("a no-op update of record 0");
         let took = start.elapsed();
         let (read_after, wrote_after) = io();
+        let map_reads = crate::v6::READS.load(std::sync::atomic::Ordering::Relaxed);
 
         let after = std::fs::read(&block.path).expect("the file reads back");
         let common = before.len().min(after.len()) / page;
@@ -5898,6 +5915,16 @@ mod tests {
         eprintln!(
             "{} of {common} pages differ: {differing:?}",
             differing.len()
+        );
+        eprintln!("allocation map walked {map_reads} times");
+
+        // Walking the allocation table is O(the file), and `v6_reindex` used
+        // to do it once per index node. Nothing about the resulting file
+        // records that cost, so this counter is the only thing that can hold
+        // it down.
+        assert!(
+            map_reads < 20,
+            "the allocation table was walked {map_reads} times for one update"
         );
 
         // The measurement this test exists to hold: a single-record update
