@@ -91,6 +91,101 @@ pub fn c_name(linkage: &str) -> Box<str> {
     stripped.to_ascii_lowercase().into_boxed_str()
 }
 
+/// WG 1.01's GALGSBL numbering, from the `GSBLIMP.LIB` import library beside
+/// the shipped DLL. Relocated from `crates/mbbs/src/exports.rs` unchanged.
+pub static GALGSBL_WG101: OrdinalTable = OrdinalTable {
+    library: GALGSBL,
+    generation: "wg101",
+    tsv: include_str!("../data/galgsbl_wg101.tsv"),
+    source_path: "archive/galacticomm/extract/wg1/GALDSRC/DLIB/GSBLIMP.LIB",
+    source_kind: SourceKind::ImportLibrary,
+    verified: "101 ordinals; agrees with the shipped WG 1.01 GALGSBL.DLL name table on all 101.",
+};
+
+/// MajorBBS 6.x. **Two independent sources agree on all 100 shared ordinals
+/// with zero disagreements and identical name sets** -- the 6.25 SDK's
+/// `GSBLIMP.LIB` and the shipped 1992 `GALGSBL.DLL`.
+///
+/// The 93- and 96-export 1992 builds are recovered but not shipped: the
+/// 93-build is a strict ordinal prefix of this one with zero disagreements on
+/// all 93 shared entries, so it can add no discrimination this table does not
+/// already provide.
+pub static GALGSBL_MBBS625: OrdinalTable = OrdinalTable {
+    library: GALGSBL,
+    generation: "mbbs625",
+    tsv: include_str!("../data/galgsbl_mbbs625.tsv"),
+    source_path: "archive/galacticomm/extract/mbbs625sdk/MBBS_SDK/INSTALLB/GSBLIMP.LIB",
+    source_kind: SourceKind::ImportLibrary,
+    verified: "100 ordinals; agrees with the 1992 GALGSBL.DLL on all 100, identical name sets.",
+};
+
+/// Worldgroup 2.x. Adds `cdixfn@102` to WG 1.01 and moves nothing.
+pub static GALGSBL_WG2: OrdinalTable = OrdinalTable {
+    library: GALGSBL,
+    generation: "wg2",
+    tsv: include_str!("../data/galgsbl_wg2.tsv"),
+    source_path: "re/wg33src/LIB/wg2/GALGSBL.DEF",
+    source_kind: SourceKind::VendorDef,
+    verified: "102 ordinals; agrees with the 1995-1996 GALGSBL.DLL binary.",
+};
+
+/// Worldgroup 3.x, 16-bit. **The same 102 names as WG 2.x with 38 of them
+/// renumbered** -- the break that makes ordinal binding version-specific.
+/// Ordinal 72 is `btuhit` here and `bturno` in every Layout A table.
+pub static GALGSBL_WG3_16: OrdinalTable = OrdinalTable {
+    library: GALGSBL,
+    generation: "wg3-16",
+    tsv: include_str!("../data/galgsbl_wg3_16.tsv"),
+    source_path: "re/wg33src/LIB/GALGSBL.DEF (#ifdef GCDOS branch)",
+    source_kind: SourceKind::VendorDef,
+    verified: "102 ordinals; agrees with the 1996-1997 GALGSBL.DLL binary.",
+};
+
+/// Worldgroup NT, 32-bit. Named for the layout rather than a release because
+/// MBBS 10's own import library carries the identical numbering -- 88 shared
+/// ordinals, zero disagreements. Whether an MBBS 10 *module* binds by ordinal
+/// at all is unresolved; see the spec's caveat. The table is established for
+/// `wgnt` regardless.
+pub static GALGSBL_LAYOUT_C: OrdinalTable = OrdinalTable {
+    library: GALGSBL,
+    generation: "layout-c",
+    tsv: include_str!("../data/galgsbl_layout_c.tsv"),
+    source_path: "re/wg33src/LIB/GALGSBL.DEF (#else branch)",
+    source_kind: SourceKind::VendorDef,
+    verified: "86 ordinals; the WG NT PE32 DLL exports these plus _btugri, _lanecb and a Borland __debuggerhookdata artifact.",
+};
+
+/// MajorBBS 6.25's MAJORBBS numbering. **Shipped first among the MAJORBBS
+/// tables because it is what excludes the `mbbs625` profile for a Worldgroup
+/// module**: the board's modules demand ordinals up to 1191 and this stops at
+/// 1180, missing 16 of them.
+///
+/// 992 export lines, not the 996 `crates/mbbs/src/exports.rs` claims -- that
+/// figure counts `@N` anywhere in the file, and four such strings sit outside
+/// export lines.
+pub static MAJORBBS_MBBS625: OrdinalTable = OrdinalTable {
+    library: MAJORBBS,
+    generation: "mbbs625",
+    tsv: include_str!("../data/majorbbs_mbbs625.tsv"),
+    source_path: "archive/galacticomm/extract/mbbs625sdk/MBBS_SDK/INSTALLB/MAJORBBS.DEF",
+    source_kind: SourceKind::VendorDef,
+    verified: "992 name@ordinal lines, zero duplicate ordinals, max 1180.",
+};
+
+/// Canonical library names.
+pub const MAJORBBS: &str = "MAJORBBS";
+pub const GALGSBL: &str = "GALGSBL";
+
+pub const GALGSBL_TABLES: &[&OrdinalTable] = &[
+    &GALGSBL_MBBS625,
+    &GALGSBL_WG101,
+    &GALGSBL_WG2,
+    &GALGSBL_WG3_16,
+    &GALGSBL_LAYOUT_C,
+];
+
+pub const MAJORBBS_TABLES: &[&OrdinalTable] = &[&MAJORBBS_MBBS625];
+
 #[cfg(test)]
 mod tests {
     use super::*;
