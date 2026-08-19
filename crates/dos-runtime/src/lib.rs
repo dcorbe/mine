@@ -40,6 +40,7 @@ pub mod driver;
 pub use ::dos::files;
 pub mod fossil;
 pub use ::dos::guest;
+pub mod host_library;
 pub mod kvm;
 pub mod mz;
 pub mod pit;

@@ -165,6 +165,13 @@ fn parse_addr(s: &str) -> Result<u32, String> {
     }
 }
 
+/// `clap`'s `value_parser` wants an owned `String`; `host_library::
+/// parse_bturno` borrows from its argument, so this just owns the borrow
+/// clap already validated shape for.
+fn parse_bturno_arg(s: &str) -> Result<String, String> {
+    dos_runtime::host_library::parse_bturno(s).map(str::to_owned)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "runexe",
@@ -249,6 +256,30 @@ struct Cli {
     /// Scan guest memory for these 16-bit values, comma separated.
     #[arg(long, value_name = "N,N", value_delimiter = ',')]
     scan_u16: Vec<u16>,
+
+    /// Which library generation's GALGSBL to synthesise when the guest opens
+    /// `GALGSBL.DLL` and no such file exists under `--root`.
+    ///
+    /// Names a `mbbs_machine::library::Profile` by its generation tag
+    /// (`wg101`, `mbbs625`, `wg2`, `wg3-16`, `layout-c`). Detection is not
+    /// run to choose this: see `dos_runtime::host_library`'s module doc for
+    /// why there is no import table to detect from here. Unset takes
+    /// `library::ANCHOR`; an unrecognised name is refused rather than
+    /// silently falling back to it.
+    #[arg(long, value_name = "NAME")]
+    family: Option<String>,
+
+    /// The eight-digit `BTURNO` serial the synthesised GALGSBL answers with
+    /// when its `GETRNO` reads it back.
+    ///
+    /// Exactly eight ASCII digits, refused otherwise: `GETRNO` reads exactly
+    /// eight bytes after the `ReG#` marker, so anything shorter or longer
+    /// would silently read back as a different serial than was typed. The
+    /// default, `00000000`, is patently not a real board's key -- a
+    /// synthetic serial means the module reads as unregistered, and that is
+    /// the honest outcome for a run that did not name a real one.
+    #[arg(long, value_name = "DIGITS", default_value = "00000000", value_parser = parse_bturno_arg)]
+    bturno: String,
 
     /// Command tail handed to the program, exactly as DOS would.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "TAIL")]
@@ -501,6 +532,8 @@ fn main() -> io::Result<()> {
     // Counted down as hits are ignored, so this one is genuinely mutable.
     let mut watch_skip = cli.watch_skip;
     let scan: Vec<u16> = cli.scan_u16;
+    let family = cli.family;
+    let bturno = cli.bturno;
 
     // Somebody is on the other end. Every guard in here exists to rescue an
     // *unattended* probe from a guest that will not stop, and every one has now
@@ -639,7 +672,15 @@ fn main() -> io::Result<()> {
     }
 
     let mut kernel = dos_runtime::dos::Dos::default();
-    kernel.state.files = Some(Files::new(root.into(), std::path::PathBuf::from(&root_dir)));
+    let mut guest_files = Files::new(root.into(), std::path::PathBuf::from(&root_dir));
+    // GALGSBL.DLL is a host library, never board data, so it never exists
+    // under --root. Synthesise it and provide it the same way any other
+    // filesystem answer arrives -- a real GALGSBL.DLL on disk still wins,
+    // exactly as `Files::provide`'s own contract says.
+    let galgsbl = dos_runtime::host_library::galgsbl(family.as_deref(), &bturno)
+        .map_err(io::Error::other)?;
+    guest_files.provide("GALGSBL.DLL", galgsbl);
+    kernel.state.files = Some(guest_files);
     // The real segment the loader built this program's PSP at, so AH=62h
     // answers with the program's own PSP rather than failing outright.
     kernel.state.psp_seg = Some(at.psp_seg);
