@@ -118,7 +118,8 @@ impl Cells {
     }
 
     /// Write bytes left to right, stopping at `max` characters or the right
-    /// edge, whichever comes first.
+    /// edge, whichever comes first. The edge is not checked here -- it is
+    /// `put`'s column guard, applied once per byte, that actually clips.
     pub fn write_str(&mut self, row: usize, col: usize, s: &[u8], attr: u8, max: usize) {
         for (i, &b) in s.iter().take(max).enumerate() {
             self.put(row, col + i, b, attr);
