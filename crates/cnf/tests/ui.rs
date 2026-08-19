@@ -2,14 +2,24 @@
 //! into a `Cells` and is read back with `line()`/`contains()`/
 //! `highlighted_rows()`; an editor takes the local `Key` enum and reports
 //! `Outcome`.
+//!
+//! The tail of this file also carries `cnf::ui::app`'s four tests that
+//! touch a real directory (`plan_save`'s file-boundary arithmetic,
+//! `attempt_save`'s post-save model, and `write_atomic`'s own behaviour).
+//! They live here rather than in `app.rs`'s own `#[cfg(test)]` module
+//! because `CARGO_TARGET_TMPDIR` -- Cargo's per-package scratch directory
+//! under `target/`, never `/tmp` -- only exists at compile time for a
+//! `tests/*.rs` integration test binary, not for a lib's own unit tests.
 
 use cnf::model::Editor;
 use cnf::set::OptionSet;
+use cnf::ui::app::{attempt_save, plan_save, write_atomic};
 use cnf::ui::edit::FieldEditor;
 use cnf::ui::help::HelpPane;
 use cnf::ui::list::OptionList;
 use cnf::ui::text::TextEditor;
 use cnf::ui::{Key, Outcome};
+use std::collections::BTreeMap;
 use textscreen::cell::Cells;
 use textscreen::widget::{Rect, Widget};
 
@@ -282,4 +292,126 @@ fn page_up_and_page_down_move_the_text_editor_by_more_than_one_line() {
     back.key(Key::End);
     back.key(Key::Char(b'X'));
     assert_eq!(line_containing_the_cursor(back.value()), "line0", "PageUp must undo PageDown by the same amount");
+}
+
+#[test]
+fn plan_save_attributes_a_flat_index_across_a_file_boundary() {
+    // `OptionSet` has no in-memory multi-file constructor (`open` reads
+    // paths, and `files` is private outside `set.rs`), so this needs a
+    // real multi-file directory. It exists because a single-file fixture
+    // cannot discriminate an off-by-one in `locate`'s (private to
+    // `app.rs`) file-crossing arithmetic: with one file, `remaining < len`
+    // and a mutated `remaining <= len` agree on every index actually
+    // exercised. Only a flat index that crosses a real file boundary can
+    // tell them apart.
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("cnf_locate_boundary_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let a_path = dir.join("A.MSG");
+    let b_path = dir.join("B.MSG");
+    std::fs::write(&a_path, b"ONE {1} N 0 9\r\n").expect("write A.MSG");
+    std::fs::write(&b_path, b"TWO {2} N 0 9\r\n").expect("write B.MSG");
+
+    let set = OptionSet::open(&[a_path, b_path]).expect("open");
+    assert_eq!(set.len(), 2, "one option per file");
+
+    let mut pending = BTreeMap::new();
+    pending.insert(1, b"9".to_vec()); // flat index 1 -- B.MSG's only option
+    let writes = plan_save(&set, &pending).expect("no WriteError expected");
+
+    assert_eq!(writes.len(), 1, "only B.MSG changed");
+    assert_eq!(writes[0].file_name, "B.MSG", "flat index 1 must resolve into B.MSG, not A.MSG");
+    assert!(
+        writes[0].msg.windows(3).any(|w| w == b"{9}"),
+        "B.MSG's own edit must land: {:?}",
+        String::from_utf8_lossy(&writes[0].msg)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attempt_save_shows_the_saved_value_not_the_value_from_before_the_save() {
+    // Batch G review, Critical: `attempt_save` used to rebuild `editor`
+    // from the `OptionSet` it read BEFORE writing the files -- the same
+    // snapshot `plan_save` diffed the pending edit against, which never
+    // saw the new value. `dirty()` came back clean (correctly -- `pending`
+    // really was empty), but the model's own displayed value reverted to
+    // what was on disk before the save, right after "saved 1 file(s)"
+    // printed. A sysop watching that would reasonably conclude the save
+    // failed, even though the file on disk was correct the whole time.
+    // This test reads the model back out through `Editor::option_at`, not
+    // just `dirty()`, because `dirty()` alone cannot tell a real save from
+    // this bug.
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("cnf_attempt_save_shows_saved_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let path = dir.join("A.MSG");
+    std::fs::write(&path, b"GAMCRD {60} N 0 32767\r\n").expect("write A.MSG");
+
+    let set = OptionSet::open(std::slice::from_ref(&path)).expect("open");
+    let mut editor = Editor::new(set);
+    editor.select(0);
+    editor.edit(b"120".to_vec()).expect("120 is in range");
+    assert_eq!(editor.option_at(0).1, b"120", "the pending edit before any save");
+
+    let status = attempt_save(&dir, std::slice::from_ref(&path), &mut editor);
+    assert!(status.contains("saved"), "expected a success message, got {status:?}");
+
+    assert!(!editor.dirty(), "nothing pending after a successful save");
+    assert_eq!(
+        editor.option_at(0).1,
+        b"120",
+        "the model must show the value that was just saved, not revert to the pre-save one: got status {status:?}"
+    );
+
+    // And the disk copy itself really did change -- not just the
+    // in-memory model.
+    let on_disk = std::fs::read(&path).expect("read back A.MSG");
+    assert!(
+        on_disk.windows(3).any(|w| w == b"120"),
+        "the file on disk must carry the new value: {:?}",
+        String::from_utf8_lossy(&on_disk)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn write_atomic_writes_the_bytes_and_leaves_no_tmp_file_behind() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("cnf_write_atomic_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let path = dir.join("X.MSG");
+
+    write_atomic(&path, b"first").expect("first write");
+    assert_eq!(std::fs::read(&path).expect("read"), b"first");
+
+    write_atomic(&path, b"second, and longer than first").expect("second write");
+    assert_eq!(std::fs::read(&path).expect("read"), b"second, and longer than first");
+
+    let tmp = path.with_extension("MSG.tmp");
+    assert!(!tmp.exists(), "the temp file must be renamed away, not left behind");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn write_atomic_failing_to_write_the_temp_file_leaves_the_original_untouched() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("cnf_write_atomic_fail_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let path = dir.join("X.MSG");
+    std::fs::write(&path, b"original").expect("seed original");
+
+    // Shadow the exact path the temp file would use with a directory, so
+    // writing there fails deterministically without touching any OS-level
+    // permission bits.
+    let tmp = path.with_extension("MSG.tmp");
+    std::fs::create_dir(&tmp).expect("shadow the tmp path with a directory");
+
+    assert!(write_atomic(&path, b"replacement").is_err(), "writing where a directory sits must fail");
+    assert_eq!(std::fs::read(&path).expect("read"), b"original", "the original must survive a failed write");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
