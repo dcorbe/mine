@@ -14,7 +14,9 @@ use crate::spec::{OptionType, SpecError, SpecFile};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteError {
-    /// The rewritten file no longer parses.
+    /// The `.MSG` bytes did not parse -- either `recompile` was handed one
+    /// that never parsed to begin with, or `rewrite` produced one that no
+    /// longer does.
     Reparse(SpecError),
     /// The rewrite changed how many messages the file holds.
     ///
