@@ -160,7 +160,12 @@ const LANGUAGE: &[u8] = b"LANGUAGE";
 /// Characters an option name is made of. Mirrors `msg.rs`'s `is_name`, which
 /// it does not export: digits and *upper-case* letters only, so comment prose
 /// (ordinary sentences) does not start a name by accident.
-fn is_name(byte: u8) -> bool {
+///
+/// `pub(crate)` rather than private: `hinge::parse` reuses this exact
+/// definition to decide whether a `(...)` it found is really a hinge or just
+/// parenthesised prose that happens to contain a `#` or `=` -- see that
+/// function's doc comment.
+pub(crate) fn is_name(byte: u8) -> bool {
     byte.is_ascii_digit() || byte.is_ascii_uppercase()
 }
 
@@ -282,6 +287,26 @@ fn last_paragraph(source: &[u8], start: usize, end: usize) -> Vec<u8> {
 
 /// Scan `source` for options, left to right, cross-checked against the
 /// messages `MsgFile` already counted.
+///
+/// Validated against every distinct `.MSG` in the tree (`tests/corpus.rs`,
+/// 186 files, ~26300 `T` options, 0 refusals as of 2026-08-18). Two rules
+/// that corpus run forced, both fixed in `hinge::parse` rather than here
+/// (this function only calls it before `parse_tail`, per the ordering `scan`
+/// has always used) -- see that function's doc comment for the full detail:
+///
+/// - A hinge is not always a trailing suffix of the tail. The corpus writes
+///   `=`/`#` hinges *before* the type letter (`(NEEDAPPR=YES) S 18 prompt`);
+///   only `*` (exclude-always) shows up after it too. Treating the hinge as
+///   always-trailing silently deleted the type letter on every before-form
+///   hinge, dropping the option from `options()` rather than mis-parsing it
+///   -- no hand-written fixture caught this because every fixture happened
+///   to put the hinge last.
+/// - A `(...)` is only a hinge if the name before `=`/`#`/`*` is name-shaped
+///   (`is_name`, the same alphabet as an option name). Without that check,
+///   ordinary prose in a `T`/`S`/`E` tail's free-text portion that happens to
+///   contain `=`/`#` -- e.g. `WGSEDTM.MSG`'s `FSENIM`, tail
+///   `T FSE Import Rebuff (Bad #)` -- parsed as a hinge on the nonsense
+///   target `"Bad "`.
 fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError> {
     let mut options = Vec::new();
     let mut index = 0usize;
@@ -322,7 +347,7 @@ fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError>
         let tail_line_end = find_line_end(source, tail_start);
         let tail = strip_cr(&source[tail_start..tail_line_end]);
         let (hinge, tail) = crate::hinge::parse(tail);
-        let kind = parse_tail(tail);
+        let kind = parse_tail(&tail);
 
         if name != LANGUAGE {
             if let Some(kind) = kind {
