@@ -571,11 +571,16 @@ impl Files {
                 // as a fallback, and only for the specific failure that means
                 // "nothing there" -- never for an ambiguous or denied name.
                 let resolved = self.resolve(&name)?;
-                let attempt = self.openat2(&resolved, flags, 0);
-                self.attempts
-                    .push((resolved.clone(), "open", attempt.is_ok()));
-                match attempt {
-                    Ok(fd) => self.install(fd, resolved, false),
+                // Recorded once the outcome is known, not before. The real
+                // path missing is how the `provided` fallback is *reached*,
+                // not something the guest asked for -- and a row saying
+                // `open ... FAILED` beside a handle the guest is happily
+                // reading makes `attempts` contradict the run it describes.
+                match self.openat2(&resolved, flags, 0) {
+                    Ok(fd) => {
+                        self.attempts.push((resolved.clone(), "open", true));
+                        self.install(fd, resolved, false)
+                    }
                     Err(e) => {
                         let code = match e.raw_os_error() {
                             Some(libc::ENOENT) => ERR_FILE_NOT_FOUND,
@@ -583,11 +588,18 @@ impl Files {
                             Some(libc::EXDEV) | Some(libc::ELOOP) => ERR_ACCESS_DENIED,
                             _ => ERR_FILE_NOT_FOUND,
                         };
-                        if code == ERR_FILE_NOT_FOUND {
-                            if let Some(bytes) = self.provided.get(&name).cloned() {
-                                return self.provided_handle(&name, &bytes);
-                            }
+                        if code == ERR_FILE_NOT_FOUND
+                            && let Some(bytes) = self.provided.get(&name).cloned()
+                        {
+                            // After the call, never before: `provided_handle`
+                            // can fail on its own (`memfd_create`, or a short
+                            // write), and recording `ok` ahead of it would
+                            // move the lie rather than fix it.
+                            let got = self.provided_handle(&name, &bytes);
+                            self.attempts.push((resolved, "provide", got.is_ok()));
+                            return got;
                         }
+                        self.attempts.push((resolved, "open", false));
                         Err(code)
                     }
                 }
@@ -1275,6 +1287,78 @@ mod tests {
         assert_eq!(fs.read(handle, &mut buf), Ok(13));
         assert_eq!(&buf, b"ReG#00000000\0");
         assert!(!root.join("GALGSBL.DLL").exists(), "nothing may be written to the board");
+    }
+
+    /// The report says what actually happened. A name answered from the
+    /// provided set records a `provide` that succeeded -- not the `open` of
+    /// the real path that missed on the way there. That miss is how the
+    /// fallback is *reached*, not something the guest asked for, and "every
+    /// file the guest asked for" is one row per ask: the guest asked once and
+    /// got a working handle. Reporting it as `open ... FAILED` while handing
+    /// back a handle makes the diagnostic contradict the run.
+    #[test]
+    fn a_provided_name_is_reported_as_provided_not_as_a_failed_open() {
+        let (_root, mut fs) = scratch("dos_provide_report");
+        fs.provide("GALGSBL.DLL", b"ReG#00000000\0".to_vec());
+        fs.open_existing(b"GALGSBL.DLL\0", 0).expect("a provided name opens");
+
+        let rows: Vec<(&str, &str, bool)> = fs
+            .attempts
+            .iter()
+            .map(|(n, how, ok)| (n.as_str(), *how, *ok))
+            .collect();
+        assert_eq!(rows, vec![("GALGSBL.DLL", "provide", true)]);
+    }
+
+    /// The other half of the same row, and the reason it is a separate test:
+    /// moving the push out of one unconditional statement and into the
+    /// branches made the failure row *losable*, where before it could not be
+    /// dropped without dropping the success row with it. A name with neither
+    /// a file nor a provided blob must still be reported, and reported as the
+    /// failure it was.
+    #[test]
+    fn a_name_with_no_file_and_no_blob_is_still_reported_as_a_failed_open() {
+        let (_root, mut fs) = scratch("dos_provide_report_miss");
+        fs.provide("GALGSBL.DLL", b"x".to_vec());
+        assert_eq!(fs.open_existing(b"WCCMMUD.MCV\0", 0), Err(ERR_FILE_NOT_FOUND));
+
+        let rows: Vec<(&str, &str, bool)> = fs
+            .attempts
+            .iter()
+            .map(|(n, how, ok)| (n.as_str(), *how, *ok))
+            .collect();
+        assert_eq!(rows, vec![("WCCMMUD.MCV", "open", false)]);
+    }
+
+    /// A synthesis that *fails* is reported as the failure it was.
+    ///
+    /// `provided_handle` ends in `install`, which refuses with
+    /// `ERR_TOO_MANY_OPEN` once all [`MAX_HANDLES`] slots are taken -- so
+    /// filling the table reaches the one branch where the guest asks for a
+    /// provided name and still gets nothing. Without this, recording the row
+    /// as an unconditional `true` passes the whole suite, because every other
+    /// test reaches `provided_handle` only when it succeeds.
+    #[test]
+    fn a_provided_name_that_could_not_be_handed_over_is_reported_as_failed() {
+        let (root, mut fs) = scratch("dos_provide_report_full");
+        fs.provide("GALGSBL.DLL", b"ReG#00000000\0".to_vec());
+        for i in 0..MAX_HANDLES {
+            let name = format!("F{i:02}.DAT");
+            std::fs::write(root.join(&name), b"x").expect("seed");
+            let mut path = name.into_bytes();
+            path.push(0);
+            fs.open_existing(&path, 0).expect("a real file opens");
+        }
+
+        assert_eq!(
+            fs.open_existing(b"GALGSBL.DLL\0", 0),
+            Err(ERR_TOO_MANY_OPEN),
+            "the table is full, so even a provided name cannot be handed over"
+        );
+        assert_eq!(
+            fs.attempts.last().map(|(n, how, ok)| (n.as_str(), *how, *ok)),
+            Some(("GALGSBL.DLL", "provide", false))
+        );
     }
 
     /// **The closed-set test, and the more important of the two.** A host that
