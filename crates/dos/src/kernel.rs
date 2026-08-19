@@ -727,10 +727,29 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
             }
         }
 
-        // 42h -- seek handle BX to CX:DX by AL.
+        // 42h -- seek handle BX to the CX:DX offset named by AL.
+        //
+        // `CX:DX` is a *signed* 32-bit displacement for AL=1 (from current)
+        // and AL=2 (from end), and reading a file's trailer by seeking
+        // backwards from its end is the ordinary way a DOS program finds an
+        // index it appended. Assembling the two halves as an unsigned value
+        // turns `CX:DX = FFFF:FFF0` from "sixteen bytes before the end" into
+        // "four gigabytes past it": the seek still succeeds, the read that
+        // follows returns zero bytes, and the program reports its own file as
+        // corrupt. That is how the 16-bit `WCCMMUTL.EXE` came to say
+        // `CANNOT READ "WCCMMPLS.MCV" VARIABLES` about a file that was fine.
+        //
+        // AL=0 (from start) is *not* signed -- it names an absolute position,
+        // and a program seeking beyond 2 GB into a file has not asked to go
+        // backwards from byte zero.
         0x42 => {
-            let offset = (i64::from(regs.cx) << 16) | i64::from(regs.dx);
+            let raw = (u32::from(regs.cx) << 16) | u32::from(regs.dx);
             let whence = regs.al();
+            let offset = if whence == 0 {
+                i64::from(raw)
+            } else {
+                i64::from(raw as i32)
+            };
             let Some(files) = dos.files.as_mut() else {
                 return fail(g, regs, ERR_INVALID_FUNCTION);
             };
@@ -1223,6 +1242,119 @@ mod tests {
         let fd = std::fs::File::open(&root).expect("open root");
         let files = Files::new(fd.into(), root.clone());
         (root, files)
+    }
+
+    /// Open `name` in the scratch root, seeded with `bytes`, and hand back a
+    /// guest plus state with the handle already open. Every seek test needs
+    /// the same three calls before the one it is actually about.
+    fn opened(name: &str, file: &str, bytes: &[u8]) -> (TestGuest, DosState, u16) {
+        let (root, fs) = with_files(name);
+        std::fs::write(root.join(file), bytes).expect("seed");
+
+        let mut g = TestGuest::new(64 * 1024);
+        let path_at = Ptr::new(0x100, 0x20);
+        let mut name_z = file.as_bytes().to_vec();
+        name_z.push(0);
+        g.poke(path_at, &name_z);
+
+        let mut dos = DosState {
+            files: Some(fs),
+            ..DosState::default()
+        };
+        let mut regs = Regs::default();
+        regs.set_ah(0x3d);
+        regs.set_al(0); // read only
+        regs.ds = path_at.seg;
+        regs.dx = path_at.off;
+        g.call_with(regs);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry(), "the fixture must open");
+        let handle = g.regs().ax;
+        (g, dos, handle)
+    }
+
+    fn seek(g: &mut TestGuest, dos: &mut DosState, handle: u16, whence: u8, off: i32) -> u32 {
+        let raw = off as u32;
+        let mut regs = Regs::default();
+        regs.set_ah(0x42);
+        regs.set_al(whence);
+        regs.bx = handle;
+        regs.cx = (raw >> 16) as u16;
+        regs.dx = (raw & 0xffff) as u16;
+        g.call_with(regs);
+        assert_eq!(dispatch(g, dos), Outcome::Continue);
+        assert!(!g.carry(), "the seek must succeed");
+        (u32::from(g.regs().dx) << 16) | u32::from(g.regs().ax)
+    }
+
+    /// Read `want` bytes from `handle` and hand back what landed in memory.
+    /// Every backward-seek test has to read, for the reason spelled out on
+    /// [`the_trailer_read_after_a_backward_seek_returns_the_last_bytes`].
+    fn read_after(g: &mut TestGuest, dos: &mut DosState, handle: u16, want: u16) -> Vec<u8> {
+        let buf_at = Ptr::new(0x100, 0x400);
+        let mut regs = Regs::default();
+        regs.set_ah(0x3f);
+        regs.bx = handle;
+        regs.cx = want;
+        regs.ds = buf_at.seg;
+        regs.dx = buf_at.off;
+        g.call_with(regs);
+        assert_eq!(dispatch(g, dos), Outcome::Continue);
+        assert!(!g.carry(), "the read must succeed");
+        let got = g.regs().ax as usize;
+        g.peek(buf_at, got).to_vec()
+    }
+
+    /// Seeking backwards from the end is how a DOS program reads an index it
+    /// appended to its own file, and `CX:DX` carries that displacement as a
+    /// signed 32-bit value. Built unsigned, `FFFF:FFF0` stops being "sixteen
+    /// bytes back" and becomes "four gigabytes forward".
+    ///
+    /// **The position `42h` reports back cannot detect that**, which is why
+    /// this test reads rather than asserting on `DX:AX`. The overshoot is
+    /// exactly `2^32`, and `DX:AX` is exactly 32 bits, so the wrong seek
+    /// reports the *identical* position as the right one -- an assertion on
+    /// the returned offset passes against the bug and against the fix, and
+    /// mutation testing is the only thing that says so. Where the file
+    /// pointer actually ended up is observable only by reading through it.
+    #[test]
+    fn the_trailer_read_after_a_backward_seek_returns_the_last_bytes() {
+        let mut body: Vec<u8> = (0..100u8).collect();
+        body[84..].copy_from_slice(&[0xab; 16]);
+        let (mut g, mut dos, handle) = opened("dos_seek_trailer_read", "TRAILER.DAT", &body);
+
+        assert_eq!(seek(&mut g, &mut dos, handle, 2, -16), 84, "reported position wraps to 84 either way");
+
+        // 512 bytes asked for, exactly as WCCMMUTL does; 16 are left.
+        let got = read_after(&mut g, &mut dos, handle, 512);
+        assert_eq!(got.len(), 16, "a short read of exactly the trailer, not zero bytes");
+        assert_eq!(got, vec![0xab; 16], "and it must be the trailer's own bytes");
+    }
+
+    /// AL=1 carries the same signed displacement, measured from where the
+    /// handle already is -- and is unobservable in `DX:AX` for the same
+    /// wrap-around reason, so this reads too.
+    #[test]
+    fn seek_from_the_current_position_accepts_a_negative_displacement() {
+        let body: Vec<u8> = (0..100u8).collect();
+        let (mut g, mut dos, handle) = opened("dos_seek_cur_neg", "SEEKME.DAT", &body);
+
+        assert_eq!(seek(&mut g, &mut dos, handle, 0, 50), 50);
+        seek(&mut g, &mut dos, handle, 1, -20);
+        let got = read_after(&mut g, &mut dos, handle, 4);
+        assert_eq!(got, vec![30, 31, 32, 33], "the byte at 30, not at 50 or past the end");
+    }
+
+    /// AL=0 names an absolute position, so the identical bit pattern that
+    /// means -16 from the end must NOT mean -16 from the start. Nothing here
+    /// makes a 4 GB file; what is being pinned is that the two modes read the
+    /// same sixteen bits differently.
+    #[test]
+    fn seek_from_the_start_reads_the_offset_as_unsigned() {
+        let (mut g, mut dos, handle) = opened("dos_seek_set_unsigned", "SEEKME.DAT", &[0u8; 100]);
+
+        let at = seek(&mut g, &mut dos, handle, 0, -16);
+        assert_eq!(at, 0xffff_fff0, "an absolute position past the end, not an error or 0");
     }
 
     #[test]
