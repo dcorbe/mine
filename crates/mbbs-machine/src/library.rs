@@ -550,6 +550,7 @@ pub fn library(spelling: &str) -> Option<&'static Library> {
 /// The unit of selection. Choosing a table per library independently is what
 /// manufactures a mixed generation -- GALGSBL from MBBS 6.25 alongside
 /// MAJORBBS from WG 1.01, a configuration nobody ever shipped or tested.
+#[derive(Debug)]
 pub struct Profile {
     /// The generation tag, matching the `generation` of every table it offers
     /// (except DOSCALLS -- see [`DOSCALLS_PHARLAP31`]).
@@ -696,6 +697,174 @@ pub fn standing(profile: &Profile, demand: &Demand) -> Standing {
         return Standing::Unevidenced { missing };
     }
     Standing::Admissible
+}
+
+/// One demanded ordinal that two admissible profiles name differently.
+#[derive(Debug)]
+pub struct Discriminator {
+    pub library: &'static str,
+    pub ordinal: u16,
+    /// `(profile, name)` for each admissible profile, so the refusal says what
+    /// each generation would have called it.
+    pub names: Vec<(&'static str, Box<str>)>,
+}
+
+/// What the evidence supports.
+#[derive(Debug)]
+pub enum Outcome {
+    /// One admissible profile.
+    Unique(&'static Profile),
+    /// Several, agreeing on every demanded ordinal, so the choice cannot be
+    /// observed by these modules. `chosen` is the anchor.
+    Unobservable {
+        chosen: &'static Profile,
+        agreeing: Vec<&'static str>,
+    },
+    /// Several, disagreeing. **Refused**: a wrong name is worse than none,
+    /// because a bare ordinal is reported while a wrong name is believed.
+    Ambiguous {
+        discriminating: Vec<Discriminator>,
+    },
+    /// Nothing admissible. Refused, carrying why each profile failed.
+    NoneAdmissible {
+        excluded: Vec<(&'static str, Vec<(&'static str, Vec<u16>)>)>,
+        unevidenced: Vec<&'static str>,
+    },
+}
+
+/// Which profile the modules' own imports support.
+pub fn detect(demand: &Demand) -> Outcome {
+    let mut admissible: Vec<&'static Profile> = Vec::new();
+    let mut excluded = Vec::new();
+    let mut unevidenced = Vec::new();
+    for p in PROFILES {
+        match standing(p, demand) {
+            Standing::Admissible => admissible.push(p),
+            Standing::Excluded { uncovered } => excluded.push((p.name, uncovered)),
+            Standing::Unevidenced { .. } => unevidenced.push(p.name),
+        }
+    }
+
+    match admissible.len() {
+        0 => Outcome::NoneAdmissible { excluded, unevidenced },
+        1 => Outcome::Unique(admissible[0]),
+        _ => {
+            let mut discriminating = Vec::new();
+            for lib in demand.libraries() {
+                let Some(wanted) = demand.ordinals(lib) else {
+                    continue;
+                };
+                for &o in wanted {
+                    let named: Vec<(&'static str, Box<str>)> = admissible
+                        .iter()
+                        .filter_map(|p| {
+                            p.table(lib)
+                                .and_then(|t| t.names().get(&o).cloned())
+                                .map(|n| (p.name, n))
+                        })
+                        .collect();
+                    if named.iter().map(|(_, n)| n).collect::<BTreeSet<_>>().len() > 1 {
+                        discriminating.push(Discriminator { library: lib, ordinal: o, names: named });
+                    }
+                }
+            }
+            if discriminating.is_empty() {
+                let chosen = admissible
+                    .iter()
+                    .copied()
+                    .find(|p| p.name == ANCHOR)
+                    // The anchor is not admissible for this board; they all
+                    // agree, so any is behaviourally identical. Take the last,
+                    // which is the newest in `PROFILES` order.
+                    .unwrap_or_else(|| admissible[admissible.len() - 1]);
+                Outcome::Unobservable {
+                    chosen,
+                    agreeing: admissible.iter().map(|p| p.name).collect(),
+                }
+            } else {
+                Outcome::Ambiguous { discriminating }
+            }
+        }
+    }
+}
+
+/// How one library is being served.
+#[derive(Debug)]
+pub enum Provision {
+    /// An authentic binary is present and loadable; its own export table is
+    /// the truth and no ordinal table is consulted.
+    Authentic { identified: Option<&'static str> },
+    /// This host's shims answer, against `table`. `None` means the chosen
+    /// profile has no table for this library, so ordinals resolve to bare
+    /// numbers rather than borrowing another generation's names.
+    Shim { table: Option<&'static OrdinalTable> },
+    /// Nothing answers. Calls become diagnosable failures.
+    Absent,
+}
+
+/// One line of the per-run provision report.
+#[derive(Debug)]
+pub struct Provisioned {
+    pub library: &'static str,
+    pub provision: Provision,
+    /// Why, when the answer is not the obvious one -- an authentic binary that
+    /// is present but cannot be loaded here says so.
+    pub note: Option<&'static str>,
+}
+
+impl Provisioned {
+    /// One human-readable line.
+    pub fn render(&self) -> String {
+        let body = match &self.provision {
+            Provision::Authentic { identified: Some(id) } => format!("authentic ({id})"),
+            Provision::Authentic { identified: None } => "authentic".to_owned(),
+            Provision::Shim { table: Some(t) } => format!("shimmed against {}", t.generation),
+            Provision::Shim { table: None } => "shimmed, no ordinal table".to_owned(),
+            Provision::Absent => "absent".to_owned(),
+        };
+        match self.note {
+            Some(note) => format!("{:<10} {body} -- {note}", self.library),
+            None => format!("{:<10} {body}", self.library),
+        }
+    }
+}
+
+/// How each demanded library will be served.
+///
+/// `present` answers whether an authentic binary for a library is available;
+/// the caller owns that question because it means "in the board directory" to
+/// one host and something else to another.
+pub fn provision(
+    demand: &Demand,
+    chosen: &'static Profile,
+    present: &dyn Fn(&str) -> bool,
+) -> Vec<Provisioned> {
+    demand
+        .libraries()
+        .map(|name| {
+            let lib = library(name);
+            let eligible = lib.map(|l| &l.authentic);
+            match (present(name), eligible) {
+                (true, Some(Eligibility::Loadable)) => Provisioned {
+                    library: name,
+                    provision: Provision::Authentic { identified: None },
+                    note: None,
+                },
+                // Present but not loadable here: shim it, and say why rather
+                // than leaving the file silently ignored.
+                (true, Some(Eligibility::NotLoadable(why))) => Provisioned {
+                    library: name,
+                    provision: Provision::Shim { table: chosen.table(name) },
+                    note: Some(why),
+                },
+                _ => Provisioned {
+                    library: name,
+                    provision: Provision::Shim { table: chosen.table(name) },
+                    note: None,
+                },
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -936,5 +1105,95 @@ mod tests {
     #[test]
     fn wg101_is_admissible_for_this_board() {
         assert!(matches!(standing(profile("wg101").expect("wg101"), &board_demand()), Standing::Admissible));
+    }
+
+    /// The board's own answer, measured. Ordinal 87 rules out wg3-16 and
+    /// layout-c; MAJORBBS rules out mbbs625; wg2 is unevidenced. One profile
+    /// is left.
+    #[test]
+    fn the_board_resolves_to_exactly_one_profile() {
+        match detect(&board_demand()) {
+            Outcome::Unique(p) => assert_eq!(p.name, "wg101"),
+            other => panic!("expected a unique profile, got {other:?}"),
+        }
+    }
+
+    /// When several admissible profiles agree on every demanded ordinal the
+    /// choice is unobservable, and the anchor is used -- but the whole
+    /// indistinguishable set is reported rather than the host claiming to have
+    /// identified the host generation.
+    #[test]
+    fn agreeing_profiles_are_reported_as_indistinguishable_and_the_anchor_wins() {
+        // Only ordinals every Layout A table agrees on, and only from
+        // libraries every one of them has a table for.
+        let mut d = Demand::new();
+        for o in [6, 7, 72] {
+            d.add("GALGSBL", o);
+        }
+        d.add("MAJORBBS", 474);
+        match detect(&d) {
+            Outcome::Unobservable { chosen, agreeing } => {
+                assert_eq!(chosen.name, ANCHOR);
+                assert!(agreeing.contains(&"mbbs625"), "got {agreeing:?}");
+                assert!(agreeing.contains(&"wg101"), "got {agreeing:?}");
+            }
+            other => panic!("expected unobservable, got {other:?}"),
+        }
+    }
+
+    /// Nothing admissible is a refusal that names the evidence, never a
+    /// fallback to a default.
+    #[test]
+    fn no_admissible_profile_refuses_and_names_the_uncovered_ordinals() {
+        let mut d = Demand::new();
+        d.add("GALGSBL", 60000); // no generation has an ordinal 60000
+        match detect(&d) {
+            Outcome::NoneAdmissible { excluded, .. } => {
+                assert!(!excluded.is_empty(), "the refusal must carry its evidence");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A library whose authentic binary is present but cannot be loaded here
+    /// must be shimmed AND say so. Silently ignoring the file is what makes a
+    /// swapped board indistinguishable from an unswapped one.
+    #[test]
+    fn an_ineligible_authentic_binary_is_shimmed_and_says_why() {
+        let d = board_demand();
+        let everything_present = |_: &str| true;
+        let rows = provision(&d, profile("wg101").expect("wg101"), &everything_present);
+        let majorbbs = rows.iter().find(|r| r.library == MAJORBBS).expect("MAJORBBS row");
+        match &majorbbs.provision {
+            Provision::Shim { .. } => {}
+            other => panic!("MAJORBBS is NE plus a Phar Lap extender and cannot be authentic: {other:?}"),
+        }
+        assert!(majorbbs.render().contains("Phar Lap"), "the reason must survive into the report");
+    }
+
+    /// With the binary present and loadable, authentic wins -- that is the
+    /// swap knob.
+    #[test]
+    fn a_present_loadable_binary_is_preferred_over_the_shim() {
+        let d = board_demand();
+        let everything_present = |_: &str| true;
+        let rows = provision(&d, profile("wg101").expect("wg101"), &everything_present);
+        let galgsbl = rows.iter().find(|r| r.library == GALGSBL).expect("GALGSBL row");
+        assert!(matches!(galgsbl.provision, Provision::Authentic { .. }));
+    }
+
+    /// With nothing present, everything is shimmed against the chosen
+    /// profile's table, and the report names the generation.
+    #[test]
+    fn with_no_binaries_present_everything_is_shimmed_against_the_chosen_generation() {
+        let d = board_demand();
+        let nothing_present = |_: &str| false;
+        let rows = provision(&d, profile("wg101").expect("wg101"), &nothing_present);
+        let galgsbl = rows.iter().find(|r| r.library == GALGSBL).expect("GALGSBL row");
+        match &galgsbl.provision {
+            Provision::Shim { table: Some(t) } => assert_eq!(t.generation, "wg101"),
+            other => panic!("expected a wg101 shim, got {other:?}"),
+        }
+        assert!(galgsbl.render().contains("wg101"));
     }
 }
