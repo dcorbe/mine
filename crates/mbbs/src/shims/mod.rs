@@ -132,8 +132,11 @@ pub(crate) const NO: u16 = -1i16 as u16;
 /// "`Shim<A>` as specified is unreachable, and the table needs a second
 /// door" for why flipping it earlier -- while ten routines still had no
 /// generic core to point at -- would not have compiled, and why those ten
-/// (plus the seventeen Btrieve routines the concrete engine behind them ties
-/// to `Wg16`) now live behind [`Abi::native`] instead of in [`routines`].
+/// live behind [`Abi::native`] instead of in [`routines`]. The Btrieve
+/// routines are NOT among them: they were moved into the shared table once
+/// `Btrieve<A>` and `Host<A>`'s own `btrieve` field stopped eliding their
+/// type parameter (`da17681`, `597ce40`), and there are 38 of them in
+/// [`routines`] today.
 pub type Shim<A> = fn(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>;
 
 // `Wg16Shim` -- a bare `fn(&mut Machine, &mut Host) -> Result<mbbs_machine::m16::Ret,
@@ -257,9 +260,11 @@ impl<A: Abi> Copy for Entry<A> {}
 /// among them now (`borland::get_module_handle`/`get_proc_address`), the two
 /// KERNEL32 symbols that needed `Wg32::resume` to learn `Cleans::Callee`
 /// before they could be registered at all. The twenty-seven that do not have
-/// a generic core -- `shims::btrieve`'s seventeen, `shims::runtime`'s eight,
-/// `shims::memory`'s `alctile`/`ptrtile` -- are not here; see [`Abi::native`]
-/// and [`wg16_native`] for where they live instead, and why.
+/// a generic core -- `shims::runtime`'s eight, `shims::memory`'s
+/// `alctile`/`ptrtile` -- are not here; see [`Abi::native`] and
+/// [`wg16_native`] for where they live instead, and why. `shims::btrieve`'s
+/// used to be on this list and no longer belongs: its routines are in the
+/// table below.
 ///
 /// Re-derive by counting the `Evidence::Unclassified)` rows inside this
 /// function's own `vec![...]` (every row ends with one); cross-check against

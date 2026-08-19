@@ -4887,11 +4887,12 @@ fn symbol_name(exports: &Exports, from: &str, symbol: &Symbol) -> String {
 /// used to be [`Host`]'s own separate `check_globals` pass.
 ///
 /// Generic over `A` since Task 9 of
-/// `docs/plans/2026-08-12-abi-border-implementation.md`, but only ever built
-/// for `Wg16` today: `Wg32::load` is Task 10's arm, unwritten. Nothing about
-/// this type assumes `Wg16` -- see [`Import`]/`Host::load`'s own doc
-/// comments for the one arm (`reach`) that is NE-specific mechanism reused
-/// generically rather than NE-specific *policy*.
+/// `docs/plans/2026-08-12-abi-border-implementation.md`. Both arms are
+/// written: `Wg32::load` parses a `PeImage`, relocates it, binds imports and
+/// arms the `__ftol` ST0 capture (`abi/wg32.rs`). Nothing about this type
+/// assumes `Wg16` -- see [`Import`]/`Host::load`'s own doc comments for the
+/// one arm (`reach`) that is NE-specific mechanism reused generically rather
+/// than NE-specific *policy*.
 struct Resolver<'a, A: Abi> {
     exports: &'static Exports,
     globals: &'a Globals<A>,
