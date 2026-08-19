@@ -66,89 +66,13 @@ pub const WGSERVER: &str = "WGSERVER";
 /// crt0 trampoline links against. See `crate::shims::dosenv`.
 pub const PHAPI: &str = "PHAPI";
 
-/// WG 1.01's export tables, from `MAJORBBS.DEF` and `GSBLIMP.LIB`.
-///
-/// Committed rather than read from `archive/` at runtime. Twenty kilobytes of
-/// derived names, and a host that loses them in a fresh checkout is a host
-/// whose refusals report bare ordinals.
-const MAJORBBS_WG101: &str = include_str!("../data/majorbbs_wg101.tsv");
-/// Recovered 2026-08-14 from the WG 1.01 `GALDLL.ZIP` binaries, the same zip
-/// the `GALME`/`GALGSBL` tables came from, and verified ordinal-by-ordinal
-/// against `GALMSG.DEF`/`GALFIL.DEF` (byte-identical in the wg1 and wg20
-/// source kits). Each binary carries one entry its `.DEF` omits -- the
-/// `_INIT__*` entry point -- the same pattern `GALME`'s table already shows.
-const GALMSG_WG101: &str = include_str!("../data/galmsg_wg101.tsv");
-const GALFIL_WG101: &str = include_str!("../data/galfil_wg101.tsv");
-/// **Weaker provenance than the tables above, and deliberately said out loud.**
-/// No `GALETL.DEF` or import library survives anywhere in the archive, so this
-/// has no independent numeric cross-check -- only that its routine names match
-/// `GALETL.DOC`'s description of a teleconferencing engine. The NE header
-/// version (6.01) matches the confirmed WG-1.01 binaries, but the copy came
-/// from a third-party archive rather than the WG 1.01 CD.
-///
-/// Three GALETL builds exist and their ordinals genuinely DISAGREE (ordinal 36
-/// is `_TL2LST` in one and `___TLCACT` in another), so they are kept as
-/// separate files and must never be merged: a wrong ordinal map is worse than
-/// none, because it makes this host confidently name the wrong routine. The
-/// other two are `galetl_wg300.tsv` and `galetl_ne5.tsv`, recovered but not
-/// wired -- nothing this host loads is a WG 3.x or Entertainment Pack module.
-const GALETL_WG101: &str = include_str!("../data/galetl_wg101.tsv");
-const GALETL_WG300: &str = include_str!("../data/galetl_wg300.tsv");
-/// The 32-bit host's own export table, recovered 2026-08-14 from the genuinely
-/// NE-format `WGSERVER.EXE` copies under `archive/_acquire/pools/full` -- five
-/// are there, and they are two distinct builds (three byte-identical 3.12/3.13
-/// and two byte-identical 3.00), NOT the PE32 `WGSERVER.EXE` that 32-bit
-/// modules import by name and needs no ordinal table at all.
-///
-/// **Verified against the vendor's own export definitions**, which do survive:
-/// `re/wg33src/LIB/wg30/WGSERVER.DEF` and `re/wg33src/LIB/WGSERVER.DEF`, from
-/// the Worldgroup 3.3 source kit. 1,227 of the 3.00 DEF's 1,234 names appear
-/// in the 3.00 table (99.4%) and 1,494 of the 3.3 DEF's 1,508 in the 3.12
-/// table (99.1%). Every name the DEFs have and the binaries do not is an
-/// NT-only routine sitting behind an `#ifdef` -- `iswinnt`,
-/// `isrunasservice`, `getlasterrortext`, `excpfilter`, `geterrortext` --
-/// which a DOS-era build correctly lacks.
-///
-/// The 3.3 DEF goes further: 1,506 of its entries carry an explicit
-/// `@ordinal`, so the 3.12 table is verified ORDINAL BY ORDINAL against it --
-/// **1,494 of 1,494 shared ordinals agree on the name, zero mismatches.**
-/// The 3.00 DEF lists names only, so that table rests on the name set plus
-/// its own binary's export table for the numbering.
-const WGSERVER_WG300: &str = include_str!("../data/wgserver_wg300.tsv");
-const WGSERVER_WG312: &str = include_str!("../data/wgserver_wg312.tsv");
-
-// GALGSBL's tables live in `mbbs_machine::library` now, so that
+// Every ordinal table lives in `mbbs_machine::library` now, so that
 // `crates/dos-runtime` can reach them without depending on this crate. The
-// provenance that justified this table moved with it.
-use mbbs_machine::library::GALGSBL_WG101;
-
-/// `GALME.DLL`'s own name table, read out of the shipped WG 1.01 binary.
-///
-/// The one place a DEF and a binary disagree in this crate: `GMEDEF.DEF` in the
-/// Worldgroup 1.01 source kit names 207 ordinals and the shipped DLL exports
-/// 208, the extra being `_INIT__GME` at ordinal 1. They agree on the other 207,
-/// and the binary is the thing the module is actually linked against.
-const GALME_WG101: &str = include_str!("../data/galme_wg101.tsv");
-
-/// `DOSCALLS`, keyed to the extender release rather than the host release.
-///
-/// No Worldgroup disk ships a `DOSCALLS.DLL`. The 286|DOS-Extender bound into
-/// `MAJORBBS.EXE` provides it, so the table comes from Phar Lap's own copy --
-/// 206 ordinals out of the NE name table of `BIN/DOSCALLS.DLL`, a binary that
-/// describes itself as "EFI FUNCTIONS - DOSCALLS EMULATION" -- plus the three
-/// its entry table skips (`DosExit`, `DosChgFilePtr`, `DosWrite`) taken from
-/// the IMPDEF records of `BC4/LIB/PHAPI.LIB`.
-///
-/// The two sources are independent and agree on all 79 ordinals they share.
-/// They differ in wording on exactly two, and those are aliases rather than
-/// conflicts: Borland's import library calls 135 and 136 `__AHSHIFT` and
-/// `__AHINCR`, which is what its runtime wants huge-pointer arithmetic to link
-/// against. What a DLL calls its own ordinal is what this records.
-///
-/// `pharlap31` is measured, not assumed. WG 1.01's `MAJORBBS.EXE` carries the
-/// 286|DOS-Extender banner and the version literal `3.1`, and the 3.04 and 3.12
-/// `DOSCALLS.DLL` files -- different binaries -- name every ordinal the same.
-const DOSCALLS_PHARLAP31: &str = include_str!("../data/doscalls_pharlap31.tsv");
+// provenance that justified each table moved with it.
+use mbbs_machine::library::{
+    DOSCALLS_PHARLAP31, GALETL_WG101, GALETL_WG300, GALFIL_WG101, GALGSBL_WG101, GALME_WG101,
+    GALMSG_WG101, MAJORBBS_WG101, WGSERVER_WG300, WGSERVER_WG312,
+};
 
 /// One host version's exports, across every DLL it ships.
 pub struct Exports {
@@ -161,13 +85,13 @@ impl Exports {
         static TABLE: OnceLock<Exports> = OnceLock::new();
         TABLE.get_or_init(|| Exports {
             by_dll: [
-                (MAJORBBS, parse(MAJORBBS_WG101)),
+                (MAJORBBS, MAJORBBS_WG101.names()),
                 (GALGSBL, GALGSBL_WG101.names()),
-                (GALME, parse(GALME_WG101)),
-                (DOSCALLS, parse(DOSCALLS_PHARLAP31)),
-                (GALMSG, parse(GALMSG_WG101)),
-                (GALFIL, parse(GALFIL_WG101)),
-                (GALETL, parse(GALETL_WG101)),
+                (GALME, GALME_WG101.names()),
+                (DOSCALLS, DOSCALLS_PHARLAP31.names()),
+                (GALMSG, GALMSG_WG101.names()),
+                (GALFIL, GALFIL_WG101.names()),
+                (GALETL, GALETL_WG101.names()),
             ]
             .into_iter()
             .collect(),
@@ -193,8 +117,8 @@ impl Exports {
         static TABLE: OnceLock<Exports> = OnceLock::new();
         TABLE.get_or_init(|| Exports {
             by_dll: [
-                (WGSERVER, parse(WGSERVER_WG300)),
-                (GALETL, parse(GALETL_WG300)),
+                (WGSERVER, WGSERVER_WG300.names()),
+                (GALETL, GALETL_WG300.names()),
             ]
             .into_iter()
             .collect(),
@@ -209,8 +133,8 @@ impl Exports {
         static TABLE: OnceLock<Exports> = OnceLock::new();
         TABLE.get_or_init(|| Exports {
             by_dll: [
-                (WGSERVER, parse(WGSERVER_WG312)),
-                (GALETL, parse(GALETL_WG300)),
+                (WGSERVER, WGSERVER_WG312.names()),
+                (GALETL, GALETL_WG300.names()),
             ]
             .into_iter()
             .collect(),
@@ -235,36 +159,7 @@ impl Exports {
     }
 }
 
-fn parse(tsv: &str) -> HashMap<u16, Box<str>> {
-    tsv.lines()
-        .filter_map(|line| {
-            let (ordinal, name) = line.split_once('\t')?;
-            Some((ordinal.trim().parse().ok()?, c_name(name.trim())))
-        })
-        .collect()
-}
-
-/// The C name behind a linkage name.
-///
-/// Borland's cdecl prefixes an underscore to every external, so the export
-/// table holds `_PRF` for what `GCOMM.H` calls `prf` and `__CTYPE` for what
-/// `ctype.h` calls `_ctype`. Exactly one underscore comes off, which is what
-/// makes those two different names rather than the same one.
-///
-/// The compiler's own helper routines keep their shape: `F_LUMOD@` has no
-/// leading underscore and is not given one. It is also the one symbol
-/// `WCCMMUD.DLL` imports by name rather than by ordinal, so both spellings have
-/// to arrive at the same entry.
-///
-/// `DOSCALLS` and `PHAPI` are far pascal, whose linkage name is the C
-/// identifier upper-cased with no underscore at all. Case is lost there and
-/// cannot be recovered mechanically, so this yields `dossetvec` for what
-/// `BSEDOS.H` spells `DosSetVec`. That is the same symbol, and the lower-case
-/// spelling is what the rest of the crate keys on.
-pub fn c_name(linkage: &str) -> Box<str> {
-    let stripped = linkage.strip_prefix('_').unwrap_or(linkage);
-    stripped.to_ascii_lowercase().into_boxed_str()
-}
+pub use mbbs_machine::library::c_name;
 
 #[cfg(test)]
 mod tests {

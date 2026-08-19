@@ -172,9 +172,232 @@ pub static MAJORBBS_MBBS625: OrdinalTable = OrdinalTable {
     verified: "992 name@ordinal lines, zero duplicate ordinals, max 1180.",
 };
 
+/// WG 1.01's export tables, from `MAJORBBS.DEF` and `GSBLIMP.LIB`.
+///
+/// Committed rather than read from `archive/` at runtime. Twenty kilobytes of
+/// derived names, and a host that loses them in a fresh checkout is a host
+/// whose refusals report bare ordinals.
+pub static MAJORBBS_WG101: OrdinalTable = OrdinalTable {
+    library: MAJORBBS,
+    generation: "wg101",
+    tsv: include_str!("../data/majorbbs_wg101.tsv"),
+    source_path: "archive/galacticomm/extract/wg1/GALDSRC/DLIB/MAJORBBS.DEF",
+    source_kind: SourceKind::VendorDef,
+    verified: "1,210 ordinals spread over 1..1323.",
+};
+
+/// `GALME.DLL`'s own name table, read out of the shipped WG 1.01 binary.
+///
+/// The one place a DEF and a binary disagree in this crate: `GMEDEF.DEF` in the
+/// Worldgroup 1.01 source kit names 207 ordinals and the shipped DLL exports
+/// 208, the extra being `_INIT__GME` at ordinal 1. They agree on the other 207,
+/// and the binary is the thing the module is actually linked against.
+pub static GALME_WG101: OrdinalTable = OrdinalTable {
+    library: GALME,
+    generation: "wg101",
+    tsv: include_str!("../data/galme_wg101.tsv"),
+    source_path: "archive/galacticomm/extract/wg101host/GALME.DLL",
+    source_kind: SourceKind::Binary,
+    verified: "208 ordinals; GMEDEF.DEF names 207 of them and agrees on every one, the extra being _INIT__GME at ordinal 1.",
+};
+
+/// Worldgroup 3.3's `GALME` numbering, from `re/wg33src/LIB/GALME.DEF` --
+/// three byte-identical copies of that `.DEF` exist in the tree and agree.
+/// 287 exports, ordinals 1-287 with no gaps (verified directly, not assumed).
+///
+/// Recovered while tracing `GALME.dll!simpsnd` (ordinal 113 here), a PE named
+/// import in every 32-bit build surveyed and so never actually unnameable by
+/// ordinal -- see `docs/2026-08-15-unnameable-imports.md`. Committed for
+/// completeness; nothing in this crate consumes it yet.
+pub static GALME_WG33: OrdinalTable = OrdinalTable {
+    library: GALME,
+    generation: "wg33",
+    tsv: include_str!("../data/galme_wg33.tsv"),
+    source_path: "re/wg33src/LIB/GALME.DEF",
+    source_kind: SourceKind::VendorDef,
+    verified: "287 name@ordinal lines, ordinals 1-287 with no gaps, verified directly.",
+};
+
+/// Recovered 2026-08-14 from the WG 1.01 `GALDLL.ZIP` binaries, the same zip
+/// the `GALME`/`GALGSBL` tables came from, and verified ordinal-by-ordinal
+/// against `GALMSG.DEF`/`GALFIL.DEF` (byte-identical in the wg1 and wg20
+/// source kits). Each binary carries one entry its `.DEF` omits -- the
+/// `_INIT__*` entry point -- the same pattern `GALME`'s table already shows.
+pub static GALMSG_WG101: OrdinalTable = OrdinalTable {
+    library: GALMSG,
+    generation: "wg101",
+    tsv: include_str!("../data/galmsg_wg101.tsv"),
+    source_path: "archive/galacticomm/extract/wg101host/GALMSG.DLL",
+    source_kind: SourceKind::Binary,
+    verified: "10 ordinals; verified against GALMSG.DEF.",
+};
+
+/// Recovered 2026-08-14 from the WG 1.01 `GALDLL.ZIP` binaries, the same zip
+/// the `GALME`/`GALGSBL` tables came from, and verified ordinal-by-ordinal
+/// against `GALMSG.DEF`/`GALFIL.DEF` (byte-identical in the wg1 and wg20
+/// source kits). Each binary carries one entry its `.DEF` omits -- the
+/// `_INIT__*` entry point -- the same pattern `GALME`'s table already shows.
+pub static GALFIL_WG101: OrdinalTable = OrdinalTable {
+    library: GALFIL,
+    generation: "wg101",
+    tsv: include_str!("../data/galfil_wg101.tsv"),
+    source_path: "archive/galacticomm/extract/wg101host/GALFIL.DLL",
+    source_kind: SourceKind::Binary,
+    verified: "104 ordinals; verified against GALFIL.DEF.",
+};
+
+/// **Weaker provenance than the tables above, and deliberately said out loud.**
+/// No `GALETL.DEF` or import library survives anywhere in the archive, so this
+/// has no independent numeric cross-check -- only that its routine names match
+/// `GALETL.DOC`'s description of a teleconferencing engine. The NE header
+/// version (6.01) matches the confirmed WG-1.01 binaries, but the copy came
+/// from a third-party archive rather than the WG 1.01 CD.
+///
+/// Three GALETL builds exist and their ordinals genuinely DISAGREE (ordinal 36
+/// is `_TL2LST` in one and `___TLCACT` in another), so they are kept as
+/// separate files and must never be merged: a wrong ordinal map is worse than
+/// none, because it makes this host confidently name the wrong routine. The
+/// other two are `galetl_wg300.tsv` and `galetl_ne5.tsv`, recovered but not
+/// wired -- nothing this host loads is a WG 3.x or Entertainment Pack module.
+pub static GALETL_WG101: OrdinalTable = OrdinalTable {
+    library: GALETL,
+    generation: "wg101",
+    tsv: include_str!("../data/galetl_wg101.tsv"),
+    source_path: "archive/_acquire/pools/full (GALETL.DLL, third-party archive copy, NE header v6.01)",
+    source_kind: SourceKind::Binary,
+    verified: "59 ordinals; no independent numeric cross-check survives -- weakest provenance among these tables.",
+};
+
+/// **Weaker provenance than the tables above, and deliberately said out loud.**
+/// No `GALETL.DEF` or import library survives anywhere in the archive, so this
+/// has no independent numeric cross-check -- only that its routine names match
+/// `GALETL.DOC`'s description of a teleconferencing engine. The NE header
+/// version (6.01) matches the confirmed WG-1.01 binaries, but the copy came
+/// from a third-party archive rather than the WG 1.01 CD.
+///
+/// Three GALETL builds exist and their ordinals genuinely DISAGREE (ordinal 36
+/// is `_TL2LST` in one and `___TLCACT` in another), so they are kept as
+/// separate files and must never be merged: a wrong ordinal map is worse than
+/// none, because it makes this host confidently name the wrong routine. The
+/// other two are `galetl_wg300.tsv` and `galetl_ne5.tsv`, recovered but not
+/// wired -- nothing this host loads is a WG 3.x or Entertainment Pack module.
+pub static GALETL_WG300: OrdinalTable = OrdinalTable {
+    library: GALETL,
+    generation: "wg300",
+    tsv: include_str!("../data/galetl_wg300.tsv"),
+    source_path: "archive/_acquire/pools/full (GALETL.DLL, WG 3.0 build, third-party archive copy)",
+    source_kind: SourceKind::Binary,
+    verified: "58 ordinals; ordinal 36 is ___TLCACT here, disagreeing with wg101's _TL2LST -- must never be merged with it.",
+};
+
+/// The third GALETL build, referenced but not wired by [`GALETL_WG101`]'s own
+/// doc comment ("the other two are `galetl_wg300.tsv` and `galetl_ne5.tsv`,
+/// recovered but not wired -- nothing this host loads is a WG 3.x or
+/// Entertainment Pack module"). No dedicated writeup for this file exists
+/// anywhere in the repo beyond that mention and its recovery in commit
+/// `d5a1bca4`; the `ne5` generation tag and provenance below are carried
+/// forward unverified rather than invented here.
+pub static GALETL_NE5: OrdinalTable = OrdinalTable {
+    library: GALETL,
+    generation: "ne5",
+    tsv: include_str!("../data/galetl_ne5.tsv"),
+    source_path: "archive/_acquire/pools/full (GALETL.DLL, Entertainment Pack build, third-party archive copy)",
+    source_kind: SourceKind::Binary,
+    verified: "52 ordinals; ordinal 50 is ___TLCACT, matching wg300 and disagreeing with wg101's _TL2LST at 36 -- not independently re-verified here.",
+};
+
+/// The 32-bit host's own export table, recovered 2026-08-14 from the genuinely
+/// NE-format `WGSERVER.EXE` copies under `archive/_acquire/pools/full` -- five
+/// are there, and they are two distinct builds (three byte-identical 3.12/3.13
+/// and two byte-identical 3.00), NOT the PE32 `WGSERVER.EXE` that 32-bit
+/// modules import by name and needs no ordinal table at all.
+///
+/// **Verified against the vendor's own export definitions**, which do survive:
+/// `re/wg33src/LIB/wg30/WGSERVER.DEF` and `re/wg33src/LIB/WGSERVER.DEF`, from
+/// the Worldgroup 3.3 source kit. 1,227 of the 3.00 DEF's 1,234 names appear
+/// in the 3.00 table (99.4%) and 1,494 of the 3.3 DEF's 1,508 in the 3.12
+/// table (99.1%). Every name the DEFs have and the binaries do not is an
+/// NT-only routine sitting behind an `#ifdef` -- `iswinnt`,
+/// `isrunasservice`, `getlasterrortext`, `excpfilter`, `geterrortext` --
+/// which a DOS-era build correctly lacks.
+///
+/// The 3.3 DEF goes further: 1,506 of its entries carry an explicit
+/// `@ordinal`, so the 3.12 table is verified ORDINAL BY ORDINAL against it --
+/// **1,494 of 1,494 shared ordinals agree on the name, zero mismatches.**
+/// The 3.00 DEF lists names only, so that table rests on the name set plus
+/// its own binary's export table for the numbering.
+pub static WGSERVER_WG300: OrdinalTable = OrdinalTable {
+    library: WGSERVER,
+    generation: "wg300",
+    tsv: include_str!("../data/wgserver_wg300.tsv"),
+    source_path: "archive/_acquire/pools/full (WGSERVER.EXE, NE 3.00 build, one of two byte-identical copies)",
+    source_kind: SourceKind::Binary,
+    verified: "1,381 ordinals; name-set verified against re/wg33src/LIB/wg30/WGSERVER.DEF -- 1,227 of the DEF's 1,234 names appear (99.4%).",
+};
+
+/// The 32-bit host's own export table, recovered 2026-08-14 from the genuinely
+/// NE-format `WGSERVER.EXE` copies under `archive/_acquire/pools/full` -- five
+/// are there, and they are two distinct builds (three byte-identical 3.12/3.13
+/// and two byte-identical 3.00), NOT the PE32 `WGSERVER.EXE` that 32-bit
+/// modules import by name and needs no ordinal table at all.
+///
+/// **Verified against the vendor's own export definitions**, which do survive:
+/// `re/wg33src/LIB/wg30/WGSERVER.DEF` and `re/wg33src/LIB/WGSERVER.DEF`, from
+/// the Worldgroup 3.3 source kit. 1,227 of the 3.00 DEF's 1,234 names appear
+/// in the 3.00 table (99.4%) and 1,494 of the 3.3 DEF's 1,508 in the 3.12
+/// table (99.1%). Every name the DEFs have and the binaries do not is an
+/// NT-only routine sitting behind an `#ifdef` -- `iswinnt`,
+/// `isrunasservice`, `getlasterrortext`, `excpfilter`, `geterrortext` --
+/// which a DOS-era build correctly lacks.
+///
+/// The 3.3 DEF goes further: 1,506 of its entries carry an explicit
+/// `@ordinal`, so the 3.12 table is verified ORDINAL BY ORDINAL against it --
+/// **1,494 of 1,494 shared ordinals agree on the name, zero mismatches.**
+/// The 3.00 DEF lists names only, so that table rests on the name set plus
+/// its own binary's export table for the numbering.
+pub static WGSERVER_WG312: OrdinalTable = OrdinalTable {
+    library: WGSERVER,
+    generation: "wg312",
+    tsv: include_str!("../data/wgserver_wg312.tsv"),
+    source_path: "archive/_acquire/pools/full (WGSERVER.EXE, NE 3.12/3.13 build, one of three byte-identical copies)",
+    source_kind: SourceKind::Binary,
+    verified: "1,495 ordinals; verified ORDINAL BY ORDINAL against re/wg33src/LIB/WGSERVER.DEF -- 1,494 of 1,494 shared ordinals agree, zero mismatches.",
+};
+
+/// `DOSCALLS`, keyed to the extender release rather than the host release.
+///
+/// No Worldgroup disk ships a `DOSCALLS.DLL`. The 286|DOS-Extender bound into
+/// `MAJORBBS.EXE` provides it, so the table comes from Phar Lap's own copy --
+/// 206 ordinals out of the NE name table of `BIN/DOSCALLS.DLL`, a binary that
+/// describes itself as "EFI FUNCTIONS - DOSCALLS EMULATION" -- plus the three
+/// its entry table skips (`DosExit`, `DosChgFilePtr`, `DosWrite`) taken from
+/// the IMPDEF records of `BC4/LIB/PHAPI.LIB`.
+///
+/// The two sources are independent and agree on all 79 ordinals they share.
+/// They differ in wording on exactly two, and those are aliases rather than
+/// conflicts: Borland's import library calls 135 and 136 `__AHSHIFT` and
+/// `__AHINCR`, which is what its runtime wants huge-pointer arithmetic to link
+/// against. What a DLL calls its own ordinal is what this records.
+///
+/// `pharlap31` is measured, not assumed. WG 1.01's `MAJORBBS.EXE` carries the
+/// 286|DOS-Extender banner and the version literal `3.1`, and the 3.04 and 3.12
+/// `DOSCALLS.DLL` files -- different binaries -- name every ordinal the same.
+pub static DOSCALLS_PHARLAP31: OrdinalTable = OrdinalTable {
+    library: DOSCALLS,
+    generation: "pharlap31",
+    tsv: include_str!("../data/doscalls_pharlap31.tsv"),
+    source_path: "Phar Lap BIN/DOSCALLS.DLL name table + BC4/LIB/PHAPI.LIB IMPDEFs",
+    source_kind: SourceKind::Binary,
+    verified: "209 ordinals; two independent sources agree on all 79 they share.",
+};
+
 /// Canonical library names.
 pub const MAJORBBS: &str = "MAJORBBS";
 pub const GALGSBL: &str = "GALGSBL";
+pub const GALMSG: &str = "GALMSG";
+pub const GALFIL: &str = "GALFIL";
+pub const GALETL: &str = "GALETL";
+pub const WGSERVER: &str = "WGSERVER";
 
 pub const GALGSBL_TABLES: &[&OrdinalTable] = &[
     &GALGSBL_MBBS625,
@@ -184,7 +407,16 @@ pub const GALGSBL_TABLES: &[&OrdinalTable] = &[
     &GALGSBL_LAYOUT_C,
 ];
 
-pub const MAJORBBS_TABLES: &[&OrdinalTable] = &[&MAJORBBS_MBBS625];
+pub const MAJORBBS_TABLES: &[&OrdinalTable] = &[&MAJORBBS_MBBS625, &MAJORBBS_WG101];
+pub const GALME_TABLES: &[&OrdinalTable] = &[&GALME_WG101, &GALME_WG33];
+pub const GALMSG_TABLES: &[&OrdinalTable] = &[&GALMSG_WG101];
+pub const GALFIL_TABLES: &[&OrdinalTable] = &[&GALFIL_WG101];
+/// **Three builds whose ordinals genuinely disagree** -- ordinal 36 is
+/// `_TL2LST` in one and `___TLCACT` in another -- so these must never be
+/// merged. A wrong ordinal map is worse than none.
+pub const GALETL_TABLES: &[&OrdinalTable] = &[&GALETL_NE5, &GALETL_WG101, &GALETL_WG300];
+pub const WGSERVER_TABLES: &[&OrdinalTable] = &[&WGSERVER_WG300, &WGSERVER_WG312];
+pub const DOSCALLS_TABLES: &[&OrdinalTable] = &[&DOSCALLS_PHARLAP31];
 
 /// How a library's symbols are named.
 ///
@@ -257,12 +489,7 @@ pub const LIBRARIES: &[Library] = &[
         // the same shape as `GALGSBL.dll` one library over. Without this
         // alias `simpsnd` misses a routine that exists.
         aliases: &["GALME.dll"],
-        // GALME does have an ordinal space -- the shipped WG 1.01 DLL exports
-        // 208 -- but that table still lives in `crates/mbbs` and has not been
-        // harvested into the registry yet. An empty slice says "has ordinals,
-        // none recorded here", which is the truth; `NamesOnly` would claim it
-        // has no ordinal space at all, which is false.
-        naming: Naming::Ordinals(&[]),
+        naming: Naming::Ordinals(GALME_TABLES),
         authentic: Eligibility::Loadable,
     },
     Library {
@@ -275,8 +502,37 @@ pub const LIBRARIES: &[Library] = &[
         name: DOSCALLS,
         aliases: &[],
         // Keyed to the extender release, not the host release.
-        naming: Naming::Ordinals(&[]),
+        naming: Naming::Ordinals(DOSCALLS_TABLES),
         authentic: Eligibility::NotLoadable("provided by the extender bound into MAJORBBS.EXE"),
+    },
+    Library {
+        name: GALMSG,
+        aliases: &[],
+        naming: Naming::Ordinals(GALMSG_TABLES),
+        authentic: Eligibility::Loadable,
+    },
+    Library {
+        name: GALFIL,
+        aliases: &[],
+        naming: Naming::Ordinals(GALFIL_TABLES),
+        authentic: Eligibility::Loadable,
+    },
+    Library {
+        name: GALETL,
+        aliases: &[],
+        naming: Naming::Ordinals(GALETL_TABLES),
+        authentic: Eligibility::Loadable,
+    },
+    Library {
+        name: WGSERVER,
+        // `canonical_dll` aliases `WGSERVER.EXE -> MAJORBBS` in `crates/mbbs`,
+        // so a `WGSERVER` library with this bare name does not collide with
+        // that alias. Do NOT give this library the alias `"WGSERVER.EXE"`:
+        // that spelling stays on `MAJORBBS`, where it resolves today, until
+        // Plan 3 splits it deliberately and re-measures what depends on it.
+        aliases: &[],
+        naming: Naming::Ordinals(WGSERVER_TABLES),
+        authentic: Eligibility::Loadable,
     },
 ];
 
