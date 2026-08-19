@@ -32,6 +32,12 @@ pub trait ByteSource {
 
     /// Copy `range` into `dst`, which must be exactly the length of the range.
     fn copy_into(&self, range: Range<usize>, dst: &mut [u8]) {
+        assert!(
+            range.start <= range.end,
+            "invalid range {}..{}",
+            range.start,
+            range.end
+        );
         assert_eq!(
             dst.len(),
             range.end - range.start,
@@ -180,5 +186,19 @@ mod tests {
             rope.copy_into(start..end, &mut dst);
             assert_eq!(dst, &bytes[start..end], "differs on {start}..{end}");
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid range")]
+    #[allow(clippy::reversed_empty_ranges)] // the inverted range is the input under test
+    fn copy_into_a_backwards_range_panics_before_the_length_check() {
+        // range.start > range.end: the ordering check must fire first, with
+        // the crate-wide "invalid range" message, rather than computing
+        // `range.end - range.start` (which would underflow) as part of a
+        // length-mismatch message.
+        let bytes = seq(10);
+        let rope = Rope::from_bytes(&bytes);
+        let mut dst = vec![0u8; 0];
+        rope.copy_into(5..2, &mut dst);
     }
 }

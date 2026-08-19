@@ -93,14 +93,7 @@ impl Rope {
     ///
     /// Panics if `range.start > range.end` or `range.end > self.len()`.
     pub fn remove(&mut self, range: Range<usize>) {
-        let len = self.len();
-        assert!(
-            range.start <= range.end,
-            "invalid range {}..{}",
-            range.start,
-            range.end
-        );
-        assert!(range.end <= len, "range end {} exceeds rope length {len}", range.end);
+        self.validate_range(&range);
         if range.start == range.end {
             return;
         }
@@ -113,14 +106,7 @@ impl Rope {
     ///
     /// Panics if `range.start > range.end` or `range.end > self.len()`.
     pub fn slice(&self, range: Range<usize>) -> Rope {
-        let len = self.len();
-        assert!(
-            range.start <= range.end,
-            "invalid range {}..{}",
-            range.start,
-            range.end
-        );
-        assert!(range.end <= len, "range end {} exceeds rope length {len}", range.end);
+        self.validate_range(&range);
         let (_head, rest) = tree::split(&self.root, range.start);
         let (middle, _tail) = tree::split(&rest, range.end - range.start);
         Rope { root: middle }
@@ -148,6 +134,20 @@ impl Rope {
     #[cfg(test)]
     pub(crate) fn check(&self) {
         tree::check_invariants(&self.root);
+    }
+
+    /// Shared range validation for `remove` and `slice`.
+    ///
+    /// Panics if `range.start > range.end` or `range.end > self.len()`.
+    fn validate_range(&self, range: &Range<usize>) {
+        let len = self.len();
+        assert!(
+            range.start <= range.end,
+            "invalid range {}..{}",
+            range.start,
+            range.end
+        );
+        assert!(range.end <= len, "range end {} exceeds rope length {len}", range.end);
     }
 }
 
@@ -382,7 +382,7 @@ mod composition_tests {
     }
 
     #[test]
-    fn a_large_insert_takes_the_bulk_route_and_agrees_with_the_direct_one() {
+    fn a_large_insert_takes_the_bulk_route() {
         let base = seq(100);
         let big = seq(BULK_THRESHOLD * 4);
         assert!(big.len() > BULK_THRESHOLD, "must exceed the routing threshold");
