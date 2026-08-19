@@ -16,14 +16,6 @@ pub struct Rect {
     pub rows: usize,
 }
 
-impl Rect {
-    #[must_use]
-    pub fn contains(&self, row: usize, col: usize) -> bool {
-        row >= self.row && row < self.row + self.rows
-            && col >= self.col && col < self.col + self.cols
-    }
-}
-
 /// Something that paints itself into a rectangle of a grid.
 pub trait Widget {
     fn render(&self, area: Rect, buf: &mut Cells);
