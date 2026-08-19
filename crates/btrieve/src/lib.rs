@@ -6182,27 +6182,76 @@ mod tests {
         std::fs::copy(&source, &path).expect("the file copies into scratch");
 
         let mut block = block_from_file(path.clone(), "WCCMP002.DAT");
-        let was = block.records().expect("the records read").len();
-        let found = block
-            .records()
-            .expect("the records read")
-            .physical(0)
-            .expect("a first record");
-        let (position, bytes) = (found.position, found.bytes.to_vec());
+        // Every record's bytes, not just how many: an *update* leaves the
+        // count alone, so a count is not enough to tell a preserved file from
+        // a half-committed one. This is why the write below is an insert and
+        // the comparison is over the records themselves.
+        let was: Vec<(u32, Vec<u8>)> = {
+            let records = block.records().expect("the records read");
+            (0..records.len())
+                .map(|at| {
+                    let found = records.physical(at).expect("in range");
+                    (found.position, found.bytes.to_vec())
+                })
+                .collect()
+        };
 
-        // The *first* update of a freshly opened file, which is the one that
-        // relocates in bulk.
+        let mut record = vec![0u8; usize::from(block.geometry.reclen)];
+        record[..4].copy_from_slice(&987_654u32.to_le_bytes());
+
+        // The *first* write against a freshly opened file, which is the one
+        // that relocates in bulk and so flips pairs more than once.
         STOP_AT.with(|at| at.set(Some(Stop::AfterBodies)));
-        let refused = block.update(position, &bytes);
+        let refused = block.insert(&record);
         STOP_AT.with(|at| at.set(None));
         assert!(refused.is_err(), "the write could not have succeeded");
 
-        let mut fresh = block_from_file(path, "WCCMP002.DAT");
-        let now = fresh
-            .records()
-            .expect("an interrupted write left the file readable")
-            .len();
+        let mut fresh = block_from_file(path.clone(), "WCCMP002.DAT");
+        let now: Vec<(u32, Vec<u8>)> = {
+            let records = fresh
+                .records()
+                .expect("an interrupted write left the file readable");
+            (0..records.len())
+                .map(|at| {
+                    let found = records.physical(at).expect("in range");
+                    (found.position, found.bytes.to_vec())
+                })
+                .collect()
+        };
+        assert_eq!(now.len(), was.len(), "the record count changed");
         assert_eq!(now, was, "the file no longer holds what it did");
+
+        // The invariant itself, asserted rather than inferred. Reading the
+        // records back is too weak to catch this: a half-committed table can
+        // still walk to the same answer, because `walk_v6` stops after
+        // `geometry.records` records and the record the write was adding
+        // sorts last. What canonicalisation actually promises is narrower and
+        // exact -- **the live half of every shadow pair is never written** --
+        // and that is checkable byte for byte.
+        let original = std::fs::read(&source).expect("the source reads");
+        let interrupted = std::fs::read(&path).expect("the scratch copy reads");
+        let page = usize::from(block.geometry.page);
+        let mut pairs = vec![(0usize, 1usize)];
+        let table = v6::Map::table_pages(&original, block.geometry.page);
+        pairs.extend(table.chunks_exact(2).map(|pair| (pair[0], pair[1])));
+
+        let generation = |image: &[u8], number: usize| -> u16 {
+            let at = number * page + at::GENERATION;
+            u16::from_le_bytes([image[at], image[at + 1]])
+        };
+        for (first, second) in pairs {
+            let live = if generation(&original, first) > generation(&original, second) {
+                first
+            } else {
+                second
+            };
+            assert_eq!(
+                &original[live * page..][..page],
+                &interrupted[live * page..][..page],
+                "physical page {live} was live before the write and was \
+                 written anyway"
+            );
+        }
     }
 
     /// What one v6 record update costs on a real 53 MB file.
