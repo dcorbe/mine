@@ -285,15 +285,27 @@ fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError>
         let name = source[name_start..name_end].to_vec();
         let help = last_paragraph(source, prev_end, name_start);
 
+        // A `}` closes the value -- always -- unless the byte before it is
+        // `~`. `~}` is a literal brace and the tilde is dropped; `~~` is a
+        // literal tilde, so a `~` that was itself consumed by a preceding `~`
+        // does not go on to escape what follows. Mirrors `msg.rs`'s
+        // `State::Value` arm exactly; that reader is validated against
+        // 10,569 messages and is the authority on this rule.
         let value_start = brace_pos + 1;
-        let mut close = value_start;
-        loop {
-            match source.get(close) {
-                Some(b'}') => break,
-                Some(_) => close += 1,
-                None => return Err(SpecError::Unterminated { name, at: value_start }),
+        let mut at = value_start;
+        let mut previous = 0u8;
+        let close = loop {
+            let Some(&byte) = source.get(at) else {
+                return Err(SpecError::Unterminated { name, at: value_start });
+            };
+            match byte {
+                b'}' if previous == b'~' => previous = 0,
+                b'}' => break at,
+                b'~' if previous == b'~' => previous = 0,
+                other => previous = other,
             }
-        }
+            at += 1;
+        };
 
         let tail_start = close + 1;
         let tail_line_end = find_line_end(source, tail_start);
@@ -410,6 +422,68 @@ ACTIVATE {DEMO} S 30 Enter your activation code\r\n";
         for opt in f.options() {
             assert!(opt.index < f.messages().len(), "index {} out of range", opt.index);
         }
+    }
+
+    #[test]
+    fn a_value_closes_on_the_first_unescaped_brace() {
+        let src = b"OPT {plain} S 10 p
+";
+        let f = SpecFile::parse("T.MSG", src).expect("parses");
+        let v = f.options()[0].value;
+        assert_eq!(&src[v.start..v.end], b"plain");
+    }
+
+    #[test]
+    fn an_escaped_brace_does_not_close_the_value() {
+        // `~}` is a literal brace. Closing on it would truncate the option and
+        // shift every message after it.
+        let src = b"OPT {a ~} b} S 10 p
+";
+        let f = SpecFile::parse("T.MSG", src).expect("parses");
+        assert_eq!(f.options().len(), 1);
+        let v = f.options()[0].value;
+        assert_eq!(&src[v.start..v.end], b"a ~} b", "span keeps the escape as written");
+    }
+
+    #[test]
+    fn a_multi_line_value_closes_mid_line_not_at_a_line_start() {
+        // 4271 corpus values do exactly this. A line-initial rule runs them to EOF.
+        let src = b"OPT {line one
+line two} S 10 p
+";
+        let f = SpecFile::parse("T.MSG", src).expect("parses");
+        assert_eq!(f.options().len(), 1);
+        let v = f.options()[0].value;
+        assert_eq!(&src[v.start..v.end], b"line one
+line two");
+    }
+
+    #[test]
+    fn a_text_option_closing_at_a_line_start_still_works() {
+        // The shape that misled the original draft. It parses because the `}`
+        // is the first unescaped one, not because it begins a line.
+        let src = b"AFKALT {
+AFK v%s.
+} T Log-on Message
+";
+        let f = SpecFile::parse("T.MSG", src).expect("parses");
+        assert_eq!(f.options()[0].kind, OptionType::Text);
+        let v = f.options()[0].value;
+        assert_eq!(&src[v.start..v.end], b"
+AFK v%s.
+");
+    }
+
+    #[test]
+    fn a_double_tilde_is_a_literal_tilde_and_does_not_escape_a_brace() {
+        // `~~}` is an escaped tilde followed by a REAL closing brace: the first
+        // tilde consumes the second, so the brace is unescaped.
+        let src = b"OPT {a~~} S 10 p
+";
+        let f = SpecFile::parse("T.MSG", src).expect("parses");
+        assert_eq!(f.options().len(), 1);
+        let v = f.options()[0].value;
+        assert_eq!(&src[v.start..v.end], b"a~~");
     }
 
     #[test]
