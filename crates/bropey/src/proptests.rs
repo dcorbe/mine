@@ -19,6 +19,7 @@ enum Op {
     FromBytes { bytes: Vec<u8> },
     Snapshot,
     Insert { at: u16, bytes: Vec<u8> },
+    Append { bytes: Vec<u8> },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -32,6 +33,8 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         // like 20 would respect.
         (any::<u16>(), proptest::collection::vec(any::<u8>(), 0..=MAX_BYTES))
             .prop_map(|(at, bytes)| Op::Insert { at, bytes }),
+        proptest::collection::vec(any::<u8>(), 0..60)
+            .prop_map(|bytes| Op::Append { bytes }),
     ]
 }
 
@@ -69,6 +72,10 @@ fn run(ops: Vec<Op>) {
                 let at = clamp(*at, model.len());
                 rope.insert(at, bytes);
                 model.splice(at..at, bytes.iter().copied());
+            }
+            Op::Append { bytes } => {
+                rope.append(Rope::from_bytes(bytes));
+                model.extend_from_slice(bytes);
             }
         }
 

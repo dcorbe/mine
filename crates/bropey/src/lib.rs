@@ -65,6 +65,12 @@ impl Rope {
         tree::insert_into(&mut self.root, offset, bytes);
     }
 
+    /// Append `other` to the end of this rope.
+    pub fn append(&mut self, other: Rope) {
+        let root = std::mem::replace(&mut self.root, Node::empty());
+        self.root = tree::append(root, other.root);
+    }
+
     /// Assert every structural invariant. Test-only; call at operation
     /// boundaries.
     #[cfg(test)]
@@ -137,5 +143,28 @@ mod insert_api_tests {
         assert_ne!(edited.to_vec(), before);
         original.check();
         edited.check();
+    }
+}
+
+#[cfg(test)]
+mod append_api_tests {
+    use super::*;
+    use crate::ByteSource;
+
+    #[test]
+    fn append_concatenates_and_leaves_clones_alone() {
+        let left = Rope::from_bytes(&(0..200).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let snapshot = left.clone();
+        let before = snapshot.to_vec();
+        let right = Rope::from_bytes(b"tail");
+
+        let mut joined = left;
+        joined.append(right);
+        joined.check();
+
+        let mut expect = before.clone();
+        expect.extend_from_slice(b"tail");
+        assert_eq!(joined.to_vec(), expect);
+        assert_eq!(snapshot.to_vec(), before, "the snapshot was mutated");
     }
 }

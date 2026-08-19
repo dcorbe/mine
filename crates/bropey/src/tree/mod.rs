@@ -1,10 +1,12 @@
 //! The tree itself.
 
+mod append;
 mod build;
 mod children;
 #[cfg(test)]
 mod invariants;
 
+pub(crate) use append::append;
 pub(crate) use build::build;
 pub(crate) use children::Children;
 #[cfg(test)]
@@ -80,6 +82,41 @@ impl Node {
                 overflow(children)
             }
         }
+    }
+
+    /// Attach a strictly shorter tree at the correct depth on the right spine,
+    /// returning this node's new right sibling if it split.
+    pub(crate) fn attach_right(&mut self, other: Arc<Node>) -> Option<Arc<Node>> {
+        let Node::Internal(children) = self else {
+            unreachable!("only called when self is taller than other, so self is internal")
+        };
+        if children.height() == other.height() + 1 {
+            children.push(other);
+        } else {
+            let last = children.len() - 1;
+            let split = children.with_child_mut(last, |child| child.attach_right(other));
+            if let Some(sibling) = split {
+                children.insert_at(last + 1, sibling);
+            }
+        }
+        overflow(children)
+    }
+
+    /// Attach a strictly shorter tree at the correct depth on the left spine,
+    /// returning this node's new right sibling if it split.
+    pub(crate) fn attach_left(&mut self, other: Arc<Node>) -> Option<Arc<Node>> {
+        let Node::Internal(children) = self else {
+            unreachable!("only called when self is taller than other, so self is internal")
+        };
+        if children.height() == other.height() + 1 {
+            children.insert_at(0, other);
+        } else {
+            let split = children.with_child_mut(0, |child| child.attach_left(other));
+            if let Some(sibling) = split {
+                children.insert_at(1, sibling);
+            }
+        }
+        overflow(children)
     }
 }
 
