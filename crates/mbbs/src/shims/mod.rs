@@ -1399,6 +1399,35 @@ fn canonical_dll(dll: &str) -> &str {
     mbbs_machine::library::library(dll).map_or(dll, |lib| lib.name)
 }
 
+/// Every C name this host registers for `dll`, across every routine table.
+///
+/// Exists for `tests/registration_surface.rs`, which checks that each one is a
+/// symbol some generation of that library actually exported. A registration
+/// whose name is wrong resolves to nothing and fails silently at the call
+/// site, so the check has to come from outside the table.
+#[must_use]
+pub fn registered_names(dll: &str) -> Vec<String> {
+    let canonical = canonical_dll(dll);
+    let mut out: Vec<String> = routines::<crate::abi::Wg16>()
+        .into_iter()
+        .filter(|(d, _, _, _, _)| *d == canonical)
+        .map(|(_, n, _, _, _)| n.to_owned())
+        .collect();
+    for (d, n, _, _, _) in WG16_ROUTINES {
+        if *d == canonical {
+            out.push((*n).to_owned());
+        }
+    }
+    for (d, n, _, _, _) in WG32_ROUTINES {
+        if *d == canonical {
+            out.push((*n).to_owned());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// A C `int` argument, sign-extended from `A`'s own width to `i32`.
 ///
 /// [`Call::int`](crate::abi::Call::int) already reads exactly
