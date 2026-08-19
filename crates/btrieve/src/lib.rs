@@ -2353,11 +2353,19 @@ impl<M: Mem> Block<M> {
             }
         }
 
+        // Read once and refreshed only after a relocation actually moves
+        // something -- the same reason [`Self::v6_reindex`]'s loop does:
+        // a relocation does rewrite the allocation table, but most passes
+        // through this loop no longer relocate at all.
+        let mut map = v6::Map::read(file, page_size)?;
+        let mut map_is_stale = false;
+
         for (logical, writes) in per_page {
-            // Re-read every time: each relocation below rewrites the
-            // allocation table, so a map taken once would resolve later pages
-            // to their stale twins.
-            let physical = v6::Map::read(file, page_size)?
+            if map_is_stale {
+                map = v6::Map::read(file, page_size)?;
+                map_is_stale = false;
+            }
+            let physical = map
                 .physical(logical)
                 .ok_or_else(|| {
                     format!(
@@ -2382,7 +2390,18 @@ impl<M: Mem> Block<M> {
                 content[within + 4..within + 8].copy_from_slice(&pages::to_long(next));
             }
 
+            // The diff [`Self::v6_reindex`]'s index loop has always had, and
+            // this one did not: a write that leaves a duplicate key's groups
+            // exactly where they were still recomputed every chain pair, and
+            // relocated every data page holding one, for bytes identical to
+            // the ones already there. The pages are *data* pages, so each
+            // needless relocation also claimed or consumed a shadow twin.
+            if content == file[at..at + page_size_usize] {
+                continue;
+            }
+
             v6::Map::relocate(file, page_size, logical, &content, [0x00, 0x44])?;
+            map_is_stale = true;
         }
 
         Ok(())
@@ -5096,6 +5115,63 @@ mod tests {
     /// a **logical** page id. On `DUPKEY30.DAT` logical 2 is physical 10, so
     /// an update would have written over a different page entirely and
     /// reported success. That is what the v6 paths exist to prevent.
+    /// An update that leaves a duplicate key's groups alone writes no chain
+    /// pages.
+    ///
+    /// `Block::v6_write_chains` recomputes every duplicate-permitting key's
+    /// `[prev][next]` pairs on every write, which is cheap, and then relocated
+    /// every data page holding one, which is not: those are data pages, so
+    /// each needless relocation spends a shadow twin as well as a page write.
+    /// `Block::v6_reindex`'s index loop has always skipped a node whose image
+    /// already matches; this is the same skip, one loop further on.
+    ///
+    /// `DUPKEY30.DAT` is genuine Btrieve 6.15's own -- 30 records, 10 values,
+    /// three records per value, 512-byte pages -- so an update that changes a
+    /// non-key byte moves no record between groups and every chain pair it
+    /// computes is already on the disk.
+    #[test]
+    fn an_update_that_moves_no_duplicate_writes_no_chain_pages() {
+        let dir = crate::testing::scratch("v6-duplicate-chain-diff");
+        let path = dir.join("DUPKEY30.DAT");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT"),
+            &path,
+        )
+        .expect("the fixture copies into a scratch directory");
+
+        let mut block = block_from_file(path, "DUPKEY30.DAT");
+        assert!(block.keys.iter().any(|k| k.duplicates), "its key permits duplicates");
+        let page = usize::from(block.geometry.page);
+
+        let found = block
+            .records()
+            .expect("v6 reads")
+            .physical(0)
+            .expect("a first record");
+        let (position, mut bytes) = (found.position, found.bytes.to_vec());
+        let last = bytes.len() - 1;
+        bytes[last] = 0x5c;
+
+        // One warm-up, so the shadow twins this file needs already exist and
+        // what is measured is the steady state a running board writes.
+        block.update(position, &bytes).expect("a warm-up update");
+        bytes[last] = 0x5d;
+
+        WROTE.with(|wrote| wrote.set(0));
+        block.update(position, &bytes).expect("an update off the key");
+        let wrote = WROTE.with(std::cell::Cell::get);
+
+        // The record's own data page, the allocation-table half that names
+        // it, the control record half, and the two-byte generation words. A
+        // chain page relocated for nothing would be one more page than that.
+        assert!(
+            wrote <= 3 * page + 4,
+            "an update that moved no duplicate wrote {wrote} bytes, which is \
+             more than the three pages and two generation words it needs"
+        );
+    }
+
     /// A record inserted into a v6 file whose key permits duplicates, joining
     /// a value that already has records under it.
     ///
