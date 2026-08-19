@@ -127,12 +127,12 @@ mod tests {
 
     #[test]
     fn from_pair_sums_and_lifts_height() {
-        let c = Children::from_pair(leaf(3), leaf(4));
+        let c = Children::from_pair(leaf(3), leaf(6));
         assert_eq!(c.len(), 2);
-        assert_eq!(c.total(), 7);
+        assert_eq!(c.total(), 9);
         assert_eq!(c.height(), 1);
         assert_eq!(c.size(0), 3);
-        assert_eq!(c.size(1), 4);
+        assert_eq!(c.size(1), 6);
     }
 
     #[test]
