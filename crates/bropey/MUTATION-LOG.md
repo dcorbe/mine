@@ -4,9 +4,15 @@ A green suite proves nothing on its own. Each mutation below was introduced
 deliberately and observed to fail the named test. Re-run this list after any
 change to the tree, the invariant checker, or the property harness.
 
+**Five of the six mutations were caught by a named test.** The sixth
+(Mutation A) was not a coverage hole in the suite — it was a badly chosen
+mutation that turned out to be an equivalent mutant, plus a second, real
+finding about which invariant-checker branch it was supposed to exercise.
+Both are documented in full below rather than papered over.
+
 | # | Mutation | Failing test | Message |
 |---|---|---|---|
-| A | `overflow`: `<=` becomes `<` | **none — suite stays green** | 59/59 unit tests pass, 5/5 smoke tests pass. `children.len() < MAX_CHILDREN` splits one entry earlier than necessary, but `half = children.len() / 2` still lands both halves at or above `MAX_CHILDREN / 2 >= MIN_CHILDREN` (guaranteed by the crate's compile-time assert), so no tree the mutation produces is actually illegal. This is the predicted gap: `check_invariants`' `MIN_CHILDREN` branch has no test that exercises it, because no test tree is deep enough to contain a non-root internal node below the minimum. |
+| A | `overflow`: `<=` becomes `<` | **none — equivalent mutant, see below** | 59/59 unit tests pass, 5/5 smoke tests pass. Not a suite gap: see "Mutation A" below for why no test *could* distinguish this mutation from correct behaviour. |
 | B | `with_child_mut`: no `Arc::make_mut` | `insert_api_tests::editing_a_clone_leaves_the_original_alone` (14 tests failed total, including `proptests::rope_matches_the_model`) | `thread 'insert_api_tests::editing_a_clone_leaves_the_original_alone' panicked at crates/bropey/src/tree/children.rs:92:54: aliased` — the `.expect("aliased")` panic. All 14 failures, including the property harness, fail on this identical panic message; none fail on a snapshot-mismatch assertion. |
 | C | `with_child_mut`: no size writeback | `tree::children::tests::with_child_mut_refreshes_the_cached_size` (20 tests failed total, including `proptests::rope_matches_the_model`) | `thread 'tree::children::tests::with_child_mut_refreshes_the_cached_size' panicked at crates/bropey/src/tree/children.rs:206:9: assertion `left == right` failed: cached size must follow the mutation / left: 3 / right: 6`. Every other failure (e.g. `composition_tests::a_large_insert_takes_the_bulk_route_and_agrees_with_the_direct_one`) fails one level later, inside `check_invariants`, with the brief's predicted text: `assertion `left == right` failed: cached size 15 disagrees with subtree length 10 at child 2`. |
 | D | `append`: no small-piece route | `tree::append::tests::an_underfull_side_is_absorbed_not_left_standing`, `tree::append::tests::repeated_small_appends_do_not_degenerate_the_tree`, `composition_tests::repeated_single_byte_removals_keep_the_tree_legal` (16 tests failed total, including `proptests::rope_matches_the_model`) | All three named tests fail identically, via `check_invariants`: `thread '...' panicked at crates/bropey/src/tree/invariants.rs:23:17: non-root leaf of N bytes is below MIN_BYTES 7` (N was 1, 1, and 6 respectively across the three). All three of the brief's named tests failed — none is weaker than intended. |
@@ -15,21 +21,74 @@ change to the tree, the invariant checker, or the property harness.
 
 ## Notes on individual mutations
 
-**Mutation A is an open finding, not a gap that was closed here.** Flipping
-`overflow`'s comparison from `<=` to `<` makes the tree split one entry
-before it strictly needs to, but every split it produces is still legal
-under `MIN_CHILDREN`/`MAX_CHILDREN`, so the mutation is behaviourally inert
-as far as every test in the suite (including `check_invariants` and the
-property harness) can tell. This confirms, by direct construction, the
-documented weakness: nothing in the suite builds a non-root internal node
-close enough to `MIN_CHILDREN` to make this comparison matter. Closing it
-needs a new test that forces a deep, narrow tree — deliberately constructed
-rather than grown by `append`/`insert`'s balancing, since neither produces
-node counts near the boundary in ordinary use — and checks the split
-point of an internal node against both bounds. No such test was added;
-this is reported for a scope decision rather than papered over.
+### Mutation A is an equivalent mutant, not a suite gap
 
-**Mutation B proves detection-by-panic only, not detection-by-snapshot.**
+Flipping `overflow`'s comparison from `children.len() <= MAX_CHILDREN` to
+`children.len() < MAX_CHILDREN` changes *when* a node splits, not what the
+resulting tree contains. At the test regime's `MAX_CHILDREN = 5`:
+
+- **Original** (`<=`): a node only splits once it holds 6 children (the
+  smallest value that fails `<= 5`). `half = 6 / 2 = 3`, so the split
+  produces **3/3**.
+- **Mutated** (`<`): a node already splits at 5 children (the smallest value
+  that fails `< 5`). `half = 5 / 2 = 2`, so the split produces **2/3**.
+
+Both outcomes satisfy `MIN_CHILDREN` (2) and `MAX_CHILDREN` (5) on both
+sides, and the rope's byte content is identical either way — only the
+packing density of the tree changes, one operation earlier. There is no
+observable difference between the mutated and unmutated program for any
+test, including the property harness, to catch. **This is a defect in the
+mutation itself, not a weakness in the suite or in the tests written across
+Tasks 1-11.** A future reader re-deriving this should not treat it as an
+open coverage hole to close — it is closed by definition, because there is
+nothing to detect.
+
+### The real finding: `MIN_CHILDREN`'s non-root branch is subsumed by an unconditional floor
+
+Mutation A was originally chosen to exercise `check_invariants`'s
+non-root `MIN_CHILDREN` assertion (`tree/invariants.rs`, the
+`if !is_root { assert!(children.len() >= MIN_CHILDREN, ...) }` branch). It
+does not, and not merely because no test tree is deep enough — the
+assertion is arithmetically unable to fire independently at test
+constants, for a different and more specific reason.
+
+`MIN_CHILDREN = MAX_CHILDREN.div_ceil(2) - 1`. At the test regime's
+`MAX_CHILDREN = 5`, that is `5.div_ceil(2) - 1 = 3 - 1 = 2`. But
+`check_invariants` also asserts, **unconditionally, for every internal node
+regardless of root status**:
+
+```rust
+assert!(
+    children.len() >= 2,
+    "internal node has {} children; nothing in this design removes a child",
+    children.len()
+);
+```
+
+Since `MIN_CHILDREN == 2` exactly equals that hard floor at test constants,
+any internal node that would fail the non-root `MIN_CHILDREN` check
+(`children.len() < 2`, i.e. `children.len() <= 1`) already fails the
+unconditional floor first — the two assertions can never disagree, so the
+`MIN_CHILDREN` branch is dead code as far as observable test behaviour goes.
+This is defence in depth against a state nothing in the crate can currently
+produce anyway: no code path removes a child from an internal node once
+placed (`overflow` only splits, never merges down; `append`/`insert` only
+add). The assertion exists for whichever future change might add a removal
+path, not to catch anything reachable today.
+
+Closing this gap for real — making the `MIN_CHILDREN` branch capable of
+firing independently of the unconditional floor — needs `MIN_CHILDREN > 2`
+at test constants, which means `MAX_CHILDREN >= 7` under `cfg(test)`
+(`min_children(7) = 4 - 1 = 3`). That re-tunes the depth/width of every tree
+the existing 64 tests build and would need re-verifying against all of
+them, or alternatively exposing `check_invariants` to the integration tests
+under `tests/`, which link the crate built *without* `cfg(test)` and were
+deliberately kept that way by an earlier ruling (see Task 3's brief). Both
+are scope decisions for the plan owner, not something to bolt on inside
+this task. No constant was changed and no test was added.
+
+### Mutation B proves detection-by-panic only, not detection-by-snapshot
+
 The corrected mutation replaces `Arc::make_mut` with
 `Arc::get_mut(...).expect("aliased")`. Every one of the 14 failures —
 `editing_a_clone_leaves_the_original_alone`, the property harness, and 12
