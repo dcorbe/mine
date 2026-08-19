@@ -187,6 +187,22 @@ pub static MAJORBBS_WG101: OrdinalTable = OrdinalTable {
     verified: "1,210 ordinals spread over 1..1323.",
 };
 
+/// Worldgroup 2.x's `MAJORBBS.DEF`, from the wg20 source kit. **Completes the
+/// `wg2` profile**: paired with [`GALGSBL_WG2`] it covers every ordinal this
+/// board's modules demand (`GALGSBL` 16, `MAJORBBS` 3 including the
+/// generation-settling 1191) with zero disagreements against `wg101` on any
+/// of them -- measured before this table was registered, not assumed after.
+/// That agreement is exactly why registering it does not change *resolution*,
+/// only what the host can honestly claim to have identified.
+pub static MAJORBBS_WG2: OrdinalTable = OrdinalTable {
+    library: MAJORBBS,
+    generation: "wg2",
+    tsv: include_str!("../data/majorbbs_wg2.tsv"),
+    source_path: "archive/galacticomm/extract/wg20/galdsrce/DLIB/MAJORBBS.DEF",
+    source_kind: SourceKind::VendorDef,
+    verified: "1,234 ordinals; covers every MAJORBBS ordinal this board demands (474, 1101, 1191) and agrees with wg101 on all three.",
+};
+
 /// `GALME.DLL`'s own name table, read out of the shipped WG 1.01 binary.
 ///
 /// The one place a DEF and a binary disagree in this crate: `GMEDEF.DEF` in the
@@ -219,6 +235,18 @@ pub static GALME_WG33: OrdinalTable = OrdinalTable {
     verified: "287 name@ordinal lines, ordinals 1-287 with no gaps, verified directly.",
 };
 
+/// Worldgroup 2.x's `GMEDEF.DEF` -- `GALME`'s definition file is named
+/// `GMEDEF.DEF`, not `GALME.DEF`, in the wg1/wg20 kits. Completes the `wg2`
+/// profile alongside [`MAJORBBS_WG2`] and [`GALGSBL_WG2`].
+pub static GALME_WG2: OrdinalTable = OrdinalTable {
+    library: GALME,
+    generation: "wg2",
+    tsv: include_str!("../data/galme_wg2.tsv"),
+    source_path: "archive/galacticomm/extract/wg20/galdsrce/DLIB/GMEDEF.DEF",
+    source_kind: SourceKind::VendorDef,
+    verified: "237 ordinals.",
+};
+
 /// Recovered 2026-08-14 from the WG 1.01 `GALDLL.ZIP` binaries, the same zip
 /// the `GALME`/`GALGSBL` tables came from, and verified ordinal-by-ordinal
 /// against `GALMSG.DEF`/`GALFIL.DEF` (byte-identical in the wg1 and wg20
@@ -231,6 +259,17 @@ pub static GALMSG_WG101: OrdinalTable = OrdinalTable {
     source_path: "archive/galacticomm/extract/wg101host/GALMSG.DLL",
     source_kind: SourceKind::Binary,
     verified: "10 ordinals; verified against GALMSG.DEF.",
+};
+
+/// MBBS 6.25's `GALMSG.DEF`, from the 6.25 SDK. Completes the `mbbs625`
+/// profile, which otherwise has no `GALMSG` table at all.
+pub static GALMSG_MBBS625: OrdinalTable = OrdinalTable {
+    library: GALMSG,
+    generation: "mbbs625",
+    tsv: include_str!("../data/galmsg_mbbs625.tsv"),
+    source_path: "archive/galacticomm/extract/mbbs625sdk/MBBS_SDK/INSTALLB/GALMSG.DEF",
+    source_kind: SourceKind::VendorDef,
+    verified: "63 ordinals.",
 };
 
 /// Recovered 2026-08-14 from the WG 1.01 `GALDLL.ZIP` binaries, the same zip
@@ -365,6 +404,26 @@ pub static WGSERVER_WG312: OrdinalTable = OrdinalTable {
     verified: "1,495 ordinals; verified ORDINAL BY ORDINAL against re/wg33src/LIB/WGSERVER.DEF -- 1,494 of 1,494 shared ordinals agree, zero mismatches.",
 };
 
+/// Worldgroup 3.3's `WGSERVER.DEF`, the vendor's own export definition.
+///
+/// **A superset of what shipped**, which is the point of harvesting it:
+/// `_dfaStat @457` is declared here and exported by neither the 3.00 nor the
+/// 3.12/3.13 binary this repo has. Before this table, `dfastat` had to sit in
+/// `registration_surface.rs`'s allowlist as a host symbol with no surviving
+/// definition; it has one, and this is it.
+///
+/// Kept alongside the binary-derived 3.00 and 3.12 tables rather than
+/// replacing them: where a binary survives it is what a module was linked
+/// against, and the DEF corroborates. See [`SourceKind`].
+pub static WGSERVER_WG33: OrdinalTable = OrdinalTable {
+    library: WGSERVER,
+    generation: "wg33",
+    tsv: include_str!("../data/wgserver_wg33.tsv"),
+    source_path: "re/wg33src/LIB/WGSERVER.DEF",
+    source_kind: SourceKind::VendorDef,
+    verified: "1506 ordinals; a superset of the 3.12 binary's 1495, including _dfaStat @457 which no shipped binary exports.",
+};
+
 /// `DOSCALLS`, keyed to the extender release rather than the host release.
 ///
 /// No Worldgroup disk ships a `DOSCALLS.DLL`. The 286|DOS-Extender bound into
@@ -408,15 +467,15 @@ pub const GALGSBL_TABLES: &[&OrdinalTable] = &[
     &GALGSBL_LAYOUT_C,
 ];
 
-pub const MAJORBBS_TABLES: &[&OrdinalTable] = &[&MAJORBBS_MBBS625, &MAJORBBS_WG101];
-pub const GALME_TABLES: &[&OrdinalTable] = &[&GALME_WG101, &GALME_WG33];
-pub const GALMSG_TABLES: &[&OrdinalTable] = &[&GALMSG_WG101];
+pub const MAJORBBS_TABLES: &[&OrdinalTable] = &[&MAJORBBS_MBBS625, &MAJORBBS_WG101, &MAJORBBS_WG2];
+pub const GALME_TABLES: &[&OrdinalTable] = &[&GALME_WG101, &GALME_WG33, &GALME_WG2];
+pub const GALMSG_TABLES: &[&OrdinalTable] = &[&GALMSG_WG101, &GALMSG_MBBS625];
 pub const GALFIL_TABLES: &[&OrdinalTable] = &[&GALFIL_WG101];
 /// **Three builds whose ordinals genuinely disagree** -- ordinal 36 is
 /// `_TL2LST` in one and `___TLCACT` in another -- so these must never be
 /// merged. A wrong ordinal map is worse than none.
 pub const GALETL_TABLES: &[&OrdinalTable] = &[&GALETL_NE5, &GALETL_WG101, &GALETL_WG300];
-pub const WGSERVER_TABLES: &[&OrdinalTable] = &[&WGSERVER_WG300, &WGSERVER_WG312];
+pub const WGSERVER_TABLES: &[&OrdinalTable] = &[&WGSERVER_WG300, &WGSERVER_WG312, &WGSERVER_WG33];
 pub const DOSCALLS_TABLES: &[&OrdinalTable] = &[&DOSCALLS_PHARLAP31];
 
 /// How a library's symbols are named.
@@ -631,7 +690,7 @@ pub const ANCHOR: &str = "wg101";
 pub const PROFILES: &[Profile] = &[
     Profile {
         name: "mbbs625",
-        tables: &[&MAJORBBS_MBBS625, &GALGSBL_MBBS625, &DOSCALLS_PHARLAP31],
+        tables: &[&MAJORBBS_MBBS625, &GALGSBL_MBBS625, &GALMSG_MBBS625, &DOSCALLS_PHARLAP31],
     },
     Profile {
         name: "wg101",
@@ -647,7 +706,7 @@ pub const PROFILES: &[Profile] = &[
     },
     Profile {
         name: "wg2",
-        tables: &[&GALGSBL_WG2, &DOSCALLS_PHARLAP31],
+        tables: &[&MAJORBBS_WG2, &GALGSBL_WG2, &GALME_WG2, &DOSCALLS_PHARLAP31],
     },
     Profile {
         name: "wg3-16",
@@ -1164,15 +1223,22 @@ mod tests {
     }
 
     /// Exclusion needs one counterexample and no other table; selection needs a
-    /// table for every demanded library. That asymmetry is what makes the
-    /// registry useful before every generation's tables exist.
+    /// table for every demanded library.
+    ///
+    /// This used `board_demand` and `wg2` until the wg2 profile gained its
+    /// MAJORBBS and GALME tables. Against that demand no profile is
+    /// `Unevidenced` any more -- every one is Admissible or Excluded -- so the
+    /// asymmetry needs a fixture of its own. `layout-c` carries only a GALGSBL
+    /// table, so a demand naming GALME leaves it neither excluded nor
+    /// selectable.
     #[test]
     fn a_profile_missing_a_table_is_unevidenced_not_admissible() {
-        let d = board_demand();
-        // wg2 has a GALGSBL table and no MAJORBBS one.
-        match standing(profile("wg2").expect("wg2"), &d) {
-            Standing::Unevidenced { missing } => assert!(missing.contains(&MAJORBBS)),
-            other => panic!("wg2 must be unevidenced, got {other:?}"),
+        let mut d = Demand::new();
+        d.add("GALGSBL", 1);
+        d.add("GALME", 30);
+        match standing(profile("layout-c").expect("layout-c"), &d) {
+            Standing::Unevidenced { missing } => assert!(missing.contains(&GALME)),
+            other => panic!("layout-c has no GALME table, so it cannot be selected: {other:?}"),
         }
     }
 
@@ -1182,13 +1248,23 @@ mod tests {
     }
 
     /// The board's own answer, measured. Ordinal 87 rules out wg3-16 and
-    /// layout-c; MAJORBBS rules out mbbs625; wg2 is unevidenced. One profile
-    /// is left.
+    /// layout-c; MAJORBBS ordinals MBBS 6.25 never had rule out mbbs625. What
+    /// is left is wg101 and wg2, which agree on every ordinal these modules
+    /// demand -- so the honest answer is that this board cannot tell them
+    /// apart, not that it is wg101.
+    ///
+    /// This test asserted `Unique(wg101)` until the wg2 profile gained its
+    /// MAJORBBS and GALME tables. That `Unique` was an artefact of a missing
+    /// table, not evidence.
     #[test]
-    fn the_board_resolves_to_exactly_one_profile() {
+    fn the_board_cannot_distinguish_wg101_from_wg2() {
         match detect(&board_demand()) {
-            Outcome::Unique(p) => assert_eq!(p.name, "wg101"),
-            other => panic!("expected a unique profile, got {other:?}"),
+            Outcome::Unobservable { chosen, agreeing } => {
+                assert_eq!(chosen.name, ANCHOR);
+                assert!(agreeing.contains(&"wg101") && agreeing.contains(&"wg2"), "{agreeing:?}");
+                assert!(!agreeing.contains(&"mbbs625"), "MAJORBBS still rules mbbs625 out");
+            }
+            other => panic!("expected the two Layout A profiles to be indistinguishable, got {other:?}"),
         }
     }
 
