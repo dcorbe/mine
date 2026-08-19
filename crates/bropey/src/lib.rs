@@ -5,9 +5,60 @@
 //! is O(1) and shares structure; editing a shared rope copies O(log n) nodes
 //! and leaves every other handle untouched.
 
+mod iter;
+mod tree;
 mod tune;
 
-// Unused until a later task builds `Rope` on top and reaches it from the
-// crate root. Scoped to the module so unrelated dead code still warns.
-#[allow(dead_code)]
-mod tree;
+pub use iter::Chunks;
+
+use std::sync::Arc;
+
+use crate::tree::Node;
+
+/// A persistent rope over arbitrary bytes.
+///
+/// `clone` is O(1) and shares structure. Editing a rope that has been cloned
+/// copies O(log n) nodes and leaves every other handle untouched.
+#[derive(Clone, Debug)]
+pub struct Rope {
+    root: Arc<Node>,
+}
+
+impl Rope {
+    /// An empty rope.
+    pub fn new() -> Rope {
+        Rope { root: Node::empty() }
+    }
+
+    /// Build a rope from bytes in O(n).
+    pub fn from_bytes(bytes: &[u8]) -> Rope {
+        Rope { root: tree::build(bytes) }
+    }
+
+    /// Total bytes.
+    pub fn len(&self) -> usize {
+        self.root.byte_len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterate the rope's chunks in byte order.
+    pub fn chunks(&self) -> Chunks<'_> {
+        Chunks::new(&self.root)
+    }
+
+    /// Assert every structural invariant. Test-only; call at operation
+    /// boundaries.
+    #[cfg(test)]
+    pub(crate) fn check(&self) {
+        tree::check_invariants(&self.root);
+    }
+}
+
+impl Default for Rope {
+    fn default() -> Rope {
+        Rope::new()
+    }
+}
