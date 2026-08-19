@@ -123,10 +123,34 @@ impl TextEditor {
             }
             Key::Home => self.col = 0,
             Key::End => self.col = self.lines[self.row].len(),
+            Key::PageUp => self.page(-(Self::PAGE_LINES as isize)),
+            Key::PageDown => self.page(Self::PAGE_LINES as isize),
             Key::Esc => return Outcome::Cancel,
+            // `Enter` is already taken -- it inserts a newline, as a
+            // multi-line editor's `Enter` must -- so `Commit` (Ctrl-S) is
+            // this editor's only way to reach `Outcome::Commit`. See
+            // `Key::Commit`'s own doc.
+            Key::Commit => return Outcome::Commit,
         }
         self.recompute_value();
         Outcome::Continue
+    }
+
+    /// How many lines `PageUp`/`PageDown` move by. Not tied to any actual
+    /// screen height -- this editor does not know one -- just a fixed jump
+    /// larger than a single line, the same way `Home`/`End` are a fixed
+    /// jump within one.
+    const PAGE_LINES: usize = 10;
+
+    /// Move the cursor `delta` lines, clamping to the first or last line
+    /// rather than panicking past either end, and keeping the column inside
+    /// whatever line it lands on -- same rule [`Key::Up`]/[`Key::Down`]
+    /// already follow.
+    fn page(&mut self, delta: isize) {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        let moved = (self.row as isize + delta).clamp(0, self.lines.len() as isize - 1) as usize;
+        self.row = moved;
+        self.col = self.col.min(self.lines[self.row].len());
     }
 
     fn recompute_value(&mut self) {

@@ -50,9 +50,13 @@ impl FieldEditor {
             Key::Right => self.cursor = (self.cursor + 1).min(self.value.len()),
             Key::Home => self.cursor = 0,
             Key::End => self.cursor = self.value.len(),
-            // A field editor has one line -- nothing to move to.
-            Key::Up | Key::Down => {}
-            Key::Enter => return Outcome::Commit,
+            // A field editor has one line -- nothing to page or move to.
+            Key::Up | Key::Down | Key::PageUp | Key::PageDown => {}
+            // `Commit` (Ctrl-S) is `Enter`'s equal here: a field editor's
+            // `Enter` already commits, so the binding that exists only to
+            // give `TextEditor` a way to commit does not need a second
+            // meaning for the type that never needed one.
+            Key::Enter | Key::Commit => return Outcome::Commit,
             Key::Esc => return Outcome::Cancel,
         }
         Outcome::Continue

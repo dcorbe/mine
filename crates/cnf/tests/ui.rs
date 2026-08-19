@@ -122,6 +122,16 @@ fn enter_commits_and_escape_cancels() {
 }
 
 #[test]
+fn commit_also_commits_a_field_editor() {
+    // `Key::Commit` (Ctrl-S) exists so `TextEditor` has a way to save, but
+    // `bin/cnf.rs` binds it uniformly across both editors -- a
+    // `FieldEditor` session left it unhandled would mean pressing Ctrl-S
+    // while editing an `N`/`S`/`E`/... option did nothing at all.
+    let mut f = FieldEditor::new(b"60".to_vec());
+    assert_eq!(f.key(Key::Commit), Outcome::Commit);
+}
+
+#[test]
 fn the_text_editor_keeps_lines_separate() {
     let mut t = TextEditor::new(b"one\r\ntwo".to_vec());
     t.key(Key::Down);
@@ -198,4 +208,78 @@ fn the_text_editor_emits_only_bare_newlines_from_a_multi_line_edit() {
     t.key(Key::Char(b'o'));
     assert_eq!(t.value(), b"one\ntwo");
     assert!(!t.value().contains(&b'\r'), "a multi-line edit must not introduce a CR: got {:?}", t.value());
+}
+
+#[test]
+fn enter_inserts_a_newline_in_the_text_editor_rather_than_committing() {
+    // Establishes the premise `a_t_edit_can_reach_outcome_commit` depends
+    // on: unlike `FieldEditor`, `Enter` is not this editor's commit key.
+    // `Outcome::Commit` is unreachable from `Enter` here on purpose -- a
+    // multi-line editor's `Enter` has to insert a line break, so nothing
+    // else can be listening for `Enter` to mean "save".
+    let mut t = TextEditor::new(b"a".to_vec());
+    assert_eq!(t.key(Key::Enter), Outcome::Continue, "Enter must not commit a multi-line editor");
+    assert!(t.value().contains(&b'\n'), "Enter must have inserted a newline instead: {:?}", t.value());
+}
+
+#[test]
+fn a_t_edit_can_reach_outcome_commit() {
+    // The hazard this crate's brief calls out by name: `Enter` inserts a
+    // newline (see the test above), so without a separate commit key a `T`
+    // edit could be typed and never saved. `T` is 73% of every option in
+    // the corpus (`crates/cnf/tests/corpus.rs`'s per-type histogram), so an
+    // editor that could not reach `Commit` for it would leave most of the
+    // format unsavable. `bin/cnf.rs` binds `Key::Commit` to Ctrl-S via
+    // `cnf::ui::from_crossterm` -- see that function's own tests for the
+    // crossterm side of this path.
+    let src = b"NOTICE {hello} T\r\n";
+    let mut e = Editor::new(OptionSet::from_source("T.MSG", src).expect("parses"));
+    let (spec, value) = e.option_at(e.selected());
+    assert_eq!(spec.kind, cnf::spec::OptionType::Text, "the fixture must actually be a T option");
+
+    let mut t = TextEditor::new(value.to_vec());
+    t.key(Key::End);
+    t.key(Key::Char(b'!'));
+    assert_eq!(t.key(Key::Commit), Outcome::Commit, "Ctrl-S (Key::Commit) must be able to commit a T edit");
+
+    // And the value it hands back is not just accepted by `Outcome` in the
+    // abstract -- it actually reaches the model and dirties the set, the
+    // same as any other committed edit would.
+    e.edit(t.value().to_vec()).expect("a plain text edit must be accepted");
+    assert!(e.dirty(), "the committed T edit must reach the model");
+    assert_eq!(e.option_at(0).1, b"hello!");
+}
+
+#[test]
+fn page_up_and_page_down_move_the_text_editor_by_more_than_one_line() {
+    fn fixture() -> Vec<u8> {
+        (0..20).map(|n| format!("line{n}")).collect::<Vec<_>>().join("\n").into_bytes()
+    }
+    fn line_containing_the_cursor(value: &[u8]) -> String {
+        // `Char('X')` is inserted at the cursor and never anywhere else, so
+        // whichever line carries it is the line the cursor was actually on
+        // when the page key ran.
+        String::from_utf8_lossy(value).lines().find(|l| l.contains('X')).unwrap_or_default().replace('X', "")
+    }
+
+    // Positive first: without any page key, End + a character marks line 0
+    // -- proving the marker itself lands on the cursor's line, not just
+    // "somewhere", before trusting it to locate PageDown's result below.
+    let mut plain = TextEditor::new(fixture());
+    plain.key(Key::End);
+    plain.key(Key::Char(b'X'));
+    assert_eq!(line_containing_the_cursor(plain.value()), "line0");
+
+    let mut down = TextEditor::new(fixture());
+    down.key(Key::PageDown);
+    down.key(Key::End);
+    down.key(Key::Char(b'X'));
+    assert_eq!(line_containing_the_cursor(down.value()), "line10", "PageDown must move by more than one line");
+
+    let mut back = TextEditor::new(fixture());
+    back.key(Key::PageDown);
+    back.key(Key::PageUp);
+    back.key(Key::End);
+    back.key(Key::Char(b'X'));
+    assert_eq!(line_containing_the_cursor(back.value()), "line0", "PageUp must undo PageDown by the same amount");
 }
