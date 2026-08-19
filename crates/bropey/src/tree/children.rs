@@ -84,6 +84,22 @@ impl Children {
         out
     }
 
+    /// Break the size/node correspondence on purpose, so the invariant checker
+    /// can be shown to catch it. Tests only — there is no other way to
+    /// construct this state, which is the point.
+    #[cfg(test)]
+    pub(crate) fn corrupt_size_for_test(&mut self, i: usize, size: usize) {
+        self.sizes[i] = size;
+    }
+
+    /// Push a child at the wrong level, so the invariant checker can be shown
+    /// to catch ragged depth. Tests only.
+    #[cfg(test)]
+    pub(crate) fn push_ragged_for_test(&mut self, node: Arc<Node>) {
+        self.sizes.push(node.byte_len());
+        self.nodes.push(node);
+    }
+
     /// The child containing `offset`, and the offset within it.
     ///
     /// Biases *right* at a child boundary: byte `n` of a child of size `n`

@@ -1,8 +1,13 @@
 //! The tree itself.
 
 mod children;
+mod invariants;
 
 pub(crate) use children::Children;
+// Unused until a later task wires the checker into mutating operations.
+// Scoped to this one re-export so unrelated dead code still warns.
+#[allow(unused_imports)]
+pub(crate) use invariants::check_invariants;
 
 use std::sync::Arc;
 
