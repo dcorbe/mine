@@ -37,6 +37,7 @@ use crate::abi::{self, Abi, Call, Wg16};
 use crate::exports::{DOSCALLS, GALGSBL, GALME, GALMSG, MAJORBBS, PHAPI};
 use crate::globals::GLOBALS;
 use evidence::Evidence;
+use mbbs_machine::library::CW3220MT;
 
 /// Whether `MBBS_TRACE_SHIMS` is set, for the shims that print an *argument*
 /// rather than just their own name.
@@ -305,7 +306,7 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // `__LOCALECONVENTION` keeps ONE leading underscore: `exports::c_name`
         // strips exactly one, and stripping greedily would merge `_OLDSEND`
         // with `__OLDSEND`, which are two different symbols.
-        (MAJORBBS, "_localeconvention", crt::localeconvention, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "_localeconvention", crt::localeconvention, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "dfsthn", misc::dfsthn, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "hrtval", misc::hrtval, Cleans::Caller, Evidence::Unclassified),
         // Both MajorMUD NT builds and Rose 3.0NT import hrtval from GALGSBL,
@@ -882,38 +883,39 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "howbuy", credits::howbuy, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/ACCOUNT.C")),
         // Borland's own C++ runtime plumbing LunatiX links against from
-        // `cw3220mt.DLL`, aliased onto `MAJORBBS` same as everything above --
-        // and the one KERNEL32 call that can be served alongside it. See
-        // `borland`'s own module doc for what each of these does, why nine
-        // of the ten are no-ops, why `abort` is not, and why
+        // `cw3220mt.DLL`, its own library since the identity split -- and the
+        // one KERNEL32 call that can be served alongside it. See `borland`'s
+        // own module doc for what each of these does, why nine of the ten
+        // are no-ops, why `abort` is not (it stays under MAJORBBS: a genuine
+        // host symbol, `_ABORT` @52 in both MAJORBBS tables), and why
         // `GetModuleHandleA`/`GetProcAddress` are deliberately *not* here.
-        (MAJORBBS, "_startup", borland::startup, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "_startupd", borland::startupd, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "@_catchcleanup$qv", borland::catch_cleanup, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "_exceptionhandler", borland::exception_handler, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "_errormessage", borland::error_message, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "_startup", borland::startup, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "_startupd", borland::startupd, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "@_catchcleanup$qv", borland::catch_cleanup, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "_exceptionhandler", borland::exception_handler, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "_errormessage", borland::error_message, Cleans::Caller, Evidence::Unclassified),
         (
-            MAJORBBS,
+            CW3220MT,
             "@__lockdebuggerdata$qv",
             borland::lock_debugger_data,
             Cleans::Caller,
             Evidence::Unclassified,
         ),
         (
-            MAJORBBS,
+            CW3220MT,
             "@__unlockdebuggerdata$qv",
             borland::unlock_debugger_data,
             Cleans::Caller,
             Evidence::Unclassified,
         ),
         (
-            MAJORBBS,
+            CW3220MT,
             "__debuggerdisableterminatecallback",
             borland::debugger_disable_terminate_callback,
             Cleans::Caller,
             Evidence::Unclassified,
         ),
-        (MAJORBBS, "_free_heaps", borland::free_heaps, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "_free_heaps", borland::free_heaps, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "abort", borland::abort, Cleans::Caller, Evidence::Unclassified),
         (KERNEL32, "getversion", borland::getversion, Cleans::Caller, Evidence::Unclassified),
         // stdcall, not cdecl -- measured at LunatiX's own call sites
@@ -1072,17 +1074,17 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // a *different symbol* from the already-registered `fgetc` because this
         // host strips exactly one leading underscore -- stripping greedily
         // would merge `_OLDSEND` and `__OLDSEND`, which are two real symbols.
-        (MAJORBBS, "_fgetc", stream::fgetc, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "_fgetc", stream::fgetc, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "stricmp", crt::stricmp, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "ultoa", crt::ultoa, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "ungetc", crt::ungetc, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "rename", crt::rename, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "getenv", crt::getenv, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "gettime", crt::gettime, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "_doserror", crt::doserror, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "__errno", crt::errno, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "_lrand", crt::lrand, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "searchpath", crt::searchpath, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "_doserror", crt::doserror, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "__errno", crt::errno, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "_lrand", crt::lrand, Cleans::Caller, Evidence::Unclassified),
+        (CW3220MT, "searchpath", crt::searchpath, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "setmode", crt::setmode, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "read", crt::read, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "write", crt::write, Cleans::Caller, Evidence::Unclassified),
@@ -1097,7 +1099,7 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "lseek", crt::lseek, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "tell", crt::tell, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "filelength", crt::filelength, Cleans::Caller, Evidence::Standard),
-        (MAJORBBS, "_write", crt::_write, Cleans::Caller, Evidence::Standard),
+        (CW3220MT, "_write", crt::_write, Cleans::Caller, Evidence::Standard),
         // The time family, and exit. No oracle for any of the four time
         // routines: the genuine ones trap to DOS/BIOS and fault when called
         // (tests/oracle_gate.rs records the measurement), so these are
@@ -1254,7 +1256,7 @@ pub(crate) fn wg16_native(dll: &str, symbol: &str) -> Option<(Shim<Wg16>, Cleans
 /// operand is on the FPU stack, and all thirteen of LunatiX's call sites are
 /// preceded by `fld`/`fild`/`fmul` with nothing pushed.
 const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans, Evidence)] = &[
-    (MAJORBBS, "_ftol", ftol::ftol, Cleans::Caller, Evidence::Unclassified),
+    (CW3220MT, "_ftol", ftol::ftol, Cleans::Caller, Evidence::Unclassified),
     // The block allocator, `Wg32` half. Same C export names as the `Wg16`
     // entries in `WG16_ROUTINES` -- this is deliberate, not the duplicate
     // registration `6d8af77` cleaned up. One symbol, two ABI-concrete bodies,
@@ -1722,6 +1724,21 @@ mod tests {
         ));
     }
 
+    /// The Borland C runtime is not the MajorBBS API and must not share its
+    /// namespace. Measured before the split: 17 names registered under
+    /// MAJORBBS appear in no host table, and every one is this runtime.
+    #[test]
+    fn the_borland_runtime_resolves_under_its_own_library_not_majorbbs() {
+        // The spelling a 32-bit module actually imports.
+        assert!(matches!(entry::<crate::abi::Wg32>("cw3220mt.DLL", "_ftol"), Entry::Routine(..)));
+        assert!(matches!(entry::<crate::abi::Wg32>("cw3220mt.DLL", "_write"), Entry::Routine(..)));
+        // And it is NOT reachable as a MajorBBS routine any more.
+        assert!(
+            matches!(entry::<crate::abi::Wg32>(MAJORBBS, "_ftol"), Entry::Unimplemented),
+            "the C runtime must stop wearing MAJORBBS's name"
+        );
+    }
+
     #[test]
     fn fsdbkg_is_wired() {
         // It used to be `Entry::Unimplemented`, on the grounds that clearing
@@ -2092,18 +2109,20 @@ mod import_surface {
         (MAJORBBS, "freblok"),
         (MAJORBBS, "galmalloc"),
         (MAJORBBS, "sizmem"),
-        // Borland's runtime, re-exported through MAJORBBS.
-        (MAJORBBS, "_fgetc"),
+        // Borland's runtime. `_fgetc`, `_doserror`, `__errno`, `_lrand` and
+        // `searchpath` moved to CW3220MT with the identity split; the rest
+        // here are separate CRT symbols that stayed on MAJORBBS.
+        (CW3220MT, "_fgetc"),
         (MAJORBBS, "stricmp"),
         (MAJORBBS, "ultoa"),
         (MAJORBBS, "ungetc"),
         (MAJORBBS, "rename"),
         (MAJORBBS, "getenv"),
         (MAJORBBS, "gettime"),
-        (MAJORBBS, "_doserror"),
-        (MAJORBBS, "__errno"),
-        (MAJORBBS, "_lrand"),
-        (MAJORBBS, "searchpath"),
+        (CW3220MT, "_doserror"),
+        (CW3220MT, "__errno"),
+        (CW3220MT, "_lrand"),
+        (CW3220MT, "searchpath"),
         (MAJORBBS, "setmode"),
         (MAJORBBS, "read"),
         (MAJORBBS, "write"),

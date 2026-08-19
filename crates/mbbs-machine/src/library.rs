@@ -463,18 +463,36 @@ pub struct Library {
 pub const GALME: &str = "GALME";
 pub const PHAPI: &str = "PHAPI";
 pub const DOSCALLS: &str = "DOSCALLS";
+pub const CW3220MT: &str = "CW3220MT";
 
 pub const LIBRARIES: &[Library] = &[
     Library {
         name: MAJORBBS,
-        // `WGSERVER.EXE` is the 32-bit host's own exports and `cw3220mt.DLL`
-        // is the Borland C runtime. They are aliased here because that is
-        // where the host registers their routines today; splitting them into
-        // libraries of their own is a later change with its own measurement.
-        aliases: &["WGSERVER.EXE", "cw3220mt.DLL"],
+        // `WGSERVER.EXE` is the 32-bit host's own exports, under its 32-bit
+        // name -- measured: the PE32 LUNATIX.DLL imports 50 names from
+        // WGSERVER.EXE of which zero are dfa* and 49 are in the MAJORBBS
+        // table, and the two tables share 894 names. That alias is correct
+        // and stays. `cw3220mt.DLL` is Borland's C runtime, a genuinely
+        // different library, and has its own entry below.
+        aliases: &["WGSERVER.EXE"],
         naming: Naming::Ordinals(MAJORBBS_TABLES),
         authentic: Eligibility::NotLoadable(
             "MAJORBBS.EXE is NE plus a Phar Lap 286 extender; neither host can run it",
+        ),
+    },
+    Library {
+        name: CW3220MT,
+        // Borland's 32-bit C runtime, which a Worldgroup NT module links
+        // alongside the host's own API. It wore MAJORBBS's name until this
+        // split, which is why 17 names registered under MAJORBBS appeared in
+        // no host table -- not in MAJORBBS's own, and not in WGSERVER's
+        // either, those two being the same library under two names.
+        aliases: &["cw3220mt.DLL"],
+        // A C runtime has no ordinal space this host has recovered: every
+        // 32-bit import of it measured so far is by name.
+        naming: Naming::NamesOnly,
+        authentic: Eligibility::NotLoadable(
+            "the real cw3220mt.DLL is Borland's runtime, not a Galacticomm library this host models",
         ),
     },
     Library {
@@ -907,10 +925,11 @@ mod tests {
         assert_eq!(names.get(&3), None, "an absent ordinal is None, never invented");
     }
 
-    /// `canonical_dll` in `crates/mbbs` folds `cw3220mt.DLL` and
-    /// `WGSERVER.EXE` onto `MAJORBBS`, so the Borland C runtime, the 32-bit
-    /// host's exports and the game API share one namespace. Aliases here keep
-    /// the identity while still resolving.
+    /// `canonical_dll` in `crates/mbbs` folds `WGSERVER.EXE` onto `MAJORBBS`
+    /// -- the 32-bit host's own exports under its 32-bit name -- so the game
+    /// API resolves under either spelling. Aliases here keep the identity
+    /// while still resolving. `cw3220mt.DLL`, the Borland C runtime, is a
+    /// genuinely different library with an entry of its own.
     #[test]
     fn an_alias_finds_its_library_without_losing_its_own_name() {
         let found = library("GALGSBL.dll").expect("alias resolves");

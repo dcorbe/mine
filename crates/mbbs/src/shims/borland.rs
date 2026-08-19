@@ -530,6 +530,12 @@ mod tests {
     /// silently swaps for another, which is the same reason
     /// `crates/mbbs/tests/lunatix.rs`'s `PINNED_MISSES` is a set equality
     /// and not a length.
+    ///
+    /// `abort` is checked separately from the loop below, under `MAJORBBS`
+    /// rather than `cw3220mt.DLL`: it sits beside this family in
+    /// `shims::borland` but is a genuine host symbol (`_ABORT` @52 in both
+    /// MAJORBBS tables) and did not move to `CW3220MT` with the identity
+    /// split.
     #[test]
     fn the_borland_runtime_family_resolves() {
         for name in [
@@ -542,13 +548,20 @@ mod tests {
             "@__unlockdebuggerdata$qv",
             "__debuggerdisableterminatecallback",
             "_free_heaps",
-            "abort",
         ] {
             assert!(
                 !matches!(entry::<Wg32>("cw3220mt.DLL", name), Entry::Unimplemented),
                 "{name} is Borland startup plumbing and must not poison a session"
             );
         }
+        assert!(
+            !matches!(entry::<Wg32>(crate::exports::MAJORBBS, "abort"), Entry::Unimplemented),
+            "abort must still resolve under MAJORBBS"
+        );
+        assert!(
+            matches!(entry::<Wg32>("cw3220mt.DLL", "abort"), Entry::Unimplemented),
+            "abort must not wear the Borland runtime's name"
+        );
     }
 
     #[test]
