@@ -10,21 +10,39 @@
 //! that reached into the registry for its own inputs would sit inside that
 //! fence rather than beside it.
 //!
-//! # `retf` stubs, not trapping thunks
+//! # A forwarder, not a stub
 //!
 //! The design spec calls for entry points that are "thunks that trap back
-//! into this host." This emits a plain `retf` (`0xcb`) per export instead.
-//! Two reasons. First, nothing loads a synthesised library from a file
-//! today -- load-time imports go through `shims::entry` and `DosLoadModule`
-//! through `dosenv`'s handle table, neither of which touches the
-//! filesystem -- so a trapping thunk would ship with no caller, the same
-//! dead-code shape that bit `provision()` two plans ago. Second, the trap
-//! mechanism differs per host: `runexe`'s guests trap through the port-out
-//! stub in `kvm.rs`, while an mbbs-hosted module goes through the loader's
-//! thunk table. Choosing one without a caller to test against would be
-//! guessing at an interface neither side has built yet. The segment layout
-//! below is exactly where a trapping thunk plugs in once a caller exists;
-//! the round-trip test does not change when it does.
+//! into this host." An m16 thunk is not bytes in a module's image, though
+//! -- it is a slot in a host-owned `bridge` selector
+//! (`THUNK_TABLE_OFFSET + slot * THUNK_STRIDE`), and the loader points an
+//! import fixup at that slot. An emitted image cannot contain one, because
+//! the selector is not known at emit time.
+//!
+//! So instead each export **imports** a routine of its own name, from a
+//! module of its own name, and the entry point is a `jmp far`
+//! (`0xea <off16> <sel16>`) through a relocation naming that import. The
+//! existing loader resolves `Target::Import` exactly the way it resolves
+//! any other module's import: through [`crate::module::ImportResolver`],
+//! which for an unresolved routine hands back a real, executable thunk
+//! slot in the bridge selector (`ea <off32> <sel>`, a far jump into the
+//! host's own code). So the guest's `call far` to the export lands on our
+//! `jmp far`, which the loader has already patched to point at that host
+//! thunk -- reusing the loader's existing `Target::Import` path rather than
+//! inventing new trapping machinery.
+//!
+//! ## The circularity this would create, and the rule that avoids it
+//!
+//! **A forwarder that imports from its own library name would resolve to
+//! itself once a resolver ever prefers an already-loaded module's exports
+//! over the host's own tables, and loop.** The rule: *the synthesised
+//! image itself must always be loaded with the unflipped resolver* --
+//! host tables first, exactly as every other load today -- so its imports
+//! bind to host shims/thunks rather than back into the image that is still
+//! being loaded. Precedence-flipping (preferring an already-loaded module
+//! over the host tables) is a decision for *other* modules loaded
+//! afterwards to opt into, per load, never a global default and never
+//! something the forwarder's own load may use.
 //!
 //! # The spec is our own reader
 //!
@@ -46,9 +64,40 @@ const NE_HEADER: usize = 0x40;
 /// Sector-alignment shift for segment data: `1 << ALIGN` bytes per sector.
 const ALIGN: u16 = 4;
 
-/// `retf`: a real, executable far return, and the whole of every entry
-/// point's code. One byte, no operand.
-const RETF: u8 = 0xcb;
+/// `jmp far ptr16:16`: the opcode byte. Followed by a 4-byte operand
+/// initialised per [`OPERAND_OFFSET_INIT`] and patched at load time by a
+/// relocation.
+const FAR_JMP: u8 = 0xea;
+
+/// The far jump's operand's initial offset word, `CHAIN_END` (`0xffff`) --
+/// matching `crate::m16::ne`'s own private constant of the same name and
+/// value, restated here because this module does not import `ne`'s private
+/// items (see this file's own doc comment on the reader being the spec).
+///
+/// A non-additive relocation's applier treats a site's *current* word as
+/// the offset of the next site in a fixup chain, walking it after every
+/// write, and stops only at `CHAIN_END` or a self-referential link. Each
+/// forwarder relocation here names exactly one site -- there is no chain --
+/// so that word must already read as "no next link" before the loader ever
+/// touches it. Zero would not do that: zero is a real segment offset, so a
+/// zero-initialised operand on any export but the very first would have the
+/// applier walk off to offset 0 of the code segment and corrupt whatever
+/// `jmp far` bytes live there.
+const OPERAND_OFFSET_INIT: u16 = 0xffff;
+
+/// Relocation source `SRC_FAR_ADDR`: a 4-byte `ptr16:16` site, offset word
+/// then selector word. Matches `crate::m16::ne`'s private constant of the
+/// same name and value; restated for the same reason as
+/// [`OPERAND_OFFSET_INIT`].
+const SRC_FAR_ADDR: u8 = 3;
+
+/// Relocation target kind `TGT_IMPORTNAME`, in the low two bits of the
+/// flags byte. Matches `crate::m16::ne`'s private constant.
+const TGT_IMPORTNAME: u8 = 2;
+
+/// Segment flag: relocation records follow this segment's file data.
+/// Matches `crate::m16::ne`'s private `SEG_RELOCINFO`.
+const SEG_RELOCINFO: u16 = 0x0100;
 
 /// A 16-bit segment's size when a length field reads zero -- both the
 /// segment-table length and a bundle bytes' worth cannot spell 64 KiB any
@@ -63,6 +112,15 @@ fn pname(out: &mut Vec<u8>, name: &str, ordinal: u16) {
     out.push(name.len() as u8);
     out.extend_from_slice(name.as_bytes());
     out.extend_from_slice(&ordinal.to_le_bytes());
+}
+
+/// A length-prefixed name with **no** trailing ordinal -- the shape the
+/// module- and imported-name tables hold, as opposed to the exported-name
+/// tables [`pname`] serves.
+fn plain_pstring(out: &mut Vec<u8>, name: &str) {
+    assert!(name.len() <= 0xff, "a pstring's length is one byte");
+    out.push(name.len() as u8);
+    out.extend_from_slice(name.as_bytes());
 }
 
 /// Places `data` at the next sector boundary and returns `(sector, length
@@ -119,16 +177,28 @@ pub fn emit(module: &str, exports: &[(u16, &str)], payload: &[u8]) -> Vec<u8> {
     let segtab = out.len();
     out.resize(segtab + 16, 0);
 
-    // No imports: zero module references, and an imported-names table
-    // holding only the leading empty string every reader of that table
-    // expects. Nothing reads through `modtab`/`imptab` today -- the
-    // module-reference loop never runs with a zero count, and there are no
-    // TGT_IMPORTNAME relocations to resolve through `imptab` -- but a
-    // dangling offset naming nothing would be a landmine for whoever adds
-    // imports later.
+    // Imports: one module reference -- `module`'s own name -- and one
+    // imported name per export, so each export's forwarding jump can name
+    // an import of the same symbol. The imported-name table leads with a
+    // placeholder empty pstring at offset 0, the convention
+    // `crates/mbbs/tests/detection.rs`'s hand-built modules also follow and
+    // the reason a real module reference is never offset 0.
+    let mut impnames = vec![0u8];
+    let module_at = impnames.len();
+    plain_pstring(&mut impnames, module);
+    let symbol_at: Vec<u16> = sorted
+        .iter()
+        .map(|&(_, name)| {
+            let at = impnames.len() as u16;
+            plain_pstring(&mut impnames, name);
+            at
+        })
+        .collect();
+
     let modtab = out.len();
+    out.extend_from_slice(&(module_at as u16).to_le_bytes());
     let imptab = out.len();
-    out.push(0);
+    out.extend_from_slice(&impnames);
 
     // Resident name table: this module's own name first -- what `own_name`
     // reads unconditionally as the table's first entry -- then one entry
@@ -143,10 +213,15 @@ pub fn emit(module: &str, exports: &[(u16, &str)], payload: &[u8]) -> Vec<u8> {
 
     // Entry table: one segment-1 bundle per export, with a skip bundle
     // filling every gap between ordinals. Code offsets are assigned in
-    // ordinal order -- one `retf` per export -- so walking `sorted` here is
-    // also laying out the code segment's bytes.
+    // ordinal order -- one forwarding `jmp far` per export -- so walking
+    // `sorted` here is also laying out the code segment's bytes.
+    //
+    // `relocs[i]` is the code-segment offset of export `i`'s jump operand
+    // (one past its opcode byte), lined up 1:1 with `symbol_at[i]` above --
+    // both built by iterating `sorted` in the same order.
     let entrytab = out.len();
-    let mut code = Vec::with_capacity(sorted.len());
+    let mut code = Vec::with_capacity(sorted.len() * 5);
+    let mut relocs = Vec::with_capacity(sorted.len());
     let mut next_ordinal = 1u16;
     for &(ordinal, _name) in &sorted {
         let mut hole = ordinal.saturating_sub(next_ordinal);
@@ -165,7 +240,14 @@ pub fn emit(module: &str, exports: &[(u16, &str)], payload: &[u8]) -> Vec<u8> {
         out.push(0x01); // flags: exported
         let offset = code.len() as u16;
         out.extend_from_slice(&offset.to_le_bytes());
-        code.push(RETF);
+        code.push(FAR_JMP);
+        relocs.push(code.len() as u16);
+        // The operand: patched at load time by the relocation below. The
+        // offset half starts life as CHAIN_END, not zero -- see
+        // OPERAND_OFFSET_INIT. The selector half's initial value is
+        // immaterial; SRC_FAR_ADDR always overwrites both halves.
+        code.extend_from_slice(&OPERAND_OFFSET_INIT.to_le_bytes());
+        code.extend_from_slice(&0u16.to_le_bytes());
         next_ordinal = ordinal + 1;
     }
     out.push(0); // terminator: a zero count ends the table
@@ -182,8 +264,29 @@ pub fn emit(module: &str, exports: &[(u16, &str)], payload: &[u8]) -> Vec<u8> {
     let (code_sector, code_len) = place_segment(&mut out, &code);
     out[segtab..segtab + 2].copy_from_slice(&code_sector.to_le_bytes());
     out[segtab + 2..segtab + 4].copy_from_slice(&code_len.to_le_bytes());
-    out[segtab + 4..segtab + 6].copy_from_slice(&0u16.to_le_bytes()); // code, no relocations
+    // SEG_RELOCINFO only when there is code to hang relocations off of --
+    // `NeImage::parse`'s `parse_segment` only looks for relocation records
+    // when the segment's file length is nonzero, so writing them for an
+    // empty code segment (a caller with no exports at all) would leave
+    // orphaned bytes the reader never consumes.
+    let code_flags = if relocs.is_empty() { 0u16 } else { SEG_RELOCINFO };
+    out[segtab + 4..segtab + 6].copy_from_slice(&code_flags.to_le_bytes());
     out[segtab + 6..segtab + 8].copy_from_slice(&code_len.to_le_bytes());
+
+    // Relocations: immediately after the code segment's file data, exactly
+    // where `parse_segment` looks for them (`start + file_len`, no sector
+    // padding in between). One SRC_FAR_ADDR/TGT_IMPORTNAME record per
+    // export, non-additive -- each names exactly one site, not a chain.
+    if !relocs.is_empty() {
+        out.extend_from_slice(&(relocs.len() as u16).to_le_bytes());
+        for (&site, &name_at) in relocs.iter().zip(symbol_at.iter()) {
+            out.push(SRC_FAR_ADDR);
+            out.push(TGT_IMPORTNAME); // no TGT_ADDITIVE: one site, not a chain
+            out.extend_from_slice(&site.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes()); // module reference index, 1-based
+            out.extend_from_slice(&name_at.to_le_bytes()); // imported name offset within imptab
+        }
+    }
 
     let (data_sector, data_len) = place_segment(&mut out, payload);
     let data_row = segtab + 8;
@@ -197,7 +300,7 @@ pub fn emit(module: &str, exports: &[(u16, &str)], payload: &[u8]) -> Vec<u8> {
     header_u16(&mut out, 0x0c, 0x8001); // library, single-data
     header_u16(&mut out, 0x0e, 2); // autodata: the payload's data segment
     header_u16(&mut out, 0x1c, 2); // segment count: code, then data
-    header_u16(&mut out, 0x1e, 0); // no imported modules
+    header_u16(&mut out, 0x1e, 1); // one imported module: this module's own name
     header_u16(&mut out, 0x20, nrtab_len as u16);
     header_u16(&mut out, 0x22, (segtab - MZ_STUB) as u16);
     header_u16(&mut out, 0x26, (restab - MZ_STUB) as u16);
@@ -283,5 +386,49 @@ mod tests {
             .position(|w| w == b"ReG#")
             .expect("a linear scan must find the marker, as GETRNO does");
         assert_eq!(&bytes[at + 4..at + 12], b"00000000");
+    }
+
+    /// Each export is a far jump through a relocation naming the same symbol
+    /// as an import. The host loader then binds that import to a real
+    /// thunk, so calling the export reaches the host routine -- using the
+    /// loader's existing `Target::Import` path rather than any new trapping
+    /// machinery. Replaces Task 1's `retf` stubs, which existed for one
+    /// task and never shipped.
+    ///
+    /// Checks the entry point's own byte, not merely that a relocation
+    /// exists somewhere in the segment. A relocation count alone cannot
+    /// tell "the export is a jump patched by this fixup" from "the export
+    /// is still a `retf`, and this fixup happens to sit at some other,
+    /// unreached site in the same segment" -- mutating the entry byte back
+    /// to `retf` while still emitting the fixup passed the weaker version
+    /// of this test outright.
+    #[test]
+    fn every_export_forwards_to_an_import_of_the_same_name() {
+        let exports = [(59u16, "_BTUXMT"), (72u16, "_BTURNO")];
+        let bytes = emit("GALGSBL", &exports, b"");
+        let image = NeImage::parse(&bytes).expect("parses");
+
+        assert!(
+            image.modules.iter().any(|m| m == "GALGSBL"),
+            "the forwarder must import from a module of its own name: {:?}",
+            image.modules
+        );
+        let imported: usize = image
+            .segments
+            .iter()
+            .flat_map(|s| s.relocations.iter())
+            .filter(|r| matches!(r.target, crate::m16::ne::Target::Import { .. }))
+            .count();
+        assert_eq!(imported, 2, "one import fixup per export");
+
+        for (ordinal, name) in exports {
+            let entry = image.entries[ordinal as usize - 1].expect("ordinal has an entry");
+            let seg = &image.segments[entry.segment as usize - 1];
+            let at = seg.file.start + entry.offset as usize;
+            assert_eq!(
+                bytes[at], 0xea,
+                "ordinal {ordinal} ({name})'s entry point must itself be the jmp far, not a stub beside an unreached fixup"
+            );
+        }
     }
 }
