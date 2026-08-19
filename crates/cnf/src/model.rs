@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::hinge;
 use crate::set::OptionSet;
+use crate::spec::OptionSpec;
 use crate::validate::{self, Invalid};
 
 /// Does `haystack` contain `needle`, ignoring ASCII case? An empty `needle`
@@ -16,6 +17,19 @@ use crate::validate::{self, Invalid};
 /// the same state.
 fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// Why [`Editor::edit`] refused to store a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    /// The value itself does not satisfy the selected option's type and
+    /// bounds -- see [`validate::check`].
+    Invalid(Invalid),
+    /// The selected row is not currently in [`Editor::visible`]. A filter or
+    /// another option's hinge hid it out from under the cursor since it was
+    /// last selected; writing to it now would be an edit landing on a row
+    /// nobody can see, which is worse than refusing outright.
+    NotVisible,
 }
 
 /// The state a sysop's editing session needs: which options exist, which are
@@ -105,6 +119,43 @@ impl Editor {
         &self.visible
     }
 
+    /// The slice of `visible` that a screen with `rows` rows should draw --
+    /// `rows` entries starting at [`Self::top`], clamped to what `visible`
+    /// actually holds. The scroll arithmetic lives here, tested, rather than
+    /// recomputed by every widget that wants to draw a page of rows.
+    #[must_use]
+    pub fn window(&self, rows: usize) -> &[usize] {
+        let start = self.top.min(self.visible.len());
+        let end = start.saturating_add(rows).min(self.visible.len());
+        &self.visible[start..end]
+    }
+
+    /// The spec for the option at flat index `n`, and its effective current
+    /// value -- a pending edit if one exists, the on-disk value otherwise.
+    /// Everything a screen needs to draw one row, from the model alone: no
+    /// widget should need to hold its own [`OptionSet`] just to know an
+    /// option's name, type, prompt or value.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`OptionSet::at`]: if `n` is not a valid flat index
+    /// into the set (`n >= ` the set's total option count), whether or not
+    /// `n` is currently visible.
+    #[must_use]
+    pub fn option_at(&self, n: usize) -> (&OptionSpec, &[u8]) {
+        let (file_index, opt) = self.set.at(n);
+        let value = self.pending.get(&n).map_or_else(
+            || {
+                self.set.files()[file_index]
+                    .messages()
+                    .get(opt.index)
+                    .expect("scan guarantees every option index addresses a real message")
+            },
+            Vec::as_slice,
+        );
+        (opt, value)
+    }
+
     /// The flat index the cursor is on.
     #[must_use]
     pub fn selected(&self) -> usize {
@@ -167,29 +218,55 @@ impl Editor {
 
     /// Try to set the selected option's value to `value`.
     ///
-    /// Validates against the option's own declared bounds before storing
-    /// anything: a rejected edit changes nothing, including [`Self::dirty`].
-    /// Storing first and validating after would leave a bad value sitting in
-    /// `pending` on the error path -- exactly the shape
+    /// Refuses before storing anything in two independent ways, checked in
+    /// this order:
+    ///
+    /// 1. The selected row must be visible. `select` deliberately does not
+    ///    enforce this (see its own doc), so it falls to `edit` to catch a
+    ///    stale selection -- most sharply when a filter hides every row:
+    ///    `recompute_visible` cannot repair `selected` onto an empty list,
+    ///    so without this check `edit` would silently write to a row nobody
+    ///    can see.
+    /// 2. The value must satisfy the option's own declared bounds
+    ///    ([`validate::check`]).
+    ///
+    /// Both checks run before `pending` is touched: a rejected edit changes
+    /// nothing, including [`Self::dirty`]. Storing first and validating
+    /// after would leave a bad value sitting in `pending` on the error path
+    /// -- exactly the shape
     /// `an_invalid_edit_is_rejected_and_leaves_the_value_alone` exists to
     /// catch.
     ///
     /// # Errors
     ///
-    /// [`Invalid`] if `value` does not satisfy the selected option's type
-    /// and bounds.
-    pub fn edit(&mut self, value: Vec<u8>) -> Result<(), Invalid> {
+    /// [`EditError::NotVisible`] if the selected row is not in
+    /// [`Self::visible`]. [`EditError::Invalid`] if `value` does not satisfy
+    /// the selected option's type and bounds.
+    pub fn edit(&mut self, value: Vec<u8>) -> Result<(), EditError> {
+        if !self.visible.contains(&self.selected) {
+            return Err(EditError::NotVisible);
+        }
         let (_, opt) = self.set.at(self.selected);
-        validate::check(&opt.kind, &value)?;
+        validate::check(&opt.kind, &value).map_err(EditError::Invalid)?;
         self.pending.insert(self.selected, value);
         self.recompute_visible();
         Ok(())
     }
 
-    /// Is there any edit not yet written back to the set?
+    /// Does any pending edit actually differ from the value on disk?
+    ///
+    /// Not simply "is `pending` non-empty": editing a value back to what it
+    /// started as leaves the entry in `pending` (removing it on a match
+    /// would be a second place this class of bug could hide), but a
+    /// sysop-facing "modified" indicator built on this must not light up
+    /// when nothing would actually change on save.
     #[must_use]
     pub fn dirty(&self) -> bool {
-        !self.pending.is_empty()
+        self.pending.iter().any(|(&n, edited)| {
+            let (file_index, opt) = self.set.at(n);
+            let on_disk = self.set.files()[file_index].messages().get(opt.index);
+            on_disk != Some(edited.as_slice())
+        })
     }
 
     /// Edited values not yet written back, keyed by flat index.
@@ -239,12 +316,60 @@ ALWAYS {2} N 0 9\r\n";
 
     #[test]
     fn selection_stays_inside_the_visible_list() {
+        // Every assertion below must be false immediately before the action
+        // that is supposed to make it true -- otherwise a no-op `move_by`,
+        // or one with a broken current-position lookup, would pass anyway.
+        // (The original version of this test started and ended at the same
+        // boundary in one half, so a `move_by` doing nothing at all still
+        // passed it -- see task-12 fix report.)
+        let mut e = editor();
+        e.select(1); // the middle, so both directions have somewhere to go
+        assert_eq!(e.selected(), 1);
+
+        e.move_by(1);
+        assert_eq!(e.selected(), 2, "one step forward from the middle");
+
+        e.move_by(-1);
+        assert_eq!(e.selected(), 1, "one step back to the middle");
+
+        e.move_by(-99);
+        assert_eq!(e.selected(), 0, "a big step back saturates at the start, not below it");
+
+        e.select(1); // back to the middle, so the next jump starts from non-zero
+        e.move_by(99);
+        assert_eq!(e.selected(), 2, "a big step forward saturates at the end, not past it");
+    }
+
+    #[test]
+    fn window_returns_the_rows_currently_on_screen() {
         let mut e = editor();
         e.select(2);
-        e.move_by(5);
-        assert_eq!(e.selected(), 2, "saturates at the end");
-        e.move_by(-99);
-        assert_eq!(e.selected(), 0, "saturates at the start");
+        e.scroll_to_show(1);
+        assert_eq!(e.window(1), &[2], "top must have scrolled to keep row 2 in a 1-row window");
+    }
+
+    #[test]
+    fn window_clamps_to_the_end_of_the_visible_list_rather_than_panicking() {
+        let e = editor();
+        assert_eq!(e.window(10), &[0, 1, 2], "asking for more rows than exist is not an error");
+    }
+
+    #[test]
+    fn option_at_gives_the_spec_and_the_effective_value_pending_first() {
+        let mut e = editor();
+        let (spec, value) = e.option_at(0);
+        assert_eq!(spec.name, b"MODE");
+        assert_eq!(value, b"FULL", "before any edit, the effective value is the on-disk one");
+
+        e.edit(b"LITE".to_vec()).expect("valid choice"); // selected starts at 0, MODE
+        let (spec, value) = e.option_at(0);
+        assert_eq!(spec.name, b"MODE", "the spec itself does not change");
+        assert_eq!(value, b"LITE", "a pending edit overrides the on-disk value");
+
+        // A different, never-edited option still reports its on-disk value.
+        let (other_spec, other_value) = e.option_at(2);
+        assert_eq!(other_spec.name, b"ALWAYS");
+        assert_eq!(other_value, b"2");
     }
 
     #[test]
@@ -283,5 +408,46 @@ OTHER {x} N 0 9\r\n";
         assert_eq!(e.visible(), &[1], "SELF no longer equals A, so it hides itself");
         assert!(e.visible().contains(&e.selected()), "the cursor must follow the row off the list");
         assert_eq!(e.selected(), 1, "OTHER is the only row left to land on");
+    }
+
+    #[test]
+    fn editing_while_the_selected_row_is_filtered_out_is_refused() {
+        // A filter narrowing to zero rows is the sharpest case:
+        // `recompute_visible` cannot repair `selected` onto an empty list,
+        // so without a check in `edit` itself this would silently write to
+        // a row nobody can see.
+        let mut e = editor();
+        e.select(0);
+        e.set_filter(b"nothing matches this");
+        assert!(e.visible().is_empty());
+        assert_eq!(e.edit(b"LITE".to_vec()), Err(EditError::NotVisible));
+        assert!(!e.dirty(), "a refused edit must not dirty the set");
+    }
+
+    #[test]
+    fn editing_a_directly_selected_hidden_row_is_refused() {
+        // `select` does not itself check visibility (see its doc) -- so a
+        // caller can point the cursor straight at a row a hinge is already
+        // hiding, without going through a filter at all. `edit` still has to
+        // catch it.
+        let mut e = editor();
+        assert!(e.visible().contains(&1), "EXTRA starts visible");
+        // Make EXTRA hidden, then aim the cursor at it directly.
+        e.select(0);
+        e.edit(b"LITE".to_vec()).expect("valid choice");
+        assert!(!e.visible().contains(&1), "EXTRA is now hidden");
+        e.select(1);
+        assert_eq!(e.edit(b"5".to_vec()), Err(EditError::NotVisible));
+    }
+
+    #[test]
+    fn reverting_an_edit_to_its_original_value_leaves_the_set_clean() {
+        let mut e = editor();
+        e.select(2); // ALWAYS, on-disk value "2"
+        e.edit(b"7".to_vec()).expect("7 is in range");
+        assert!(e.dirty(), "7 differs from the on-disk value 2");
+        e.edit(b"2".to_vec()).expect("2 is in range");
+        assert!(!e.dirty(), "back to the on-disk value: nothing would change on save");
+        assert!(e.pending().contains_key(&2), "the pending entry itself may still be kept");
     }
 }
