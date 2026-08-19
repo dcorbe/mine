@@ -2,12 +2,21 @@
 //!
 //! Most of a terminal loop cannot be unit-tested -- there is no terminal to
 //! drive it with, and the workspace has no precedent for faking one. What
-//! *can* be pulled out of that loop and tested directly is kept here: the
-//! file picker's navigation (the same pure state-machine shape as
+//! *can* be exercised without one is kept here instead: the file picker's
+//! navigation (the same pure state-machine shape as
 //! [`crate::model::Editor`], just without a hinge or a filter), the fixed
-//! screen layout's arithmetic, the quit-while-dirty rule, and what a save
-//! should write before anything is written. `bin/cnf.rs` itself is left
+//! screen layout's arithmetic, the quit-while-dirty rule, the commit chain
+//! an in-progress edit runs through on its way into the model
+//! ([`commit_edit`]), and the save path itself ([`attempt_save`],
+//! [`write_atomic`], [`plan_save`]) -- real disk I/O, not a pure function,
+//! but still exercised directly against a real temp directory rather than
+//! left untested just because it touches a filesystem. `bin/cnf.rs` is left
 //! holding only the terminal I/O and the glue between these pieces.
+//!
+//! Batch G review moved two things here that used to live in the binary,
+//! untested: `handle_editing_key`'s commit chain (now [`commit_edit`]), and
+//! `attempt_save` itself, after review caught a bug in it that no test
+//! existed to catch (see [`attempt_save`]'s own doc).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -15,8 +24,12 @@ use std::path::{Path, PathBuf};
 use textscreen::cell::Cells;
 use textscreen::widget::{Rect, Widget};
 
+use crate::model::{EditError, Editor};
 use crate::set::OptionSet;
+use crate::spec::OptionType;
 use crate::write::{self, WriteError};
+
+use super::Key;
 
 const NORMAL: u8 = 0x07;
 const SELECTED: u8 = 0x70;
@@ -154,6 +167,60 @@ pub fn confirm_quit(dirty: bool, armed: bool) -> bool {
     !dirty || armed
 }
 
+/// Whether keystroke `key` should disarm the quit-confirmation flag
+/// [`confirm_quit`] reads -- every key except a repeated `q`/`Q`, which is
+/// the one key allowed to accumulate across two presses (the confirmation
+/// itself). Resetting on everything else is what makes it a *repeated* `q`
+/// rather than any two presses anywhere in a session.
+#[must_use]
+pub fn disarms_quit(key: Key) -> bool {
+    !matches!(key, Key::Char(b'q' | b'Q'))
+}
+
+/// What happened when [`commit_edit`] tried to apply an in-progress edit's
+/// current value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// Accepted and applied to the model -- `Editor::dirty` may now be
+    /// true. The caller should close the edit session.
+    Committed,
+    /// [`write::check_edit`] refused first: a `T` value that dropped or
+    /// reordered a `printf` conversion. The model was never touched --
+    /// the caller should keep the session open so the value can be fixed.
+    SpecifiersChanged(String),
+    /// [`crate::model::Editor::edit`] refused the value against the
+    /// option's own bounds. The model was never touched -- keep the
+    /// session open.
+    Invalid(String),
+    /// The selected row is no longer visible
+    /// ([`crate::model::EditError::NotVisible`]). Nothing is left to keep
+    /// editing -- the caller should close the session.
+    NotVisible,
+}
+
+/// Try to commit `value` -- an in-progress edit's current value, for the
+/// selected option of type `kind` that started as `original` -- into
+/// `editor`.
+///
+/// [`write::check_edit`] runs before [`crate::model::Editor::edit`], not
+/// after: a sysop who learns a `%s` is missing only once they have already
+/// left the field has already lost the edit that dropped it (see
+/// `write::check_edit`'s own doc). Pulled out of `bin/cnf.rs`'s event loop
+/// so this ordering itself is something a test can hold onto --
+/// `commit_edit_refuses_on_specifiers_before_touching_the_model` is built
+/// exactly to catch the two steps being swapped or either one being
+/// skipped.
+pub fn commit_edit(editor: &mut Editor, kind: &OptionType, original: &[u8], value: Vec<u8>) -> CommitOutcome {
+    if let Err(e) = write::check_edit(kind, original, &value) {
+        return CommitOutcome::SpecifiersChanged(format!("{e:?}"));
+    }
+    match editor.edit(value) {
+        Ok(()) => CommitOutcome::Committed,
+        Err(EditError::Invalid(invalid)) => CommitOutcome::Invalid(format!("{invalid:?}")),
+        Err(EditError::NotVisible) => CommitOutcome::NotVisible,
+    }
+}
+
 /// Resolve the sibling file names [`crate::set::siblings`] declares against
 /// the `*.MSG` files actually present in `listing` (the same convention
 /// [`crate::set::list_msg_files`] returns), matching case-insensitively on
@@ -261,6 +328,109 @@ pub fn plan_save(set: &OptionSet, pending: &BTreeMap<usize, Vec<u8>>) -> Result<
         out.push(SaveWrite { file_name: file.name().to_string(), msg, mcv });
     }
     Ok(out)
+}
+
+/// Write `bytes` to `path` without ever leaving a truncated file there.
+///
+/// `std::fs::write` truncates the destination before writing it -- a crash
+/// or a disk-full error partway through leaves whatever was already there
+/// destroyed and the new content incomplete. Writing to a sibling `.tmp`
+/// file first and renaming it into place avoids that: `rename` on every
+/// platform this runs on is a single directory-entry update, so the
+/// destination is either the old file, complete, or the new one, complete
+/// -- never a partial write of either.
+///
+/// # Errors
+///
+/// Any I/O failure writing the temp file or renaming it into place. The
+/// temp file is best-effort cleaned up on a write failure; a rename
+/// failure leaves it behind (the original `path` is untouched either way).
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Save every changed file. Reopens the file set fresh from disk first (so
+/// the writer splices against the same bytes it is about to overwrite,
+/// never a stale in-memory copy), computes the whole plan with
+/// [`plan_save`] before writing anything, and only then writes -- a
+/// [`WriteError`] anywhere in the plan means nothing here is written at
+/// all.
+///
+/// Each file is written with [`write_atomic`], so a crash or a disk-full
+/// error mid-write cannot truncate a `.MSG` or `.MCV` that was already on
+/// disk. That still leaves one smaller, unavoidable window: the `.MSG` and
+/// its `.MCV` are two separate files, written (and renamed into place) one
+/// after the other, not as a single atomic unit, so a failure between the
+/// two renames can leave a file's `.MSG` updated with its `.MCV` one
+/// generation behind. The message on that path says exactly which file and
+/// which half, rather than leaving a sysop staring at a board that will not
+/// start with no idea why.
+///
+/// Reopens `paths` **again, fresh, after the writes succeed** to rebuild
+/// `editor` -- not the snapshot read before them. Batch G review caught the
+/// bug in reusing that earlier snapshot: it is the pre-save bytes
+/// `plan_save` diffed the edits against, so rebuilding the model from it
+/// puts every just-saved value back to what it was before the save.
+/// `dirty()` would report clean (correctly -- `pending` really is empty),
+/// but the sysop would watch their own edit revert on screen right after
+/// "saved N file(s)" printed, while the disk copy was actually correct.
+/// `attempt_save_shows_the_saved_value_not_the_value_from_before_the_save`
+/// is the regression test for exactly this.
+pub fn attempt_save(dir: &Path, paths: &[PathBuf], editor: &mut Editor) -> String {
+    let before = match OptionSet::open(paths) {
+        Ok(s) => s,
+        Err(e) => return format!("could not reopen the files to save: {e}"),
+    };
+    let writes = match plan_save(&before, editor.pending()) {
+        Err((name, e)) => return format!("save refused, nothing written: {name}: {e:?}"),
+        Ok(writes) => writes,
+    };
+    if writes.is_empty() {
+        return "nothing to save".to_string();
+    }
+
+    for (done, w) in writes.iter().enumerate() {
+        let msg_path = dir.join(&w.file_name);
+        if let Err(e) = write_atomic(&msg_path, &w.msg) {
+            return format!("disk write failed after {done}/{} file(s): {}: {e}", writes.len(), msg_path.display());
+        }
+        let mcv_path = mcv_path(&msg_path);
+        if let Err(e) = write_atomic(&mcv_path, &w.mcv) {
+            return format!(
+                "disk write failed after {done}/{} file(s) plus {}'s .MSG -- its .MCV is now stale: {}: {e}",
+                writes.len(),
+                w.file_name,
+                mcv_path.display()
+            );
+        }
+    }
+
+    let selected = editor.selected();
+    match OptionSet::open(paths) {
+        Ok(after) => {
+            *editor = Editor::new(after);
+            editor.select(selected);
+            format!("saved {} file(s)", writes.len())
+        }
+        Err(e) => {
+            // The writes themselves already succeeded -- only reloading
+            // them failed. `editor`'s pending edits are left exactly as
+            // they were rather than discarded: the model's values already
+            // match what is now on disk, they just were not rebuilt into a
+            // fresh `Editor`, so `dirty()` will keep reporting them as
+            // pending until the next successful save. Said plainly rather
+            // than silently claiming success or losing the edits.
+            format!("saved {} file(s), but could not reload afterward: {e}", writes.len())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -478,6 +648,154 @@ mod tests {
             "B.MSG's own edit must land: {:?}",
             String::from_utf8_lossy(&writes[0].msg)
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disarms_quit_is_true_for_everything_except_a_repeated_q() {
+        assert!(!disarms_quit(Key::Char(b'q')), "q must NOT disarm -- it is the key being armed");
+        assert!(!disarms_quit(Key::Char(b'Q')), "case must not matter");
+        assert!(disarms_quit(Key::Char(b's')), "any other key disarms");
+        assert!(disarms_quit(Key::Enter));
+        assert!(disarms_quit(Key::Esc));
+    }
+
+    fn number_option() -> OptionType {
+        OptionType::Number { floor: 0, ceiling: 32767 }
+    }
+
+    #[test]
+    fn commit_edit_applies_an_accepted_value() {
+        let src = b"GAMCRD {60} N 0 32767\r\n";
+        let mut e = Editor::new(OptionSet::from_source("T.MSG", src).expect("parses"));
+        let outcome = commit_edit(&mut e, &number_option(), b"60", b"120".to_vec());
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert!(e.dirty());
+        assert_eq!(e.option_at(0).1, b"120");
+    }
+
+    #[test]
+    fn commit_edit_refuses_on_specifiers_before_touching_the_model() {
+        // `validate::check` always accepts a `Text` value (see its own
+        // doc), so this fixture is refused ONLY by `write::check_edit`'s
+        // specifier check -- if `commit_edit` skipped that call, or ran it
+        // after `Editor::edit` instead of before, this value would land in
+        // `pending` and dirty the editor. Proves the ORDER, not just that
+        // a refusal is possible.
+        let src = b"NOTICE {hello %s} T\r\n";
+        let mut e = Editor::new(OptionSet::from_source("T.MSG", src).expect("parses"));
+        let outcome = commit_edit(&mut e, &OptionType::Text, b"hello %s", b"hello".to_vec());
+        assert!(matches!(outcome, CommitOutcome::SpecifiersChanged(_)), "got {outcome:?}");
+        assert!(!e.dirty(), "check_edit's refusal must happen before Editor::edit ever touches pending");
+    }
+
+    #[test]
+    fn commit_edit_reports_invalid_without_dirtying() {
+        let src = b"GAMCRD {60} N 0 32767\r\n";
+        let mut e = Editor::new(OptionSet::from_source("T.MSG", src).expect("parses"));
+        let outcome = commit_edit(&mut e, &number_option(), b"60", b"99999".to_vec());
+        assert!(matches!(outcome, CommitOutcome::Invalid(_)), "got {outcome:?}");
+        assert!(!e.dirty(), "a refused edit must not dirty the model");
+    }
+
+    #[test]
+    fn commit_edit_reports_not_visible_without_dirtying() {
+        // Same shape as `model.rs`'s own
+        // `editing_while_the_selected_row_is_filtered_out_is_refused`: a
+        // filter narrows to zero rows, so the selected row -- still
+        // pointed at by `Editor::selected` -- is no longer in
+        // `Editor::visible`.
+        let src = b"MODE {FULL} E FULL,LITE\r\n";
+        let mut e = Editor::new(OptionSet::from_source("T.MSG", src).expect("parses"));
+        e.set_filter(b"nothing matches this");
+        assert!(e.visible().is_empty());
+        let kind = OptionType::Enum { choices: vec![b"FULL".to_vec(), b"LITE".to_vec()] };
+        let outcome = commit_edit(&mut e, &kind, b"FULL", b"LITE".to_vec());
+        assert_eq!(outcome, CommitOutcome::NotVisible);
+        assert!(!e.dirty());
+    }
+
+    #[test]
+    fn attempt_save_shows_the_saved_value_not_the_value_from_before_the_save() {
+        // Batch G review, Critical: `attempt_save` used to rebuild `editor`
+        // from the `OptionSet` it read BEFORE writing the files -- the same
+        // snapshot `plan_save` diffed the pending edit against, which never
+        // saw the new value. `dirty()` came back clean (correctly --
+        // `pending` really was empty), but the model's own displayed value
+        // reverted to what was on disk before the save, right after
+        // "saved 1 file(s)" printed. A sysop watching that would reasonably
+        // conclude the save failed, even though the file on disk was
+        // correct the whole time. This test reads the model back out
+        // through `Editor::option_at`, not just `dirty()`, because `dirty()`
+        // alone cannot tell a real save from this bug.
+        let dir = std::env::temp_dir().join(format!("cnf_attempt_save_shows_saved_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("A.MSG");
+        std::fs::write(&path, b"GAMCRD {60} N 0 32767
+").expect("write A.MSG");
+
+        let set = OptionSet::open(std::slice::from_ref(&path)).expect("open");
+        let mut editor = Editor::new(set);
+        editor.select(0);
+        editor.edit(b"120".to_vec()).expect("120 is in range");
+        assert_eq!(editor.option_at(0).1, b"120", "the pending edit before any save");
+
+        let status = attempt_save(&dir, std::slice::from_ref(&path), &mut editor);
+        assert!(status.contains("saved"), "expected a success message, got {status:?}");
+
+        assert!(!editor.dirty(), "nothing pending after a successful save");
+        assert_eq!(
+            editor.option_at(0).1,
+            b"120",
+            "the model must show the value that was just saved, not revert to the pre-save one: got status {status:?}"
+        );
+
+        // And the disk copy itself really did change -- not just the
+        // in-memory model.
+        let on_disk = std::fs::read(&path).expect("read back A.MSG");
+        assert!(
+            on_disk.windows(3).any(|w| w == b"120"),
+            "the file on disk must carry the new value: {:?}",
+            String::from_utf8_lossy(&on_disk)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_writes_the_bytes_and_leaves_no_tmp_file_behind() {
+        let dir = std::env::temp_dir().join(format!("cnf_write_atomic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("X.MSG");
+
+        write_atomic(&path, b"first").expect("first write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"first");
+
+        write_atomic(&path, b"second, and longer than first").expect("second write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"second, and longer than first");
+
+        let tmp = path.with_extension("MSG.tmp");
+        assert!(!tmp.exists(), "the temp file must be renamed away, not left behind");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_failing_to_write_the_temp_file_leaves_the_original_untouched() {
+        let dir = std::env::temp_dir().join(format!("cnf_write_atomic_fail_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("X.MSG");
+        std::fs::write(&path, b"original").expect("seed original");
+
+        // Shadow the exact path the temp file would use with a directory,
+        // so writing there fails deterministically without touching any
+        // OS-level permission bits.
+        let tmp = path.with_extension("MSG.tmp");
+        std::fs::create_dir(&tmp).expect("shadow the tmp path with a directory");
+
+        assert!(write_atomic(&path, b"replacement").is_err(), "writing where a directory sits must fail");
+        assert_eq!(std::fs::read(&path).expect("read"), b"original", "the original must survive a failed write");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

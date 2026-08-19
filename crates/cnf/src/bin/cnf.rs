@@ -3,19 +3,20 @@
 //! Everything with a pure input and a pure output lives in the library, not
 //! here -- `cnf::ui::from_crossterm` (translating one terminal key event)
 //! and `cnf::ui::app` (the file picker's navigation, the fixed screen
-//! layout, the quit-while-dirty rule, and what a save should write, all
-//! computed without touching a filesystem or a terminal). What is left in
-//! this file is what genuinely cannot be tested without a real terminal:
-//! the event loop itself, and the two hazards that come with owning one --
-//! unwinding raw mode and the alternate screen on every exit path
-//! (including a panic), and making sure a save that hits any error writes
-//! nothing at all.
+//! layout, the quit-while-dirty rule, the commit chain an in-progress edit
+//! runs through on its way into the model, and what a save should write,
+//! all computed without touching a filesystem or a terminal). What is left
+//! in this file is what genuinely cannot be tested without a real
+//! terminal: the event loop itself, and the two hazards that come with
+//! owning one -- unwinding raw mode and the alternate screen on every exit
+//! path (including a panic), and making sure a save that hits any error
+//! writes nothing at all.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use cnf::model::{EditError, Editor};
+use cnf::model::Editor;
 use cnf::set::{self, OptionSet};
 use cnf::spec::OptionType;
 use cnf::ui::app::{self, Picker};
@@ -24,7 +25,6 @@ use cnf::ui::help::HelpPane;
 use cnf::ui::list::OptionList;
 use cnf::ui::text::TextEditor;
 use cnf::ui::{Key, Outcome, from_crossterm};
-use cnf::write;
 use crossterm::event::{Event, KeyEventKind};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use textscreen::cell::Cells;
@@ -92,13 +92,22 @@ fn restore_terminal() {
 /// drop -- covering every *normal* exit path out of [`run`] (`?`, an early
 /// `return`, falling off the end of the loop) the way [`install_panic_hook`]
 /// covers the abnormal one. Between the two, there is no path out of this
-/// binary that leaves the terminal in raw mode or on the alternate screen.
+/// binary that leaves the terminal in raw mode or on the alternate screen --
+/// including the narrow window inside [`Self::enter`] itself, between raw
+/// mode succeeding and the alternate screen failing: there is no `Self` yet
+/// for `Drop` to act on at that point, so it is unwound explicitly instead.
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+        if let Err(e) = crossterm::execute!(io::stdout(), EnterAlternateScreen) {
+            // Raw mode already succeeded and nothing exists yet to `Drop`
+            // it back out -- undone here instead of leaving the terminal
+            // raw for whatever prints the error this `Err` becomes.
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(e);
+        }
         Ok(Self)
     }
 }
@@ -132,7 +141,7 @@ struct EditingState {
 
 /// One option's in-progress edit: whichever of the two editors its
 /// [`OptionType`] calls for, plus the value it started as (for
-/// [`write::check_edit`], which needs to compare against it and which
+/// [`cnf::write::check_edit`], which needs to compare against it and which
 /// neither editor widget exposes on its own).
 enum EditSession {
     Field { kind: OptionType, original: Vec<u8>, editor: FieldEditor },
@@ -178,7 +187,7 @@ impl EditSession {
     }
 
     /// The refusal a Ctrl-S would meet right now, shown live -- `Field`
-    /// sessions have nothing to warn about (`write::check_edit` is a no-op
+    /// sessions have nothing to warn about (`cnf::write::check_edit` is a no-op
     /// for every kind but `Text`; see its own doc).
     fn warning(&self) -> Option<String> {
         match self {
@@ -291,9 +300,8 @@ fn open_editor(all_msgs: &[PathBuf], chosen: &Path) -> io::Result<(Editor, Vec<P
 /// whole program should exit.
 fn handle_editing_key(state: &mut EditingState, key: Key, status: &mut Option<String>) -> bool {
     // Any key other than a repeated `q` disarms the quit confirmation --
-    // see `app::confirm_quit`'s own doc for why this reset belongs to the
-    // caller rather than to that function.
-    if !matches!(key, Key::Char(b'q' | b'Q')) {
+    // `app::disarms_quit` is the tested decision, this just applies it.
+    if app::disarms_quit(key) {
         state.quit_armed = false;
     }
 
@@ -306,27 +314,21 @@ fn handle_editing_key(state: &mut EditingState, key: Key, status: &mut Option<St
             }
             Outcome::Commit => {
                 let value = session.value().to_vec();
-                // `write::check_edit` is the format-specifier refusal for
-                // `T`: a no-op for every other kind, so calling it
-                // unconditionally keeps the rule in one place rather than
-                // an `if let Text` the caller has to remember. Checked
-                // here, at commit, rather than only at save time -- a
-                // sysop who learns their edit dropped a `%s` only when
-                // they try to save the whole set has already left the
-                // field that broke it.
-                match write::check_edit(&session.kind(), session.original(), &value) {
-                    Err(e) => *status = Some(format!("refused: {e:?}")),
-                    Ok(()) => match state.editor.edit(value) {
-                        Ok(()) => {
-                            state.session = None;
-                            *status = None;
-                        }
-                        Err(EditError::Invalid(invalid)) => *status = Some(format!("invalid: {invalid:?}")),
-                        Err(EditError::NotVisible) => {
-                            *status = Some("that option is no longer visible".to_string());
-                            state.session = None;
-                        }
-                    },
+                // `app::commit_edit` is the check_edit-then-editor.edit
+                // chain, tested there (including that the two cannot be
+                // skipped or reordered) precisely because this call site
+                // cannot be: `bin/cnf.rs` has no test coverage of its own.
+                match app::commit_edit(&mut state.editor, &session.kind(), session.original(), value) {
+                    app::CommitOutcome::Committed => {
+                        state.session = None;
+                        *status = None;
+                    }
+                    app::CommitOutcome::SpecifiersChanged(e) => *status = Some(format!("refused: {e}")),
+                    app::CommitOutcome::Invalid(e) => *status = Some(format!("invalid: {e}")),
+                    app::CommitOutcome::NotVisible => {
+                        *status = Some("that option is no longer visible".to_string());
+                        state.session = None;
+                    }
                 }
             }
         }
@@ -355,7 +357,7 @@ fn handle_editing_key(state: &mut EditingState, key: Key, status: &mut Option<St
             *status = None;
         }
         Key::Char(b's' | b'S') => {
-            *status = Some(attempt_save(&state.dir, &state.paths, &mut state.editor));
+            *status = Some(app::attempt_save(&state.dir, &state.paths, &mut state.editor));
         }
         Key::Char(b'q' | b'Q') => {
             if app::confirm_quit(state.editor.dirty(), state.quit_armed) {
@@ -367,57 +369,6 @@ fn handle_editing_key(state: &mut EditingState, key: Key, status: &mut Option<St
         _ => {}
     }
     false
-}
-
-/// Save every changed file. Reopens the file set fresh from disk first (so
-/// the writer splices against the same bytes it is about to overwrite,
-/// never a stale in-memory copy), computes the whole plan with
-/// [`app::plan_save`] before writing anything, and only then writes -- a
-/// [`cnf::write::WriteError`] anywhere in the plan means nothing here is
-/// written at all.
-///
-/// A disk error partway through the actual writes (as opposed to a
-/// `WriteError` from the plan itself) is a different, smaller hazard: by
-/// that point every file's bytes are already fully computed, so at most one
-/// file's `.MSG` can end up written without its matching `.MCV` -- and the
-/// message says exactly that, rather than leaving a sysop staring at a
-/// board that will not start with no idea why.
-fn attempt_save(dir: &Path, paths: &[PathBuf], editor: &mut Editor) -> String {
-    let fresh = match OptionSet::open(paths) {
-        Ok(s) => s,
-        Err(e) => return format!("could not reopen the files to save: {e}"),
-    };
-    let writes = match app::plan_save(&fresh, editor.pending()) {
-        Err((name, e)) => return format!("save refused, nothing written: {name}: {e:?}"),
-        Ok(writes) => writes,
-    };
-    if writes.is_empty() {
-        return "nothing to save".to_string();
-    }
-
-    for (done, w) in writes.iter().enumerate() {
-        let msg_path = dir.join(&w.file_name);
-        if let Err(e) = std::fs::write(&msg_path, &w.msg) {
-            return format!("disk write failed after {done}/{} file(s): {}: {e}", writes.len(), msg_path.display());
-        }
-        let mcv_path = app::mcv_path(&msg_path);
-        if let Err(e) = std::fs::write(&mcv_path, &w.mcv) {
-            return format!(
-                "disk write failed after {done}/{} file(s) plus {}'s .MSG -- its .MCV is now stale: {}: {e}",
-                writes.len(),
-                w.file_name,
-                mcv_path.display()
-            );
-        }
-    }
-
-    // The plan was computed against `fresh`, not `editor`'s own (possibly
-    // stale) set, so `editor` is rebuilt from it: its pending edits are now
-    // on disk, and this is the only way to make `dirty()` agree.
-    let selected = editor.selected();
-    *editor = Editor::new(fresh);
-    editor.select(selected);
-    format!("saved {} file(s)", writes.len())
 }
 
 fn render(app: &App, status: Option<&str>, cells: &mut Cells) {
