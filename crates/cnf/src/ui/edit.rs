@@ -22,10 +22,21 @@ pub struct FieldEditor {
 }
 
 impl FieldEditor {
-    /// Start editing `initial`, cursor at the beginning.
+    /// Start editing `initial`, cursor at the end.
+    ///
+    /// Not the beginning: for any `N`/`L`/`H` option whose message embeds a
+    /// prompt before the value (`GAMCRD {Credits per minute consumed while
+    /// in the game 60}` is the canonical real shape), a cursor at column 0
+    /// makes a sysop's very first keystroke insert *before* that prose
+    /// rather than replace the value after it -- and nothing catches the
+    /// result: `validate::check` inspects only the last whitespace-delimited
+    /// token (via `msg::value`), so `"9Credits per minute...60"` validates
+    /// and saves, permanently mangling the leading prose. Starting at the
+    /// end is also simply what every ordinary text field does.
     #[must_use]
     pub fn new(initial: Vec<u8>) -> Self {
-        Self { value: initial, cursor: 0 }
+        let cursor = initial.len();
+        Self { value: initial, cursor }
     }
 
     #[must_use]

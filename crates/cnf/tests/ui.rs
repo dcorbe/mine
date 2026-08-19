@@ -123,6 +123,27 @@ fn typing_and_backspace_edit_the_value() {
 }
 
 #[test]
+fn the_cursor_starts_at_the_end_of_the_initial_value_not_the_front() {
+    // Critical fix, `ui/edit.rs`: `FieldEditor::new` used to start the
+    // cursor at column 0, so the very first keystroke inserted at the
+    // FRONT of the value. For any N/L/H option whose message embeds a
+    // prompt before the value -- `GAMCRD`'s "Credits per minute consumed
+    // while in the game 60" is the canonical real shape -- that silently
+    // produced "9Credits per minute...60", which `validate::check`
+    // (looking only at the last whitespace-delimited token) accepts and
+    // saves, permanently mangling the leading prose. Deliberately no
+    // `Key::End` here -- that would paper over exactly the bug this test
+    // exists to catch.
+    let mut f = FieldEditor::new(b"Credits per minute consumed while in the game 60".to_vec());
+    f.key(Key::Char(b'9'));
+    assert_eq!(
+        f.value(),
+        b"Credits per minute consumed while in the game 609",
+        "the first keystroke must land after the existing value, not before it"
+    );
+}
+
+#[test]
 fn enter_commits_and_escape_cancels() {
     let mut f = FieldEditor::new(b"60".to_vec());
     assert_eq!(f.key(Key::Char(b'1')), Outcome::Continue);
