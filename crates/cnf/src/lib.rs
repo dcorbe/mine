@@ -4,5 +4,6 @@ pub mod hinge;
 pub mod model;
 pub mod set;
 pub mod spec;
+pub mod ui;
 pub mod validate;
 pub mod write;
