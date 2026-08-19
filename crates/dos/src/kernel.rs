@@ -375,9 +375,9 @@ fn fail<G: Guest>(g: &mut G, mut regs: Regs, code: u16) -> Outcome {
 pub fn is_implemented(ah: u8) -> bool {
     matches!(
         ah,
-        0x02 | 0x09 | 0x0e | 0x19 | 0x1a | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x30 | 0x35 | 0x3c
-            | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x48 | 0x49 | 0x4a | 0x4c
-            | 0x4e | 0x4f | 0x56 | 0x58 | 0x5c | 0x62 | 0x67
+        0x02 | 0x09 | 0x0e | 0x19 | 0x1a | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x2f | 0x30 | 0x35
+            | 0x3c | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x48 | 0x49 | 0x4a
+            | 0x4c | 0x4e | 0x4f | 0x56 | 0x58 | 0x5c | 0x62 | 0x67
     )
 }
 
@@ -536,6 +536,27 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
         // is meaningful; see `dta` for what stands in for it until called.
         0x1a => {
             dos.dta = Some(regs.ds_dx());
+            ok(g, regs)
+        }
+
+        // 2Fh -- get the Disk Transfer Address, as ES:BX.
+        //
+        // The read side of `AH=1Ah`, and it has to agree with what `4Eh`/`4Fh`
+        // actually write to, which is [`dta`] -- including the PSP+0x80
+        // default a program that never called `1Ah` still has. Answering from
+        // `dos.dta` alone would report nothing at all in exactly the case a
+        // program is most likely to ask: it wants to save the DTA, point it
+        // somewhere of its own, and put the original back.
+        //
+        // With no program loaded there is no PSP to default to and nothing
+        // truthful to answer, so the call is refused rather than reporting
+        // segment zero as though it were a real address.
+        0x2f => {
+            let Some(at) = dta(dos) else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            regs.es = at.seg;
+            regs.bx = at.off;
             ok(g, regs)
         }
 
@@ -1355,6 +1376,67 @@ mod tests {
 
         let at = seek(&mut g, &mut dos, handle, 0, -16);
         assert_eq!(at, 0xffff_fff0, "an absolute position past the end, not an error or 0");
+    }
+
+    /// `2Fh` must answer with the address `4Eh` actually writes to, which
+    /// before any `1Ah` is the PSP's own default -- not "unset".
+    #[test]
+    fn get_dta_answers_the_psp_default_before_ah_1a_is_ever_called() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState {
+            psp_seg: Some(0x1000),
+            ..DosState::default()
+        };
+        let mut regs = Regs::default();
+        regs.set_ah(0x2f);
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!((g.regs().es, g.regs().bx), (0x1000, 0x80));
+    }
+
+    /// And the round trip a program actually performs: save the DTA, move it,
+    /// read it back.
+    #[test]
+    fn set_then_get_dta_round_trips_the_far_pointer() {
+        let mut g = TestGuest::new(64 * 1024);
+        let mut dos = DosState {
+            psp_seg: Some(0x1000),
+            ..DosState::default()
+        };
+        let mut regs = Regs::default();
+        regs.set_ah(0x1a);
+        regs.ds = 0x2222;
+        regs.dx = 0x0345;
+        g.call_with(regs);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+
+        let mut regs = Regs::default();
+        regs.set_ah(0x2f);
+        g.call_with(regs);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(
+            (g.regs().es, g.regs().bx),
+            (0x2222, 0x0345),
+            "2Fh must report what 1Ah stored, not the PSP default it replaced"
+        );
+    }
+
+    /// With no program there is no PSP to default to; reporting segment zero
+    /// as an address would be worse than refusing.
+    #[test]
+    fn get_dta_with_no_program_loaded_fails_rather_than_naming_segment_zero() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState::default();
+        let mut regs = Regs::default();
+        regs.set_ah(0x2f);
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, ERR_INVALID_FUNCTION);
     }
 
     #[test]
