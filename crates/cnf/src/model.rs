@@ -112,6 +112,20 @@ impl Editor {
         }
     }
 
+    /// Whether the underlying set has no options at all -- a file with
+    /// nothing configurable in it (measured: 4 of 186 distinct corpus
+    /// files, the Tele-Arena `TSGARN*.MSG` data files). Distinct from
+    /// [`Self::visible`] being empty, which can also happen to a
+    /// non-empty set when a filter or every hinge hides every row; that
+    /// case still has a valid `selected` index to draw around, this one
+    /// does not. A caller opening a file should refuse to build a screen
+    /// around an editor this returns `true` for, rather than let a widget
+    /// discover it by panicking on [`Self::option_at`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
     /// Flat indices passing both the current hinge state and the current
     /// filter, in set order.
     #[must_use]

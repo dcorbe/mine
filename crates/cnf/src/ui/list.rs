@@ -26,6 +26,12 @@ impl Widget for OptionList<'_> {
         }
         let editor = self.0;
         let selected = editor.selected();
+        // `window` draws only from `Editor::visible`, so `index` below is
+        // always a valid flat index -- unlike `Editor::selected()` on its
+        // own (see `HelpPane`'s guard), this loop already never calls
+        // `option_at` with anything but one. An empty set or an empty
+        // `visible` both fall out for free: `window` returns nothing to
+        // iterate.
         for (offset, &index) in editor.window(area.rows).iter().enumerate() {
             let row = area.row + offset;
             let attr = if index == selected { SELECTED } else { NORMAL };

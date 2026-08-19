@@ -246,6 +246,18 @@ fn run(dir: &Path, msg_files: Vec<PathBuf>) -> io::Result<()> {
                 }
                 if let Some(chosen) = open_request {
                     match open_editor(&msg_files, &chosen) {
+                        Ok((editor, _)) if editor.is_empty() => {
+                            // No typed option in this file (or in any
+                            // FILE0n sibling it pulled in) -- 4 of the 186
+                            // distinct corpus files, the Tele-Arena
+                            // `TSGARN*.MSG` data files. Entering the editor
+                            // screen over nothing to show is dishonest --
+                            // it used to also panic on the first paint
+                            // (`HelpPane` calling `option_at` on a set of
+                            // zero), which is the whole reason this check
+                            // exists. Stay on the picker instead.
+                            status = Some("no configurable options in this file".to_string());
+                        }
                         Ok((editor, paths)) => {
                             status = None;
                             app = App::Editing(Box::new(EditingState {

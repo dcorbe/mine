@@ -20,6 +20,16 @@ impl Widget for HelpPane<'_> {
             return;
         }
         let editor = self.0;
+        // `option_at` panics if `selected()` is not a valid flat index, and
+        // is only guaranteed valid when `visible` is non-empty (see
+        // `Editor`'s own field doc). A caller is expected to refuse to open
+        // an editor with zero options at all (`Editor::is_empty`), but this
+        // guards independently rather than trusting that: a panic in a
+        // render path takes the whole editor down, so degrading to a blank
+        // pane here is the safer failure.
+        if editor.visible().is_empty() {
+            return;
+        }
         let (spec, _) = editor.option_at(editor.selected());
 
         let mut row = area.row;
