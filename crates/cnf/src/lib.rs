@@ -2,4 +2,5 @@
 
 pub mod hinge;
 pub mod spec;
+pub mod validate;
 pub mod write;
