@@ -53,6 +53,18 @@ impl Rope {
         Chunks::new(&self.root)
     }
 
+    /// Insert `bytes` at `offset`.
+    ///
+    /// Panics if `offset > self.len()`. Inserting at exactly `len()` appends.
+    pub fn insert(&mut self, offset: usize, bytes: &[u8]) {
+        let len = self.len();
+        assert!(offset <= len, "insert offset {offset} exceeds rope length {len}");
+        if bytes.is_empty() {
+            return;
+        }
+        tree::insert_into(&mut self.root, offset, bytes);
+    }
+
     /// Assert every structural invariant. Test-only; call at operation
     /// boundaries.
     #[cfg(test)]
@@ -64,5 +76,57 @@ impl Rope {
 impl Default for Rope {
     fn default() -> Rope {
         Rope::new()
+    }
+}
+
+#[cfg(test)]
+mod insert_api_tests {
+    use super::*;
+    use crate::ByteSource;
+
+    #[test]
+    fn insert_at_every_offset_of_a_multi_level_rope() {
+        let base: Vec<u8> = (0..300).map(|i| (i % 251) as u8).collect();
+        for offset in 0..=base.len() {
+            let mut rope = Rope::from_bytes(&base);
+            rope.insert(offset, b"XYZ");
+            rope.check();
+            let mut expect = base.clone();
+            expect.splice(offset..offset, b"XYZ".iter().copied());
+            assert_eq!(rope.to_vec(), expect, "differs inserting at {offset}");
+        }
+    }
+
+    #[test]
+    fn inserting_nothing_is_a_no_op() {
+        let mut rope = Rope::from_bytes(b"abc");
+        rope.insert(1, &[]);
+        assert_eq!(rope.to_vec(), b"abc");
+    }
+
+    #[test]
+    fn insert_at_the_end_is_legal() {
+        let mut rope = Rope::from_bytes(b"abc");
+        rope.insert(3, b"d");
+        assert_eq!(rope.to_vec(), b"abcd");
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds rope length")]
+    fn insert_past_the_end_panics() {
+        let mut rope = Rope::from_bytes(b"abc");
+        rope.insert(4, b"d");
+    }
+
+    #[test]
+    fn editing_a_clone_leaves_the_original_alone() {
+        let original = Rope::from_bytes(&(0..300).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let before = original.to_vec();
+        let mut edited = original.clone();
+        edited.insert(150, b"INTRUDER");
+        assert_eq!(original.to_vec(), before, "the original was mutated through a shared node");
+        assert_ne!(edited.to_vec(), before);
+        original.check();
+        edited.check();
     }
 }

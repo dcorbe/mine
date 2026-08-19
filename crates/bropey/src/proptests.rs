@@ -7,6 +7,7 @@
 
 use proptest::prelude::*;
 
+use crate::tune::MAX_BYTES;
 use crate::{ByteSource, Rope};
 
 /// One operation applied to both the rope and the model.
@@ -17,17 +18,24 @@ use crate::{ByteSource, Rope};
 enum Op {
     FromBytes { bytes: Vec<u8> },
     Snapshot,
+    Insert { at: u16, bytes: Vec<u8> },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         proptest::collection::vec(any::<u8>(), 0..80).prop_map(|bytes| Op::FromBytes { bytes }),
         Just(Op::Snapshot),
+        // Bounded by MAX_BYTES, not an arbitrary literal: the direct-insert
+        // path this exercises accepts at most MAX_BYTES per call (larger
+        // inputs route through the bulk path added in Task 10), and under
+        // cfg(test) MAX_BYTES shrinks to a value smaller than a fixed literal
+        // like 20 would respect.
+        (any::<u16>(), proptest::collection::vec(any::<u8>(), 0..=MAX_BYTES))
+            .prop_map(|(at, bytes)| Op::Insert { at, bytes }),
     ]
 }
 
 /// Scale an arbitrary index into `0..=len`.
-#[allow(dead_code)]
 fn clamp(raw: u16, len: usize) -> usize {
     if len == 0 { 0 } else { (raw as usize) % (len + 1) }
 }
@@ -51,6 +59,11 @@ fn run(ops: Vec<Op>) {
             }
             Op::Snapshot => {
                 snapshots.push((rope.clone(), model.clone()));
+            }
+            Op::Insert { at, bytes } => {
+                let at = clamp(*at, model.len());
+                rope.insert(at, bytes);
+                model.splice(at..at, bytes.iter().copied());
             }
         }
 
