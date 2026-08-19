@@ -71,6 +71,23 @@ pub struct Span {
     pub end: usize,
 }
 
+/// A named `{value}` construct, whether or not it went on to parse as a typed
+/// option.
+///
+/// `FILE0n` is why this exists and `options()` cannot answer for it: measured
+/// against every `FILE0n` line in the recovered archive (62 lines, all
+/// `FILE01`), none carries a type letter -- the tail is either empty or free
+/// English prose (`FILE01 {ELWICTXT.MSG} Infinity Complex Message File`), so
+/// `parse_tail` returns `None` for every one of them and `scan` never puts
+/// them in `options`. `crate::set::siblings` reads this list instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Named {
+    pub name: Vec<u8>,
+    /// The bytes between `{` and its matching `}`, same convention as
+    /// [`OptionSpec::value`].
+    pub value: Span,
+}
+
 /// One configurable option, and where in the file it lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionSpec {
@@ -118,17 +135,19 @@ pub struct SpecFile {
     source: Vec<u8>,
     messages: MsgFile,
     options: Vec<OptionSpec>,
+    named: Vec<Named>,
 }
 
 impl SpecFile {
     pub fn parse(name: &str, source: &[u8]) -> Result<Self, SpecError> {
         let messages = MsgFile::parse(name, source).map_err(SpecError::Message)?;
-        let options = scan(source, &messages)?;
+        let (options, named) = scan(source, &messages)?;
         Ok(Self {
             name: name.to_string(),
             source: source.to_vec(),
             messages,
             options,
+            named,
         })
     }
 
@@ -150,6 +169,13 @@ impl SpecFile {
     #[must_use]
     pub fn options(&self) -> &[OptionSpec] {
         &self.options
+    }
+
+    /// Every named `{value}` construct in the file, typed or not. See
+    /// [`Named`] for why `options()` is not enough on its own.
+    #[must_use]
+    pub fn named(&self) -> &[Named] {
+        &self.named
     }
 }
 
@@ -307,8 +333,9 @@ fn last_paragraph(source: &[u8], start: usize, end: usize) -> Vec<u8> {
 ///   contain `=`/`#` -- e.g. `WGSEDTM.MSG`'s `FSENIM`, tail
 ///   `T FSE Import Rebuff (Bad #)` -- parsed as a hinge on the nonsense
 ///   target `"Bad "`.
-fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError> {
+fn scan(source: &[u8], messages: &MsgFile) -> Result<(Vec<OptionSpec>, Vec<Named>), SpecError> {
     let mut options = Vec::new();
+    let mut named = Vec::new();
     let mut index = 0usize;
     let mut prev_end = 0usize;
     let mut pos = 0usize;
@@ -350,6 +377,10 @@ fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError>
         let kind = parse_tail(&tail);
 
         if name != LANGUAGE {
+            named.push(Named {
+                name: name.clone(),
+                value: Span { start: value_start, end: close },
+            });
             if let Some(kind) = kind {
                 options.push(OptionSpec {
                     index,
@@ -372,7 +403,7 @@ fn scan(source: &[u8], messages: &MsgFile) -> Result<Vec<OptionSpec>, SpecError>
         return Err(SpecError::CountMismatch { scanned: index, counted: messages.len() });
     }
 
-    Ok(options)
+    Ok((options, named))
 }
 
 #[cfg(test)]
@@ -477,6 +508,23 @@ ACTIVATE {DEMO} S 30 Enter your activation code\r\n";
                 assert_eq!(message, raw, "option {:?} points at the wrong message", opt.name);
             }
         }
+    }
+
+    #[test]
+    fn an_untyped_name_is_in_named_but_not_in_options() {
+        // FILE0n is the real-world case: `FILE01 {ELWICTXT.MSG} Infinity
+        // Complex Message File` has no type letter (`Infinity` is not a
+        // single-character type), so it never parses as an option, but it is
+        // still a name-shaped `{value}` construct that `set::siblings` needs
+        // to find.
+        let src = b"FILE01 {ELWICTXT.MSG} Infinity Complex Message File\r\n\
+LEVEL0 {}\r\n";
+        let f = SpecFile::parse("ELWIC.MSG", src).expect("parses");
+        assert!(f.options().is_empty(), "FILE01 has no type letter and is not an option");
+        let names: Vec<&[u8]> = f.named().iter().map(|n| n.name.as_slice()).collect();
+        assert_eq!(names, vec![&b"FILE01"[..], &b"LEVEL0"[..]]);
+        let v = f.named()[0].value;
+        assert_eq!(&src[v.start..v.end], b"ELWICTXT.MSG");
     }
 
     #[test]
