@@ -1,10 +1,15 @@
-//! Widgets, exercised with no terminal at all: rendered into a `Cells` and
-//! read back with `line()`/`contains()`/`highlighted_rows()`.
+//! Widgets and editors, exercised with no terminal at all: a widget renders
+//! into a `Cells` and is read back with `line()`/`contains()`/
+//! `highlighted_rows()`; an editor takes the local `Key` enum and reports
+//! `Outcome`.
 
 use cnf::model::Editor;
 use cnf::set::OptionSet;
+use cnf::ui::edit::FieldEditor;
 use cnf::ui::help::HelpPane;
 use cnf::ui::list::OptionList;
+use cnf::ui::text::TextEditor;
+use cnf::ui::{Key, Outcome};
 use textscreen::cell::Cells;
 use textscreen::widget::{Rect, Widget};
 
@@ -80,4 +85,73 @@ fn the_help_pane_wraps_rather_than_truncating_mid_word() {
     let mut buf = Cells::blank(20, 3);
     HelpPane(&e).render(Rect { col: 0, row: 0, cols: 20, rows: 3 }, &mut buf);
     assert!(!buf.line(0).ends_with('c'), "wrapped mid-word: {:?}", buf.line(0));
+}
+
+#[test]
+fn typing_and_backspace_edit_the_value() {
+    let mut f = FieldEditor::new(b"60".to_vec());
+    f.key(Key::End);
+    f.key(Key::Char(b'0'));
+    assert_eq!(f.value(), b"600");
+    f.key(Key::Backspace);
+    assert_eq!(f.value(), b"60");
+}
+
+#[test]
+fn enter_commits_and_escape_cancels() {
+    let mut f = FieldEditor::new(b"60".to_vec());
+    assert_eq!(f.key(Key::Char(b'1')), Outcome::Continue);
+    assert_eq!(f.key(Key::Enter), Outcome::Commit);
+    let mut f = FieldEditor::new(b"60".to_vec());
+    assert_eq!(f.key(Key::Esc), Outcome::Cancel);
+}
+
+#[test]
+fn the_text_editor_keeps_lines_separate() {
+    let mut t = TextEditor::new(b"one\r\ntwo".to_vec());
+    t.key(Key::Down);
+    t.key(Key::End);
+    t.key(Key::Char(b'!'));
+    assert_eq!(t.value(), b"one\r\ntwo!");
+}
+
+#[test]
+fn the_text_editor_accepts_a_brace_anywhere() {
+    // An earlier draft refused a line-initial `}` as "not representable". It is
+    // representable -- the writer escapes it as `~}` -- and refusing what the
+    // format can express is as much a defect as accepting what it cannot.
+    let mut t = TextEditor::new(b"one\r\n".to_vec());
+    t.key(Key::Down);
+    t.key(Key::Char(b'}'));
+    assert_eq!(t.value(), b"one\r\n}", "the brace is ordinary text");
+    assert!(t.warning().is_none(), "and nothing to warn about");
+}
+
+#[test]
+fn the_text_editor_warns_when_an_edit_would_change_the_specifiers() {
+    let mut t = TextEditor::new(b"hello %s".to_vec());
+    t.key(Key::End);
+    for _ in 0..2 {
+        t.key(Key::Backspace);
+    }
+    assert!(t.warning().is_some(), "dropping %s must warn while typing");
+}
+
+#[test]
+fn the_text_editor_emits_only_bare_newlines_from_a_multi_line_edit() {
+    // The seam where the UI meets the format: `msg.rs` drops every `\r`
+    // inside a value on decode (unconditionally, by the format's own rules),
+    // so a CRLF break survives `write::escape` unchanged and then vanishes on
+    // the writer's own reparse -- the save is refused as
+    // `WriteError::EditedMessageWrong`, even though nothing above the editor
+    // did anything wrong. If `Key::Enter` ever inserts `\r\n` instead of `\n`,
+    // this is where it would show up.
+    let mut t = TextEditor::new(b"one".to_vec());
+    t.key(Key::End);
+    t.key(Key::Enter);
+    t.key(Key::Char(b't'));
+    t.key(Key::Char(b'w'));
+    t.key(Key::Char(b'o'));
+    assert_eq!(t.value(), b"one\ntwo");
+    assert!(!t.value().contains(&b'\r'), "a multi-line edit must not introduce a CR: got {:?}", t.value());
 }
