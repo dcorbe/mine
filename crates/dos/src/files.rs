@@ -15,6 +15,7 @@
 //!    is still `NUL`, and a program writing to `PRN` must not leave a file
 //!    called `PRN` in the root.
 
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -404,6 +405,15 @@ pub struct Files {
     pub attempts: Vec<(String, &'static str, bool)>,
     /// The search a `4Eh` started, if `4Fh` might still continue it.
     search: Option<FindSearch>,
+    /// Bytes the host injects for a name that has no file on disk, keyed by
+    /// the same upper-cased spelling `translate` folds every path to.
+    ///
+    /// This crate does not know or care why a name is here -- which
+    /// libraries, which generation, which serial is `dos-runtime`'s decision
+    /// (it can see the registry; this crate depends on `libc` alone). A real
+    /// file always wins: this map is consulted only after the real path has
+    /// already failed as not-found, never before.
+    provided: HashMap<String, Vec<u8>>,
 }
 
 impl Files {
@@ -416,7 +426,20 @@ impl Files {
             ambiguous: Vec::new(),
             attempts: Vec::new(),
             search: None,
+            provided: HashMap::new(),
         }
+    }
+
+    /// Register bytes this host will answer with when a DOS program opens
+    /// `name` and no real file by that name exists. `name` is folded to the
+    /// same upper-cased spelling `translate` produces, so lookup matches
+    /// regardless of how the caller wrote it.
+    ///
+    /// This is the whole of what `crates/dos` knows about synthesis: bytes
+    /// keyed by name. Which names, and what is in them, is decided entirely
+    /// by the caller.
+    pub fn provide(&mut self, name: &str, bytes: Vec<u8>) {
+        self.provided.insert(name.to_ascii_uppercase(), bytes);
     }
 
     /// The directory everything under this jail resolves beneath.
@@ -543,20 +566,70 @@ impl Files {
                     1 => libc::O_WRONLY,
                     _ => libc::O_RDWR,
                 };
-                let name = self.resolve(&name)?;
-                let attempt = self.openat2(&name, flags, 0);
+                // A real file always wins: try the actual path first, exactly
+                // as before synthesis existed. `provided` is consulted only
+                // as a fallback, and only for the specific failure that means
+                // "nothing there" -- never for an ambiguous or denied name.
+                let resolved = self.resolve(&name)?;
+                let attempt = self.openat2(&resolved, flags, 0);
                 self.attempts
-                    .push((name.clone(), "open", attempt.is_ok()));
-                let fd = attempt
-                    .map_err(|e| match e.raw_os_error() {
-                        Some(libc::ENOENT) => ERR_FILE_NOT_FOUND,
-                        Some(libc::EACCES) | Some(libc::EPERM) => ERR_ACCESS_DENIED,
-                        Some(libc::EXDEV) | Some(libc::ELOOP) => ERR_ACCESS_DENIED,
-                        _ => ERR_FILE_NOT_FOUND,
-                    })?;
-                self.install(fd, name, false)
+                    .push((resolved.clone(), "open", attempt.is_ok()));
+                match attempt {
+                    Ok(fd) => self.install(fd, resolved, false),
+                    Err(e) => {
+                        let code = match e.raw_os_error() {
+                            Some(libc::ENOENT) => ERR_FILE_NOT_FOUND,
+                            Some(libc::EACCES) | Some(libc::EPERM) => ERR_ACCESS_DENIED,
+                            Some(libc::EXDEV) | Some(libc::ELOOP) => ERR_ACCESS_DENIED,
+                            _ => ERR_FILE_NOT_FOUND,
+                        };
+                        if code == ERR_FILE_NOT_FOUND {
+                            if let Some(bytes) = self.provided.get(&name).cloned() {
+                                return self.provided_handle(&name, &bytes);
+                            }
+                        }
+                        Err(code)
+                    }
+                }
             }
         }
+    }
+
+    /// A handle over bytes this host provides rather than a file on disk.
+    ///
+    /// A `memfd` rather than a new `Handle` variant, because every read goes
+    /// through `libc::read(h.fd, ..)` and every seek through `lseek` -- so an
+    /// anonymous in-memory file means the whole read path needs no change at
+    /// all. `device_handle` opens `/dev/null` for the same structural reason;
+    /// this is that trick with content in it.
+    fn provided_handle(&mut self, name: &str, bytes: &[u8]) -> Result<u16, u16> {
+        // SAFETY: a constant name of our own choosing, and MFD_CLOEXEC.
+        let fd = unsafe { libc::memfd_create(c"dos-host-library".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(ERR_ACCESS_DENIED);
+        }
+        // SAFETY: freshly created descriptor we now own.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut written = 0usize;
+        while written < bytes.len() {
+            // SAFETY: writing a live slice to a descriptor we own.
+            let n = unsafe {
+                libc::write(
+                    fd.as_raw_fd(),
+                    bytes[written..].as_ptr().cast(),
+                    bytes.len() - written,
+                )
+            };
+            if n <= 0 {
+                return Err(ERR_ACCESS_DENIED);
+            }
+            written += n as usize;
+        }
+        // SAFETY: rewinding a descriptor we own.
+        if unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+            return Err(ERR_ACCESS_DENIED);
+        }
+        self.install(fd, name.to_owned(), false)
     }
 
     /// `3Ch` -- create, truncating anything already there.
@@ -1186,5 +1259,57 @@ mod tests {
     fn find_first_stays_inside_the_sandbox_for_a_traversal_attempt() {
         let (_root, mut a) = scratch("find_escape");
         assert_eq!(a.find_first(b"..\\*.*\0", 0), Err(ERR_PATH_NOT_FOUND));
+    }
+
+    // -- synthesised host libraries --
+
+    /// A name the caller provided is answered from memory, with content, and
+    /// nothing is written to the root.
+    #[test]
+    fn a_provided_library_opens_and_reads_back_its_bytes() {
+        let (root, mut fs) = scratch("dos_provide_read");
+        fs.provide("GALGSBL.DLL", b"ReG#00000000\0".to_vec());
+
+        let handle = fs.open_existing(b"GALGSBL.DLL\0", 0).expect("a provided name opens");
+        let mut buf = [0u8; 13];
+        assert_eq!(fs.read(handle, &mut buf), Ok(13));
+        assert_eq!(&buf, b"ReG#00000000\0");
+        assert!(!root.join("GALGSBL.DLL").exists(), "nothing may be written to the board");
+    }
+
+    /// **The closed-set test, and the more important of the two.** A host that
+    /// answers for anything missing would pass the test above and still be
+    /// wrong: a missing board data file must keep failing exactly as loudly as
+    /// it does today.
+    #[test]
+    fn a_name_that_was_not_provided_still_fails_to_open() {
+        let (_root, mut fs) = scratch("dos_provide_closed");
+        fs.provide("GALGSBL.DLL", b"x".to_vec());
+        assert_eq!(fs.open_existing(b"WCCMMUD.MCV\0", 0), Err(ERR_FILE_NOT_FOUND));
+    }
+
+    /// A real file always wins. Synthesis is a fallback, never an override.
+    #[test]
+    fn a_real_file_beats_a_provided_one() {
+        let (root, mut fs) = scratch("dos_provide_real_wins");
+        std::fs::write(root.join("GALGSBL.DLL"), b"ON DISK").expect("seed");
+        fs.provide("GALGSBL.DLL", b"SYNTHESISED".to_vec());
+
+        let handle = fs.open_existing(b"GALGSBL.DLL\0", 0).expect("opens");
+        let mut buf = [0u8; 7];
+        assert_eq!(fs.read(handle, &mut buf), Ok(7));
+        assert_eq!(&buf, b"ON DISK", "the authentic file must win");
+    }
+
+    /// Seek has to work, because a reader may not start at zero.
+    #[test]
+    fn a_provided_library_is_seekable() {
+        let (_root, mut fs) = scratch("dos_provide_seek");
+        fs.provide("GALGSBL.DLL", b"0123456789".to_vec());
+        let handle = fs.open_existing(b"GALGSBL.DLL\0", 0).expect("opens");
+        assert_eq!(fs.seek(handle, -4, 2), Ok(6));
+        let mut buf = [0u8; 4];
+        assert_eq!(fs.read(handle, &mut buf), Ok(4));
+        assert_eq!(&buf, b"6789");
     }
 }
