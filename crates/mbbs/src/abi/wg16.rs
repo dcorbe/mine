@@ -43,6 +43,7 @@ impl Abi for Wg16 {
     /// `char fd`, third field, after two `int`s.
     const FILE_FD_OFFSET: u16 = 4;
     const FILE_FD_WIDTH: u16 = 1;
+    const FSD_FIELD: crate::fsd::FieldLayout = crate::fsd::FieldLayout::WG16;
 
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
         mbbs_machine::m16::FarPtr::from_bytes(bytes.try_into().expect("PTR_WIDTH bytes"))

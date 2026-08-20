@@ -230,6 +230,23 @@ pub trait Abi {
     /// (`tests/wg32_stream_flags_offset.rs`).
     const FILE_FD_WIDTH: u16;
 
+    /// This ABI's layout of `struct fsdfld`, the FSD's per-field record.
+    ///
+    /// Load-bearing for the same reason [`Abi::FILE_FLAGS_OFFSET`] is, and it
+    /// broke the same way: a module indexes `fsdscb->flddat[]` **without
+    /// calling this host**. `WCCMMUD` sets `FFFAVD` on fourteen fields with a
+    /// bare `or byte [flddat + n*sizeof(struct fsdfld) + 12], 0x80`, and the
+    /// only thing that makes those writes and this host's reads name the same
+    /// byte is agreeing on `sizeof`. They did not: the 16-bit struct is 23
+    /// bytes and the 32-bit one is 36, because `INT` is `int`
+    /// (`re/wg33src/INC/GCTYPDEF.H:88`). A host that used 23 for both saw the
+    /// module's flags only for field 0 -- the one index where the two strides
+    /// coincide -- so every "avoid" field past it stayed enterable and
+    /// MajorMUD's character sheet let the player type over the *minimum and
+    /// maximum* columns of each stat. See [`crate::fsd::FieldLayout`] for the
+    /// measurement both numbers come from.
+    const FSD_FIELD: crate::fsd::FieldLayout;
+
     /// Decode a pointer from exactly [`PTR_WIDTH`](Abi::PTR_WIDTH) bytes, in
     /// this ABI's own layout.
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr;
@@ -1137,6 +1154,7 @@ mod tests {
         const FILE_SIZE: usize = Wg16::FILE_SIZE;
         const FILE_FD_OFFSET: u16 = Wg16::FILE_FD_OFFSET;
         const FILE_FD_WIDTH: u16 = Wg16::FILE_FD_WIDTH;
+        const FSD_FIELD: crate::fsd::FieldLayout = Wg16::FSD_FIELD;
 
         fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
             Wg16::ptr_from_bytes(bytes)

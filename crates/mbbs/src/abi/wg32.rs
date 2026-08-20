@@ -188,6 +188,7 @@ impl Abi for Wg32 {
     /// measured).
     const FILE_FD_OFFSET: u16 = 0x16;
     const FILE_FD_WIDTH: u16 = 4;
+    const FSD_FIELD: crate::fsd::FieldLayout = crate::fsd::FieldLayout::WG32;
 
     /// The `Wg32`-only routines, the mirror of `Wg16`'s own override.
     ///

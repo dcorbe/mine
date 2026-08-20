@@ -143,11 +143,12 @@ fn offset<A: Abi>(base: A::Ptr, by: usize) -> Result<A::Ptr, ShimError> {
 /// `n * sizeof(struct fsdfld)`, in arithmetic that cannot wrap. `n` has been
 /// checked against `fsdscb->numfld` before it gets here, but `numfld` is itself
 /// read out of a control block the module holds a pointer to -- so a module
-/// that wrote 60000 there could ask for field 3000, and `3000 * 23` is not a
+/// that wrote 60000 there could ask for field 3000, and `3000 * 23` (or, in the
+/// 32-bit ABI, `3000 * 36`) is not a
 /// `u16`. In release that wraps and reads a `struct fsdfld` from somewhere else
 /// in the segment, which resolves, and is a plausible answer.
-fn field_at(n: u16) -> usize {
-    usize::from(n) * usize::from(fsd::FSDFLD)
+fn field_at<A: Abi>(n: u16) -> usize {
+    A::FSD_FIELD.record_at(n)
 }
 
 /// An answer string, read out of module memory. `stranslen()`, `FSD.C:2061`.
@@ -232,7 +233,7 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
     // `maxfld`, `FSDBBS.C:130`: the field array and the punctuation array share
     // the output buffer, and the punctuation array gets its MBPMAX first.
-    let max_fields = (OUTBSZ - MBPMAX) / fsd::FSDFLD;
+    let max_fields = (OUTBSZ - MBPMAX) / A::FSD_FIELD.size;
     let form = fsd::compile(&template, &spec, max_fields, ascn_for(amode));
 
     if !form.errors.is_empty() {
@@ -259,7 +260,7 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     }
 
     let size = form
-        .size()
+        .size(&A::FSD_FIELD)
         .map_err(|e| ShimError::Failed(format!("fsdroom: {e}")))?;
 
     // `fsdppc()`'s outputs go into the session control block, where `fsdapr`
@@ -385,7 +386,7 @@ pub fn fsdapr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         )));
     };
     let needed = form
-        .size()
+        .size(&A::FSD_FIELD)
         .map_err(|e| ShimError::Failed(format!("fsdapr: {e}")))?;
     if length < needed {
         return Err(ShimError::Failed(format!(
@@ -411,7 +412,7 @@ pub fn fsdapr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let mut bytes = form.punctuation.clone();
     let flddat_at = bytes.len();
     for (field, (ansoff, anslen)) in form.fields.iter().zip(&installed.offsets) {
-        bytes.extend_from_slice(&field.record(*ansoff, *anslen));
+        bytes.extend_from_slice(&field.record(&A::FSD_FIELD, *ansoff, *anslen));
     }
     let newans_at = bytes.len();
     bytes.extend_from_slice(&installed.text);
@@ -479,20 +480,18 @@ fn field_record_mem<A: Abi>(
     block: &fsd::Scb<A>,
     field: u16,
     who: &str,
-) -> Result<[u8; fsd::FSDFLD as usize], ShimError> {
+) -> Result<Vec<u8>, ShimError> {
     if field >= block.numfld() {
         return Err(ShimError::Failed(format!(
             "{who}({field}): the form has {} fields",
             block.numfld()
         )));
     }
-    let at = offset::<A>(block.flddat(), field_at(field))?;
+    let at = offset::<A>(block.flddat(), field_at::<A>(field))?;
     let bytes = at
-        .resolve(mem, usize::from(fsd::FSDFLD))
+        .resolve(mem, usize::from(A::FSD_FIELD.size))
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let mut out = [0u8; fsd::FSDFLD as usize];
-    out.copy_from_slice(bytes);
-    Ok(out)
+    Ok(bytes.to_vec())
 }
 
 /// [`field_record_mem`] reached through a `Cpu`. Generic since Task 12.
@@ -501,13 +500,13 @@ fn field_record<A: Abi>(
     block: &fsd::Scb<A>,
     field: u16,
     who: &str,
-) -> Result<[u8; fsd::FSDFLD as usize], ShimError> {
+) -> Result<Vec<u8>, ShimError> {
     field_record_mem(A::mem_ref(machine), block, field, who)
 }
 
 /// Where a field's answer starts, out of its record.
-fn answer_offset(record: &[u8; fsd::FSDFLD as usize]) -> u16 {
-    u16::from_le_bytes([record[fsd::fld::ANSOFF], record[fsd::fld::ANSOFF + 1]])
+fn answer_offset<A: Abi>(record: &[u8]) -> u16 {
+    A::FSD_FIELD.int_at(record, A::FSD_FIELD.ansoff) as u16
 }
 
 /// `char *fsdnan(int fldi)` -- where field `fldi`'s answer is. `FSD.C:2190`.
@@ -533,7 +532,7 @@ pub fn fsdnan<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let record = field_record_mem(call.mem(), &block, field, "fsdnan")?;
     Ok(abi::Ret::Ptr(offset::<A>(
         block.newans(),
-        usize::from(answer_offset(&record)),
+        usize::from(answer_offset::<A>(&record)),
     )?))
 }
 
@@ -664,7 +663,7 @@ fn fsdfxt_answer<A: Abi>(mem: &A::Mem, host: &Host<A>, field: u16) -> Result<Vec
         return Ok(Vec::new());
     }
     let record = field_record_mem(mem, &block, field, "fsdfxt")?;
-    let at = offset::<A>(block.newans(), usize::from(answer_offset(&record)))?;
+    let at = offset::<A>(block.newans(), usize::from(answer_offset::<A>(&record)))?;
     at.read_cstr(mem)
         .map(<[u8]>::to_vec)
         .map_err(|e| ShimError::Failed(e.to_string()))
@@ -729,15 +728,15 @@ pub fn fsdord<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let number = Into::<u32>::into(call.int()) as u16;
     let (mut block, at) = prepared_mem(call.mem(), host, "fsdord")?;
     let record = field_record_mem(call.mem(), &block, number, "fsdord")?;
-    let field = fsd::Field::from_record(&record);
+    let field = fsd::Field::from_record(&A::FSD_FIELD, &record);
 
     let spec = block
         .fldspc()
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
-    let ansoff = answer_offset(&record);
-    let anslen = record[fsd::fld::ANSLEN];
+    let ansoff = answer_offset::<A>(&record);
+    let anslen = record[A::FSD_FIELD.anslen];
     let answer = offset::<A>(block.newans(), usize::from(ansoff))?
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
@@ -790,13 +789,13 @@ pub fn fsdord<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     // `chkalt`'s value came through `endtkn`, which clamps at ANSLEN -- so this
     // fits, and the conversion says so rather than assuming it.
     let mut record = record;
-    record[fsd::fld::ANSLEN] = u8::try_from(canonical.len()).map_err(|_| {
+    record[A::FSD_FIELD.anslen] = u8::try_from(canonical.len()).map_err(|_| {
         ShimError::Failed(format!(
             "fsdord({number}): the alternate is {} bytes and anslen is a char",
             canonical.len()
         ))
     })?;
-    offset::<A>(block.flddat(), field_at(number))?
+    offset::<A>(block.flddat(), field_at::<A>(number))?
         .write(call.mem(), &record)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
 
@@ -804,14 +803,14 @@ pub fn fsdord<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     // fields *after* this one, and none before.
     for later in number + 1..block.numfld() {
         let mut record = field_record_mem(call.mem(), &block, later, "fsdord")?;
-        let moved = i32::from(answer_offset(&record)) + grew;
+        let moved = i32::from(answer_offset::<A>(&record)) + grew;
         let moved = u16::try_from(moved).map_err(|_| {
             ShimError::Failed(format!(
                 "fsdord({number}): moving field {later}'s answer by {grew} puts it at {moved}"
             ))
         })?;
-        record[fsd::fld::ANSOFF..fsd::fld::ANSOFF + 2].copy_from_slice(&moved.to_le_bytes());
-        offset::<A>(block.flddat(), field_at(later))?
+        A::FSD_FIELD.set_int_at(&mut record, A::FSD_FIELD.ansoff, i32::from(moved));
+        offset::<A>(block.flddat(), field_at::<A>(later))?
             .write(call.mem(), &record)
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
@@ -1129,7 +1128,7 @@ pub fn vfyadn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let field = u8::try_from(fldno).map_err(|_| {
         ShimError::Failed(format!("vfyadn: field {fldno} does not fit fsdscb->entfld's byte"))
     })?;
-    let ansoff = answer_offset(&record);
+    let ansoff = answer_offset::<A>(&record);
     let current = offset::<A>(block.newans(), usize::from(ansoff))?
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
@@ -1444,7 +1443,7 @@ fn read_answers_mem<A: Abi>(mem: &A::Mem, block: &fsd::Scb<A>) -> Result<fsd::An
     let mut offsets = Vec::with_capacity(usize::from(block.numfld()));
     for i in 0..block.numfld() {
         let record = field_record_mem(mem, block, i, "fsdprc")?;
-        offsets.push((answer_offset(&record), record[fsd::fld::ANSLEN]));
+        offsets.push((answer_offset::<A>(&record), record[A::FSD_FIELD.anslen]));
     }
     Ok(fsd::Answers {
         text,
@@ -1604,12 +1603,12 @@ pub(crate) fn fsdprc<A: Abi>(
     for i in 0..block.numfld() {
         let mut record = field_record(machine, &block, i, "fsdprc")?;
         let (ansoff, anslen) = answers.offsets[usize::from(i)];
-        record[fsd::fld::ANSOFF..fsd::fld::ANSOFF + 2].copy_from_slice(&ansoff.to_le_bytes());
-        record[fsd::fld::ANSLEN] = anslen;
+        A::FSD_FIELD.set_int_at(&mut record, A::FSD_FIELD.ansoff, i32::from(ansoff));
+        record[A::FSD_FIELD.anslen] = anslen;
         if i == u16::from(entfld) && changed {
             record[fsd::fld::FLAGS] |= fsd::flags::CHANGED;
         }
-        offset::<A>(block.flddat(), field_at(i))?
+        offset::<A>(block.flddat(), field_at::<A>(i))?
             .write(A::mem(machine), &record)
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
@@ -2271,7 +2270,7 @@ mod tests {
         let template = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
         let template = f.machine.read_cstr(template).expect("text").to_vec();
         let expected = crate::fsd::compile(&template, b"ONE TWO", (4096 - 200) / 23, fsd::Ascn::Line)
-            .size()
+            .size(&crate::fsd::FieldLayout::WG16)
             .expect("fits");
 
         let args = [0, spec.offset, spec.selector, 0];

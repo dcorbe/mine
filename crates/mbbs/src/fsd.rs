@@ -85,7 +85,133 @@ pub const ANSIWD: u16 = 80;
 /// that matters and not this crate's layout of the Rust one -- which omits the
 /// two members `fsdans()` fills in and would be a different size. `FSD.H:262`
 /// states it outright: `/* (23 bytes long) */`.
-pub const FSDFLD: u16 = 23;
+///
+/// **16-bit only.** `FSD.H:262`'s comment is true of the compiler that header
+/// was written for and of no other: `re/wg33src/INC/GCTYPDEF.H:88` is
+/// `typedef int INT;`, so the four `INT` members widen to 4 bytes and align to
+/// 4 in a 32-bit build and the struct becomes 36. [`FieldLayout`] is the
+/// authority that knows which; this constant is [`FieldLayout::WG16`]'s
+/// `size`, kept under its old name because the 16-bit oracle tests
+/// (`tests/fsd_statics.rs`, `tests/fsd_oracle.rs`) pin real `MAJORBBS.EXE`
+/// instruction bytes against it and must go on naming the 16-bit number.
+pub const FSDFLD: u16 = FieldLayout::WG16.size;
+
+/// The layout of `struct fsdfld` (`FSD.H:254-270`) in one ABI's compiler.
+///
+/// # Why this is per-ABI and [`fld`]'s own offsets are not
+///
+/// Everything before `flags` is `CHAR`-sized -- `ansgto[GTOLEN+1]`, `width`,
+/// `xwidth`, `attr` -- so `flags` sits at 12 in both builds and [`fld`] can
+/// state the head of the struct once. Everything from `fspoff` on is `INT`,
+/// and `INT` is the whole difference: 2 bytes in the 16-bit build, 4 in the
+/// 32-bit one, with 4-byte alignment inserting two bytes of padding after
+/// `fldtyp` and rounding the struct up to 36.
+///
+/// # Measured, not assumed
+///
+/// The same discipline [`crate::abi::Abi::FILE_FLAGS_OFFSET`] documents, and
+/// for the same reason: the module reaches into this array *without calling
+/// this host*. `_EDIT_CHARACTER_STATS` sets `FFFAVD` (`0x80`) on fourteen
+/// fields with a bare `or byte [flddat + n*stride + 12], 0x80`, and
+/// `crate::shims::fsd::live_form_mem` has to read those bytes back from the
+/// same addresses the module wrote them to. Both strides below are read off
+/// the two real binaries rather than derived from an alignment rule:
+///
+/// | | 16-bit | 32-bit |
+/// |---|---|---|
+/// | binary | `re/exports/WCCMMUD_decompiled.c` | `re/wg_nt_ghidra/exports/WCCMMUD_decompiled.c` |
+/// | routine | `_EDIT_CHARACTER_STATS` | `edit_character_stats` |
+/// | offsets | `0x3a 0x51 0x68 0x7f 0xad 0xc4 0xf2 0x109 0x137 0x14e 0x17c 0x193 0x1c1 0x1d8` | `0x54 0x78 0x9c 0xc0 0x108 300 0x174 0x198 0x1e0 0x204 0x24c 0x270 0x2b8 0x2dc` |
+/// | stride | 23 | 36 |
+///
+/// Each list divides exactly -- no remainder -- by its own stride once
+/// `flags`'s 12 is taken off, and both then name the *same* fourteen field
+/// numbers: 2, 3, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20. Those are Race,
+/// Class, and the minimum and maximum of each of the six stats in MajorMUD's
+/// `EDITCHA1` template -- which is the independent half of the measurement,
+/// because that template's field runs were enumerated from `WCCTEXT.MSG`
+/// without reference to either binary. `fsd_layout_decodes_what_the_module_wrote`
+/// is that cross-check, kept as a test.
+///
+/// A fifteenth site, conditional, pokes field 0 (`+0xc` in both). It is the
+/// one offset the two strides agree on, which is why a test that pins only it
+/// cannot tell a right stride from a wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldLayout {
+    /// `sizeof(struct fsdfld)` -- the stride between consecutive records.
+    pub size: u16,
+    /// Bytes one `INT` member occupies.
+    pub int_width: usize,
+    /// `int fspoff`.
+    pub fspoff: usize,
+    /// `int tmpoff`.
+    pub tmpoff: usize,
+    /// `int mbpoff`.
+    pub mbpoff: usize,
+    /// `int ansoff`.
+    pub ansoff: usize,
+    /// `char anslen`.
+    pub anslen: usize,
+}
+
+impl FieldLayout {
+    /// Borland 16-bit, byte-aligned (`-a-`): the 23 bytes `FSD.H:262` names.
+    pub const WG16: Self = Self {
+        size: 23,
+        int_width: 2,
+        fspoff: 14,
+        tmpoff: 16,
+        mbpoff: 18,
+        ansoff: 20,
+        anslen: 22,
+    };
+
+    /// 32-bit, `INT` 4 bytes and 4-aligned: two bytes of padding after
+    /// `fldtyp` at 13, the four `INT`s at 16/20/24/28, `anslen` at 32, and the
+    /// struct rounded up to 36 so the array stays aligned.
+    pub const WG32: Self = Self {
+        size: 36,
+        int_width: 4,
+        fspoff: 16,
+        tmpoff: 20,
+        mbpoff: 24,
+        ansoff: 28,
+        anslen: 32,
+    };
+
+    /// Byte offset of field `n`'s record within `flddat[]`.
+    pub const fn record_at(&self, n: u16) -> usize {
+        n as usize * self.size as usize
+    }
+
+    /// Read one `INT` member, sign-extended from this ABI's width.
+    ///
+    /// Signed because `mbpoff`'s `-1` ("no embedded punctuation") is the one
+    /// value whose *sign* is load-bearing: [`Field::from_record`] tests it,
+    /// and a `-1` written as 4 bytes and read as 2 is still -1 only by
+    /// accident of little-endian order. Read at the declared width so the
+    /// accident is not the reason.
+    pub fn int_at(&self, record: &[u8], at: usize) -> i32 {
+        match self.int_width {
+            2 => i32::from(i16::from_le_bytes([record[at], record[at + 1]])),
+            4 => i32::from_le_bytes([
+                record[at],
+                record[at + 1],
+                record[at + 2],
+                record[at + 3],
+            ]),
+            // A width neither ABI declares is a layout nobody measured.
+            // Reading four bytes anyway would answer, plausibly and wrongly.
+            n => panic!("struct fsdfld has no {n}-byte INT in any ABI this host serves"),
+        }
+    }
+
+    /// Write one `INT` member at this ABI's width.
+    pub fn set_int_at(&self, record: &mut [u8], at: usize, value: i32) {
+        let bytes = value.to_le_bytes();
+        record[at..at + self.int_width].copy_from_slice(&bytes[..self.int_width]);
+    }
+}
 
 /// `sizeof(struct fsdscb)`, `FSD.H:275`.
 ///
@@ -313,16 +439,24 @@ pub mod fld {
     pub const FLAGS: usize = 12;
     /// `char fldtyp`.
     pub const FLDTYP: usize = 13;
-    /// `int fspoff`.
-    pub const FSPOFF: usize = 14;
-    /// `int tmpoff`.
-    pub const TMPOFF: usize = 16;
-    /// `int mbpoff`.
-    pub const MBPOFF: usize = 18;
-    /// `int ansoff`.
-    pub const ANSOFF: usize = 20;
-    /// `char anslen`.
-    pub const ANSLEN: usize = 22;
+    /// `int fspoff`, **16-bit only**.
+    ///
+    /// The five members from here down are the ones `INT` widens, so they
+    /// move between builds -- see [`super::FieldLayout`], which is the
+    /// authority for all five. These aliases remain because the 16-bit oracle
+    /// tests pin real `MAJORBBS.EXE` instruction bytes against them
+    /// (`tests/fsd_statics.rs:1384` assembles `add es:[bx+ANSOFF]`), and
+    /// those must go on naming the 16-bit numbers. **Nothing on a code path a
+    /// 32-bit module can reach may use them.**
+    pub const FSPOFF: usize = super::FieldLayout::WG16.fspoff;
+    /// `int tmpoff`, **16-bit only** -- see [`FSPOFF`].
+    pub const TMPOFF: usize = super::FieldLayout::WG16.tmpoff;
+    /// `int mbpoff`, **16-bit only** -- see [`FSPOFF`].
+    pub const MBPOFF: usize = super::FieldLayout::WG16.mbpoff;
+    /// `int ansoff`, **16-bit only** -- see [`FSPOFF`].
+    pub const ANSOFF: usize = super::FieldLayout::WG16.ansoff;
+    /// `char anslen`, **16-bit only** -- see [`FSPOFF`].
+    pub const ANSLEN: usize = super::FieldLayout::WG16.anslen;
 }
 
 /// What a template character means. `FSD.C:44`'s `tmpspc[]` table.
@@ -446,8 +580,8 @@ impl Field {
     /// `fsdppc(templt, 0)` skips every branch that would -- so the real host
     /// left whatever `alczer` or the stack had put there. Zero is that, and it
     /// is the same zero every run.
-    pub fn record(&self, ansoff: u16, anslen: u8) -> [u8; FSDFLD as usize] {
-        let mut out = [0u8; FSDFLD as usize];
+    pub fn record(&self, layout: &FieldLayout, ansoff: u16, anslen: u8) -> Vec<u8> {
+        let mut out = vec![0u8; usize::from(layout.size)];
         // `char ansgto[GTOLEN+1]`, NUL-terminated in place. Off the ANSI path
         // this is empty and the array stays the zeros `alczer` left, which is
         // what the original does too -- `fsdppc(templt,0)` never writes it.
@@ -461,19 +595,22 @@ impl Field {
         out[fld::ATTR] = self.attr;
         out[fld::FLAGS] = self.flags;
         out[fld::FLDTYP] = self.kind;
-        out[fld::FSPOFF..fld::FSPOFF + 2].copy_from_slice(&self.spec_at.to_le_bytes());
-        out[fld::TMPOFF..fld::TMPOFF + 2].copy_from_slice(&self.template_at.to_le_bytes());
+        layout.set_int_at(&mut out, layout.fspoff, i32::from(self.spec_at));
+        layout.set_int_at(&mut out, layout.tmpoff, i32::from(self.template_at));
         // `-1`, not `0`: `tmpfld()` writes -1 for a field with no embedded
         // punctuation and `embscn()` overwrites only the ones that joined, so a
         // zero here would name the first punctuation template rather than none.
-        let mbpoff = self.punctuation_at.map_or(-1i16, |at| at as i16);
-        out[fld::MBPOFF..fld::MBPOFF + 2].copy_from_slice(&mbpoff.to_le_bytes());
-        out[fld::ANSOFF..fld::ANSOFF + 2].copy_from_slice(&ansoff.to_le_bytes());
-        out[fld::ANSLEN] = anslen;
+        //
+        // Written at the ABI's own `INT` width, so the 32-bit build gets
+        // `0xffffffff` and not a `0x0000ffff` that reads back as 65535.
+        let mbpoff = self.punctuation_at.map_or(-1i32, |at| i32::from(at));
+        layout.set_int_at(&mut out, layout.mbpoff, mbpoff);
+        layout.set_int_at(&mut out, layout.ansoff, i32::from(ansoff));
+        out[layout.anslen] = anslen;
         out
     }
 
-    /// A field read back out of the 23 bytes it occupies in module memory.
+    /// A field read back out of the bytes it occupies in module memory.
     ///
     /// The inverse of [`Field::record`], and the reason it exists is that the
     /// array in the session buffer is the module's: `WCCMMUD.DLL` sets
@@ -483,8 +620,8 @@ impl Field {
     ///
     /// `ansoff` and `anslen` are not returned. They belong to the answer string
     /// rather than to the field, and a caller that needs them has the record.
-    pub fn from_record(record: &[u8; FSDFLD as usize]) -> Self {
-        let mbpoff = i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]);
+    pub fn from_record(layout: &FieldLayout, record: &[u8]) -> Self {
+        let mbpoff = layout.int_at(record, layout.mbpoff);
         let gto = &record[fld::ANSGTO..fld::ANSGTO + GTOLEN + 1];
         let gto = &gto[..gto.iter().position(|&b| b == 0).unwrap_or(GTOLEN)];
         Self {
@@ -494,8 +631,8 @@ impl Field {
             ansgto: gto.to_vec(),
             flags: record[fld::FLAGS],
             kind: record[fld::FLDTYP],
-            spec_at: u16::from_le_bytes([record[fld::FSPOFF], record[fld::FSPOFF + 1]]),
-            template_at: u16::from_le_bytes([record[fld::TMPOFF], record[fld::TMPOFF + 1]]),
+            spec_at: layout.int_at(record, layout.fspoff) as u16,
+            template_at: layout.int_at(record, layout.tmpoff) as u16,
             punctuation_at: (mbpoff >= 0).then_some(mbpoff as u16),
         }
     }
@@ -1004,9 +1141,9 @@ impl Form {
     /// real host would have wrapped silently and returned a negative, which
     /// `dclvda` would then have ignored -- a form too big to size, sized wrong,
     /// with nothing said.
-    pub fn size(&self) -> Result<u16, FormError> {
+    pub fn size(&self, layout: &FieldLayout) -> Result<u16, FormError> {
         let total = self.punctuation.len() as u32
-            + self.fields.len() as u32 * u32::from(FSDFLD)
+            + self.fields.len() as u32 * u32::from(layout.size)
             + u32::from(self.answer_max)
             + 1;
         u16::try_from(total).map_err(|_| FormError::TooBig(total))
@@ -5681,6 +5818,166 @@ mod tests {
     use crate::abi::Wg16;
     use mbbs_machine::m16::FarPtr;
 
+    /// Every offset `WCCMMUD` ORs `FFFAVD` into, in both builds.
+    ///
+    /// Read straight off the two decompiles -- `_EDIT_CHARACTER_STATS` in
+    /// `re/exports/WCCMMUD_decompiled.c:11944-11990` and
+    /// `edit_character_stats` in
+    /// `re/wg_nt_ghidra/exports/WCCMMUD_decompiled.c:1873-1909`. Fourteen
+    /// unconditional sites each, in source order, plus a fifteenth
+    /// conditional one at `+0xc` that both builds share and that is therefore
+    /// deliberately **not** in these lists: see below.
+    const AVOIDED_16: [usize; 14] = [
+        0x3a, 0x51, 0x68, 0x7f, 0xad, 0xc4, 0xf2, 0x109, 0x137, 0x14e, 0x17c, 0x193, 0x1c1, 0x1d8,
+    ];
+    const AVOIDED_32: [usize; 14] = [
+        0x54, 0x78, 0x9c, 0xc0, 0x108, 300, 0x174, 0x198, 0x1e0, 0x204, 0x24c, 0x270, 0x2b8, 0x2dc,
+    ];
+
+    /// Which fields MajorMUD's `EDITCHA1` template says those must be.
+    ///
+    /// Derived from the template alone, with no reference to either binary:
+    /// the field runs in `WCCTEXT.MSG`'s `EDITCHA1` are, in order, four `?`
+    /// runs (Given Name, Family Name, Race, Class), then six stat rows of
+    /// three `$$$$` runs each (minimum, maximum, value), then three `?` runs
+    /// (hair length, hair colour, eye colour) and one for `Exit:`. So Race is
+    /// 2, Class is 3, and each stat's minimum and maximum are `4+3k` and
+    /// `5+3k`. Fields 22, 23 and 24 being hair length, hair colour and eye
+    /// colour is the same numbering
+    /// [`crate::shims::fsd::fsdord`]'s own doc comment already states.
+    const AVOIDED_FIELDS: [u16; 14] = [2, 3, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20];
+
+    /// A layout is right when it decodes what the module actually wrote.
+    ///
+    /// This is the regression test for the 32-bit character sheet letting the
+    /// player type over the minimum and maximum columns of every stat. The
+    /// host allocates `flddat[]` and the module writes `FFFAVD` into it
+    /// without calling back, so the *only* thing that makes the module's
+    /// writes and [`crate::shims::fsd::live_form_mem`]'s reads name the same
+    /// byte is agreeing on `sizeof(struct fsdfld)`. They did not: the host
+    /// used 23 for both ABIs.
+    ///
+    /// Two independent measurements have to agree here, which is what makes
+    /// this a test and not a restatement of the constant:
+    ///
+    /// 1. each build's own offsets divide exactly by its own stride, and
+    /// 2. the field numbers that fall out are the same fourteen in both --
+    ///    and are the fourteen the *template* independently says they are.
+    ///
+    /// A wrong stride fails all three: it leaves a remainder, and even where
+    /// it happens not to, it names a different field.
+    #[test]
+    fn fsd_layout_decodes_what_the_module_wrote() {
+        for (layout, offsets, build) in [
+            (FieldLayout::WG16, AVOIDED_16, "16-bit"),
+            (FieldLayout::WG32, AVOIDED_32, "32-bit"),
+        ] {
+            let mut got = Vec::new();
+            for off in offsets {
+                let from_flags = off
+                    .checked_sub(fld::FLAGS)
+                    .unwrap_or_else(|| panic!("{build}: {off:#x} is before flags"));
+                assert_eq!(
+                    from_flags % usize::from(layout.size),
+                    0,
+                    "{build}: the module ORs FFFAVD into {off:#x}, which is not \
+                     `flags` (+{}) of any record at a stride of {} -- so this \
+                     host would read that byte back from the wrong field",
+                    fld::FLAGS,
+                    layout.size,
+                );
+                got.push((from_flags / usize::from(layout.size)) as u16);
+            }
+            assert_eq!(
+                got, AVOIDED_FIELDS,
+                "{build}: the fourteen fields the module avoids must be Race, \
+                 Class and the minimum and maximum of each of the six stats, \
+                 which is what the EDITCHA1 template's own field runs say they \
+                 are"
+            );
+        }
+    }
+
+    /// The one offset that cannot tell a right stride from a wrong one.
+    ///
+    /// `edit_character_stats`'s fifteenth, conditional `FFFAVD` site pokes
+    /// field 0, at `+0xc` in both builds -- because `n * stride` is zero for
+    /// every stride. `fsdego_reads_flddat_flags_live_not_the_host_s_cached_form`
+    /// pokes field 0 too, which is why a green suite did not notice the
+    /// 32-bit stride was wrong for two years' worth of fields 1 and up. Kept
+    /// as an executable note so the next person to add an FSD layout test
+    /// knows not to anchor it at field 0.
+    #[test]
+    fn field_zero_cannot_discriminate_a_stride() {
+        assert_eq!(FieldLayout::WG16.record_at(0), FieldLayout::WG32.record_at(0));
+        assert_ne!(FieldLayout::WG16.record_at(1), FieldLayout::WG32.record_at(1));
+    }
+
+    /// `mbpoff`'s `-1` has to be -1 at the width the ABI declares.
+    ///
+    /// The sign is what [`Field::from_record`] tests to decide whether a field
+    /// has embedded punctuation at all. Written as two bytes into a 32-bit
+    /// record, `0x0000ffff` reads back as 65535 -- positive -- and every field
+    /// in the form would claim punctuation template 65535.
+    #[test]
+    fn a_field_with_no_punctuation_round_trips_as_minus_one_in_both_abis() {
+        let plain = compile(b"?? ??", b"A B", MANY, Ascn::Line);
+        for layout in [FieldLayout::WG16, FieldLayout::WG32] {
+            let mut field = plain.fields[0].clone();
+            field.punctuation_at = None;
+            field.spec_at = 0x1234;
+            field.template_at = 0x0567;
+            let record = field.record(&layout, 0x89, 7);
+            assert_eq!(record.len(), usize::from(layout.size));
+            let back = Field::from_record(&layout, &record);
+            assert_eq!(back.punctuation_at, None, "stride {}", layout.size);
+            assert_eq!(back.spec_at, 0x1234, "stride {}", layout.size);
+            assert_eq!(back.template_at, 0x0567, "stride {}", layout.size);
+            assert_eq!(record[layout.anslen], 7, "stride {}", layout.size);
+
+            // Read back at the *declared* width rather than through
+            // `int_at`, which would agree with a wrong `int_width` as
+            // readily as a right one -- the record has to look like what
+            // that ABI's own compiler would have written, because the
+            // module reads it with that compiler's code and not with ours.
+            let whole = &record[layout.mbpoff..layout.mbpoff + layout.int_width];
+            assert!(
+                whole.iter().all(|b| *b == 0xff),
+                "stride {}: mbpoff's -1 must fill all {} of its declared \
+                 bytes, not {whole:02x?} -- a module reading the other half \
+                 gets a large positive punctuation index",
+                layout.size,
+                layout.int_width,
+            );
+        }
+    }
+
+    /// The declared widths have to be the ABI's own.
+    ///
+    /// `int_width` is otherwise invisible: this host writes these records
+    /// *and* reads them, so a wrong width round-trips through itself
+    /// perfectly and every other test still passes. It is checked against
+    /// [`crate::abi::Abi::INT_WIDTH`] -- the width the rest of the host
+    /// already proved, argument frame by argument frame -- so the two cannot
+    /// drift apart.
+    #[test]
+    fn each_abi_s_field_layout_uses_that_abi_s_own_int() {
+        use crate::abi::{Abi, Wg32};
+        assert_eq!(Wg16::FSD_FIELD.int_width, Wg16::INT_WIDTH);
+        assert_eq!(Wg32::FSD_FIELD.int_width, Wg32::INT_WIDTH);
+        for layout in [FieldLayout::WG16, FieldLayout::WG32] {
+            // `fspoff` starts the run of INTs and they are contiguous.
+            assert_eq!(layout.tmpoff, layout.fspoff + layout.int_width);
+            assert_eq!(layout.mbpoff, layout.tmpoff + layout.int_width);
+            assert_eq!(layout.ansoff, layout.mbpoff + layout.int_width);
+            assert_eq!(layout.anslen, layout.ansoff + layout.int_width);
+            // `fldtyp` is the last CHAR before them, at 13; a 32-bit build
+            // pads to the INT's own alignment and a byte-aligned one does not.
+            assert_eq!(layout.fspoff, 14 + (layout.int_width - 2));
+            assert!(usize::from(layout.size) >= layout.anslen + 1);
+        }
+    }
+
     /// The maximum this host's 4,096-byte output buffer allows. See the
     /// `fsdroom` shim for where it comes from; a unit test just needs a number
     /// big enough not to be the thing under test.
@@ -5761,7 +6058,7 @@ mod tests {
         assert_eq!(joined.fields[0].xwidth, 8);
         assert_eq!(joined.fields[0].punctuation_at, Some(0));
         assert_eq!(joined.punctuation, b"   -    \0");
-        assert_eq!(joined.size(), Ok(48));
+        assert_eq!(joined.size(&FieldLayout::WG16), Ok(48));
     }
 
     #[test]
@@ -9952,7 +10249,7 @@ mod tests {
         // `23*i+12` -- `seg 3:0x4344` is field 2 at 58 and `seg 3:0x4444` is
         // field 20 at 472.
         let form = compile(b"Ok Y/N", b"OK", MANY, Ascn::Line);
-        let record = form.fields[0].record(7, 3);
+        let record = form.fields[0].record(&FieldLayout::WG16, 7, 3);
         assert_eq!(record.len(), usize::from(FSDFLD));
         assert_eq!(record[fld::FLAGS], flags::MULTICHOICE | flags::ALTERNATES);
         assert_eq!(record[fld::WIDTH], 3);
@@ -9970,14 +10267,14 @@ mod tests {
         // the fields that joined. Zero would name the first punctuation
         // template rather than none.
         let plain = compile(b"?? ??", b"A B", MANY, Ascn::Line);
-        let record = plain.fields[0].record(0, 0);
+        let record = plain.fields[0].record(&FieldLayout::WG16, 0, 0);
         assert_eq!(
             i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]),
             -1
         );
 
         let joined = compile(b"###-####", b"P", MANY, Ascn::Line);
-        let record = joined.fields[0].record(0, 0);
+        let record = joined.fields[0].record(&FieldLayout::WG16, 0, 0);
         assert_eq!(
             i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]),
             0
@@ -9995,7 +10292,10 @@ mod tests {
             compile(b"?? ??", b"A(SECRET) B(MULTICHOICE ALT=x)", MANY, Ascn::Line),
         ] {
             for field in &form.fields {
-                assert_eq!(&Field::from_record(&field.record(41, 7)), field);
+                for layout in [FieldLayout::WG16, FieldLayout::WG32] {
+                    let record = field.record(&layout, 41, 7);
+                    assert_eq!(&Field::from_record(&layout, &record), field);
+                }
             }
         }
     }
@@ -10028,8 +10328,8 @@ mod tests {
             + form.fields.len() * usize::from(FSDFLD)
             + usize::from(form.answer_max)
             + 1;
-        assert_eq!(form.size(), Ok(expected as u16));
-        assert_eq!(form.size(), Ok(59));
+        assert_eq!(form.size(&FieldLayout::WG16), Ok(expected as u16));
+        assert_eq!(form.size(&FieldLayout::WG16), Ok(59));
     }
 
     /// `chktyp()`, `FSD.C:861`. A multiple-choice field rejects *any* typed
