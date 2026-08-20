@@ -52,6 +52,7 @@
 
 pub mod acs;
 pub mod btrcall;
+pub mod corpus;
 pub mod census;
 mod create;
 pub mod format;
