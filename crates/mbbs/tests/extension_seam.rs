@@ -151,3 +151,30 @@ fn a_handled_line_leaves_the_channel_ready_for_the_next() {
         "the second line must reach dispatch resolution"
     );
 }
+
+struct Greeter;
+
+impl Extension<Wg16> for Greeter {
+    fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
+        ctx.print(b"hello\r\n");
+        Verdict::Handled
+    }
+}
+
+#[test]
+fn a_handler_can_write_to_the_channel() {
+    let mut f = Fixture::new();
+    let module = f.minimal_module();
+    let chan = f.console();
+    f.host.set_extension(Box::new(Greeter));
+
+    f.host.gsbl_mut().push_input(chan, b"anything\r");
+    f.host.poll(&mut f.machine, &module).expect("polled");
+
+    let out = f.host.gsbl_mut().drain_output(chan);
+    assert!(
+        String::from_utf8_lossy(&out).contains("hello"),
+        "handler output must reach the channel, got: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+}

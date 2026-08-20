@@ -39,6 +39,20 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
     pub fn line(&self) -> &str {
         &self.line
     }
+
+    /// Send bytes to this channel.
+    ///
+    /// **CP437 bytes, not UTF-8.** This goes to the same `transmit` the
+    /// module's own output uses, and translation happens in the socket task
+    /// above it -- so a handler that wants a box-drawing character writes the
+    /// CP437 code point, not the Unicode one.
+    ///
+    /// Bypasses `prfbuf` entirely: that buffer belongs to the module, and a
+    /// handler writing into it would interleave with output the module has
+    /// composed but not yet sent.
+    pub fn print(&mut self, bytes: &[u8]) {
+        self.host.gsbl_mut().transmit(self.chan, bytes);
+    }
 }
 
 /// Something that participates in the host's events.
