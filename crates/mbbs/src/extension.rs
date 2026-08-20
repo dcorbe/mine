@@ -290,58 +290,63 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
     /// setter is ever added to the module, this comment is now wrong and
     /// should be replaced with a call to it.
     ///
-    /// # Four words, not two -- both copies, always
+    /// # Three fields, six words -- the module's own invariant, replicated
     ///
-    /// The record stores experience TWICE: `0x3c`/`0x3e` and `0x46f`/`0x471`,
-    /// each a 32-bit total, low word first (`_RESTRUCTURE_EXPERIENCE`,
-    /// `re/exports/WCCMMUD_named.c:72423-72425`, states the layout plainly).
-    /// **Neither copy is authoritative on its own:**
-    /// `_RESTRUCTURE_EXPERIENCE` copies `0x3c`/`0x3e` INTO `0x46f`/`0x471`,
-    /// and runs from five places -- `_LOAD_PLAYER` itself (`:318-320`, the
-    /// load-bearing one: every character load runs it), `_SHOW_STATUS`
-    /// (`:32438`), `_CMD_EXPERIENCE` (`:54425`), `_CMD_SYSOP` (`:63219`),
+    /// The record stores experience in THREE places, not two:
+    /// `0x3c`/`0x3e` (32-bit, low word first) is the raw total; `0x46f`/
+    /// `0x471` is that same total **modulo 1,000,000,000**; `0x46b`/`0x46d`
+    /// is the **count of billions** (the quotient). This is not this
+    /// method's own invention -- it is exactly what
+    /// `_RESTRUCTURE_EXPERIENCE` computes, in full
+    /// (`re/exports/WCCMMUD_named.c:72415-72442`):
+    ///
+    ///
+    /// An earlier version of this comment (and this method) read only the
+    /// first three lines and concluded `_RESTRUCTURE_EXPERIENCE` performs a
+    /// flat copy -- **that reading was wrong.** It performs a copy AND a
+    /// reduction; the `while` loop is not incidental cleanup, it is the
+    /// step that keeps `0x46f`/`0x471` a bounded remainder rather than an
+    /// unbounded total, and it is what every other writer in the module
+    /// (`_ADD_EXPERIENCE`'s own delta-processing loop,
+    /// `re/exports/WCCMMUD_named.c:1378-1401`, subtracts the identical
+    /// `0x3b9aca00` and increments the identical `0x46b`/`0x46d` counter)
+    /// already agrees with. This method now replicates the full
+    /// three-field invariant: `0x3c`/`0x3e` = `exp`, `0x46f`/`0x471` =
+    /// `exp % 1_000_000_000`, `0x46b`/`0x46d` = `exp / 1_000_000_000`. No
+    /// clamping, no rejecting large values -- `exp` is `u32` and every value
+    /// it can hold is handled, the same way `_RESTRUCTURE_EXPERIENCE`
+    /// itself handles every value already on a record it is given.
+    ///
+    /// **Neither `0x3c`/`0x3e` nor `0x46f`/`0x471`/`0x46b`/`0x46d` is
+    /// authoritative alone.** `_RESTRUCTURE_EXPERIENCE` runs from five
+    /// places -- `_LOAD_PLAYER` itself (`:318-320`, the load-bearing one:
+    /// every character load runs it), `_SHOW_STATUS` (`:32438`),
+    /// `_CMD_EXPERIENCE` (`:54425`), `_CMD_SYSOP` (`:63219`),
     /// `_GENERATE_TOP_LIST` (`:76200`) -- each guarded by a per-record flag
     /// (`base + 0x7b8` bit `0x20`) that is set once restructuring has run.
-    /// So: on a record whose flag is still clear, writing only
-    /// `0x46f`/`0x471` is silently reverted back to `0x3c`/`0x3e` the next
-    /// time the character loads. On a record whose flag is already set,
-    /// writing only `0x3c`/`0x3e` does nothing live -- the module never
-    /// rereads it. Writing both is correct in either state, which is why
-    /// this writes all four words unconditionally rather than branching on
-    /// the flag.
+    /// On a record whose flag is still clear, writing only
+    /// `0x46f`/`0x471`/`0x46b`/`0x46d` is silently reverted back to
+    /// `0x3c`/`0x3e` (reduced afresh) the next time the character loads. On
+    /// a record whose flag is already set -- the normal state of any
+    /// actively played character, since `_LOAD_PLAYER` restructures
+    /// unconditionally the first time -- writing only `0x3c`/`0x3e` does
+    /// nothing live: **`_SHOW_STATUS` formats `0x46b`/`0x46d`/`0x46f`/
+    /// `0x471` straight to the player's status screen with no
+    /// re-normalisation when the flag is set** (`:32438-32455`), so a stale
+    /// or under-written value there is visible on the player's very next
+    /// `st`, not deferred to some later event. Writing all three fields
+    /// unconditionally is correct in either flag state, which is why this
+    /// never branches on the flag itself.
     ///
     /// A prior session's own live-board measurement
     /// (`majormud-character-record-layout` memory, verified twice against
-    /// real characters) independently reaches the same requirement from the
-    /// opposite direction: "`0x46f` -- the live value `st` displays...
-    /// [p]atching only `0x03c` silently fails."
-    ///
-    /// # What this does NOT do: recompute a level threshold
-    ///
-    /// `_ADD_EXPERIENCE`'s own additive path is not a plain mirror of these
-    /// two fields once the restructure flag is set -- past that point it
-    /// treats `0x46f`/`0x471` as a running "progress within the current
-    /// auto-level bracket" accumulator: it adds the delta, then a `while`
-    /// loop drains whole per-level thresholds out of it, incrementing a
-    /// separate level-bonus counter (`0x46b`/`0x46d`) each time
-    /// (`re/exports/WCCMMUD_named.c:1378-1401`). This method does not
-    /// replicate that: it sets `0x46f`/`0x471` to the SAME raw total as
-    /// `0x3c`/`0x3e`, the same seeding `_RESTRUCTURE_EXPERIENCE` itself
-    /// performs on a fresh migration, not a delta-and-wrap. Consequence: a
-    /// call here never grants (or owes) a bonus level through that
-    /// counter, and never touches `0x46b`/`0x46d` at all -- the module's
-    /// own leveling-from-training path (`majormud-character-record-layout`
-    /// memory: "Experience alone does NOT raise level") is unaffected
-    /// either way. What is genuinely left un-reconciled: if a later
-    /// `_ADD_EXPERIENCE` call reads `0x46f`/`0x471` as "progress since the
-    /// last bonus level" rather than "the same total as `0x3c`/`0x3e`,
-    /// restated," a `set_exp` that jumps the total by a large amount could
-    /// hand that next `_ADD_EXPERIENCE` call an oversized delta to
-    /// pre-process through its own wrap loop the next time the player earns
-    /// any experience at all -- not on save, not on the next load, only on
-    /// the next `_ADD_EXPERIENCE`. Nothing in this fixture can exercise
-    /// that call to confirm or rule it out; see `task-8-report.md`'s "what
-    /// is untestable" section.
+    /// real characters) independently reaches part of the same requirement
+    /// from the opposite direction: "`0x46f` -- the live value `st`
+    /// displays... [p]atching only `0x03c` silently fails." That
+    /// measurement predates this comment's correction and did not exercise
+    /// a total past 1,000,000,000, so it does not by itself confirm the
+    /// `0x46b`/`0x46d` billions field -- the decompile above is this
+    /// method's authority for that field.
     ///
     /// # Persistence
     ///
@@ -353,21 +358,29 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
     /// # Errors
     ///
     /// As [`CommandCtx::player_record`], if the caller's own record cannot
-    /// be resolved. As [`CommandCtx::write_at`], if any of the four writes
+    /// be resolved. As [`CommandCtx::write_at`], if any of the six writes
     /// runs off the resolved record (should never happen against a real
     /// 1998-byte record, but never silently skipped either way). As
     /// [`CommandCtx::call_export`]/[`CommandCtx::player_record`]'s own
     /// pattern, if `_SAVE_PLAYER` is not an export the module answers for,
     /// or stops the machine.
     pub fn set_experience(&mut self, exp: u32) -> io::Result<()> {
-        let record = self.player_record()?;
-        let lo = (exp & 0xffff) as u16;
-        let hi = (exp >> 16) as u16;
+        /// `_RESTRUCTURE_EXPERIENCE`'s own reduction modulus
+        /// (`0x3b9aca00`, `re/exports/WCCMMUD_named.c:72426-72439`) --
+        /// named so the three field computations below read as "the same
+        /// one number," not three independent literals that could drift
+        /// apart under a later edit.
+        const BILLION: u32 = 1_000_000_000;
 
-        self.write_at(A::ptr_offset(record, 0x3c), &lo.to_le_bytes())?;
-        self.write_at(A::ptr_offset(record, 0x3e), &hi.to_le_bytes())?;
-        self.write_at(A::ptr_offset(record, 0x46f), &lo.to_le_bytes())?;
-        self.write_at(A::ptr_offset(record, 0x471), &hi.to_le_bytes())?;
+        let record = self.player_record()?;
+        let write_u32 = |ctx: &mut Self, delta: u16, value: u32| -> io::Result<()> {
+            ctx.write_at(A::ptr_offset(record, delta), &(value as u16).to_le_bytes())?;
+            ctx.write_at(A::ptr_offset(record, delta + 2), &((value >> 16) as u16).to_le_bytes())
+        };
+
+        write_u32(self, 0x3c, exp)?;
+        write_u32(self, 0x46f, exp % BILLION)?;
+        write_u32(self, 0x46b, exp / BILLION)?;
 
         let usrnum = A::Int::from(self.chan.number() as u16);
         match self.call_export("_SAVE_PLAYER", &[Arg::Int(usrnum)])? {

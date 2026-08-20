@@ -442,19 +442,25 @@ fn get_player_code(ptr: mbbs_machine::m16::FarPtr) -> Vec<u8> {
 }
 
 /// [`SetExperienceCaller::result`]'s shape: whether `set_experience` itself
-/// succeeded, and -- only when it did -- the four words read back afterward.
-/// Named so clippy's `type_complexity` lint (and a human reader) sees one
-/// name instead of a nested `Option<(Result<...>, Option<...>)>` at the use
+/// succeeded, and -- only when it did -- the six words read back afterward,
+/// in the order `[0x3c, 0x3e, 0x46f, 0x471, 0x46b, 0x46d]`. Widened from
+/// four to six words when the review of this task's first draft found that
+/// `_RESTRUCTURE_EXPERIENCE` writes a THIRD field (`0x46b`/`0x46d`, the
+/// billions count -- see `set_experience`'s own doc comment) that the
+/// original draft never wrote and this reader never read. Named so
+/// clippy's `type_complexity` lint (and a human reader) sees one name
+/// instead of a nested `Option<(Result<...>, Option<...>)>` at the use
 /// site.
-type SetExperienceResult = (io::Result<()>, Option<[u16; 4]>);
+type SetExperienceResult = (io::Result<()>, Option<[u16; 6]>);
 
-/// Calls [`CommandCtx::set_experience`], then reads all four words the
-/// double-write is supposed to leave behind -- `0x3c`/`0x3e` and
-/// `0x46f`/`0x471` -- straight out of the same record `_GET_PLAYER` hands
-/// back, through a second, independent `player_record()` this struct's own
-/// `command` makes itself. Never trusts `set_experience`'s own `Ok(())`
-/// alone -- that only proves it ran to completion, not that it wrote what
-/// it claims.
+/// Calls [`CommandCtx::set_experience`], then reads all six words the
+/// module's own three-field invariant is supposed to leave behind --
+/// `0x3c`/`0x3e` (the raw total), `0x46f`/`0x471` (the total modulo one
+/// billion), `0x46b`/`0x46d` (the billions count) -- straight out of the
+/// same record `_GET_PLAYER` hands back, through a second, independent
+/// `player_record()` this struct's own `command` makes itself. Never
+/// trusts `set_experience`'s own `Ok(())` alone -- that only proves it ran
+/// to completion, not that it wrote what it claims.
 struct SetExperienceCaller {
     exp: u32,
     result: Arc<Mutex<Option<SetExperienceResult>>>,
@@ -469,7 +475,14 @@ impl Extension<Wg16> for SetExperienceCaller {
                 let bytes = ctx.read_at(Wg16::ptr_offset(record, delta), 2).expect("read_at must resolve");
                 u16::from_le_bytes([bytes[0], bytes[1]])
             };
-            Some([word(ctx, 0x3c), word(ctx, 0x3e), word(ctx, 0x46f), word(ctx, 0x471)])
+            Some([
+                word(ctx, 0x3c),
+                word(ctx, 0x3e),
+                word(ctx, 0x46f),
+                word(ctx, 0x471),
+                word(ctx, 0x46b),
+                word(ctx, 0x46d),
+            ])
         } else {
             None
         };
@@ -484,12 +497,16 @@ impl Extension<Wg16> for SetExperienceCaller {
 /// pair and not the other leaves the character internally inconsistent:
 /// this asserts BOTH read back as the new value, against a genuine
 /// `_GET_PLAYER` returning real, resolvable backing memory (not a fixture
-/// stub) and a genuine `_SAVE_PLAYER` call afterward.
+/// stub) and a genuine `_SAVE_PLAYER` call afterward. `exp` here is well
+/// under one billion, so the third field (`0x46b`/`0x46d`, the billions
+/// count) is expected to read back zero either way --
+/// [`setting_experience_past_a_billion_writes_the_reduced_remainder_and_billions_count`]
+/// is the test that actually exercises a nonzero billions count.
 ///
 /// This is the test the plan's own mutation step exists to prove has real
 /// teeth: deleting either pair of writes from `set_experience` must fail
-/// this exact assertion (both mutations are run and quoted in
-/// `task-8-report.md`, not merely described).
+/// this exact assertion (all three mutations this task now carries are run
+/// and quoted in `task-8-report.md`, not merely described).
 #[test]
 fn setting_experience_writes_both_copies() {
     let mut f = Fixture::new();
@@ -509,10 +526,51 @@ fn setting_experience_writes_both_copies() {
 
     let (outcome, words) = result.lock().expect("lock").take().expect("command ran");
     outcome.expect("set_experience must succeed against a real _GET_PLAYER/_SAVE_PLAYER");
-    let words = words.expect("must have read back all four words");
+    let words = words.expect("must have read back all six words");
     assert_eq!(
         words,
-        [0x5678, 0x1234, 0x5678, 0x1234],
-        "both the 0x3c/0x3e copy and the 0x46f/0x471 copy must read back the new value; got {words:x?}"
+        [0x5678, 0x1234, 0x5678, 0x1234, 0, 0],
+        "both the 0x3c/0x3e copy and the 0x46f/0x471 copy must read back the new value, and \
+         the billions count (0x3c/0x3e was under one billion) must read back zero; got {words:x?}"
+    );
+}
+
+/// The reduction the review of this task's first draft found missing: past
+/// one billion, `0x46f`/`0x471` must hold the REMAINDER (not the raw
+/// total) and `0x46b`/`0x46d` must hold the billions count --
+/// `_RESTRUCTURE_EXPERIENCE`'s own invariant
+/// (`re/exports/WCCMMUD_named.c:72415-72442`; see `set_experience`'s own
+/// doc comment for the full reading).
+///
+/// `exp = 3_141_592_653` is deliberately chosen so all three stored fields
+/// are distinctive and none is zero or equal to another: `0x3c`/`0x3e` is
+/// the full value, `0x46f`/`0x471` is the remainder `141_592_653`
+/// (`0x0870884d`), `0x46b`/`0x46d` is the billions count `3`. A swap
+/// between any two fields, or a dropped low/high half of any one, changes
+/// the read-back in a way this exact assertion catches -- unlike a round
+/// value (all zero high words, or a billions count of 0 or 1) which could
+/// hide several of those bugs at once.
+#[test]
+fn setting_experience_past_a_billion_writes_the_reduced_remainder_and_billions_count() {
+    let mut f = Fixture::new();
+    let record_ptr = Wg16::mem(&mut f.machine).alloc_region(2000).expect("alloc real backing memory");
+    let get_player = get_player_code(record_ptr);
+    let save_player = [0xcbu8];
+    let module_bytes = module_bytes_exporting_many(&[("_GET_PLAYER", &get_player), ("_SAVE_PLAYER", &save_player)]);
+    let module = f.host.load(&mut f.machine, &module_bytes).expect("loads");
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = SetExperienceCaller { exp: 3_141_592_653, result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let (outcome, words) = result.lock().expect("lock").take().expect("command ran");
+    outcome.expect("set_experience must succeed against a real _GET_PLAYER/_SAVE_PLAYER");
+    let words = words.expect("must have read back all six words");
+    assert_eq!(
+        words,
+        [0xe64d, 0xbb40, 0x884d, 0x0870, 3, 0],
+        "0x3c/0x3e must hold the raw total, 0x46f/0x471 must hold the total modulo one \
+         billion, and 0x46b/0x46d must hold the billions count; got {words:x?}"
     );
 }
