@@ -6477,6 +6477,116 @@ mod tests {
         );
     }
 
+    /// What one `obtbtvl` costs on the board's largest v5 file.
+    ///
+    /// `_UPDATE_POLLING_ROUTINE` (`re/exports/WCCMMUD_named.c:57538`) is
+    /// MajorMUD's database update. `_BEGIN_UPDATING` (`:57678`) opens a file,
+    /// proves it is not empty with option 13 (`Op::Highest`), and installs the
+    /// worker through `begin_polling`; the worker then walks the file one
+    /// record per poll dispatch with `obtbtvl(rec, key, 0, 8, 0)` -- option 8
+    /// is `Op::Greater` -- and `stop_polling`s itself when the walk runs out.
+    ///
+    /// Every one of those dispatches spends one unit of `Host::cycle`'s
+    /// per-second poll grant, which is the same grant that serves player
+    /// channels. So what one step costs is what the grant buys, and the last
+    /// line printed here is the share of every second the update takes at the
+    /// shipped `--polls-per-second 512`.
+    ///
+    /// Ignored because it needs a real `WCCUPDAT.DAT`, which is not in the
+    /// repo. Run it with:
+    ///
+    /// ```text
+    /// WCCUPDAT=~/peepeebbs/WCCUPDAT.DAT \\
+    ///   cargo test --release -p btrieve --lib -- --ignored --nocapture \\
+    ///   v5_keyed_walk_cost_per_obtbtvl
+    /// ```
+    #[test]
+    #[ignore = "needs a real WCCUPDAT.DAT, named by $WCCUPDAT"]
+    fn v5_keyed_walk_cost_per_obtbtvl() {
+        let Ok(source) = std::env::var("WCCUPDAT") else {
+            eprintln!("set WCCUPDAT=/path/to/WCCUPDAT.DAT to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v5-keyed-walk-cost");
+        let path = dir.join("WCCUPDAT.DAT");
+        std::fs::copy(&source, &path).expect("the file copies into scratch");
+        let size = std::fs::metadata(&path).expect("the copy stats").len();
+
+        // `/proc/self/io`'s `rchar`, the same counter the v6 write-cost test
+        // uses: bytes this process asked the kernel for, which is the question
+        // "does a step go back to the disk?".
+        let rchar = || -> u64 {
+            let text = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+            text.lines()
+                .find_map(|l| l.strip_prefix("rchar:"))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+
+        let read_at_open = rchar();
+        let opening = std::time::Instant::now();
+        let mut block = block_from_file(path, "WCCUPDAT.DAT");
+        let open_took = opening.elapsed();
+        assert_eq!(block.geometry.version, Version::V5);
+        let reclen = block.geometry.reclen;
+        let page = block.geometry.page;
+
+        let loading = std::time::Instant::now();
+        let count = block.records().expect("the records read").len();
+        let load_took = loading.elapsed();
+        let read_after_load = rchar();
+
+        let mut locks = LockTable::default();
+        let first = block
+            .get(0, Op::Lowest, &[], 0, &mut locks, reclen)
+            .expect("the lowest key reads")
+            .expect("a first record");
+        let mut key = first.key.expect("a keyed read carries its key");
+
+        let steps = 2000.min(count.saturating_sub(1));
+        let read_before_walk = rchar();
+        let walking = std::time::Instant::now();
+        let mut worst = std::time::Duration::ZERO;
+        let mut done = 0usize;
+        for _ in 0..steps {
+            let one = std::time::Instant::now();
+            let found = block
+                .get(0, Op::Greater, &key, 0, &mut locks, reclen)
+                .expect("a keyed walk step");
+            let took = one.elapsed();
+            let Some(next) = found else { break };
+            if took > worst {
+                worst = took;
+            }
+            key = next.key.expect("a keyed read carries its key");
+            done += 1;
+        }
+        let walk_took = walking.elapsed();
+        let read_after_walk = rchar();
+
+        let each = walk_took / u32::try_from(done.max(1)).unwrap_or(1);
+        eprintln!(
+            "WCCUPDAT.DAT: {} MB, {count} records, v5, {page}-byte pages, reclen {reclen}",
+            size / 1_048_576
+        );
+        eprintln!(
+            "open: {open_took:?}; records() model build: {load_took:?}; together they read {} MB",
+            (read_after_load - read_at_open) / 1_048_576
+        );
+        eprintln!(
+            "{done} keyed Greater steps: {walk_took:?} total, {each:?} each, worst {worst:?}"
+        );
+        eprintln!(
+            "the walk read {} bytes from the kernel -- ~0 means the model is in memory \
+             and a step is pure CPU",
+            read_after_walk - read_before_walk
+        );
+        eprintln!(
+            "at the shipped 512 polls/s that is {:.0} ms of every second spent in obtbtvl",
+            each.as_secs_f64() * 512.0 * 1000.0
+        );
+    }
+
     /// A record this host inserts into a file **genuine Btrieve 6.15 wrote**,
     /// read back whole from disk.
     ///
