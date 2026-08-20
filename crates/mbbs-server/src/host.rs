@@ -893,7 +893,7 @@ fn life<A: Abi>(
         // good and ready" is this number, and nothing else in the loop can
         // shorten it.
         let turn_start = Instant::now();
-        let cycles = host.cycle(&mut machine, &module, boot.passes)?;
+        let cycles = host.cycle(&mut machine, &module, &mut || false)?;
         let spent = turn_start.elapsed();
         turns += 1;
         if spent > worst_turn {

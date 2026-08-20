@@ -488,8 +488,9 @@ impl<A: Abi> Ended<A> {
 /// `#[derive(..)]`, for the same reason: only `A::Poison`, buried inside
 /// `Ended<A>`, varies with `A`.
 pub struct Cycles<A: Abi> {
-    /// Passes made, at most `max`. The host's own share of
-    /// [`Host::clock_reads`], since each pass reads the clock once.
+    /// Passes made before the interrupt asked for the thread back, or before
+    /// the board went idle. The host's own share of [`Host::clock_reads`],
+    /// since each pass reads the clock once.
     pub iterations: usize,
 
     /// Module calls made: polling routines, entry points, and fired kicks.
@@ -3976,9 +3977,17 @@ impl<A: Abi> Host<A> {
     /// catch the tick counter up to the clock, running [`Host::prcrtk`] once per
     /// elapsed second.
     ///
-    /// **`max` bounds passes, not dispatches.** A bound on dispatches would
-    /// make a module that stopped polling to wait on a timer return zero work
-    /// forever.
+    /// **`interrupted` is asked once per pass, not once per dispatch.** It is
+    /// consulted at the end of a pass, after that pass's `syscyc`/`prcrtk`
+    /// catch-up, so time work is never starved by a caller in a hurry. A
+    /// bound on dispatches would make a module that stopped polling to wait
+    /// on a timer return zero work forever.
+    ///
+    /// `--passes` used to bound this loop. It was a proxy for "has input
+    /// arrived?", and a count cannot answer that question: it fired when
+    /// nothing was waiting and stayed silent when something was. The pump
+    /// peeks its own mailbox now, which is the signal itself. See
+    /// `docs/superpowers/specs/2026-08-20-cycle-interrupt-and-syscyc-design.md`.
     ///
     /// It returns as soon as nothing is queued, rather than spinning until a
     /// timer comes due. The caller advances time by sleeping and calling back;
@@ -3997,7 +4006,7 @@ impl<A: Abi> Host<A> {
         &mut self,
         machine: &mut A::Cpu,
         module: &A::Module,
-        max: usize,
+        interrupted: &mut dyn FnMut() -> bool,
     ) -> io::Result<Cycles<A>> {
         let mut iterations = 0;
         let mut dispatched = 0;
@@ -4070,11 +4079,11 @@ impl<A: Abi> Host<A> {
         // the first pass is charged for its own work and not for the vector's.
         let mut pass_mark = std::time::Instant::now();
 
-        // No clock bound. `max` -- `--passes` -- is the only bound on a cycle,
-        // and it defaults to unbounded, so a cycle turns until the board goes
-        // idle. See `mbbs_server::DEFAULT_PASSES` for the measurement that
-        // retired the 250ms budget this loop used to carry.
-        while iterations < max {
+        // No clock bound. `interrupted` is the only bound on a cycle, and a
+        // caller with nothing to say passes `&mut || false`, so a cycle turns
+        // until the board goes idle. See `mbbs_server::DEFAULT_PASSES` for the
+        // measurement that retired the 250ms budget this loop used to carry.
+        loop {
             iterations += 1;
 
 
@@ -4225,14 +4234,36 @@ impl<A: Abi> Host<A> {
                     },
                 });
             }
-        }
 
-        let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
-        Ok(Cycles {
-            iterations,
-            dispatched,
-            ended: Ended::Bound { next_kick },
-        })
+            // **The interrupt, consulted here and nowhere else.** After the
+            // tick catch-up above, never before it: a predicate answered at
+            // the top of the pass would let a fast typist return this call
+            // before `syscyc`/`prcrtk` ever ran, and the module's world would
+            // stop for as long as they kept typing. Every pass therefore
+            // carries its own second of time work before it can be cut short.
+            //
+            // After the `pending()` test above, too. A drained board is
+            // `Idle`/`Waiting`, which is a fact about the module; `Bound` is a
+            // fact about the caller wanting the thread back. Asking in the
+            // other order would report the caller's impatience as the
+            // module's state and send the driver straight back into a `cycle`
+            // with nothing to do.
+            //
+            // Nothing else bounds this loop. The poll budget
+            // (`Host::refill_polls`) always was the real bound -- `dopoll`
+            // stops re-arming when it runs out, the queue drains, and the
+            // `pending()` test above returns. The `max` count this replaced
+            // was redundant safety on top of that, and a proxy for "has input
+            // arrived?" that could not answer the question.
+            if interrupted() {
+                let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
+                return Ok(Cycles {
+                    iterations,
+                    dispatched,
+                    ended: Ended::Bound { next_kick },
+                });
+            }
+        }
     }
 
     /// `Dispatch::Native`'s side of [`Host::poll`]'s `sttrou`/`stsrou`
@@ -6462,7 +6493,7 @@ mod tests {
         // drain, but nothing left in `channel.input` once it has.
         f.host.gsbl_mut().push_input(chan, b"Kai");
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 5).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(
             cycles.ended,
             Ended::Idle,
@@ -6709,7 +6740,7 @@ mod tests {
         // `poll_dispatches_cycle_to_stsrou`'s identical comment.
         set_state(&mut f, console, state);
         f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
-        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
         assert_eq!(cycles.dispatched, 1, "one CYCLE is one entry into stsrou");
         assert!(
@@ -7362,7 +7393,7 @@ mod tests {
     fn cycle_fires_the_syscyc_vector_when_the_scan_does_not_advance() {
         let (mut f, module, rou) = polling_fixture();
 
-        let quiet = f.host.cycle(&mut f.machine, &module, 4).expect("ran");
+        let quiet = f.host.cycle(&mut f.machine, &module, &mut || false).expect("ran");
         assert_eq!(
             quiet.dispatched, 0,
             "with syscyc null there is nothing to call, and nothing is called"
@@ -7377,7 +7408,7 @@ mod tests {
             .write(&mut f.machine, "syscyc", &bytes)
             .expect("syscyc is a placed global");
 
-        let turned = f.host.cycle(&mut f.machine, &module, 4).expect("ran");
+        let turned = f.host.cycle(&mut f.machine, &module, &mut || false).expect("ran");
         assert!(
             turned.dispatched >= 1,
             "an installed syscyc vector is called once the scan stops advancing; \
@@ -7448,33 +7479,42 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_with_nothing_to_do_ends_idle_without_burning_the_bound() {
+    fn a_cycle_with_nothing_to_do_ends_idle_on_the_first_pass() {
         let (mut f, module, _rou) = polling_fixture();
-        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(cycles.ended, Ended::Idle);
         assert_eq!(cycles.dispatched, 0);
         assert_eq!(cycles.iterations, 1, "it works that out on the first pass");
     }
 
+    /// A caller that asks for the thread back gets it, on the pass it asks.
+    ///
+    /// This replaces `a_polling_channel_ticks_until_the_bound`, which pinned
+    /// the `max` parameter. That count was a proxy for "has input arrived?"
+    /// and a bad one; the predicate is the signal itself, so the count and
+    /// the test that measured it both went.
     #[test]
-    fn a_polling_channel_ticks_until_the_bound() {
+    fn a_cycle_hands_the_thread_back_when_the_interrupt_asks() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
         f.host.refill_polls(&mut f.machine, 1_000).expect("armed");
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 20).expect("cycled");
+        let mut asks = 0;
+        let cycles = f
+            .host
+            .cycle(&mut f.machine, &module, &mut || {
+                asks += 1;
+                asks >= 3
+            })
+            .expect("cycled");
 
-        assert_eq!(cycles.iterations, 20, "the bound is what stopped it");
-        assert_eq!(cycles.dispatched, 20, "one tick a pass, self-sustaining");
+        assert_eq!(cycles.iterations, 3, "the interrupt is what stopped it");
+        assert_eq!(cycles.dispatched, 3, "one tick a pass, self-sustaining");
         assert_eq!(cycles.ended, Ended::Bound { next_kick: None });
         // The status queue must not have grown while all that happened.
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(gsbl::Gsbl::POLSTS));
-        assert_eq!(
-            f.host.gsbl_mut().next_status(console),
-            None,
-            "exactly one status outstanding after 20 ticks, not 21 and not 2^20"
-        );
+        assert_eq!(f.host.gsbl_mut().next_status(console), None);
     }
 
     /// The same question as
@@ -7498,10 +7538,17 @@ mod tests {
         f.host.kicks.push(Kick { delay: 7, dstrou: rou });
         f.host.kicks.push(Kick { delay: 45, dstrou: rou });
 
-        // A polling channel keeps `pending()` true, so the loop runs out of
-        // passes instead of returning early -- which is the only way to reach
-        // the tail at all.
-        let cycles = f.host.cycle(&mut f.machine, &module, 20).expect("cycled");
+        // A polling channel keeps `pending()` true, so the early return is
+        // never taken and the interrupt is what ends the call -- which is the
+        // only way to reach the `Bound` arm at all.
+        let mut asks = 0;
+        let cycles = f
+            .host
+            .cycle(&mut f.machine, &module, &mut || {
+                asks += 1;
+                asks >= 20
+            })
+            .expect("cycled");
 
         assert_eq!(
             cycles.ended,
@@ -7527,7 +7574,7 @@ mod tests {
         while dispatched == 0 {
             calls += 1;
             assert!(calls < 20, "the kick never came due");
-            let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+            let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
             assert_eq!(
                 cycles.iterations, 1,
                 "nothing is ever pending here, so every call returns on its first pass"
@@ -7537,7 +7584,7 @@ mod tests {
 
         assert_eq!(dispatched, 1, "the kick fired, once");
         assert_eq!(calls, 4, "two reads to the second, two seconds to the kick");
-        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(cycles.ended, Ended::Idle, "and then there was nothing left");
     }
 
@@ -7572,9 +7619,9 @@ mod tests {
             // what `Ended::Waiting` tells it to do -- and the next call has
             // all of them to catch up in one go.
             f.host.set_clock(Clock::pinned(1_135_952_405));
-            f.host.cycle(&mut f.machine, &module, 10).expect("first");
+            f.host.cycle(&mut f.machine, &module, &mut || false).expect("first");
             f.host.set_clock(Clock::pinned(1_135_952_405 + elapsed));
-            f.host.cycle(&mut f.machine, &module, 10).expect("second").dispatched
+            f.host.cycle(&mut f.machine, &module, &mut || false).expect("second").dispatched
         };
         let fired = |elapsed| dispatches(true, elapsed) - dispatches(false, elapsed);
 
@@ -7610,11 +7657,11 @@ mod tests {
         let (mut f, module, _rou) = polling_fixture();
 
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, 10).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
         let before = f.host.globals().word(&f.machine, "ticker").expect("ticker is a placed global");
 
         f.host.set_clock(Clock::pinned(1_135_952_405 + 4));
-        f.host.cycle(&mut f.machine, &module, 10).expect("second call owes four seconds");
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("second call owes four seconds");
         let after = f.host.globals().word(&f.machine, "ticker").expect("read");
 
         assert_eq!(
@@ -7636,14 +7683,14 @@ mod tests {
         let (mut f, module, _rou) = polling_fixture();
 
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, 10).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
         f.host
             .globals()
             .write(&mut f.machine, "ticker", &65535u16.to_le_bytes())
             .expect("ticker is a placed global");
 
         f.host.set_clock(Clock::pinned(1_135_952_405 + 1));
-        f.host.cycle(&mut f.machine, &module, 10).expect("one more second elapses");
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("one more second elapses");
 
         assert_eq!(
             f.host.globals().word(&f.machine, "ticker").expect("read"),
@@ -7671,7 +7718,7 @@ mod tests {
         f.host.set_clock(Clock::pinned(1_135_952_405));
         f.host.refill_polls(&mut f.machine, 5).expect("armed");
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 100).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         let census = f.host.take_census();
 
         assert_eq!(cycles.dispatched, 5, "the budget bought five dispatches");
@@ -7722,7 +7769,7 @@ mod tests {
         f.host.kicks.push(Kick { delay: 60, dstrou: rou });
         f.host.set_clock(Clock::pinned(1_135_952_405));
 
-        let first = f.host.cycle(&mut f.machine, &module, 10).expect("cycled");
+        let first = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(first.iterations, 1, "nothing pending; one pass");
         f.host.drain_notes();
 
@@ -7730,7 +7777,7 @@ mod tests {
         // woke two seconds later on input that turned out to be nothing.
         f.host.set_clock(Clock::pinned(1_135_952_405 + 2));
 
-        let second = f.host.cycle(&mut f.machine, &module, 10).expect("cycled");
+        let second = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(second.iterations, 1, "still nothing pending; still one pass");
         assert_eq!(second.dispatched, 0, "and nothing was dispatched at all");
 
@@ -7788,7 +7835,7 @@ mod tests {
         f.host.kicks.push(Kick { delay: 60, dstrou: rou });
         f.host.set_clock(Clock::pinned(1_135_952_405));
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 10_000).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
         assert_eq!(
             cycles.ended,
@@ -7821,7 +7868,7 @@ mod tests {
         f.host.kicks.push(Kick { delay: 7, dstrou: rou });
         f.host.kicks.push(Kick { delay: 45, dstrou: rou });
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 10).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
         assert_eq!(
             cycles.ended,
@@ -7840,7 +7887,7 @@ mod tests {
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
         f.host.refill_polls(&mut f.machine, 5).expect("armed");
-        let cycles = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
         assert_eq!(cycles.dispatched, 5, "the budget, not the pass bound");
         assert_eq!(
@@ -7864,11 +7911,11 @@ mod tests {
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
         f.host.refill_polls(&mut f.machine, 3).expect("armed");
-        let first = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        let first = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(first.dispatched, 3);
 
         f.host.refill_polls(&mut f.machine, 3).expect("armed again");
-        let second = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        let second = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(second.dispatched, 3, "the second burst polls too");
     }
 
@@ -7885,7 +7932,7 @@ mod tests {
         f.host.refill_polls(&mut f.machine, 100).expect("armed");
         // One pass: dispatches one poll, and `dopoll` re-arms because budget
         // remains. So a status is queued when the refill below runs.
-        let _ = f.host.cycle(&mut f.machine, &module, 1).expect("cycled");
+        let _ = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         f.host.refill_polls(&mut f.machine, 100).expect("refilled while armed");
 
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(gsbl::Gsbl::POLSTS));
@@ -7941,7 +7988,7 @@ mod tests {
         );
 
         // And they are not merely queued: both armings become dispatches.
-        let cycles = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(
             cycles.dispatched, 101,
             "the budget plus one, and the plus one is the point: when the \
@@ -7976,7 +8023,7 @@ mod tests {
             !f.host.gsbl().polling_armed(console),
             "a budget of zero arms nothing, or it buys a poll it did not grant"
         );
-        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(cycles.dispatched, 0);
     }
 
@@ -7990,13 +8037,13 @@ mod tests {
         f.host.set_clock(Clock::pinned(1_135_952_405));
 
         f.host.refill_polls(&mut f.machine, 2).expect("armed");
-        let cut = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        let cut = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(cut.ended, Ended::Waiting { next_kick: 60, polls_cut: true });
 
         // Nothing polling: the budget is untouched, so nothing was cut.
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, None).expect("channel 0");
         f.host.refill_polls(&mut f.machine, 2).expect("nothing to arm");
-        let uncut = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        let uncut = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         assert_eq!(uncut.ended, Ended::Waiting { next_kick: 60, polls_cut: false });
     }
 
@@ -8065,7 +8112,7 @@ mod tests {
 
         f.host.gsbl_mut().push_input(console, b"look\r");
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 4).expect("cycle runs");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycle runs");
         match cycles.ended {
             Ended::Stopped(mbbs_machine::m16::Poison::Fault { .. }, Some(chan)) => {
                 assert_eq!(
@@ -8085,12 +8132,12 @@ mod tests {
     fn a_clock_that_goes_backwards_resyncs_instead_of_firing_four_billion_rounds() {
         let (mut f, module, rou) = polling_fixture();
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        let _ = f.host.cycle(&mut f.machine, &module, 1).expect("cycled");
+        let _ = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
         f.host.kicks.push(Kick { delay: 1, dstrou: rou });
         f.host.set_clock(Clock::pinned(1_135_952_000));
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 3).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
         assert_eq!(cycles.dispatched, 0, "going backwards fires nothing");
         assert!(
@@ -8109,7 +8156,7 @@ mod tests {
         f.host.set_clock(Clock::pinned(1_135_952_405));
         f.host.kicks.push(Kick { delay: 2, dstrou: rou });
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 3).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
         assert_eq!(cycles.dispatched, 0, "no second has elapsed yet");
         assert_eq!(
@@ -8136,8 +8183,15 @@ mod tests {
         f.host.set_clock(Clock::stepped(1_135_952_405, 1));
 
         let n = 100_000;
+        let mut left = n;
         let at = std::time::Instant::now();
-        let idle = f.host.cycle(&mut f.machine, &module, n).expect("cycled");
+        let idle = f
+            .host
+            .cycle(&mut f.machine, &module, &mut || {
+                left -= 1;
+                left == 0
+            })
+            .expect("cycled");
         let each = at.elapsed() / idle.iterations as u32;
         eprintln!("{} idle passes, {each:?} each", idle.iterations);
 
@@ -8145,8 +8199,15 @@ mod tests {
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
         f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
+        let mut left = n;
         let at = std::time::Instant::now();
-        let busy = f.host.cycle(&mut f.machine, &module, n).expect("cycled");
+        let busy = f
+            .host
+            .cycle(&mut f.machine, &module, &mut || {
+                left -= 1;
+                left == 0
+            })
+            .expect("cycled");
         let each = at.elapsed() / busy.iterations as u32;
         eprintln!("{} dispatching passes, {each:?} each", busy.iterations);
     }
