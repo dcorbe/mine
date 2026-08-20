@@ -439,43 +439,6 @@ impl PollCensus {
 /// pass under a second cannot have cost the module a timer.
 const STALL_FLOOR: Duration = Duration::from_secs(1);
 
-/// How long one [`Host::cycle`] call may spend before it hands control back,
-/// regardless of how many passes that took.
-///
-/// `max` -- `--passes`, 32 by default -- is a *count*, and the thing that
-/// actually matters is time: `mbbs-server`'s loop reads the socket in exactly
-/// one place, so a keystroke arriving just after `cycle` was entered waits for
-/// the whole call. `--passes`'s own doc records the tuning that produced 32,
-/// measured at 104-352ms per call on the 16-bit board.
-///
-/// A count cannot hold that promise across boards. On the 32-bit module the
-/// same 32 passes take 4-7 seconds: each pass drives the module's realtime
-/// engine through roughly 60,000 shim dispatches -- `MBBS_TRACE_SHIMS` counted
-/// 1,918,319 `ptrblok` calls in one session, 99.7% of its traffic -- so
-/// per-pass cost is two orders of magnitude larger than when 32 was chosen,
-/// and the host reports "one pass took 7.5s" while a player waits that long to
-/// see a keystroke echo.
-///
-/// So the loop stops on whichever bound comes first. A slower board does fewer
-/// passes rather than overrunning; a faster one still gets its 32. This is what
-/// makes the count a safety net instead of the only bound.
-///
-/// # Verified by measurement, not by a unit test
-///
-/// Stated because the gap matters: this is checked against the live 32-bit
-/// board -- the same scripted session goes from 11 stall notes, worst pass
-/// 7.4s, to none -- and `mbbs-server`'s
-/// `the_pass_bound_sits_below_the_poll_budget_so_a_burst_stays_interruptible`
-/// still holds, which this only strengthens.
-///
-/// There is no unit test. `Host::cycle`'s test fixtures reach a terminal state
-/// of their own -- `Ended::Idle` with nothing queued, or a stop on an
-/// unresolved thunk once input is pushed -- before either bound is reached, so
-/// every assertion I could get out of them would be measuring that stop rather
-/// than this budget. A test that cannot fail for the right reason is worse than
-/// the absence of one, so this is the absence, said out loud.
-const PASS_BUDGET: Duration = Duration::from_millis(250);
-
 /// Whether one pass of [`Host::cycle`] took long enough to be worth reporting,
 /// and what to say about it.
 ///
@@ -1528,12 +1491,6 @@ pub struct Host<A: Abi> {
     /// and which is not hot by construction: a `Datum` resolves at load time
     /// and never traps, and an `Unimplemented` stops the module.
     resolved: Vec<Option<(shims::Shim<A>, shims::Cleans)>>,
-
-    /// How long one [`Host::cycle`] call may run. See [`PASS_BUDGET`], which is
-    /// the default; a field so a test can shrink it instead of burning the real
-    /// budget in wall-clock, and so an operator can retune it without a
-    /// rebuild.
-    pass_budget: Duration,
 }
 
 /// What `poll` does with a status.
@@ -1852,7 +1809,6 @@ impl<A: Abi> Host<A> {
             inited: false,
             survey: None,
             resolved: Vec::new(),
-            pass_budget: PASS_BUDGET,
         };
 
         // `clock()` counts from here. Set after construction because
@@ -2148,11 +2104,6 @@ impl<A: Abi> Host<A> {
     /// `inventory` is a shared handle rather than a value this method takes
     /// ownership of, because `Host` does not live long enough to be trusted
     /// with the only copy -- see this struct's own `survey` field.
-    /// Retune how long one [`Host::cycle`] call may run. See [`PASS_BUDGET`].
-    pub fn set_pass_budget(&mut self, budget: Duration) {
-        self.pass_budget = budget;
-    }
-
     pub fn enable_survey(&mut self, inventory: survey::Shared) {
         self.survey = Some(inventory);
     }
@@ -4119,21 +4070,11 @@ impl<A: Abi> Host<A> {
         // the first pass is charged for its own work and not for the vector's.
         let mut pass_mark = std::time::Instant::now();
 
-        // Whichever bound comes first -- see `PASS_BUDGET`.
-        let cycle_start = std::time::Instant::now();
+        // No clock bound. `max` -- `--passes` -- is the only bound on a cycle,
+        // and it defaults to unbounded, so a cycle turns until the board goes
+        // idle. See `mbbs_server::DEFAULT_PASSES` for the measurement that
+        // retired the 250ms budget this loop used to carry.
         while iterations < max {
-            if iterations > 0 && cycle_start.elapsed() >= self.pass_budget {
-                let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
-                return Ok(Cycles {
-                    iterations,
-                    dispatched,
-                    // The same answer reaching `max` gives: `Ended::Bound`
-                    // is what drives `Wait::Now`, so the driver comes
-                    // straight back rather than sleeping on a board that
-                    // still has work queued.
-                    ended: Ended::Bound { next_kick },
-                });
-            }
             iterations += 1;
 
 
