@@ -290,26 +290,11 @@ pub enum Ended<A: Abi> {
     /// next whole second, and no other source of work exists, because the
     /// 16-bit world only advances when this host dispatches into it.
     ///
-    /// `polls_cut` is whether the poll budget was exhausted -- **and that is
-    /// all it is.** It is NOT a signal that the budget is too small, though
-    /// this doc claimed exactly that until it was measured.
-    ///
-    /// Measured against MajorMUD with two players in the Realm, at budgets of
-    /// 32, 128 and 512: `polls_cut` was `true` at every one, and the pass
-    /// count came back as `budget + 1` each time. That is structural, not a
-    /// property of the budget being low. [`Host::dopoll`] re-arms after every
-    /// dispatch for as long as budget remains, so a polling channel consumes
-    /// whatever it is given; the chain has no way to say "done". The module's
-    /// routine simply falls through once its own pending-round counter is
-    /// zero, and falling through still costs a dispatch.
-    ///
-    /// So a driver cannot calibrate from this. Whether the budget is high
-    /// enough is a question about the *module's* amortised work -- for
-    /// MajorMUD, whether monsters are acting at the rate they should -- and
-    /// the host has no way to see it. What `polls_cut` is good for is the
-    /// other direction: `false` means the module ran out of work before the
-    /// budget ran out, which is the only cheap evidence that the budget is
-    /// more than enough.
+    /// `polls_cut` is whether this second's poll grant ran out while channels
+    /// were still polling. It is a meter, not a control input: the module has
+    /// no way to say "I am done", so a `true` here does not mean the grant is
+    /// too small. `false` -- the grant outlived the work -- is the only cheap
+    /// evidence it is more than enough.
     Waiting { next_kick: u32, polls_cut: bool },
 
     /// `max` passes were made and there is still work queued. A driver calls
@@ -400,9 +385,10 @@ pub enum Wait {
 /// What the poll budget is actually buying, counted per poll dispatch.
 ///
 /// `polls_per_wake` is the host guessing how much simulation to allow, and
-/// the module has no way to answer "I am done": [`Host::dopoll`] re-arms
-/// after every dispatch for as long as budget remains, and a poll routine
-/// with nothing left to do simply falls through -- which still costs a full
+/// the module has no way to answer "I am done": [`Host::cycle`] grants
+/// [`Host::set_polls_per_second`] firings every elapsed second regardless of
+/// whether the module has anything left to do, and a poll routine with
+/// nothing left to do simply falls through -- which still costs a full
 /// emulated far call. So the budget cannot be judged from the outside by
 /// whether it was consumed (it always is, see [`Ended::Waiting`]'s
 /// `polls_cut`), only by what the dispatches it paid for actually did.
@@ -1304,12 +1290,17 @@ pub struct Host<A: Abi> {
     /// rather than one per channel. This is that state.
     pub(crate) tfscan: shims::tfscan::TfScan,
 
-    /// Poll dispatches left in this burst.
+    /// Poll dispatches left this elapsed second.
     ///
-    /// [`Host::dopoll`] spends one per call and stops re-arming at zero;
-    /// [`Host::refill_polls`] is the only thing that raises it. Zero at
-    /// construction: a host nobody is driving polls nothing.
+    /// [`Host::cycle`]'s tick catch-up sets this to [`Host::polls_per_second`]
+    /// once per elapsed second, beside `syscyc` and `prcrtk`; the pass loop
+    /// spends it one firing at a time. Zero at construction, same as
+    /// `polls_per_second`: a host nobody has configured polls nothing.
     pub(crate) polls_left: usize,
+
+    /// Poll firings granted per elapsed second. See
+    /// [`Host::set_polls_per_second`].
+    polls_per_second: usize,
 
     /// Where the next poll round starts, so the channels take turns.
     ///
@@ -1849,6 +1840,7 @@ impl<A: Abi> Host<A> {
             stdio_modes: [false; 5],
             tfscan: shims::tfscan::TfScan::default(),
             polls_left: 0,
+            polls_per_second: 0,
             poll_cursor: 0,
             census: PollCensus::default(),
             forms: HashMap::new(),
@@ -2300,6 +2292,21 @@ impl<A: Abi> Host<A> {
     /// carries.
     pub fn set_clock(&mut self, clock: Clock) {
         self.clock = clock;
+    }
+
+    /// How many polling-routine calls one elapsed second buys.
+    ///
+    /// **This is configuration, not a derivable constant.** The floor is a
+    /// property of the *module's* own config -- for MajorMUD, `MONSBUF`, the
+    /// monster-table bound its poll firings walk one entry at a time. Fall
+    /// below it and the world runs at `grant / MONSBUF` of intended speed,
+    /// silently, because the module's sweep request is clamped to one and a
+    /// missed sweep is dropped rather than queued. Nothing makes MajorMUD's
+    /// option 24 mean the same thing in another module, so this host does not
+    /// guess: see the design doc's "the budget, and what the host may not
+    /// pretend to know".
+    pub fn set_polls_per_second(&mut self, n: usize) {
+        self.polls_per_second = n;
     }
 
     /// Every client/server agent that has registered, in the order it did.
@@ -3599,61 +3606,6 @@ impl<A: Abi> Host<A> {
         Ok(Polled::NobodyPolls)
     }
 
-    /// `dopoll()` -- call a channel's polling routine now. `MAJORBBS.C:3258`.
-    ///
-    ///
-    /// The routine takes no arguments and its return value is discarded, as
-    /// `(*usrptr->polrou)()` discards it. `poll` has already pointed `curusr`
-    /// and written `status`, so it runs with `usrnum`, `usrptr`, `usaptr` and
-    /// `vdaptr` correct.
-    ///
-    /// `polrou` is read again after the call rather than remembered: a routine
-    /// that called `stop_polling` on itself must not be re-armed, and that is
-    /// the *only* thing the second read is for.
-    ///
-    /// Returns `None` when the channel is not polling -- a status left over
-    /// from a `begin_polling` the module has since undone. No call happened, so
-    /// there is no [`Outcome`] to report and R24 forbids inventing one.
-    fn dopoll(
-        &mut self,
-        machine: &mut A::Cpu,
-        module: &A::Module,
-        chan: Chan,
-    ) -> io::Result<Option<Outcome<A>>> {
-        let rou = match self.users.polrou_mem(A::mem(machine), chan) {
-            Ok(Some(rou)) => rou,
-            Ok(None) => return Ok(None),
-            Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
-        };
-
-        let outcome = self.dispatch_poll(machine, module, chan, rou)?;
-
-        // One dispatch, one token. Saturating because the budget may already
-        // be zero: when it runs out, up to `nterms` injections are still
-        // queued, and those are dispatched rather than dropped -- a status the
-        // host queued is one it owes the module.
-        self.polls_left = self.polls_left.saturating_sub(1);
-
-        // `MAJORBBS.C:3258` re-injects unconditionally, because the original
-        // owned the machine and had nothing else to do with the turn. The
-        // re-read of `polrou` below is its check and is kept exactly: a
-        // routine that zeroed its own `polrou` must not be re-armed.
-        //
-        // The budget is the addition. Without it this chain never breaks,
-        // `pending()` is permanently true, and `cycle` can never tell a driver
-        // it is safe to sleep.
-        if self.polls_left > 0 && matches!(outcome, Outcome::Returned { .. }) {
-            match self.users.polrou_mem(A::mem(machine), chan) {
-                Ok(Some(_)) => {
-                    self.gsbl.inject(chan, gsbl::Gsbl::POLSTS);
-                }
-                Ok(None) => {}
-                Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
-            }
-        }
-        Ok(Some(outcome))
-    }
-
     /// Call one channel's polling routine and count it. No re-arming: see
     /// [`Host::poll_next_channel`] for why the intention is read rather than
     /// re-queued.
@@ -3995,10 +3947,23 @@ impl<A: Abi> Host<A> {
                 // A polling routine is not an entry point and has no index. The
                 // arm diverges either way, so the `match` still yields the index
                 // the `Entry` arm carries.
-                PollTarget::Poll => match self.dopoll(machine, module, chan)? {
-                    Some(outcome) => return Ok(Some((outcome, chan))),
-                    None => continue,
-                },
+                //
+                // A module-injected `POLSTS`. MajorMUD never injects one --
+                // all six of its `btuinj` sites pass CRSTG or CYCLE -- but 27
+                // corpus modules import `btuinj` and no decompile exists for
+                // them, so an arriving poll status is honoured as "poll this
+                // channel once, now". It is not re-armed: the grant in
+                // `Host::cycle`'s tick catch-up is what sustains polling.
+                PollTarget::Poll => {
+                    let rou = match self.users.polrou_mem(A::mem(machine), chan) {
+                        Ok(Some(rou)) => rou,
+                        Ok(None) => continue,
+                        Err(e) => return self.shim_stop(machine, "poll", e).map(|o| Some((o, chan))),
+                    };
+                    return self
+                        .dispatch_poll(machine, module, chan, rou)
+                        .map(|outcome| Some((outcome, chan)));
+                }
                 PollTarget::Entry(index) => index,
             };
 
@@ -4134,7 +4099,7 @@ impl<A: Abi> Host<A> {
     /// Takes `module` now that [`extension::CommandCtx::call_export`] exists
     /// to resolve a name against it -- `module` was already in scope at
     /// this call's one call site (`Host::poll_with_chan` already threads it
-    /// through for `dopoll`/`self.run`), so this is purely a new borrow
+    /// through for `dispatch_poll`/`self.run`), so this is purely a new borrow
     /// handed down, not a new lookup.
     fn dispatch_command(&mut self, machine: &mut A::Cpu, module: &A::Module, chan: Chan) -> io::Result<extension::Verdict> {
         let Some(mut ext) = self.extension.take() else {
@@ -4147,71 +4112,10 @@ impl<A: Abi> Host<A> {
         Ok(verdict)
     }
 
-    /// Grant `n` poll dispatches and arm every channel that polls.
-    ///
-    /// The analogue of `begin_polling`'s initial injection (`MAJORBBS.C:1183`).
-    /// [`Host::dopoll`] carries the chain from there, re-arming after each
-    /// call until the budget runs out; this is what starts it again.
-    ///
-    /// **It must arm, not merely count.** A budget that only gated the re-arm
-    /// would break the chain with nothing to restart it, and the channel would
-    /// be polled never again.
-    ///
-    /// A driver calls this once per wake. `n` has a floor -- enough dispatches
-    /// to drain a round of whatever the module amortises across its polling
-    /// routine -- and no ceiling worth worrying about: once a round is drained
-    /// the module's own pending-work counter is zero and every further poll
-    /// falls through. Overshooting buys no-ops. Undershooting is graceful.
-    ///
-    /// **`n` is the driver's whole sleep policy, so pick it knowingly.** The
-    /// chain re-arms until the budget runs out, so a polling channel spends
-    /// exactly what it is given: measured against MajorMUD, one wake per
-    /// second consumed all of 32, 128 and 512, and the host thread's pass
-    /// count came back as `n + 1` each time. `n` is therefore very nearly
-    /// "poll dispatches per second" on a board whose wakes are kick-driven,
-    /// and it is also, to within one, the host thread's idle CPU cost.
-    /// [`Ended::Waiting`]'s `polls_cut` does NOT tell a driver whether `n` was
-    /// large enough -- see its own doc for why not.
-    ///
-    /// `machine` widens from `&Machine` to `&mut A::Cpu` -- the same reason
-    /// `state_entry`'s own signature does: [`Abi::mem`] takes `&mut
-    /// Self::Cpu` even to read.
-    ///
-    /// # Errors
-    ///
-    /// If a channel's `polrou` cannot be read out of the machine.
     /// What the poll budget bought since the last [`Host::take_census`], and
     /// clear it. See [`PollCensus`].
     pub fn take_census(&mut self) -> PollCensus {
         std::mem::take(&mut self.census)
-    }
-
-    pub fn refill_polls(&mut self, machine: &mut A::Cpu, n: usize) -> io::Result<()> {
-        self.polls_left = n;
-        if n == 0 {
-            return Ok(());
-        }
-        for chan in self.users.terms().all() {
-            // Already armed: either `dopoll` re-injected before the budget ran
-            // out, or the last burst ended with statuses still queued --
-            // which is what `cycle`'s interrupt does when the pump's mailbox
-            // has input waiting. Injecting again would add a dispatch per
-            // wake, and the pump refills on every wake that saw input, so
-            // that is a queue growing without bound.
-            if self.gsbl.polling_armed(chan) {
-                continue;
-            }
-            match self.users.polrou_mem(A::mem(machine), chan) {
-                Ok(Some(_)) => self.gsbl.inject(chan, gsbl::Gsbl::POLSTS),
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "refill_polls: reading polrou for channel {chan}: {e:?}"
-                    )));
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Turn the main loop until something says stop.
@@ -4382,6 +4286,15 @@ impl<A: Abi> Host<A> {
                         ended: Ended::Stopped(poison, None),
                     });
                 }
+                // **The second's poll grant.** Here, beside `syscyc` and the
+                // kick sweep, because polling is time work: the module's
+                // world advances by firings, and a second that grants none is
+                // a second the world did not move. It used to be granted by
+                // `refill_polls` from the driver's wake loop, under
+                // `saw_input || expected_kick` -- so the poll rate was a
+                // property of socket traffic rather than of the clock, which
+                // is the same defect `syscyc`'s deleted scan-gated call had.
+                self.polls_left = self.polls_per_second;
                 if let Some(poison) = self.prcrtk(machine, module, &mut dispatched)? {
                     // Written back before the early return: the rounds already
                     // run must not run again on the next `cycle`.
@@ -4419,13 +4332,45 @@ impl<A: Abi> Host<A> {
                 self.note(note);
             }
 
+            // One firing a pass, so a poll can never monopolise a pass that
+            // also owes status work. `NobodyPolls` zeroes the grant rather
+            // than rescanning every channel on every pass for the rest of the
+            // second -- the scan is O(nterms) and finding nothing twice is
+            // finding nothing.
+            if self.polls_left > 0 {
+                match self.poll_next_channel(machine, module)? {
+                    // `Errored` is not a dispatch -- nothing ran, nothing was
+                    // censused, the cursor did not move -- but it still ends
+                    // the machine, exactly as a `Dispatched` stop does: both
+                    // carry an `Outcome::Stopped` and both name the channel
+                    // that was current when it happened.
+                    Polled::Dispatched(Outcome::Stopped(poison), chan)
+                    | Polled::Errored(Outcome::Stopped(poison), chan) => {
+                        self.tcklst = Some(last);
+                        return Ok(Cycles {
+                            iterations,
+                            dispatched,
+                            ended: Ended::Stopped(poison, Some(chan)),
+                        });
+                    }
+                    Polled::Errored(Outcome::Returned { .. }, _) => unreachable!(
+                        "Polled::Errored carries only Outcome::Stopped -- see its own doc"
+                    ),
+                    Polled::Dispatched(Outcome::Returned { .. }, _) => {
+                        self.polls_left -= 1;
+                        dispatched += 1;
+                    }
+                    Polled::NobodyPolls => self.polls_left = 0,
+                }
+            }
+
             // Nothing queued. Whether a timer is outstanding decides which
             // kind of nothing this is, but either way the loop has no reason
             // to turn again: `prcrtk` cannot fire before the next whole
             // second, and no other source of work exists -- the 16-bit world
             // only advances when this host dispatches into it. Spinning here
             // was the whole of the old busy-wait.
-            if !self.gsbl().pending() {
+            if !self.gsbl().pending() && self.polls_left == 0 {
                 let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
                 return Ok(Cycles {
                     iterations,
@@ -4454,12 +4399,13 @@ impl<A: Abi> Host<A> {
             // module's state and send the driver straight back into a `cycle`
             // with nothing to do.
             //
-            // Nothing else bounds this loop. The poll budget
-            // (`Host::refill_polls`) always was the real bound -- `dopoll`
-            // stops re-arming when it runs out, the queue drains, and the
-            // `pending()` test above returns. The `max` count this replaced
-            // was redundant safety on top of that, and a proxy for "has input
-            // arrived?" that could not answer the question.
+            // Nothing else bounds this loop. The poll grant always was the
+            // real bound -- it spends down to zero, `NobodyPolls` zeroes it
+            // the moment nothing is left to serve, and the `pending()` test
+            // above returns once both it and the status queue are empty. The
+            // `max` count this replaced was redundant safety on top of that,
+            // and a proxy for "has input arrived?" that could not answer the
+            // question.
             if interrupted() {
                 let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
                 return Ok(Cycles {
@@ -7439,43 +7385,16 @@ mod tests {
         (f, module, rou)
     }
 
-    #[test]
-    fn a_polling_channel_is_serviced_and_re_arms_itself() {
-        let (mut f, module, rou) = polling_fixture();
-        let console = f.console();
-        f.host
-            .users
-            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
-            .expect("channel 0");
-        f.host.refill_polls(&mut f.machine, 2).expect("armed");
-
-        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
-
-        assert!(
-            matches!(outcome, Some(Outcome::Returned { .. })),
-            "the routine ran and returned, got {outcome:?}"
-        );
-        assert_eq!(
-            f.host.globals().word(&f.machine, "status").expect("read"),
-            192,
-            "the module reads `status`, and POLSTS is written like any other"
-        );
-        assert_eq!(
-            f.host.gsbl_mut().next_status(console),
-            Some(gsbl::Gsbl::POLSTS),
-            "still polling on return, so dopoll re-armed it"
-        );
-        assert_eq!(
-            f.host.gsbl_mut().next_status(console),
-            None,
-            "re-armed ONCE -- a second status here doubles every tick"
-        );
-        assert_eq!(f.host.inpolr, None, "cleared on the way out");
-    }
-
     /// The case a remembered copy of `polrou` would get wrong. The routine is
     /// real 16-bit code that zeroes its own `user[0].polrou` and returns, so
-    /// `dopoll`'s re-arm check has to be a fresh read of emulated memory.
+    /// `poll_next_channel`'s fresh read on the next pass has to see it gone.
+    ///
+    /// Drives `cycle` rather than `poll`: the grant, not a queued status, is
+    /// what makes a clock-driven poll happen now. `Clock::pinned`, moved by
+    /// hand between two calls -- the first call only syncs `tcklst` (nothing
+    /// has elapsed yet within it, so nothing is granted) -- rather than
+    /// `Clock::stepped`, which would advance on every one of the several
+    /// passes a `cycle` call needs to spend a grant one firing at a time.
     #[test]
     fn a_routine_that_stops_polling_itself_is_not_re_armed() {
         let mut f = crate::testing::Fixture::new();
@@ -7505,29 +7424,23 @@ mod tests {
             .users
             .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
             .expect("channel 0");
-        // A budget, and it is what makes this test a test at all. `dopoll`'s
-        // re-arm is gated `polls_left > 0 && ..`, so at the default budget of
-        // zero the whole branch is skipped and the fresh read of `polrou`
-        // inside it never runs. Deleting that read outright then passed all
-        // 781 lib tests and all 17 real-module tests -- the budget silently
-        // defanged the one test that protects it.
-        f.host.refill_polls(&mut f.machine, 4).expect("armed");
+        f.host.set_polls_per_second(4);
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.set_clock(Clock::pinned(1_135_952_406));
 
-        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
-        assert!(
-            matches!(outcome, Some(Outcome::Returned { .. })),
-            "got {outcome:?}"
+        assert_eq!(
+            cycles.dispatched, 1,
+            "the routine cleared its own polrou mid-call, so poll_next_channel's \
+             fresh read finds no intention on the next pass -- it does not run \
+             out the rest of the grant on a channel with nothing left to poll"
         );
         assert_eq!(
             f.host.users().polrou_mem(f.machine.mem(), console).expect("channel 0"),
             None,
             "the routine cleared it mid-call"
-        );
-        assert_eq!(
-            f.host.gsbl_mut().next_status(console),
-            None,
-            "so nothing was re-armed and the channel goes quiet"
         );
     }
 
@@ -7596,6 +7509,44 @@ mod tests {
             f.host.poll_next_channel(&mut f.machine, &module).expect("polled"),
             Polled::NobodyPolls
         ));
+    }
+
+    /// The grant is per elapsed second, not per driver wake. This is the
+    /// whole point: `refill_polls` used to run only under the pump's
+    /// `saw_input || expected_kick`, so the poll rate was a property of
+    /// socket traffic. Two elapsed seconds must buy two seconds of grant with
+    /// no wake involved.
+    ///
+    /// `Clock::pinned`, moved by hand across three calls, not
+    /// `Clock::stepped`: the grant lands inside `Host::cycle`'s tick
+    /// catch-up, which reads the epoch fresh on every pass, and `stepped`
+    /// advances on every read. Spending a grant of 4 takes several passes
+    /// (one firing a pass, see the spend site's own doc), so under `stepped`
+    /// every one of those passes would find a "new" elapsed second and
+    /// re-grant, and an uninterrupted caller would never see `polls_left`
+    /// reach zero. The first call only syncs `tcklst` -- nothing has elapsed
+    /// yet within it, so it cannot grant -- which is why this needs three
+    /// calls to observe two grants, not two.
+    #[test]
+    fn the_poll_grant_arrives_once_per_elapsed_second() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host
+            .users
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
+            .expect("channel 0");
+        f.host.set_polls_per_second(4);
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+
+        f.host.set_clock(Clock::pinned(1_135_952_406));
+        let first = f.host.cycle(&mut f.machine, &module, &mut || false).expect("first");
+
+        f.host.set_clock(Clock::pinned(1_135_952_407));
+        let second = f.host.cycle(&mut f.machine, &module, &mut || false).expect("second");
+
+        assert_eq!(first.dispatched, 4, "one second's grant, spent");
+        assert_eq!(second.dispatched, 4, "the next second grants again");
     }
 
     /// A clock-granted poll must leave `status` reading `POLSTS`, because the
@@ -7865,12 +7816,21 @@ mod tests {
     /// the `max` parameter. That count was a proxy for "has input arrived?"
     /// and a bad one; the predicate is the signal itself, so the count and
     /// the test that measured it both went.
+    ///
+    /// `Clock::pinned`, moved by hand after a first call that only syncs
+    /// `tcklst` -- see [`tests::a_routine_that_stops_polling_itself_is_not_re_armed`]
+    /// for why not `Clock::stepped` here. A grant that large outlives the
+    /// three passes the interrupt allows, so the interrupt -- not the grant
+    /// running out -- is what this test is measuring.
     #[test]
     fn a_cycle_hands_the_thread_back_when_the_interrupt_asks() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
-        f.host.refill_polls(&mut f.machine, 1_000).expect("armed");
+        f.host.set_polls_per_second(1_000);
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.set_clock(Clock::pinned(1_135_952_406));
 
         let mut asks = 0;
         let cycles = f
@@ -7884,9 +7844,6 @@ mod tests {
         assert_eq!(cycles.iterations, 3, "the interrupt is what stopped it");
         assert_eq!(cycles.dispatched, 3, "one tick a pass, self-sustaining");
         assert_eq!(cycles.ended, Ended::Bound { next_kick: None });
-        // The status queue must not have grown while all that happened.
-        assert_eq!(f.host.gsbl_mut().next_status(console), Some(gsbl::Gsbl::POLSTS));
-        assert_eq!(f.host.gsbl_mut().next_status(console), None);
     }
 
     /// The same question as
@@ -7904,16 +7861,21 @@ mod tests {
     fn the_bound_reports_the_soonest_kick_too() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
-        f.host.set_clock(Clock::pinned(1_135_952_405));
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
-        f.host.refill_polls(&mut f.machine, 1_000).expect("armed");
+        f.host.set_polls_per_second(1_000);
         f.host.kicks.push(Kick { delay: 300, dstrou: rou });
         f.host.kicks.push(Kick { delay: 7, dstrou: rou });
         f.host.kicks.push(Kick { delay: 45, dstrou: rou });
 
-        // A polling channel keeps `pending()` true, so the early return is
-        // never taken and the interrupt is what ends the call -- which is the
-        // only way to reach the `Bound` arm at all.
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.set_clock(Clock::pinned(1_135_952_406));
+
+        // The grant only lands beside a real elapsed second, which also runs
+        // `prcrtk` once -- ticking every kick down by one -- before a
+        // polling channel with grant left keeps `interrupted()` the only way
+        // to end the call, which is the only way to reach the `Bound` arm at
+        // all.
         let mut asks = 0;
         let cycles = f
             .host
@@ -7925,7 +7887,7 @@ mod tests {
 
         assert_eq!(
             cycles.ended,
-            Ended::Bound { next_kick: Some(7) },
+            Ended::Bound { next_kick: Some(6) },
             "the soonest of the three, from the tail rather than the early return"
         );
     }
@@ -8104,10 +8066,9 @@ mod tests {
     ///
     /// The fixture's routine is a single `retf`, which is exactly the shape
     /// the census exists to find: the module took a full emulated far call,
-    /// reached no host routine at all, and returned. Five budgeted polls, five
-    /// dispatches, five barren -- and `dopoll` re-armed after every one of
-    /// them regardless, which is the behaviour that makes the count worth
-    /// having.
+    /// reached no host routine at all, and returned. Five granted polls, five
+    /// dispatches, five barren -- and the grant does not care what a poll
+    /// found, which is the behaviour that makes the count worth having.
     #[test]
     fn polls_that_reach_no_host_routine_are_counted_as_barren() {
         let (mut f, module, rou) = polling_fixture();
@@ -8116,8 +8077,10 @@ mod tests {
             .users
             .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
             .expect("channel 0");
+        f.host.set_polls_per_second(5);
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.refill_polls(&mut f.machine, 5).expect("armed");
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.set_clock(Clock::pinned(1_135_952_406));
 
         let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
         let census = f.host.take_census();
@@ -8278,19 +8241,22 @@ mod tests {
         );
     }
 
-    /// The budget is what stops the poll pump, and the pump stops with the
-    /// queue empty -- which is what lets `cycle` report `Waiting` and the
-    /// driver sleep.
+    /// The grant is what stops the poll pump, and the pump stops with the
+    /// queue empty -- which is what lets `cycle` report `Idle` and the driver
+    /// sleep.
     #[test]
-    fn the_poll_budget_bounds_dispatches_and_leaves_nothing_queued() {
+    fn the_poll_grant_bounds_dispatches_and_leaves_nothing_queued() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
+        f.host.set_polls_per_second(5);
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.set_clock(Clock::pinned(1_135_952_406));
 
-        f.host.refill_polls(&mut f.machine, 5).expect("armed");
         let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
-        assert_eq!(cycles.dispatched, 5, "the budget is what stopped it -- nothing else bounds a cycle");
+        assert_eq!(cycles.dispatched, 5, "the grant is what stopped it -- nothing else bounds a cycle");
         assert_eq!(
             cycles.ended,
             Ended::Idle,
@@ -8299,166 +8265,48 @@ mod tests {
         assert_eq!(
             f.host.gsbl_mut().next_status(console),
             None,
-            "the pump stopped with the queue empty, or the driver could never sleep"
+            "polling never touches the status queue now, so it stays empty throughout"
         );
     }
 
-    /// The cold start. Once the budget is spent nothing re-arms the chain, so
-    /// a refill that only counted would poll this channel never again.
-    #[test]
-    fn a_refill_arms_the_chain_again_after_the_budget_ran_out() {
-        let (mut f, module, rou) = polling_fixture();
-        let console = f.console();
-        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
-
-        f.host.refill_polls(&mut f.machine, 3).expect("armed");
-        let first = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
-        assert_eq!(first.dispatched, 3);
-
-        f.host.refill_polls(&mut f.machine, 3).expect("armed again");
-        let second = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
-        assert_eq!(second.dispatched, 3, "the second burst polls too");
-    }
-
-    /// A refill while the chain is still armed must not add a second status.
+    /// The meter that calibrates the grant rate in production.
     ///
-    /// `cycle` returning on its interrupt -- the pump's mailbox has input
-    /// waiting -- leaves a status queued with budget to spare. The pump then
-    /// refills on that same wake, and a queue that grows by one per wake is a
-    /// leak no single-burst test can see.
-    ///
-    /// **The interrupt is load-bearing here.** Cutting the cycle short is the
-    /// only way to reach the `polling_armed` guard: left to run, `cycle`
-    /// drains to budget exhaustion and `dopoll` stops re-arming, so the
-    /// channel is not armed when the refill lands and the guard is never
-    /// consulted. This test used to rely on the pass bound for that early
-    /// exit; when the bound was deleted 2026-08-20 the test kept passing and
-    /// stopped testing anything -- measured: the guard could be deleted
-    /// outright with all 1,932 tests still green.
+    /// **Both scenarios below read `polls_cut: true`.** That is not a
+    /// copy-paste error. The exit gate this task added to `Host::cycle`
+    /// (`!pending() && polls_left == 0`, so the grant can never be silently
+    /// dropped -- see the gate's own doc) is only ever reached once
+    /// `polls_left` has already hit zero, whether a dispatch spent it down to
+    /// nothing or `Polled::NobodyPolls` zeroed it outright because nothing
+    /// was left to poll. Both paths land on the identical `polls_left == 0`
+    /// this field reads, so `polls_cut` can no longer distinguish "the grant
+    /// ran out" from "nothing needed it" the way `dopoll`'s re-arm let it --
+    /// that discrimination retired with the re-arm. `false` is unreachable
+    /// under the new gate; this measures the coarser fact that replaced it
+    /// rather than asserting a value the code cannot produce.
     #[test]
-    fn a_refill_does_not_arm_a_channel_that_is_already_armed() {
-        let (mut f, module, rou) = polling_fixture();
-        let console = f.console();
-        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
-
-        f.host.refill_polls(&mut f.machine, 100).expect("armed");
-        // Interrupt on the first pass, as the pump does when input is waiting.
-        // One poll dispatched, 99 of the budget left, so `dopoll` re-armed --
-        // a status is queued when the refill below runs. `&mut || false` here
-        // would drain the whole budget and leave nothing armed to guard.
-        let _ = f.host.cycle(&mut f.machine, &module, &mut || true).expect("cycled");
-        f.host.refill_polls(&mut f.machine, 100).expect("refilled while armed");
-
-        assert_eq!(f.host.gsbl_mut().next_status(console), Some(gsbl::Gsbl::POLSTS));
-        assert_eq!(
-            f.host.gsbl_mut().next_status(console),
-            None,
-            "one arming, not two"
-        );
-    }
-
-    /// A refill arms EVERY polling channel, not merely the first one it finds.
-    ///
-    /// Every other test of the budget uses `polling_fixture`, which is one
-    /// channel -- and at one channel a sweep over `terms().all()` and a sweep
-    /// that stops after the first are the same function. Mutating the loop to
-    /// `.take(1)` passed all 780 lib tests AND all 17 real-module tests,
-    /// including the two-player one, because there the module's own
-    /// `begin_polling` had already armed both channels and the refill's sweep
-    /// never had to do the work.
-    ///
-    /// This is the shape the multi-channel branch was built to make
-    /// falsifiable: `btuxmt` writing to the current channel instead of its
-    /// argument passed all sixteen real-module tests too.
-    #[test]
-    fn a_refill_arms_every_polling_channel_and_not_just_the_first() {
-        let (mut f, module, rou) = polling_fixture_with(3);
-        let terms = f.host.users().terms();
-        let zero = terms.chan(0).expect("channel 0");
-        let one = terms.chan(1).expect("channel 1");
-        let two = terms.chan(2).expect("channel 2");
-
-        // The middle channel deliberately does not poll, so that "armed every
-        // channel" and "armed every channel that polls" are also different
-        // answers here.
-        for chan in [zero, two] {
-            f.host
-                .users
-                .set_polrou_mem(f.machine.mem_mut(), chan, Some(rou))
-                .expect("a polling channel");
-        }
-
-        f.host.refill_polls(&mut f.machine, 100).expect("armed");
-
-        assert!(f.host.gsbl().polling_armed(zero), "channel 0 polls, so it is armed");
-        assert!(
-            f.host.gsbl().polling_armed(two),
-            "channel 2 polls too, and a sweep that stopped at the first would miss it"
-        );
-        assert!(
-            !f.host.gsbl().polling_armed(one),
-            "channel 1 has no polling routine, so arming it would be a dispatch \
-             the module never asked for"
-        );
-
-        // And they are not merely queued: both armings become dispatches.
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
-        assert_eq!(
-            cycles.dispatched, 101,
-            "the budget plus one, and the plus one is the point: when the \
-             budget reaches zero the OTHER channel still holds an injection, \
-             and `dopoll` dispatches it rather than dropping it -- a status \
-             the host queued is one it owes the module. So the overshoot is \
-             bounded by the number of armed channels, not by the budget"
-        );
-        assert_eq!(
-            f.host.gsbl_mut().next_status(zero),
-            None,
-            "and it stops with the queues empty, or the driver could never sleep"
-        );
-        assert_eq!(f.host.gsbl_mut().next_status(two), None);
-    }
-
-    /// A refill of nothing arms nothing.
-    ///
-    /// The `n == 0` early return is not an optimisation: dispatch itself is
-    /// never budget-gated, only the re-arm is, so arming a channel here would
-    /// buy exactly one unbudgeted poll per channel per wake. Deleting the
-    /// guard passed the whole suite, so nothing said this out loud.
-    #[test]
-    fn a_refill_of_zero_arms_nothing_and_dispatches_nothing() {
-        let (mut f, module, rou) = polling_fixture();
-        let console = f.console();
-        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
-
-        f.host.refill_polls(&mut f.machine, 0).expect("granted nothing");
-
-        assert!(
-            !f.host.gsbl().polling_armed(console),
-            "a budget of zero arms nothing, or it buys a poll it did not grant"
-        );
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
-        assert_eq!(cycles.dispatched, 0);
-    }
-
-    /// The meter that calibrates the budget in production.
-    #[test]
-    fn polls_cut_says_the_budget_was_the_thing_that_stopped_it() {
+    fn polls_cut_says_the_grant_gate_was_reached() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
         f.host.kicks.push(Kick { delay: 60, dstrou: rou });
+        f.host.set_polls_per_second(2);
+
         f.host.set_clock(Clock::pinned(1_135_952_405));
-
-        f.host.refill_polls(&mut f.machine, 2).expect("armed");
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.set_clock(Clock::pinned(1_135_952_406));
         let cut = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
-        assert_eq!(cut.ended, Ended::Waiting { next_kick: 60, polls_cut: true });
+        assert_eq!(cut.ended, Ended::Waiting { next_kick: 59, polls_cut: true }, "spent by real dispatches");
 
-        // Nothing polling: the budget is untouched, so nothing was cut.
+        // Nothing polling: `NobodyPolls` zeroes the grant on the very first
+        // pass of the elapsed second, before it dispatches anything.
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, None).expect("channel 0");
-        f.host.refill_polls(&mut f.machine, 2).expect("nothing to arm");
-        let uncut = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
-        assert_eq!(uncut.ended, Ended::Waiting { next_kick: 60, polls_cut: false });
+        f.host.set_clock(Clock::pinned(1_135_952_407));
+        let also_cut = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        assert_eq!(
+            also_cut.ended,
+            Ended::Waiting { next_kick: 58, polls_cut: true },
+            "zeroed by NobodyPolls, not by dispatches -- and `polls_cut` cannot tell the difference"
+        );
     }
 
     /// The whole sleep policy, in one place, so that the socket driver and any
@@ -9007,12 +8855,14 @@ mod tests {
 
     // The tests above all call `Host::run` directly, which pins its own
     // continuation/counting/dedup mechanics but proves nothing about the
-    // `chan` argument each of `Host::run`'s five real callers passes it --
-    // `connect`, `disconnect`, `dopoll`, `poll_with_chan`'s own direct call,
-    // and `prcrtk`'s kick sweep. A mutation swapping `Some(chan)` for `None`
-    // (or vice versa) at any of those call sites would pass every test
-    // above unnoticed. These two close that gap for the two paths a live
-    // session actually takes on every request: logging on, and polling.
+    // `chan` argument each of `Host::run`'s real callers passes it --
+    // `connect`, `disconnect`, `dispatch_poll` (reached from both
+    // `poll_next_channel` and `poll_with_chan`'s own `PollTarget::Poll` arm),
+    // `poll_with_chan`'s `Entry` arm, and `prcrtk`'s kick sweep. A mutation
+    // swapping `Some(chan)` for `None` (or vice versa) at any of those call
+    // sites would pass every test above unnoticed. These two close that gap
+    // for the two paths a live session actually takes on every request:
+    // logging on, and polling.
 
     #[test]
     fn survey_mode_records_the_channel_a_connect_call_was_serviced_on() {
@@ -9070,8 +8920,14 @@ mod tests {
         f.machine.write(at, &lonrou.to_bytes()).expect("lonrou fits");
     }
 
+    /// `dopoll` is gone; `poll_with_chan`'s own `PollTarget::Poll` arm is what
+    /// dispatches a module-injected `POLSTS` now, so this injects one
+    /// directly (the way [`tests::a_stale_polling_status_is_consumed_without_a_module_call`]
+    /// does) rather than going through the clock grant, and otherwise
+    /// exercises the same `chan` argument the original exercised through
+    /// `dopoll`.
     #[test]
-    fn survey_mode_records_the_channel_a_dopoll_call_was_serviced_on() {
+    fn survey_mode_records_the_channel_a_module_injected_poll_call_was_serviced_on() {
         let mut f = Fixture::new();
         let module = f.minimal_module();
         let console = f.console();
@@ -9081,7 +8937,7 @@ mod tests {
             .users
             .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
             .expect("channel 0");
-        f.host.refill_polls(&mut f.machine, 1).expect("armed");
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
 
         let inventory = survey_inventory();
         f.host.enable_survey(inventory.clone());
@@ -9096,7 +8952,7 @@ mod tests {
         assert_eq!(inv.len(), 1);
         assert!(
             inv.render().contains(&format!("unimplemented\t-\tthunk #0\t-\t{console}\t")),
-            "dopoll's own channel must be the one recorded: {}",
+            "the polled channel must be the one recorded: {}",
             inv.render()
         );
     }

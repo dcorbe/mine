@@ -441,7 +441,10 @@ struct Drain {
     /// Never contains `In::Shutdown` -- see `stopping`.
     apply: Vec<In>,
     /// Whether anything in `apply` was real input rather than a bare
-    /// `In::Alarm` -- step 3's `expected_kick` companion.
+    /// `In::Alarm`. `life` no longer reads this: the poll-refill step it fed
+    /// (`saw_input || expected_kick`) was deleted 2026-08-20, when polling
+    /// moved to a clock-driven grant in `Host::cycle` instead of the pump's
+    /// own wakes.
     saw_input: bool,
     /// The first `In::Shutdown` drained, pulled out of `apply`'s batch
     /// because ending the loop is `life`'s job, not `apply`'s -- see
@@ -523,7 +526,6 @@ fn report_census<A: Abi>(
     due: &mut Instant,
     every: Option<Duration>,
     turns: &mut u64,
-    refills: &mut u64,
     worst_turn: &mut Duration,
 ) {
     let Some(every) = every else { return };
@@ -531,9 +533,8 @@ fn report_census<A: Abi>(
         return;
     }
     *due = Instant::now() + every;
-    let (loops, grants, longest) = (*turns, *refills, *worst_turn);
+    let (loops, longest) = (*turns, *worst_turn);
     *turns = 0;
-    *refills = 0;
     *worst_turn = Duration::ZERO;
     let census = host.take_census();
     if census.polls == 0 {
@@ -556,7 +557,7 @@ fn report_census<A: Abi>(
         worst = census.worst,
     );
     eprintln!(
-        "mbbs-server: census[m{who}]: {loops} driver turns, {grants} refills, \
+        "mbbs-server: census[m{who}]: {loops} driver turns, \
          worst cycle {longest:.0?} -- that is the ceiling on input latency",
         who = who.0,
     );
@@ -945,10 +946,9 @@ fn life<A: Abi>(
     let census_every = census_interval();
     let mut census_due = Instant::now();
     // Driver-loop counters for the same report: how many turns this interval
-    // took, how many of them granted a fresh poll budget, and the longest
-    // single `cycle` call -- the ceiling on input latency. Reset with it.
+    // took, and the longest single `cycle` call -- the ceiling on input
+    // latency. Reset with it.
     let mut turns = 0u64;
-    let mut refills = 0u64;
     let mut worst_turn = Duration::ZERO;
     // Messages `Host::cycle`'s interrupt took out of the mailbox and has not
     // handed to `apply` yet. At most one: the predicate stops filling it as
@@ -989,8 +989,7 @@ fn life<A: Abi>(
         //    taking one per wake would make a ten-line paste cost ten wakes.
         //    `In::Alarm` carries no work of its own (see its own doc) but
         //    still has to pass through `apply` so a driver here behaves
-        //    exactly like `apply`'s other callers -- `saw_input` is what
-        //    tells step 3 apart from a bare bell.
+        //    exactly like `apply`'s other callers.
         //
         //    `drain_turn` is what makes this run unconditionally, even when
         //    `wake` just reported `Gone` above: `peeked` was received before
@@ -1021,30 +1020,8 @@ fn life<A: Abi>(
             // only by a test that drives `run` with a channel of its own.
             return Ok(LifeEnd::Gone);
         }
-        let saw_input = batch.saw_input;
 
-        // 3. The pump as a derived clock (design doc §7): grant a fresh poll
-        //    budget only on a turn that had a reason to expect new work --
-        //    real input, or a `Wait::Until` deadline this same loop armed
-        //    for an outstanding kick. Never unconditionally: a turn reached
-        //    only by a stray `Alarm` while nothing was expected
-        //    (`Wait::Blocked` -- no kick was ever outstanding to ring for,
-        //    see `arm`) or by `Wait::Now`'s non-blocking peek (`Ended::Bound`
-        //    already has budget left over from the burst in progress, so
-        //    handing it a fresh one would just restart the countdown) is
-        //    left to run `cycle` on whatever `polls_left` already is --
-        //    ordinarily zero, which is exactly a `polling_armed` channel's
-        //    resting state between bursts. `syscyc` and `prcrtk`'s kick
-        //    sweep are unaffected either way: neither is gated on
-        //    `polls_left` (see `Host::cycle`), so they run regardless -- the
-        //    "free rider" design doc §7 names them.
-        let expected_kick = matches!(wait, Wait::Until(_));
-        if saw_input || expected_kick {
-            refills += 1;
-            host.refill_polls(&mut machine, boot.polls_per_wake)?;
-        }
-
-        // 4. Turn the world.
+        // 3. Turn the world.
         //
         // Timed because this is exactly how long a keystroke can sit unread
         // in the worst case. The interrupt closure below also polls `rx`, so
@@ -1081,18 +1058,18 @@ fn life<A: Abi>(
         if let Some(meter) = &boot.calls_total {
             meter.store(host.calls(), Ordering::Relaxed);
         }
-        report_census(&mut host, boot.machine, &mut census_due, census_every, &mut turns, &mut refills, &mut worst_turn);
+        report_census(&mut host, boot.machine, &mut census_due, census_every, &mut turns, &mut worst_turn);
 
-        // 5. Everything the channels queued goes out.
+        // 4. Everything the channels queued goes out.
         flush(&mut host, &mut machine, &module, &mut pool, &mut conns, terms)?;
 
-        // 6. Say whatever this turn noticed. Ahead of the `Ended::Stopped`
+        // 5. Say whatever this turn noticed. Ahead of the `Ended::Stopped`
         //    arm below on purpose: the notes from the turn that ended the
         //    life are the ones most worth having, and a drain placed after
         //    that `return` would never run on the turn that mattered.
         report_notes(&mut host);
 
-        // 6b. Close any channel whose module handed it back to the BBS.
+        // 5b. Close any channel whose module handed it back to the BBS.
         //
         //     `Registration::AbsentBbs` is what a module reaches when it
         //     writes `state = 0` -- "return this user to the menuing

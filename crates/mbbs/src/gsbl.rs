@@ -472,8 +472,10 @@ impl Gsbl {
     pub const OVRFLW: i16 = 253;
 
     /// `POLSTS` -- the polling status code, `MAJORBBS.H:232`, "like CYCLE, but
-    /// auto". `begin_polling` injects one and `dopoll` re-injects after every
-    /// call, which is the whole mechanism by which a polling channel ticks.
+    /// auto". `begin_polling` injects one; a module that injects `POLSTS`
+    /// itself through `btuinj` gets one dispatch out of it, not a chain --
+    /// [`crate::Host::cycle`]'s own per-second grant is what sustains a
+    /// polling channel now.
     pub const POLSTS: i16 = 192;
 
     /// Bytes have arrived from the terminal.
@@ -619,25 +621,6 @@ impl Gsbl {
     #[must_use]
     pub fn pending(&self) -> bool {
         self.peek().is_some()
-    }
-
-    /// Whether this channel already has a `POLSTS` waiting.
-    ///
-    /// [`crate::Host::refill_polls`] asks before injecting one. Arming a
-    /// channel that is already armed adds a status the rotation will dispatch
-    /// twice, and since a refill happens on every driver wake, the queue would
-    /// grow without bound for as long as the channel polls.
-    ///
-    /// This is the same question `begin_polling` asks as `polrou == NULL`
-    /// (`MAJORBBS.C:1183`) before its own injection, asked of the queue rather
-    /// than of the routine, because the host arms channels the module has
-    /// already told it about.
-    #[must_use]
-    pub fn polling_armed(&self, chan: Chan) -> bool {
-        self.channel(chan)
-            .status
-            .iter()
-            .any(|&status| status == Self::POLSTS)
     }
 
     /// The channel [`Gsbl::scan`] would name, without naming it.
@@ -2480,9 +2463,9 @@ mod tests {
     }
 
     /// `inject` no longer answers whether the channel existed, because it can
-    /// no longer be asked about one that does not. The two host-side callers
-    /// -- `begin_polling` and `Host::dopoll` -- discarded that answer, which is
-    /// the loose thread this type was introduced to cut.
+    /// no longer be asked about one that does not. Its host-side caller --
+    /// `begin_polling` -- discarded that answer, which is the loose thread
+    /// this type was introduced to cut.
     #[test]
     fn a_status_can_be_injected_from_the_host_side() {
         let mut g = one();
@@ -2611,43 +2594,6 @@ mod tests {
             gsbl.scan().map(Chan::number),
             Some(0),
             "three tests did not consume channel 0's turn"
-        );
-    }
-
-    /// Two channels, because a query that reads only channel zero passes every
-    /// test written with one. `peek`'s own doc records that exact mutation
-    /// surviving 739 tests.
-    #[test]
-    fn polling_armed_answers_per_channel() {
-        let terms = Terms::new(2);
-        let zero = terms.chan(0).expect("channel 0");
-        let one = terms.chan(1).expect("channel 1");
-        let mut g = Gsbl::new(terms);
-
-        assert!(!g.polling_armed(zero));
-        assert!(!g.polling_armed(one));
-
-        g.inject(one, Gsbl::POLSTS);
-        assert!(!g.polling_armed(zero), "channel 0 was not armed");
-        assert!(g.polling_armed(one), "channel 1 was");
-
-        // A status that is not POLSTS is not an arming.
-        g.inject(zero, Gsbl::CRSTG);
-        assert!(!g.polling_armed(zero), "a waiting line is not a waiting poll");
-
-        assert_eq!(g.next_status(one), Some(Gsbl::POLSTS));
-        assert!(!g.polling_armed(one), "taken, so no longer armed");
-
-        // A POLSTS behind another status is still an arming. This is the
-        // ordinary case in the Realm, not a corner: a channel whose player
-        // typed a line holds CRSTG ahead of its poll, and `refill_polls` runs
-        // on every driver wake. A front-only reading would answer `false`
-        // here, inject a second POLSTS, and grow the queue by one per wake --
-        // which is the whole leak this query exists to prevent.
-        g.inject(zero, Gsbl::POLSTS);
-        assert!(
-            g.polling_armed(zero),
-            "CRSTG is queued ahead of it, and it is armed all the same"
         );
     }
 
