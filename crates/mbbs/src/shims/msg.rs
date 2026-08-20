@@ -955,6 +955,32 @@ mod tests {
         assert_eq!(f.invoke(numopt, &[2, 0, 32767]).expect("read"), Ret::U16(60));
     }
 
+    /// `Host::numeric_options` is the boot-time diagnostic spec S7 asks for
+    /// (`crates/mbbs-server/src/host.rs`'s boot-time `numopt` report,
+    /// gated on `MBBS_POLL_CENSUS`): every `(msgnum, value)` a module's
+    /// `numopt` calls have read, so an operator can apply
+    /// `--polls-per-second`'s own rule -- MONSBUF, option 24, for MajorMUD
+    /// -- without this host guessing what the number means. A successful
+    /// call records; a refused one (outside its bounds) must not, or the
+    /// list would claim the module read a value it never accepted.
+    #[test]
+    fn numopt_records_what_it_read_for_the_boot_time_diagnostic() {
+        let mut f = Fixture::new();
+        opened(&mut f);
+        assert_eq!(f.host.numeric_options(), &[], "nothing asked yet");
+
+        f.invoke(numopt, &[2, 0, 32767]).expect("read");
+        assert_eq!(f.host.numeric_options(), &[(2, 60)]);
+
+        let refused = f.invoke(numopt, &[2, 0, 10]);
+        assert!(refused.is_err(), "60 is outside 0..=10");
+        assert_eq!(
+            f.host.numeric_options(),
+            &[(2, 60)],
+            "a refused call recorded nothing new"
+        );
+    }
+
     /// Call `scnmdf(mdfnam, linpfx)` and read back what it answered.
     fn scan(f: &mut Fixture, mdfnam: &str, linpfx: &str) -> Vec<u8> {
         let name = f.text(mdfnam);
