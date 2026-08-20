@@ -4014,8 +4014,9 @@ impl<A: Abi> Host<A> {
         // **Once per `cycle`, not once per pass.** The original's test is
         // per main-loop iteration, and its loop never slept -- it spun as fast
         // as the CPU allowed, so the vector fired far more often than this.
-        // This host instead runs up to `max` passes and then sleeps a second,
-        // and firing per pass costs a far call into the module for each one:
+        // This host instead turns passes until the interrupt or idle ends the
+        // call, and the caller sleeps between calls; firing per pass costs a
+        // far call into the module for each one:
         // measured, that tripled module entries per second (about 512 polls to
         // about 1536) and made `cycle` overrun its own second, which the host
         // reports as "N seconds of timers in one pass -- the host stalled".
@@ -7522,11 +7523,12 @@ mod tests {
     /// of the other place that answers it.
     ///
     /// `cycle` computes `next_kick` at two sites: the early return, when
-    /// nothing is queued, and the tail, when the pass bound is reached with
-    /// work still going. A fixture with nothing polling can only ever reach
-    /// the first. Review found the second by mutating it alone to `.max()` and
-    /// watching all 774 tests stay green -- the two sites are the same
-    /// arithmetic written twice, which is how call sites drift apart.
+    /// nothing is queued, and the `interrupted()` arm, when the caller asks
+    /// for the thread back with work still going. A fixture with nothing
+    /// polling can only ever reach the first. Review found the second by
+    /// mutating it alone to `.max()` and watching all 774 tests stay green --
+    /// the two sites are the same arithmetic written twice, which is how call
+    /// sites drift apart.
     #[test]
     fn the_bound_reports_the_soonest_kick_too() {
         let (mut f, module, rou) = polling_fixture();
