@@ -683,6 +683,30 @@ fn life<A: Abi>(
     // `boot.root`, which is why `Host::new` does not do it. See
     // `Host::open_genbb` for the disassembled call site that made it necessary.
     host.open_genbb(&mut machine);
+
+    // `MBBS_CYCLE_UNBOUNDED` -- an experiment switch, not a tuning knob.
+    //
+    // `Host::cycle` normally stops on whichever comes first of `--passes` (a
+    // count) and `mbbs::PASS_BUDGET` (250ms of wall clock). Setting this
+    // removes the time bound, so a call turns until the board has nothing
+    // pending or `--passes` runs out -- which is what the original's main loop
+    // did: it never slept and spun as fast as the CPU allowed.
+    //
+    // It is here to be measured against, and it is expected to be WORSE for a
+    // player: `mbbs-server` reads the socket in exactly one place, so a
+    // keystroke waits for the whole call. This is the shape `--passes 1024`
+    // already had before it was cut to 32 -- one call ran the entire poll
+    // budget without ever looking at the socket. Pair it with `--passes` to
+    // control how unbounded "unbounded" really is.
+    if std::env::var_os("MBBS_CYCLE_UNBOUNDED").is_some() {
+        host.set_pass_budget(std::time::Duration::from_secs(u32::MAX.into()));
+        eprintln!(
+            "mbbs-server: MBBS_CYCLE_UNBOUNDED -- the 250ms cycle budget is off; \
+             a cycle now turns until the board is idle or --passes ({}) runs out. \
+             Input latency is bounded by that call, not by a clock.",
+            boot.passes
+        );
+    }
     // Every life gets the SAME shared inventory `run` built -- see `Boot::survey`'s
     // own doc for why this cannot be a fresh `Inventory` per life: a `Host`
     // (and everything it owns) is rebuilt from scratch on every restart, and
