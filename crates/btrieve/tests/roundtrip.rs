@@ -40,10 +40,23 @@ fn the_round_trip_count_only_grows() {
     }
 
     let mut passing = 0usize;
+    let mut unreadable = 0usize;
     let mut first_faults: Vec<String> = Vec::new();
     for entry in &files {
-        let Ok(original) = std::fs::read(&entry.path) else {
-            continue;
+        let original = match std::fs::read(&entry.path) {
+            Ok(original) => original,
+            Err(e) => {
+                unreadable += 1;
+                if first_faults.len() < 10 {
+                    first_faults.push(format!(
+                        "  {} ({:?}): could not read the file at all: {}",
+                        entry.path.display(),
+                        entry.id.generation,
+                        e
+                    ));
+                }
+                continue;
+            }
         };
         match read::file(&original) {
             Ok(model) => {
@@ -78,7 +91,14 @@ fn the_round_trip_count_only_grows() {
         }
     }
 
-    println!("round trip: {passing} of {} corpus files", files.len());
+    if unreadable == 0 {
+        println!("round trip: {passing} of {} corpus files", files.len());
+    } else {
+        println!(
+            "round trip: {passing} of {} corpus files ({unreadable} unreadable)",
+            files.len()
+        );
+    }
     let pin = pin();
     assert!(
         passing >= pin,
