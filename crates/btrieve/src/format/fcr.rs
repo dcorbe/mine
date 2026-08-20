@@ -8,7 +8,7 @@
 //!
 //! Only three fields are established by primary evidence today -- the family
 //! lead, the version word, and the page size, all read by the engine's own
-//! open path at `W32MKDE_decompiled.c:33906-33934`. Everything else in the
+//! open path at `W32MKDE_decompiled.c:33906-33941`. Everything else in the
 //! 512-byte record is described here as a single `undescribed` range so that
 //! the layout tiles and the *size* of what remains unknown is visible and
 //! shrinking. That range is not an opaque blob in the model's sense: nothing
@@ -31,10 +31,10 @@ static V5_FIELDS: &[Field] = &[
         cite: "W32MKDE FUN_00435970: `*param_1 == 0` selects the pre-v6 family",
     },
     Field {
-        name: "reserved_4",
+        name: "undescribed_4",
         at: 4,
         len: 2,
-        cite: "not yet established; between the lead and the version word",
+        cite: "NOT YET HARVESTED -- between the lead and the version word",
     },
     Field {
         name: "version",
@@ -65,10 +65,10 @@ static V6_FIELDS: &[Field] = &[
         cite: "W32MKDE FUN_00435970: `*param_1 == 0x4346` (\"FC\") selects v6",
     },
     Field {
-        name: "reserved_4",
+        name: "undescribed_4",
         at: 4,
         len: 4,
-        cite: "not yet established; between the lead and the page size",
+        cite: "NOT YET HARVESTED -- between the lead and the page size",
     },
     Field {
         name: "page_size",

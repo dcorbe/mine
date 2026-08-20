@@ -1,6 +1,6 @@
 //! Which format generation a file is, decided the way the engine decides it.
 //!
-//! Transcribed from `re/btrieve_ghidra/exports/W32MKDE_decompiled.c:33906-33934`
+//! Transcribed from `re/btrieve_ghidra/exports/W32MKDE_decompiled.c:33906-33941`
 //! (`FUN_00435970`), the file-open control-record check, reached from three
 //! call sites in the shipping 32-bit MicroKernel engine. Nothing here is
 //! inferred: every accepted value is a literal comparison in that function.
