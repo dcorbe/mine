@@ -153,6 +153,11 @@ pub enum Polled<A: Abi> {
     /// No channel has a `polrou` at all. The caller should stop asking for
     /// this second rather than rescan every channel on every pass.
     NobodyPolls,
+    /// Reading the channel's `polrou` failed and the machine was stopped.
+    /// **Not** a dispatch: no routine ran, nothing was censused, and the
+    /// cursor did not advance -- so a caller tallying dispatches must not
+    /// count this.
+    Errored(Outcome<A>, Chan),
 }
 
 impl<A: Abi> Clone for Outcome<A> {
@@ -3568,7 +3573,7 @@ impl<A: Abi> Host<A> {
             let rou = match self.users.polrou_mem(A::mem(machine), chan) {
                 Ok(Some(rou)) => rou,
                 Ok(None) => continue,
-                Err(e) => return self.shim_stop(machine, "poll_next_channel", e).map(|o| Polled::Dispatched(o, chan)),
+                Err(e) => return self.shim_stop(machine, "poll_next_channel", e).map(|o| Polled::Errored(o, chan)),
             };
             self.poll_cursor = (index + 1) % count;
             let outcome = self.dispatch_poll(machine, module, chan, rou)?;
@@ -3642,6 +3647,19 @@ impl<A: Abi> Host<A> {
         chan: Chan,
         rou: A::Ptr,
     ) -> io::Result<Outcome<A>> {
+        // **The module reads `usrnum`/`usrptr`/`usaptr`/`vdaptr`.**
+        // `poll_with_chan` points them at `chan` before every dispatch
+        // (`lib.rs:3992`), mirroring the vendor's `curusr(usrnum)` ahead of
+        // channel service (`MAJORBBS.C:629`). A poll that arrives from the
+        // clock rather than from the status queue must point them too, or
+        // the routine runs against whatever channel was current last --
+        // MajorMUD's in-Realm poller indexes its own per-channel workspace
+        // off `usrnum`, so a stale one reads and writes another player's
+        // state. On the `dopoll` path this is a harmless second call:
+        // `poll_with_chan` already pointed the same channel moments before.
+        if let Err(e) = self.point_curusr_mem(A::mem(machine), chan) {
+            return self.shim_stop(machine, "dispatch_poll", e);
+        }
         // **The module reads `status`.** `poll_with_chan` writes it before
         // every dispatch (`lib.rs:3913`); a poll that arrives from the clock
         // rather than from the status queue must write it too, or the module
@@ -7550,6 +7568,7 @@ mod tests {
             match f.host.poll_next_channel(&mut f.machine, &module).expect("polled") {
                 Polled::Dispatched(_, chan) => served.push(chan.index()),
                 Polled::NobodyPolls => panic!("three channels poll"),
+                Polled::Errored(..) => panic!("nothing here should fault"),
             }
         }
 
@@ -7591,6 +7610,59 @@ mod tests {
             gsbl::Gsbl::POLSTS as u16,
             "the module reads `status`; a clock-granted poll must set it"
         );
+    }
+
+    /// A clock-granted poll must point `usrnum` (and `usrptr`/`usaptr`/
+    /// `vdaptr` with it) at the channel being served, exactly as
+    /// `poll_with_chan` does before every queue-driven dispatch
+    /// (`lib.rs:3992`) and as the vendor's `curusr(usrnum)` does before
+    /// channel service (`MAJORBBS.C:629`). Channel 1, not the console: at one
+    /// channel, "current" and "channel zero" coincide by accident and this
+    /// would not discriminate a missing `point_curusr_mem` call from one that
+    /// never ran. Before `dispatch_poll` pointed curusr, `usrnum` was still
+    /// -1 (nobody current since construction -- `Fixture` never points it),
+    /// so this also fails honestly rather than silently if the call is lost.
+    #[test]
+    fn a_clock_granted_poll_points_curusr_at_the_polled_channel() {
+        let (mut f, module, rou) = polling_fixture_with(3);
+        let terms = f.host.users.terms();
+        let chan1 = terms.chan(1).expect("channel 1");
+        f.host
+            .users
+            .set_polrou_mem(f.machine.mem_mut(), chan1, Some(rou))
+            .expect("polrou set");
+
+        let _ = f.host.poll_next_channel(&mut f.machine, &module).expect("polled");
+
+        assert_eq!(
+            f.host.current_channel_mem(f.machine.mem()).expect("curusr was pointed"),
+            chan1,
+            "the routine ran with usrnum naming the channel it serves"
+        );
+    }
+
+    /// Reading `polrou` can fail -- a segment fault, same as
+    /// `polrou_cannot_be_asked_about_a_channel_that_does_not_exist` documents
+    /// for `Users::polrou_mem` itself -- and when it does, no routine ran: no
+    /// `run`, no `inpolr`, no census, no cursor advance. `Polled::Errored` is
+    /// the variant for that, kept apart from `Dispatched` so a caller tallying
+    /// dispatches never counts a channel that never ran.
+    #[test]
+    fn poll_next_channel_reports_errored_when_polrou_cannot_be_read() {
+        let (mut f, module, _rou) = polling_fixture();
+        let console = f.console();
+        let slot = f.host.users().slot(console);
+        f.machine
+            .free_segment(slot.selector)
+            .expect("the user table's segment can be freed out from under it");
+
+        match f.host.poll_next_channel(&mut f.machine, &module).expect("polled") {
+            Polled::Errored(_, chan) => {
+                assert_eq!(chan, console, "the channel whose polrou could not be read");
+            }
+            Polled::Dispatched(..) => panic!("a segment fault is not a dispatch -- nothing ran"),
+            Polled::NobodyPolls => panic!("the fault happens before this host can say nobody polls"),
+        }
     }
 
     /// Every read steps the clock, the module's and the host's alike, so the
