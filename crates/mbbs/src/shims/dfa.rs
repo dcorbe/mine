@@ -271,12 +271,13 @@ pub fn dfaOpen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
         eprintln!("mbbs-trace: DFAOPEN {name} -> {block:?}");
     }
 
-    if let Some(dropped) = host.btrieve.dfa_set(block) {
-        host.note(format!(
-            "the dfaSetBlk stack is ten deep and overflowed, so {dropped} fell off the \
-             bottom -- exactly as it would have on the real host"
-        ));
-    }
+    // Deliberately unreported. The overflow is normal MajorMUD behaviour and
+    // the drop is the fidelity: the module nests `dfaSetBlk` deeper than ten
+    // and the real host lost the outermost entry too -- see `Btrieve::dfa_set`,
+    // where the ten-deep limit and what falls off it are documented. Saying so
+    // at runtime told nobody anything after the first time and buried the
+    // notes that matter, at `WCCKNMS2.DAT [x1678]` in one session.
+    let _ = host.btrieve.dfa_set(block);
     Ok(abi::Ret::Ptr(block))
 }
 
@@ -338,12 +339,13 @@ pub fn dfaSetBlk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
     if dfaptr != Btrieve::<AbiMem<A>>::null() {
         host.btrieve.block(dfaptr).map_err(|e| ShimError::Failed(format!("dfaSetBlk: {e}")))?;
     }
-    if let Some(dropped) = host.btrieve.dfa_set(dfaptr) {
-        host.note(format!(
-            "the dfaSetBlk stack is ten deep and overflowed, so {dropped} fell off the \
-             bottom -- exactly as it would have on the real host"
-        ));
-    }
+    // Deliberately unreported. The overflow is normal MajorMUD behaviour and
+    // the drop is the fidelity: the module nests `dfaSetBlk` deeper than ten
+    // and the real host lost the outermost entry too -- see `Btrieve::dfa_set`,
+    // where the ten-deep limit and what falls off it are documented. Saying so
+    // at runtime told nobody anything after the first time and buried the
+    // notes that matter, at `WCCKNMS2.DAT [x1678]` in one session.
+    let _ = host.btrieve.dfa_set(dfaptr);
     Ok(abi::Ret::Void)
 }
 
@@ -1858,10 +1860,16 @@ mod tests {
     }
 
     #[test]
-    fn the_dfa_stack_is_ten_deep_and_the_eleventh_drops_the_oldest_and_is_reported() {
+    fn the_dfa_stack_is_ten_deep_and_the_eleventh_drops_the_oldest() {
         // `DFSTSZ` is 10 and the shift is `movmem`, not an index -- so an
         // eleventh push neither refuses nor grows the stack: it silently
-        // loses the outermost entry, and this host reports it.
+        // loses the outermost entry.
+        //
+        // Asserted on the stack itself, not on a host note. The note this
+        // used to check was removed: MajorMUD overflows this stack as a
+        // matter of course, thousands of times a session, so it reported
+        // normal behaviour as if it were a fault. The *drop* is still the
+        // fidelity being tested, and it is observable without it.
         let mut f = Fixture::new();
         let first = open(&mut f, "SAMPLE.DAT", 64);
         let other = open(&mut f, "OTHER.DAT", 32);
@@ -1870,19 +1878,33 @@ mod tests {
         for _ in 0..11 {
             f.invoke(dfaSetBlk, &[other.offset, other.selector]).expect("sets");
         }
-        assert!(
-            f.host.notes().iter().any(|n| n.contains("fell off")),
-            "the overflow is reported: {:?}",
-            f.host.notes()
-        );
 
-        for _ in 0..10 {
+        // Thirteen restores, and the number is measured rather than reasoned
+        // about. Thirteen pushes happened -- `first` from its open, `other`
+        // from its own, then eleven explicit sets -- and with the stack made
+        // deep enough to keep them all, `first` comes back on restore 13
+        // exactly. Any smaller count is a tautology: at ten, and at twelve,
+        // `other` is on top whether the stack dropped anything or not, and a
+        // DFSTSZ=32 mutation passes. Verified in both directions.
+        for _ in 0..13 {
             f.invoke(dfaRstBlk, &[]).expect("restores");
         }
         assert_ne!(
             f.host.btrieve().dfa_current(),
             first,
-            "the outermost entry never comes back -- it fell off the bottom"
+            "the outermost entry never comes back -- it fell off the bottom. A \
+             stack deep enough to have kept it answers SAMPLE.DAT here, which \
+             is what makes this the assertion that catches a wrong DFSTSZ"
+        );
+        assert_eq!(
+            f.host.btrieve().dfa_current(),
+            other,
+            "OTHER.DAT, and never null: `dfaRstBlk` is \
+             `movmem(dfastk+1,dfastk,..)`, whose destination is one entry \
+             shorter than the stack, so the bottom slot is never written and \
+             repeats forever. This stack does not drain, which is why `first` \
+             being unreachable is a claim about the drop rather than about \
+             running out of entries"
         );
     }
 
