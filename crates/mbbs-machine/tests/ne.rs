@@ -32,6 +32,10 @@ const ADDITIVE: u8 = 4;
 
 /// Segment table flags.
 const SEG_DATA: u16 = 0x0001;
+/// The flag that told the real memory manager a segment could be relocated and
+/// reached through a handle. This host maps every segment once at a fixed
+/// address, so it loads exactly as a fixed one does -- see `parse_segment`.
+const SEG_MOVEABLE: u16 = 0x0010;
 const SEG_RELOCINFO: u16 = 0x0100;
 
 /// A relocation record, as eight bytes in the file. Spelled out rather than
@@ -78,6 +82,8 @@ impl Reloc {
 #[derive(Clone, Default)]
 struct Seg {
     data: Vec<u8>,
+    /// Sets `SEG_MOVEABLE` in the segment table row.
+    moveable: bool,
     /// Bytes to allocate. Zero means 64 KiB, as the format has it.
     minalloc: u16,
     is_data: bool,
@@ -123,6 +129,13 @@ struct Ne {
     imported_names: Vec<String>,
     /// Entry points by ordinal from 1. `None` is an ordinal the linker skipped.
     entries: Vec<Option<(u8, u16)>>,
+    /// Emit `entries` as MOVEABLE bundles -- six bytes each, carrying the
+    /// segment per entry with an `INT 3Fh` between, rather than three bytes
+    /// under a segment-numbered indicator. Measured layout: see
+    /// `a_moveable_entry_bundle_names_its_segment_per_entry`.
+    moveable_entries: bool,
+    /// Corrupt the `INT 3Fh` marker, to check the loader notices.
+    break_moveable_thunk: bool,
     /// Exports in the resident name table, and in the non-resident one.
     resident: Vec<(String, u16)>,
     nonresident: Vec<(String, u16)>,
@@ -175,6 +188,18 @@ impl Ne {
         for entry in &self.entries {
             match entry {
                 None => entrytab.extend_from_slice(&[1, 0]),
+                Some((segment, offset)) if self.moveable_entries => {
+                    // count, then 0xFF for a moveable bundle; then per entry:
+                    // flags, INT 3Fh, segment, offset.
+                    entrytab.extend_from_slice(&[1, 0xff, 0x01]);
+                    if self.break_moveable_thunk {
+                        entrytab.extend_from_slice(&[0x90, 0x90]);
+                    } else {
+                        entrytab.extend_from_slice(&[0xcd, 0x3f]);
+                    }
+                    entrytab.push(*segment);
+                    entrytab.extend_from_slice(&offset.to_le_bytes());
+                }
                 Some((segment, offset)) => {
                     entrytab.extend_from_slice(&[1, *segment, 0x01]);
                     entrytab.extend_from_slice(&offset.to_le_bytes());
@@ -236,6 +261,9 @@ impl Ne {
             let mut flags = 0u16;
             if seg.is_data {
                 flags |= SEG_DATA;
+            }
+            if seg.moveable {
+                flags |= SEG_MOVEABLE;
             }
             if !seg.relocs.is_empty() {
                 flags |= SEG_RELOCINFO;
@@ -1147,4 +1175,159 @@ fn an_autodata_segment_that_does_not_exist_is_an_error() {
         err.to_string().contains("automatic data segment"),
         "got {err}"
     );
+}
+
+/// A moveable segment loads, exactly as a fixed one does.
+///
+/// `SEG_MOVEABLE` told the real memory manager the segment could be relocated
+/// and reached through a handle. This host maps every segment once, at a fixed
+/// address, with its own LDT descriptor, so the flag describes a facility that
+/// does not exist here rather than one this loader lacks.
+///
+/// This was a refusal until 2026-08-20, and it was the single reason 148 of the
+/// 254 module binaries under `archive/modules/dlls` could not be loaded at all.
+#[test]
+fn a_moveable_segment_loads_like_a_fixed_one() {
+    let ne = Ne {
+        segments: vec![
+            Seg {
+                moveable: true,
+                ..Seg::code(vec![0xcb])
+            },
+            Seg::data(vec![1, 2, 3, 4]),
+        ],
+        entries: vec![Some((1, 0))],
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    let image = NeImage::parse(&ne.finish()).expect("a moveable segment is not a refusal");
+    assert_eq!(image.segments.len(), 2);
+
+    let mut machine = Machine::new().expect("16-bit machine");
+    let module = machine.load_ne(&ne.finish(), &nothing).expect("loaded");
+    assert!(
+        module.segment_selector(1).is_some(),
+        "the moveable segment got a descriptor like any other"
+    );
+}
+
+/// A moveable entry bundle carries the segment number per entry, with the real
+/// loader's `INT 3Fh` thunk between the flags and it.
+///
+/// Measured, not taken from a specification: the first moveable bundle of
+/// `archive/modules/dlls/ISVADV__Advbdynt/_SETUP.DLL` reads
+/// `03 cd 3f 01 24 00` -- flags `03`, `cd 3f`, segment `01`, offset `0x0024`.
+#[test]
+fn a_moveable_entry_bundle_names_its_segment_per_entry() {
+    let ne = Ne {
+        segments: vec![Seg::code(vec![0xcb]), Seg::data(vec![0; 4])],
+        entries: vec![Some((1, 0x0024)), Some((2, 0x05d4))],
+        moveable_entries: true,
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    let image = NeImage::parse(&ne.finish()).expect("moveable bundles parse");
+    assert_eq!(image.entries.len(), 2);
+    let first = image.entries[0].expect("ordinal 1");
+    assert_eq!((first.segment, first.offset), (1, 0x0024));
+    let second = image.entries[1].expect("ordinal 2");
+    assert_eq!((second.segment, second.offset), (2, 0x05d4));
+}
+
+/// A relocation whose target segment byte is `0xFF` names an entry-table
+/// ordinal, not a segment, and resolves through the entry table.
+///
+/// The fixup that lands is an ordinary internal one, which is the whole point:
+/// resolving here means `Target` and every fixup path below stay unchanged.
+/// Asserted on the patched bytes rather than on the parse, because a resolution
+/// that produced the right `Target` and wrote it to the wrong place would pass
+/// a parse-level check.
+#[test]
+fn a_moveable_relocation_resolves_through_the_entry_table() {
+    let mut code = vec![0u8; 0x10];
+    code[0x00..0x02].copy_from_slice(&0xffffu16.to_le_bytes());
+
+    let mut ne = Ne {
+        segments: vec![Seg::code(code), Seg::data(vec![0xaa; 16])],
+        // Ordinal 1 names segment 2, offset 6 -- the same place the fixed-target
+        // case in `every_relocation_combination_the_real_module_uses_applies`
+        // points at, so the two are directly comparable.
+        entries: vec![Some((2, 0x0006))],
+        moveable_entries: true,
+        autodata: 2,
+        ..Ne::default()
+    };
+    ne.segments[0] = ne.segments[0].clone().with(&[Reloc {
+        source: FAR_ADDR,
+        flags: INTERNALREF,
+        offset: 0x00,
+        lo: 0x00ff, // moveable: the segment byte is 0xFF
+        hi: 1,      // entry-table ordinal 1
+    }]);
+
+    let mut machine = Machine::new().expect("16-bit machine");
+    let module = machine.load_ne(&ne.finish(), &nothing).expect("loaded");
+    let code_sel = module.segment_selector(1).expect("segment 1");
+    let data_sel = module.segment_selector(2).expect("segment 2");
+
+    assert_eq!(module.relocations_applied(), 1);
+    assert_eq!(
+        word(&machine, code_sel, 0x00),
+        0x0006,
+        "the offset came from the entry table, not from the relocation's own hi word"
+    );
+    assert_eq!(
+        word(&machine, code_sel, 0x02),
+        data_sel,
+        "and the selector is segment 2's, which is what ordinal 1 names"
+    );
+}
+
+/// A moveable bundle without its `INT 3Fh` marker is a malformed file, and is
+/// refused as one rather than read as though the bytes lined up.
+#[test]
+fn a_moveable_bundle_without_its_thunk_is_refused() {
+    let ne = Ne {
+        segments: vec![Seg::code(vec![0xcb])],
+        entries: vec![Some((1, 0x0024))],
+        moveable_entries: true,
+        break_moveable_thunk: true,
+        autodata: 1,
+        ..Ne::default()
+    };
+
+    let e = NeImage::parse(&ne.finish()).expect_err("the marker is part of the format");
+    let text = e.to_string();
+    assert!(text.contains("moveable entry bundle"), "{text}");
+    assert!(text.contains("3fcd") || text.contains("0x3fcd"), "{text}");
+}
+
+/// A moveable relocation naming an ordinal the entry table does not define is
+/// refused, naming the ordinal. Answering it would mean inventing a target.
+#[test]
+fn a_moveable_relocation_past_the_entry_table_is_refused() {
+    let mut code = vec![0u8; 0x10];
+    code[0x00..0x02].copy_from_slice(&0xffffu16.to_le_bytes());
+
+    let mut ne = Ne {
+        segments: vec![Seg::code(code), Seg::data(vec![0; 4])],
+        entries: vec![Some((1, 0x0006))],
+        moveable_entries: true,
+        autodata: 2,
+        ..Ne::default()
+    };
+    ne.segments[0] = ne.segments[0].clone().with(&[Reloc {
+        source: FAR_ADDR,
+        flags: INTERNALREF,
+        offset: 0x00,
+        lo: 0x00ff,
+        hi: 9, // there is one ordinal, not nine
+    }]);
+
+    let e = NeImage::parse(&ne.finish()).expect_err("ordinal 9 does not exist");
+    let text = e.to_string();
+    assert!(text.contains("moveable relocation"), "{text}");
+    assert!(text.contains('9'), "{text}");
 }

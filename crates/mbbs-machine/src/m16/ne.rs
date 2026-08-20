@@ -82,6 +82,12 @@ const INTERNALREF_MOVEABLE: u8 = 0xff;
 /// The entry-table bundle indicator for moveable entries.
 const BUNDLE_MOVEABLE: u8 = 0xff;
 
+/// `INT 3Fh`, little-endian, as it sits between a moveable entry's flags and
+/// its segment number. The real loader patched over this to reach the segment
+/// once it had been placed; this host places every segment at a fixed address
+/// and never needs to, so it is read only as the format marker it also is.
+const MOVEABLE_THUNK: u16 = 0x3fcd;
+
 /// End of a relocation source chain.
 const CHAIN_END: u16 = 0xffff;
 
@@ -124,10 +130,17 @@ pub enum NeError {
     /// not stop.
     ChainRunsAway { segment: u16, offset: u16 },
 
-    /// A moveable segment, which nothing here supports. No Galacticomm module
-    /// measured so far has one -- `WCCMMUD.DLL` declares zero moveable entries
-    /// -- so this is a clear refusal rather than a guess.
-    Moveable,
+    /// A structure whose bytes do not match the format.
+    ///
+    /// Replaces a `Moveable` variant that meant "this loader refuses moveable
+    /// segments", which it no longer does. That variant's own doc said no
+    /// Galacticomm module measured so far had one; 148 of the 254 module
+    /// binaries under `archive/modules/dlls` do, and every one of them was
+    /// unloadable because of it.
+    Malformed {
+        what: &'static str,
+        why: String,
+    },
 
     /// A relocation source type the format does not define.
     UnknownSource { source: u8 },
@@ -186,7 +199,7 @@ impl fmt::Display for NeError {
                 f,
                 "the relocation chain at {offset:#06x} in segment {segment} does not end"
             ),
-            Self::Moveable => write!(f, "moveable segments are not supported"),
+            Self::Malformed { what, why } => write!(f, "{what}: {why}"),
             Self::UnknownSource { source } => {
                 write!(
                     f,
@@ -442,6 +455,12 @@ impl NeImage {
             modules.push(r.pstring("module name", imptab + rel)?.0);
         }
 
+        // Before the segments, because a segment's relocations can name a
+        // moveable target by entry-table ordinal and `parse_relocation`
+        // resolves that here rather than deferring it -- which is what keeps
+        // `Target` and every fixup below unchanged.
+        let entries = parse_entry_table(&r, entrytab)?;
+
         let mut segments = Vec::with_capacity(usize::from(segment_count));
         for i in 0..usize::from(segment_count) {
             segments.push(parse_segment(
@@ -450,10 +469,9 @@ impl NeImage {
                 align,
                 imptab,
                 (i + 1) as u16,
+                &entries,
             )?);
         }
-
-        let entries = parse_entry_table(&r, entrytab)?;
 
         // The resident name table's own first entry -- what `collect_names`
         // below drops as the "not an export" leading string, because that
@@ -505,15 +523,24 @@ fn parse_segment(
     align: u16,
     imptab: usize,
     number: u16,
+    entries: &[Option<EntryPoint>],
 ) -> Result<SegmentEntry, NeError> {
     let sector = r.u16("segment table", at)? as usize;
     let length = r.u16("segment table", at + 2)?;
     let flags = r.u16("segment table", at + 4)?;
     let minalloc = r.u16("segment table", at + 6)?;
 
-    if flags & SEG_MOVEABLE != 0 {
-        return Err(NeError::Moveable);
-    }
+    // `SEG_MOVEABLE` is deliberately NOT refused. It told the real memory
+    // manager that this segment could be relocated and reached through a
+    // handle; this host maps every segment once, at a fixed address, with its
+    // own LDT descriptor, and never moves it. So the flag describes a facility
+    // that does not exist here rather than one this loader lacks, and a
+    // moveable segment loads exactly as a fixed one does.
+    //
+    // What would break is a module that moves or discards a segment through
+    // the handle-based memory API -- and it has no route to: the only way it
+    // names a segment is a selector this loader wrote, which always describes
+    // the same mapping.
 
     // A zero sector means the segment has no file data. Otherwise a zero length
     // means 64 KiB, because the field is a word and 64 KiB does not fit.
@@ -548,7 +575,7 @@ fn parse_segment(
         let count = r.u16("relocation count", at)?;
         relocations.reserve(usize::from(count));
         for i in 0..usize::from(count) {
-            relocations.push(parse_relocation(r, at + 2 + i * 8, imptab)?);
+            relocations.push(parse_relocation(r, at + 2 + i * 8, imptab, entries)?);
         }
     }
 
@@ -561,7 +588,12 @@ fn parse_segment(
 }
 
 /// One 8-byte relocation record.
-fn parse_relocation(r: &Reader<'_>, at: usize, imptab: usize) -> Result<Relocation, NeError> {
+fn parse_relocation(
+    r: &Reader<'_>,
+    at: usize,
+    imptab: usize,
+    entries: &[Option<EntryPoint>],
+) -> Result<Relocation, NeError> {
     let source = match r.u8("relocation", at)? {
         SRC_LOBYTE => Source::LoByte,
         SRC_SEGMENT => Source::Segment,
@@ -580,7 +612,48 @@ fn parse_relocation(r: &Reader<'_>, at: usize, imptab: usize) -> Result<Relocati
             // the target is moveable and `hi` is an entry-table ordinal instead.
             let segment = lo as u8;
             if segment == INTERNALREF_MOVEABLE {
-                return Err(NeError::Moveable);
+                // `hi` is an entry-table ordinal, 1-based, not an offset. The
+                // entry it names carries the segment and offset the real
+                // loader would have patched in once it placed the segment, so
+                // resolving it here yields an ordinary `Target::Internal` and
+                // nothing downstream has to know the difference.
+                //
+                // **No module in `archive/modules/dlls` uses this form.**
+                // Measured: 95,436 `TGT_INTERNALREF` records across 62 of the
+                // 209 NE modules, and not one has `0xff` in the segment byte.
+                // So unlike the moveable *segment* flag and the moveable
+                // *entry bundle* -- which 148 modules each have, and which are
+                // what actually unblocked them -- this path is exercised only
+                // by `tests/ne.rs`'s synthetic module.
+                //
+                // Implemented anyway, because it is part of the format and
+                // refusing it would leave the same wall standing for a module
+                // outside this corpus. But said out loud, because the variant
+                // this replaced carried a comment claiming no Galacticomm
+                // module had moveable segments, and 148 of them do.
+                let ordinal = hi;
+                let entry = usize::from(ordinal)
+                    .checked_sub(1)
+                    .and_then(|i| entries.get(i))
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| NeError::Malformed {
+                        what: "moveable relocation",
+                        why: format!(
+                            "names entry-table ordinal {ordinal}, which this \
+                             module's entry table does not define ({} ordinals)",
+                            entries.len()
+                        ),
+                    })?;
+                return Ok(Relocation {
+                    source,
+                    target: Target::Internal {
+                        segment: entry.segment,
+                        offset: entry.offset,
+                    },
+                    additive: flags & TGT_ADDITIVE != 0,
+                    offset,
+                });
             }
             Target::Internal {
                 segment,
@@ -623,7 +696,46 @@ fn parse_entry_table(r: &Reader<'_>, at: usize) -> Result<Vec<Option<EntryPoint>
         match indicator {
             // The linker skipping ordinals. No entry data follows.
             0 => entries.extend(std::iter::repeat_n(None, count)),
-            BUNDLE_MOVEABLE => return Err(NeError::Moveable),
+            // A moveable bundle's entries are six bytes, not three: the
+            // segment number is carried per entry rather than once in the
+            // indicator, with the real loader's `INT 3Fh` thunk between.
+            //
+            // Measured on `ISVADV__Advbdynt/_SETUP.DLL`, whose first moveable
+            // bundle reads `03 cd 3f 01 24 00` -- flags `03`, the two bytes
+            // `cd 3f` (`INT 3Fh`), segment `01`, offset `0024`.
+            //
+            // The resulting `EntryPoint` is the same shape a fixed bundle
+            // produces, which is the point: nothing downstream needs to know
+            // which kind of bundle an ordinal came from.
+            BUNDLE_MOVEABLE => {
+                for _ in 0..count {
+                    let flags = r.u8("entry table", at)?;
+                    // Checked rather than skipped: these two bytes are the
+                    // format's own marker, so a bundle without them is a
+                    // malformed file and not a moveable one, and saying which
+                    // is the difference between a useful refusal and a
+                    // confusing one.
+                    let thunk = r.u16("entry table", at + 1)?;
+                    if thunk != MOVEABLE_THUNK {
+                        return Err(NeError::Malformed {
+                            what: "moveable entry bundle",
+                            why: format!(
+                                "expected the INT 3Fh thunk {MOVEABLE_THUNK:#06x} \
+                                 between an entry's flags and its segment, found \
+                                 {thunk:#06x}"
+                            ),
+                        });
+                    }
+                    let segment = r.u8("entry table", at + 3)?;
+                    let offset = r.u16("entry table", at + 4)?;
+                    at += 6;
+                    entries.push(Some(EntryPoint {
+                        segment,
+                        offset,
+                        exported: flags & 0x01 != 0,
+                    }));
+                }
+            }
             segment => {
                 for _ in 0..count {
                     let flags = r.u8("entry table", at)?;
