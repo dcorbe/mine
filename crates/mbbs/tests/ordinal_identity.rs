@@ -16,7 +16,7 @@
 //!
 //! # The ordinal space, and the trap in it
 //!
-//! `re/ordinal-renames.tsv` holds two comparisons, both **within a single
+//! `re/api-renames.tsv` holds two comparisons, both **within a single
 //! numbering**. First, the MAJORBBS space as numbered by MAJORBBS (wg2) against
 //! the same space as numbered by the wg2-era `WGSERVER` import library: those
 //! two really are one numbering -- `__WRITE` is `@48` in both -- and 38 slots
@@ -67,7 +67,7 @@ use mbbs::shims::{Entry, entry};
 
 /// Ordinal slots the host serves from two different bodies today.
 ///
-/// `(library, ordinal)`. **May only shrink.** Each entry is one export the
+/// The name pair, as `re/api-renames.tsv` spells it. **May only shrink.** Each entry is one export the
 /// vendor numbered once and this host answers twice, so the two answers can
 /// drift -- and `ce64fbbe` is the drift already found, at `@162`.
 ///
@@ -76,49 +76,49 @@ use mbbs::shims::{Entry, entry};
 /// registers against `mlt::getmsg`; where the two genuinely take different
 /// arguments, it means both funnelling into one shared core, which
 /// `shims::btrieve`'s `pub(crate)` helpers already do for part of the family.
-const SPLIT_BODIES: &[(&str, u16)] = &[
-    // `@51` (aabbtv/dfaacqabs) and `@313` (gabbtv/dfagetabs) are deliberately
-    // absent: the host registers the `btv*` name but not the `dfa*` one at
-    // those two slots, so there is only one body and nothing to disagree.
-    // `dfaacqabslock` and `dfagetabslock` are different routines at `@1100`
-    // and `@999`.
-    ("MAJORBBS", 53),   // absbtv / dfaabs
-    ("MAJORBBS", 117),  // clsbtv / dfaclose
-    ("MAJORBBS", 133),  // cntrbtv / dfacountrec
-    ("MAJORBBS", 144),  // crtbtv / dfacreate
-    ("MAJORBBS", 162),  // delbtv / dfadelete -- the pair that drifted
-    ("MAJORBBS", 170),  // dinsbtv / dfainsertdup
-    ("MAJORBBS", 180),  // dupdbtv / dfaupdatedup
-    ("MAJORBBS", 351),  // insbtv / dfainsert
-    ("MAJORBBS", 357),  // invbtv / dfainsertv
-    ("MAJORBBS", 388),  // llnbtv / dfalastlen
-    ("MAJORBBS", 447),  // omdbtv / dfamode
-    ("MAJORBBS", 455),  // opnbtv / dfaopen
-    ("MAJORBBS", 484),  // qnpbtv / dfaquerynp
-    ("MAJORBBS", 485),  // qrybtv / dfaquery
-    ("MAJORBBS", 505),  // rstbtv / dfarstblk
-    ("MAJORBBS", 534),  // setbtv / dfasetblk
-    ("MAJORBBS", 588),  // sttbtv / dfastat
-    ("MAJORBBS", 621),  // updbtv / dfaupdate
-    ("MAJORBBS", 622),  // upvbtv / dfaupdatev
-    ("MAJORBBS", 904),  // rlenbtv / dfareclen
-    ("MAJORBBS", 996),  // getbtvl / dfagetlock
-    ("MAJORBBS", 997),  // obtbtvl / dfaacqlock
-    ("MAJORBBS", 998),  // anpbtvlk / dfaacqnplock
-    ("MAJORBBS", 999),  // gabbtvl / dfagetabslock
-    ("MAJORBBS", 1100), // aabbtvl / dfaacqabslock
-    ("MAJORBBS", 1101), // stpbtvl / dfasteplock
-    ("MAJORBBS", 1102), // unlbtv / dfaunlock
-    ("MAJORBBS", 1103), // wslbtv / dfawaslocked
+const SPLIT_BODIES: &[(&str, &str)] = &[
+    ("aabbtvl", "dfaacqabslock"),
+    ("absbtv", "dfaabs"),
+    ("anpbtvlk", "dfaacqnplock"),
+    ("clsbtv", "dfaclose"),
+    ("cntrbtv", "dfacountrec"),
+    ("crtbtv", "dfacreate"),
+    ("delbtv", "dfadelete"),
+    ("dinsbtv", "dfainsertdup"),
+    ("dupdbtv", "dfaupdatedup"),
+    ("gabbtvl", "dfagetabslock"),
+    ("getbtvl", "dfagetlock"),
+    ("insbtv", "dfainsert"),
+    ("invbtv", "dfainsertv"),
+    ("llnbtv", "dfalastlen"),
+    ("obtbtvl", "dfaacqlock"),
+    ("omdbtv", "dfamode"),
+    ("opnbtv", "dfaopen"),
+    ("qnpbtv", "dfaquerynp"),
+    ("qrybtv", "dfaquery"),
+    ("rlenbtv", "dfareclen"),
+    ("rstbtv", "dfarstblk"),
+    ("setbtv", "dfasetblk"),
+    ("stpbtvl", "dfasteplock"),
+    ("sttbtv", "dfastat"),
+    ("unlbtv", "dfaunlock"),
+    ("updbtv", "dfaupdate"),
+    ("upvbtv", "dfaupdatev"),
+    ("wslbtv", "dfawaslocked"),
 ];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// `(library, ordinal, majorbbs_name, wgserver_name)` from the committed table.
-fn renames() -> Vec<(String, u16, String, String)> {
-    let path = repo_root().join("re/ordinal-renames.tsv");
+/// `(library, name_a, name_b)` from the committed table.
+///
+/// The ordinal column is read past deliberately. Most of `GALPORT.C`'s pairs
+/// have no slot of their own -- they are macros over the ordinal-exported
+/// primitives -- so keying this on an ordinal would drop the majority of the
+/// vendor's own map.
+fn renames() -> Vec<(String, String, String)> {
+    let path = repo_root().join("re/api-renames.tsv");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} is committed: {e}", path.display()));
     let mut out = Vec::new();
@@ -130,19 +130,14 @@ fn renames() -> Vec<(String, u16, String, String)> {
         assert_eq!(
             f.len(),
             5,
-            "every row is library/ordinal/name/name/source: {line:?}"
+            "every row is library/name_a/name_b/ordinal/source: {line:?}"
         );
-        out.push((
-            f[0].to_owned(),
-            f[1].parse().expect("ordinal is a number"),
-            f[2].to_owned(),
-            f[3].to_owned(),
-        ));
+        out.push((f[0].to_owned(), f[1].to_owned(), f[2].to_owned()));
     }
     assert!(
-        out.len() > 30,
-        "re/ordinal-renames.tsv parsed to {} rows, too few to be the derived \
-         table -- did its format change?",
+        out.len() > 60,
+        "re/api-renames.tsv parsed to {} rows, too few to be the vendor's own \
+         map (67 GALPORT.C pairs alone) -- did its format change?",
         out.len()
     );
     out
@@ -150,73 +145,80 @@ fn renames() -> Vec<(String, u16, String, String)> {
 
 /// Every slot where the host registers both names, partitioned by whether the
 /// two resolve to one body.
-fn both_registered() -> (BTreeSet<(String, u16)>, Vec<String>) {
+fn both_registered() -> (BTreeSet<(String, String)>, BTreeSet<(String, String)>) {
     let mut shared = BTreeSet::new();
-    let mut split = Vec::new();
-    for (lib, ordinal, a, b) in renames() {
+    let mut split = BTreeSet::new();
+    for (lib, a, b) in renames() {
         let (Entry::Routine(fa, _), Entry::Routine(fb, _)) =
             (entry::<Wg16>(&lib, &a), entry::<Wg16>(&lib, &b))
         else {
             continue; // only one side registered: nothing can disagree yet
         };
+        let _ = lib;
         if std::ptr::fn_addr_eq(fa, fb) {
-            shared.insert((lib, ordinal));
+            shared.insert((a, b));
         } else {
-            split.push(format!("{lib} @{ordinal}: `{a}` and `{b}`"));
+            split.insert((a, b));
         }
     }
     (shared, split)
 }
 
-/// The pin: exactly the slots served from two bodies, and no new ones.
+/// The pin: exactly the pairs whose registered wrappers differ, and no new ones.
+///
+/// **What this measures, precisely.** Two *registered functions*, not two
+/// implementations. A pair that shares a `pub(crate)` core and differs only in
+/// how it finds its block still shows up here, and that is fine -- ten of the
+/// 28 already reach a common core (`dfa.rs` calls `btv::locate` nine times,
+/// `btv::update_variable` six, `btv::delbtv` five). Wrapper identity is a
+/// proxy, and the property that actually matters is that neither name carries
+/// its own copy of the decision.
+///
+/// So do not read a shrinking count as the goal. The goal is that every pair
+/// with real logic funnels into one core, which is what `insert_record` and
+/// `delete_record` did for the insert and delete families. What this pin
+/// guarantees is narrower and still worth having: a NEW pair cannot appear
+/// without somebody writing it down, and `getmsgblk` appeared silently.
 #[test]
-fn no_new_export_slot_gains_a_second_body() {
-    let (_, split) = both_registered();
-    let actual: BTreeSet<(String, u16)> = split
+fn no_new_pair_gains_a_second_body() {
+    let (_, actual) = both_registered();
+    let expected: BTreeSet<(String, String)> = SPLIT_BODIES
         .iter()
-        .map(|s| {
-            let (lib, rest) = s.split_once(" @").expect("formatted above");
-            let ordinal = rest.split(':').next().unwrap().parse().expect("ordinal");
-            (lib.to_owned(), ordinal)
-        })
-        .collect();
-    let expected: BTreeSet<(String, u16)> = SPLIT_BODIES
-        .iter()
-        .map(|(l, o)| ((*l).to_owned(), *o))
+        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
         .collect();
 
     let gained: Vec<_> = actual.difference(&expected).collect();
     assert!(
         gained.is_empty(),
-        "an export slot the vendor numbered once is now served by two \
-         different bodies in this host, and two bodies can drift -- `ce64fbbe` \
-         is the drift already found. Register one name against the other's \
-         body (see `getmsgblk` in shims::mod), or funnel both into one shared \
-         core:\n{gained:#?}\nall split slots:\n{}",
-        split.join("\n"),
+        "a routine the vendor renamed is now served by two different \
+         registered bodies in this host, and two bodies can drift -- \
+         `ce64fbbe` (dfaDelete's cursor) and `f0f40187` (invbtv's stale \
+         refusal) are the two that already did. Give one name the other's \
+         body, or funnel both into one `pub(crate)` core:\n{gained:#?}",
     );
 
     let closed: Vec<_> = expected.difference(&actual).collect();
     assert!(
         closed.is_empty(),
-        "these slots no longer have two bodies -- remove them from \
+        "these pairs no longer have two registered bodies -- remove them from \
          SPLIT_BODIES, which may only shrink:\n{closed:#?}",
     );
 }
 
-/// The rename that started this, closed: `getmsg` and `getmsgblk` are `@326`
-/// in the same numbering and now resolve to one function.
+/// The rename that started this, closed: `getmsg` and `getmsgblk` resolve to
+/// one function.
 ///
 /// Named separately so the pin above cannot pass by comparing nothing, and
 /// asserted by address rather than behaviour -- two bodies that agree today
 /// pass a behavioural check and then drift.
 #[test]
 fn the_getmsg_rename_is_one_body() {
-    let at = renames()
-        .into_iter()
-        .find(|(_, _, a, b)| a == "getmsg" && b == "getmsgblk")
-        .expect("re/ordinal-renames.tsv carries the getmsg/getmsgblk slot");
-    assert_eq!(at.1, 326, "GCOMM.H's renamed message routine is ordinal 326");
+    assert!(
+        renames()
+            .iter()
+            .any(|(_, a, b)| a == "getmsg" && b == "getmsgblk"),
+        "re/api-renames.tsv carries the getmsg/getmsgblk pair"
+    );
 
     let (Entry::Routine(a, _), Entry::Routine(b, _)) = (
         entry::<Wg16>("MAJORBBS", "getmsg"),
@@ -224,5 +226,5 @@ fn the_getmsg_rename_is_one_body() {
     ) else {
         panic!("both names resolve");
     };
-    assert!(std::ptr::fn_addr_eq(a, b), "one export slot, one body");
+    assert!(std::ptr::fn_addr_eq(a, b), "one export, one body");
 }
