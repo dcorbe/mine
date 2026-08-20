@@ -537,6 +537,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mbbs-lua"
+version = "0.1.0"
+dependencies = [
+ "mbbs",
+ "mlua",
+]
+
+[[package]]
 name = "mbbs-machine"
 version = "0.1.0"
 dependencies = [
