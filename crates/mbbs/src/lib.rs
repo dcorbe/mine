@@ -4082,8 +4082,11 @@ impl<A: Abi> Host<A> {
 
         // No clock bound. `interrupted` is the only bound on a cycle, and a
         // caller with nothing to say passes `&mut || false`, so a cycle turns
-        // until the board goes idle. See `mbbs_server::DEFAULT_PASSES` for the
-        // measurement that retired the 250ms budget this loop used to carry.
+        // until the board goes idle. See
+        // `docs/superpowers/specs/2026-08-20-cycle-interrupt-and-syscyc-design.md`'s
+        // "Retired measurements" appendix for the measurement that retired
+        // the 250ms budget (and the `--passes` count bound) this loop used
+        // to carry.
         loop {
             iterations += 1;
 

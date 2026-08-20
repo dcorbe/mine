@@ -849,10 +849,23 @@ fn life<A: Abi>(
         }
 
         // 1. Sleep according to what the previous cycle told us to do.
+        //
+        //    `Woke::Gone` is not an immediate return any more. `peeked` can
+        //    hold a message the interrupt closure already took out of `rx`
+        //    on a prior turn -- every sender being gone says nobody can send
+        //    *again*, it says nothing about a message already received.
+        //    Returning here unconditionally would be exactly the silent
+        //    drop `wait_with_peek`'s own doc warns about, just with no hang
+        //    left to notice it by. `gone` is acted on after step 2 has had
+        //    its chance to drain whatever `peeked` was holding.
+        let mut gone = false;
         let first = match wake(armed, rx) {
             Woke::Message(msg) => Some(msg),
             Woke::Nothing => None,
-            Woke::Gone => return Ok(LifeEnd::Gone),
+            Woke::Gone => {
+                gone = true;
+                None
+            }
         };
 
         // 2. Drain every message available, not just the one that woke us --
@@ -864,7 +877,9 @@ fn life<A: Abi>(
         //
         //    `peeked` goes first: it was received before anything `wake`
         //    returns this turn, and draining it out of order would answer
-        //    messages younger than it before it is even applied.
+        //    messages younger than it before it is even applied. This runs
+        //    unconditionally, even when `wake` just reported `Gone` above --
+        //    see this loop's own comment.
         let mut saw_input = false;
         let mut stopping = None;
         for msg in peeked
@@ -893,6 +908,19 @@ fn life<A: Abi>(
             // `WCCRECOV.FLG` is gone.
             let _ = done.send(());
             return Ok(LifeEnd::ShutDown);
+        }
+        if gone {
+            // Whatever `peeked` was holding has just been applied above, in
+            // the same batch a live `Shutdown` would have been (and, had it
+            // been a `Shutdown`, `stopping` would already have returned
+            // above with a real `shut_down()` sweep, not this bare exit).
+            // There is nothing left to drain and nobody left to serve: every
+            // sender is gone, including the one `conn::spawn_machine`'s own
+            // alarm task keeps for the process's whole life -- see that
+            // function's doc for why that makes this path unreachable on a
+            // real board, and reachable only by a test that drives `run`
+            // with a channel of its own.
+            return Ok(LifeEnd::Gone);
         }
 
         // 3. The pump as a derived clock (design doc §7): grant a fresh poll
@@ -1330,6 +1358,66 @@ mod tests {
             Wait::Until(Duration::from_secs(5))
         );
         assert_eq!(wait_with_peek(Wait::Stop, true), Wait::Stop);
+    }
+
+    /// The gap `wait_with_peek`'s own doc warns about, closed for real:
+    /// `peeked` is a message the interrupt closure already took out of `rx`,
+    /// so `wake` finding `rx` itself empty *and* disconnected (`Woke::Gone`)
+    /// on some later turn says nobody can send *again* -- it says nothing
+    /// about a message already received. `life` no longer returns on
+    /// `Woke::Gone` before step 2's drain runs; this reproduces that
+    /// ordering directly, since `life` itself cannot be driven without a
+    /// real `.DLL` (see this module's own doc): a fully disconnected `rx`
+    /// really does report `Gone`, and a message drained ahead of it --
+    /// exactly `peeked.take().into_iter().chain(first).chain(..)`'s order --
+    /// still reaches `apply` and lands in GSBL rather than vanishing with
+    /// the connection's last sender.
+    #[test]
+    fn a_message_drained_ahead_of_a_gone_wake_still_reaches_apply() {
+        use mbbs::testing::Fixture;
+
+        let terms = Terms::new(1);
+        let mut fixture = Fixture::rooted_with_terms(
+            mbbs::testing::scratch("mbbs-server-host-peeked-survives-gone"),
+            terms,
+        );
+        let module = fixture.minimal_module();
+        let chan = fixture.console();
+
+        let mut pool = Pool::new(MachineId(0), terms);
+        let routed = pool.key(chan);
+        let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
+        // Connected, unlike the two guard tests above -- the point here is
+        // that a peeked message reaches a *live* channel, not that it gets
+        // turned away from a dead one.
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+        conns[routed.chan.index()] = Some(out_tx);
+
+        // Every sender dropped: exactly what `wake` sees once the interrupt
+        // closure has already taken the one message anyone was ever going
+        // to send.
+        let (tx, rx) = std::sync::mpsc::channel::<In>();
+        drop(tx);
+        assert!(
+            matches!(wake(Wait::Now, &rx), Woke::Gone),
+            "the channel must report Gone, not spin"
+        );
+
+        // `life`'s step 2, reproduced: `peeked` drains first, ahead of
+        // whatever else `rx` still holds (nothing, here -- the point is
+        // that `rx` being empty and Gone must not stop this message).
+        let peeked = Some(In::Input { chan: routed, bytes: b"hi\r".to_vec() });
+        for msg in peeked.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+            super::apply(&mut fixture.host, &mut fixture.machine, &module, &mut pool, &mut conns, msg)
+                .expect("applies");
+        }
+
+        assert_eq!(
+            fixture.host.gsbl_mut().take_line(chan),
+            Some(b"hi".to_vec()),
+            "the peeked message must have reached GSBL, not been dropped \
+             with the connection's last sender"
+        );
     }
 
     /// `apply`'s `Connect` arm, stripped of the `Host`/`Module` it would
