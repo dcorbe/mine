@@ -364,7 +364,10 @@ pub struct Gsbl {
     /// it: `lstunm` is "last user-number returned by `btuscn()`"
     /// (`MAJORBBS.C:325`), and `if (newunm <= lstunm) (*syscyc)()` fires the
     /// system cycle on the *wrap*, a test that means nothing unless the scan
-    /// rotates.
+    /// rotates. That is the vendor's shape, not this host's: `Host::cycle`
+    /// fires `syscyc` once per elapsed second instead, off the clock, and
+    /// never off this wrap -- see
+    /// `cycle_does_not_fire_syscyc_merely_because_the_scan_did_not_advance`.
     ///
     /// Lives here rather than on `Host` because it is GSBL's state, not the
     /// main loop's -- the original kept its own cursor and handed out the

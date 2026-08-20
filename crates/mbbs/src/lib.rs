@@ -1203,11 +1203,6 @@ pub struct Host<A: Abi> {
     /// eleven handlers had a bug the real host stopped it for, and silently
     /// accepting the eleventh would hide it.
     pub(crate) rtirs: Vec<A::Ptr>,
-    /// `lstunm` -- "last user-number returned by `btuscn()`"
-    /// (`MAJORBBS.C:325`). Only the `syscyc` test in [`Host::cycle`] reads it.
-    /// Starts at 0, as the original's uninitialised global does, so the very
-    /// first pass fires the vector.
-    lstunm: i16,
 
     /// Routines registered through `initask` (`GCOMM.H:493`,
     /// `int initask(void (*tskaddr)(int taskid))`), in registration order --
@@ -1784,7 +1779,6 @@ impl<A: Abi> Host<A> {
             noted: HashSet::new(),
             kicks: Vec::new(),
             rtirs: Vec::new(),
-            lstunm: 0,
             tasks: Vec::new(),
             stdio_modes: [false; 5],
             tfscan: shims::tfscan::TfScan::default(),
@@ -4011,60 +4005,16 @@ impl<A: Abi> Host<A> {
         let mut iterations = 0;
         let mut dispatched = 0;
 
-        // **Once per `cycle`, not once per pass.** The original's test is
-        // per main-loop iteration, and its loop never slept -- it spun as fast
-        // as the CPU allowed, so the vector fired far more often than this.
-        // This host instead turns passes until the interrupt or idle ends the
-        // call, and the caller sleeps between calls; firing per pass costs a
-        // far call into the module for each one:
-        // measured, that tripled module entries per second (about 512 polls to
-        // about 1536) and made `cycle` overrun its own second, which the host
-        // reports as "N seconds of timers in one pass -- the host stalled".
-        // The module only needs the gate set once between `_BACKGROUND_FAST`
-        // runs, and that routine is an `rtkick` heartbeat re-arming once a
-        // second, so once per cycle is enough to keep the Realm turning.
-        // `MAJORBBS.C:419-424`, the one part of the main loop this host
-        // used to decline:
-        //
-        //
-        // `syscyc` is `MAJORBBS.H:715`, "system-cycle vector (tail is
-        // `prctask()`)" -- the pointer a module chains its own real-time
-        // engine onto at init. Declining it was not a scoping saving: it
-        // is why MajorMUD's Realm was frozen. `_MAJORMUD_SYSCYC`
-        // (export 106) is the ONLY writer of the module's fast-tick gate;
-        // `_BACKGROUND_FAST` tests that bit, does its work, and clears it,
-        // so with the vector uncalled the gate was set twice at init and
-        // never again -- monsters never moved, and the per-player movement
-        // delay at `+0x6ac`, which only `_FAST_UPDATE_CHARACTER`
-        // decrements, never counted down. Measured: calling this is what
-        // makes "You hear movement to the north" appear at all.
-        //
-        // `peek` rather than `scan` because the vector fires on the scan's
-        // *answer*, before the channel is serviced, and `scan` advances the
-        // rotation; `peek` is the same query without the side effect.
-        // `-1` is `btuscn`'s own "nothing queued", which is `<= lstunm`
-        // for every channel number -- so an idle pass fires it too, as the
-        // original's does.
-        //
-        // `prctask`, the vector's documented tail, runs immediately below.
-        // `MAJORBBS.C:323` makes it the vector's INITIAL value, so on the
-        // original a chaining module ends by running it; this host runs it
-        // here instead, which reaches the same place without depending on
-        // every module's own chain bookkeeping being right. The Rose 2.0
-        // (`RCIROSE.DLL`) is the module that made this necessary -- it calls
-        // `initask`, where MajorMUD registers nothing.
-        let newunm: i16 = self.gsbl().peek().map_or(-1, |index| index as i16);
-        if newunm <= self.lstunm
-            && let Some(poison) = self.syscyc(machine, module, &mut dispatched)?
-        {
-            return Ok(Cycles {
-                iterations,
-                dispatched,
-                // `None`: the vector belongs to no channel.
-                ended: Ended::Stopped(poison, None),
-            });
-        }
-        self.lstunm = newunm;
+        // **`syscyc` is not fired here.** `MAJORBBS.C:419-424` fires it
+        // whenever the channel scan does not advance; this host fires it once
+        // per elapsed second instead, in the catch-up below, ahead of that
+        // second's kicks. The scan-based call was deleted 2026-08-20: the
+        // module's gate is idempotent (`|= 1`) and `_BACKGROUND_FAST` consumes
+        // it at 1 Hz, so it could not advance the Realm by a tick the
+        // per-second call does not -- it only tied the vector's rate to this
+        // pump's cadence, and with it every measurement of this host to the
+        // board's load. See the test
+        // `cycle_does_not_fire_syscyc_merely_because_the_scan_did_not_advance`.
 
         if let Some(poison) = self.prctask(machine, module, &mut dispatched)? {
             return Ok(Cycles {
@@ -7383,25 +7333,29 @@ mod tests {
     }
 
 
-    /// `MAJORBBS.C:419-424` fires the `syscyc` vector whenever the channel
-    /// scan does not advance. This host declined it for most of its life, and
-    /// that single omission froze MajorMUD's entire real-time engine: its
-    /// `_MAJORMUD_SYSCYC` is the only writer of the fast-tick gate that
-    /// `_BACKGROUND_FAST` tests and clears, so with the vector uncalled the
-    /// gate was set at init and never again -- monsters never moved and no
-    /// player's movement delay ever counted down. See `cycle`'s own comment.
+    /// **The channel scan is not a `syscyc` trigger, and the clock is.**
     ///
-    /// The null case is asserted first and is not a formality: a `cycle` that
-    /// called through a null vector would jump to whatever lives at 0:0.
+    /// `MAJORBBS.C:419-424` fires the vector whenever the scan does not
+    /// advance, and this host did too until 2026-08-20. That call could not
+    /// advance MajorMUD's world by a single tick the per-second call does not:
+    /// `_MAJORMUD_SYSCYC` sets a gate with `|= 1` and `_BACKGROUND_FAST` --
+    /// an `rtkick` heartbeat -- tests and clears it at 1 Hz, so setting it
+    /// once and setting it a thousand times between two heartbeats are
+    /// indistinguishable. What it *did* do was tie the vector's rate to the
+    /// pump's cadence, which is a function of socket traffic rather than of
+    /// time, and made every measurement of this host depend on load.
+    ///
+    /// The vendor could not make this separation: on Worldgroup 3.3 NT
+    /// `syscyc` *was* the I/O pump (`TCPIP.C:420` chains a zero-timeout
+    /// `select()` onto it). Here tokio owns I/O and the vector carries only
+    /// the module's gate.
+    ///
+    /// `Fixture::new`'s clock is frozen, so no second elapses across these
+    /// calls and the per-second site cannot fire -- which is exactly what
+    /// makes the assertion below discriminate.
     #[test]
-    fn cycle_fires_the_syscyc_vector_when_the_scan_does_not_advance() {
+    fn cycle_does_not_fire_syscyc_merely_because_the_scan_did_not_advance() {
         let (mut f, module, rou) = polling_fixture();
-
-        let quiet = f.host.cycle(&mut f.machine, &module, &mut || false).expect("ran");
-        assert_eq!(
-            quiet.dispatched, 0,
-            "with syscyc null there is nothing to call, and nothing is called"
-        );
 
         // Install a vector, as a module's init routine does.
         let mut bytes = [0u8; 4];
@@ -7412,13 +7366,17 @@ mod tests {
             .write(&mut f.machine, "syscyc", &bytes)
             .expect("syscyc is a placed global");
 
-        let turned = f.host.cycle(&mut f.machine, &module, &mut || false).expect("ran");
-        assert!(
-            turned.dispatched >= 1,
-            "an installed syscyc vector is called once the scan stops advancing; \
-             dispatched was {}",
-            turned.dispatched
-        );
+        for turn in 0..4 {
+            let cycles = f
+                .host
+                .cycle(&mut f.machine, &module, &mut || false)
+                .expect("ran");
+            assert_eq!(
+                cycles.dispatched, 0,
+                "turn {turn}: the clock did not move, so an installed syscyc \
+                 vector must not be called -- an idle scan is not a trigger"
+            );
+        }
     }
 
     /// A registered task runs on every cycle, and keeps running -- that is
@@ -7630,11 +7588,12 @@ mod tests {
         };
         let fired = |elapsed| dispatches(true, elapsed) - dispatches(false, elapsed);
 
-        // One for the vendor's own idle-pass call at the top of `cycle`
-        // (`MAJORBBS.C:421`, which fires whether or not a second has passed),
-        // plus one per elapsed second ahead of that second's kicks.
-        assert_eq!(fired(1), 2, "one second: the idle-pass call and that second's");
-        assert_eq!(fired(4), 5, "four seconds: the idle-pass call and four more");
+        // One per elapsed second, ahead of that second's kicks -- and nothing
+        // else. `MAJORBBS.C:421`'s idle-pass call (fired whether or not a
+        // second had passed) was deleted 2026-08-20; see
+        // `cycle_does_not_fire_syscyc_merely_because_the_scan_did_not_advance`.
+        assert_eq!(fired(1), 1, "one second: that second's call, nothing more");
+        assert_eq!(fired(4), 4, "four seconds: four calls, one per second");
 
         // The scaling is the whole point. A constant here -- which is what
         // firing once per `cycle` gave -- means the module loses every second
