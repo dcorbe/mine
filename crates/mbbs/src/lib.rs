@@ -4175,6 +4175,7 @@ impl<A: Abi> Host<A> {
         machine: &mut A::Cpu,
         module: &A::Module,
         interrupted: &mut dyn FnMut() -> bool,
+        emit: &mut dyn FnMut(&mut gsbl::Gsbl),
     ) -> io::Result<Cycles<A>> {
         let mut iterations = 0;
         let mut dispatched = 0;
@@ -4243,6 +4244,16 @@ impl<A: Abi> Host<A> {
                 // consumed it either way.
                 None => {}
             }
+
+            // **Ahead of the tick catch-up below, and that is the point.**
+            // Whatever the status dispatch above just produced -- a
+            // keystroke's echo, most of the time -- goes to the caller now,
+            // before this pass spends its `syscyc`/`prcrtk` sweep. It used to
+            // wait for `cycle` to return, because `flush` was the driver's
+            // step 4 (`mbbs-server/src/host.rs:1085`); on a live board that
+            // put MajorMUD's 16-68 ms `_BACKGROUND_FAST` heartbeat in front of
+            // every echo unlucky enough to land in a pass that owed a second.
+            emit(&mut self.gsbl);
 
             // `MAJORBBS.C:476`, with two changes the original did not need.
             // `get_or_insert` is the first pass syncing rather than catching up
@@ -4361,6 +4372,14 @@ impl<A: Abi> Host<A> {
                 }
             }
             self.tcklst = Some(last);
+
+            // And again behind the sweep, so anything the sweep itself
+            // produced -- a monster's arrival, a save's notice -- does not
+            // wait for the next pass to be seen. Two calls a pass is the
+            // contract `the_emitter_runs_on_both_sides_of_the_tick_catch_up`
+            // pins: emitting only here is the bug this change removes.
+            emit(&mut self.gsbl);
+
             // **Elapsed epoch time is not evidence of a stall.** `tcklst`
             // persists across `cycle` calls, and between two of them the
             // driver is asleep -- that is what `Ended::Waiting` is for. So
@@ -6691,7 +6710,7 @@ mod tests {
         // drain, but nothing left in `channel.input` once it has.
         f.host.gsbl_mut().push_input(chan, b"Kai");
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
         assert_eq!(
             cycles.ended,
             Ended::Idle,
@@ -6938,7 +6957,7 @@ mod tests {
         // `poll_dispatches_cycle_to_stsrou`'s identical comment.
         set_state(&mut f, console, state);
         f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
 
         assert_eq!(cycles.dispatched, 1, "one CYCLE is one entry into stsrou");
         assert!(
@@ -7473,10 +7492,10 @@ mod tests {
             .expect("channel 0");
         f.host.set_polls_per_second(4);
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first call syncs tcklst");
         f.host.set_clock(Clock::pinned(1_135_952_406));
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
 
         assert_eq!(
             cycles.dispatched, 1,
@@ -7584,13 +7603,13 @@ mod tests {
             .expect("channel 0");
         f.host.set_polls_per_second(4);
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first call syncs tcklst");
 
         f.host.set_clock(Clock::pinned(1_135_952_406));
-        let first = f.host.cycle(&mut f.machine, &module, &mut || false).expect("first");
+        let first = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first");
 
         f.host.set_clock(Clock::pinned(1_135_952_407));
-        let second = f.host.cycle(&mut f.machine, &module, &mut || false).expect("second");
+        let second = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("second");
 
         assert_eq!(first.dispatched, 4, "one second's grant, spent");
         assert_eq!(second.dispatched, 4, "the next second grants again");
@@ -7630,7 +7649,7 @@ mod tests {
             .expect("channel 0");
         f.host.set_polls_per_second(POLLS_PER_SECOND);
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first call syncs tcklst");
 
         // Every read of this clock looks like a fresh elapsed second --
         // draining `POLLS_PER_SECOND` firings takes that many passes, and
@@ -7639,7 +7658,7 @@ mod tests {
         // would.
         f.host.set_clock(Clock::stepped(1_135_952_406, 1_000));
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
 
         assert_eq!(
             cycles.dispatched, POLLS_PER_SECOND,
@@ -7833,7 +7852,7 @@ mod tests {
         for turn in 0..4 {
             let cycles = f
                 .host
-                .cycle(&mut f.machine, &module, &mut || false)
+                .cycle(&mut f.machine, &module, &mut || false, &mut |_| {})
                 .expect("ran");
             assert_eq!(
                 cycles.dispatched, 0,
@@ -7907,7 +7926,7 @@ mod tests {
     #[test]
     fn a_cycle_with_nothing_to_do_ends_idle_on_the_first_pass() {
         let (mut f, module, _rou) = polling_fixture();
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
         assert_eq!(cycles.ended, Ended::Idle);
         assert_eq!(cycles.dispatched, 0);
         assert_eq!(cycles.iterations, 1, "it works that out on the first pass");
@@ -7932,7 +7951,7 @@ mod tests {
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
         f.host.set_polls_per_second(1_000);
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first call syncs tcklst");
         f.host.set_clock(Clock::pinned(1_135_952_406));
 
         let mut asks = 0;
@@ -7941,7 +7960,7 @@ mod tests {
             .cycle(&mut f.machine, &module, &mut || {
                 asks += 1;
                 asks >= 3
-            })
+            }, &mut |_| {})
             .expect("cycled");
 
         assert_eq!(cycles.iterations, 3, "the interrupt is what stopped it");
@@ -7971,7 +7990,7 @@ mod tests {
         f.host.kicks.push(Kick { delay: 45, dstrou: rou });
 
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first call syncs tcklst");
         f.host.set_clock(Clock::pinned(1_135_952_406));
 
         // The grant only lands beside a real elapsed second, which also runs
@@ -7985,7 +8004,7 @@ mod tests {
             .cycle(&mut f.machine, &module, &mut || {
                 asks += 1;
                 asks >= 20
-            })
+            }, &mut |_| {})
             .expect("cycled");
 
         assert_eq!(
@@ -8012,7 +8031,7 @@ mod tests {
         while dispatched == 0 {
             calls += 1;
             assert!(calls < 20, "the kick never came due");
-            let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+            let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
             assert_eq!(
                 cycles.iterations, 1,
                 "nothing is ever pending here, so every call returns on its first pass"
@@ -8022,7 +8041,7 @@ mod tests {
 
         assert_eq!(dispatched, 1, "the kick fired, once");
         assert_eq!(calls, 4, "two reads to the second, two seconds to the kick");
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
         assert_eq!(cycles.ended, Ended::Idle, "and then there was nothing left");
     }
 
@@ -8057,9 +8076,9 @@ mod tests {
             // what `Ended::Waiting` tells it to do -- and the next call has
             // all of them to catch up in one go.
             f.host.set_clock(Clock::pinned(1_135_952_405));
-            f.host.cycle(&mut f.machine, &module, &mut || false).expect("first");
+            f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first");
             f.host.set_clock(Clock::pinned(1_135_952_405 + elapsed));
-            f.host.cycle(&mut f.machine, &module, &mut || false).expect("second").dispatched
+            f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("second").dispatched
         };
         let fired = |elapsed| dispatches(true, elapsed) - dispatches(false, elapsed);
 
@@ -8080,6 +8099,96 @@ mod tests {
         );
     }
 
+    /// Output queued before a heavy tick catch-up reaches the emitter during
+    /// the call, not after it.
+    ///
+    /// This is the input-latency bug measured 2026-08-20: `flush` ran only
+    /// once `cycle` returned (`mbbs-server/src/host.rs:1085`), so an echo
+    /// generated at the top of a pass sat in the channel's output buffer
+    /// until that pass's `syscyc`/`prcrtk` sweep finished. On a live board
+    /// that sweep is MajorMUD's 1 Hz `_BACKGROUND_FAST` heartbeat and costs
+    /// 16-68 ms, which is exactly the slow half of the bimodal keystroke
+    /// latency the board showed (0.2-0.8 ms against 12.9-30.9 ms, on
+    /// byte-identical 637-byte redraws).
+    #[test]
+    fn a_cycle_hands_output_to_the_emitter_without_waiting_to_return() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        let mut bytes = [0u8; 4];
+        bytes[0..2].copy_from_slice(&rou.offset.to_le_bytes());
+        bytes[2..4].copy_from_slice(&rou.selector.to_le_bytes());
+        f.host
+            .globals()
+            .write(&mut f.machine, "syscyc", &bytes)
+            .expect("syscyc is a placed global");
+
+        // A cycle that owes four seconds of catch-up: the heavy sweep whose
+        // duration used to be added to every keystroke that landed in it.
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host
+            .cycle(&mut f.machine, &module, &mut || false, &mut |_| {})
+            .expect("the first call only syncs tcklst");
+        f.host.gsbl_mut().transmit_raw(console, b"ECHO");
+        f.host.set_clock(Clock::pinned(1_135_952_405 + 4));
+
+        let mut seen: Vec<u8> = Vec::new();
+        f.host
+            .cycle(&mut f.machine, &module, &mut || false, &mut |gsbl| {
+                seen.extend_from_slice(&gsbl.drain_output(console));
+            })
+            .expect("the second call owes four seconds");
+
+        assert_eq!(
+            seen, b"ECHO",
+            "the emitter must receive output during the call, not after it"
+        );
+        assert!(
+            f.host.gsbl_mut().drain_output(console).is_empty(),
+            "the emitter drained it, so nothing may be left behind for a \
+             post-return flush to find"
+        );
+    }
+
+    /// The emitter runs on both sides of the tick catch-up, twice per pass.
+    ///
+    /// Ahead of it so a keystroke's echo does not wait for the sweep -- the
+    /// whole point -- and again behind it so output the sweep itself produced
+    /// (a monster's arrival, a save's notice) does not wait for the next
+    /// pass. Pinned as a count because that is what discriminates: emitting
+    /// only after the catch-up, which is the bug, gives exactly one call per
+    /// pass and would leave every other assertion here satisfied.
+    #[test]
+    fn the_emitter_runs_on_both_sides_of_the_tick_catch_up() {
+        let (mut f, module, rou) = polling_fixture();
+        let mut bytes = [0u8; 4];
+        bytes[0..2].copy_from_slice(&rou.offset.to_le_bytes());
+        bytes[2..4].copy_from_slice(&rou.selector.to_le_bytes());
+        f.host
+            .globals()
+            .write(&mut f.machine, "syscyc", &bytes)
+            .expect("syscyc is a placed global");
+
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host
+            .cycle(&mut f.machine, &module, &mut || false, &mut |_| {})
+            .expect("the first call only syncs tcklst");
+        f.host.set_clock(Clock::pinned(1_135_952_405 + 1));
+
+        let mut calls = 0usize;
+        let cycles = f
+            .host
+            .cycle(&mut f.machine, &module, &mut || false, &mut |_| calls += 1)
+            .expect("the second call owes a second");
+
+        assert_eq!(
+            calls,
+            cycles.iterations * 2,
+            "two emitter calls per pass -- one before the catch-up, one after; \
+             {} passes ran and the emitter was called {calls} times",
+            cycles.iterations
+        );
+    }
+
     /// A caller that always wants the thread back still gets a second of the
     /// module's time on every call. The interrupt is consulted after the tick
     /// catch-up precisely so that a fast typist cannot stop the world.
@@ -8096,8 +8205,8 @@ mod tests {
         f.host.set_clock(Clock::stepped(1_135_952_405, 1_000));
 
         // First call syncs `tcklst`; the second owes a second of time work.
-        let _ = f.host.cycle(&mut f.machine, &module, &mut || true).expect("first");
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || true).expect("second");
+        let _ = f.host.cycle(&mut f.machine, &module, &mut || true, &mut |_| {}).expect("first");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || true, &mut |_| {}).expect("second");
 
         assert!(
             cycles.dispatched >= 1,
@@ -8123,11 +8232,11 @@ mod tests {
         let (mut f, module, _rou) = polling_fixture();
 
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first call syncs tcklst");
         let before = f.host.globals().word(&f.machine, "ticker").expect("ticker is a placed global");
 
         f.host.set_clock(Clock::pinned(1_135_952_405 + 4));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("second call owes four seconds");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("second call owes four seconds");
         let after = f.host.globals().word(&f.machine, "ticker").expect("read");
 
         assert_eq!(
@@ -8149,14 +8258,14 @@ mod tests {
         let (mut f, module, _rou) = polling_fixture();
 
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first call syncs tcklst");
         f.host
             .globals()
             .write(&mut f.machine, "ticker", &65535u16.to_le_bytes())
             .expect("ticker is a placed global");
 
         f.host.set_clock(Clock::pinned(1_135_952_405 + 1));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("one more second elapses");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("one more second elapses");
 
         assert_eq!(
             f.host.globals().word(&f.machine, "ticker").expect("read"),
@@ -8182,10 +8291,10 @@ mod tests {
             .expect("channel 0");
         f.host.set_polls_per_second(5);
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first call syncs tcklst");
         f.host.set_clock(Clock::pinned(1_135_952_406));
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
         let census = f.host.take_census();
 
         assert_eq!(cycles.dispatched, 5, "the budget bought five dispatches");
@@ -8236,7 +8345,7 @@ mod tests {
         f.host.kicks.push(Kick { delay: 60, dstrou: rou });
         f.host.set_clock(Clock::pinned(1_135_952_405));
 
-        let first = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let first = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
         assert_eq!(first.iterations, 1, "nothing pending; one pass");
         f.host.drain_notes();
 
@@ -8244,7 +8353,7 @@ mod tests {
         // woke two seconds later on input that turned out to be nothing.
         f.host.set_clock(Clock::pinned(1_135_952_405 + 2));
 
-        let second = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let second = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
         assert_eq!(second.iterations, 1, "still nothing pending; still one pass");
         assert_eq!(second.dispatched, 0, "and nothing was dispatched at all");
 
@@ -8302,7 +8411,7 @@ mod tests {
         f.host.kicks.push(Kick { delay: 60, dstrou: rou });
         f.host.set_clock(Clock::pinned(1_135_952_405));
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
 
         assert_eq!(
             cycles.ended,
@@ -8335,7 +8444,7 @@ mod tests {
         f.host.kicks.push(Kick { delay: 7, dstrou: rou });
         f.host.kicks.push(Kick { delay: 45, dstrou: rou });
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
 
         assert_eq!(
             cycles.ended,
@@ -8354,10 +8463,10 @@ mod tests {
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
         f.host.set_polls_per_second(5);
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("first call syncs tcklst");
         f.host.set_clock(Clock::pinned(1_135_952_406));
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
 
         assert_eq!(cycles.dispatched, 5, "the grant is what stopped it -- nothing else bounds a cycle");
         assert_eq!(
@@ -8439,7 +8548,7 @@ mod tests {
 
         f.host.gsbl_mut().push_input(console, b"look\r");
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycle runs");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycle runs");
         match cycles.ended {
             Ended::Stopped(mbbs_machine::m16::Poison::Fault { .. }, Some(chan)) => {
                 assert_eq!(
@@ -8459,12 +8568,12 @@ mod tests {
     fn a_clock_that_goes_backwards_resyncs_instead_of_firing_four_billion_rounds() {
         let (mut f, module, rou) = polling_fixture();
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        let _ = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let _ = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
 
         f.host.kicks.push(Kick { delay: 1, dstrou: rou });
         f.host.set_clock(Clock::pinned(1_135_952_000));
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
 
         assert_eq!(cycles.dispatched, 0, "going backwards fires nothing");
         assert!(
@@ -8483,7 +8592,7 @@ mod tests {
         f.host.set_clock(Clock::pinned(1_135_952_405));
         f.host.kicks.push(Kick { delay: 2, dstrou: rou });
 
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
 
         assert_eq!(cycles.dispatched, 0, "no second has elapsed yet");
         assert_eq!(
@@ -8517,7 +8626,7 @@ mod tests {
             .cycle(&mut f.machine, &module, &mut || {
                 left -= 1;
                 left == 0
-            })
+            }, &mut |_| {})
             .expect("cycled");
         let each = at.elapsed() / idle.iterations as u32;
         eprintln!("{} idle passes, {each:?} each", idle.iterations);
@@ -8533,7 +8642,7 @@ mod tests {
             .cycle(&mut f.machine, &module, &mut || {
                 left -= 1;
                 left == 0
-            })
+            }, &mut |_| {})
             .expect("cycled");
         let each = at.elapsed() / busy.iterations as u32;
         eprintln!("{} dispatching passes, {each:?} each", busy.iterations);

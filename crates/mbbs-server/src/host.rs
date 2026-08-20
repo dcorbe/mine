@@ -1050,6 +1050,11 @@ fn life<A: Abi>(
         // The closure is scoped to this block so its borrow of `peeked` and
         // `rx` ends before step 2 of the *next* turn needs to drain them.
         let turn_start = Instant::now();
+        // Channels whose output could not be handed over *during* the cycle.
+        // Collected rather than acted on there: hanging one up needs `host`,
+        // `machine` and `pool`, and `host` is mutably borrowed by `cycle` for
+        // as long as the emitter can run. See `drop_channel`.
+        let mut undeliverable: Vec<Chan> = Vec::new();
         let cycles = {
             let mut interrupted = || {
                 if peeked.is_none() {
@@ -1057,8 +1062,32 @@ fn life<A: Abi>(
                 }
                 peeked.is_some()
             };
-            host.cycle(&mut machine, &module, &mut interrupted)?
+            // **Step 4 used to be the only place output left this host, and
+            // that was the input-latency bug.** `flush` still runs below and
+            // is still what sweeps a channel nothing dispatched into, but an
+            // echo no longer waits for `cycle` to return to find it: the
+            // emitter hands it over twice a pass, on both sides of the tick
+            // catch-up. See `Host::cycle`'s own comments at both call sites,
+            // and `MBBS_TRACE_TURNS` for the measurement that found it.
+            let mut emit = |gsbl: &mut mbbs::gsbl::Gsbl| {
+                for chan in terms.all() {
+                    let bytes = gsbl.drain_output(chan);
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    let Some(sender) = &conns[chan.index()] else {
+                        continue;
+                    };
+                    if sender.try_send(Out::Bytes(bytes)).is_err() {
+                        undeliverable.push(chan);
+                    }
+                }
+            };
+            host.cycle(&mut machine, &module, &mut interrupted, &mut emit)?
         };
+        for chan in undeliverable {
+            drop_channel(&mut host, &mut machine, &module, &mut pool, &mut conns, chan)?;
+        }
         let spent = turn_start.elapsed();
         turns += 1;
         if spent > worst_turn {
@@ -1311,22 +1340,39 @@ fn flush<A: Abi>(
             continue;
         };
         if sender.try_send(Out::Bytes(bytes)).is_err() {
-            // Full (a client that cannot keep up) or Closed (the connection
-            // task is already gone): the same treatment either way, because
-            // a socket that will not drain is indistinguishable from one
-            // that is gone. This is already the lost-carrier path.
-            host.hangup(machine, module, chan)?;
-            // `chan` here is a bare `Chan` from `terms.all()`, not a
-            // `Routed` that arrived on the wire -- `Pool::key` is the
-            // caller-trusts-itself pairing for exactly that case (this
-            // pool's own sweep of its own channels), as opposed to
-            // `Pool::give_back`'s guarded acceptance of a `Routed` handed in
-            // from outside. See `pool.rs`'s doc on both.
-            pool.give_back(pool.key(chan));
-            conns[chan.index()] = None;
-            eprintln!("mbbs-server: channel {chan} dropped (could not send output), hung up");
+            drop_channel(host, machine, module, pool, conns, chan)?;
         }
     }
+    Ok(())
+}
+
+/// Hang up a channel whose output could not be handed to its connection.
+///
+/// Full (a client that cannot keep up) or Closed (the connection task is
+/// already gone): the same treatment either way, because a socket that will
+/// not drain is indistinguishable from one that is gone. This is already the
+/// lost-carrier path.
+///
+/// One function because there are now two places that reach it -- [`flush`],
+/// and `life`'s own sweep of what the in-cycle emitter could not deliver --
+/// and a second copy of the pool bookkeeping is how those two drift apart.
+fn drop_channel<A: Abi>(
+    host: &mut Host<A>,
+    machine: &mut A::Cpu,
+    module: &A::Module,
+    pool: &mut Pool,
+    conns: &mut [Option<Sender<Out>>],
+    chan: Chan,
+) -> io::Result<()> {
+    host.hangup(machine, module, chan)?;
+    // `chan` here is a bare `Chan` from `terms.all()`, not a `Routed` that
+    // arrived on the wire -- `Pool::key` is the caller-trusts-itself pairing
+    // for exactly that case (this pool's own sweep of its own channels), as
+    // opposed to `Pool::give_back`'s guarded acceptance of a `Routed` handed
+    // in from outside. See `pool.rs`'s doc on both.
+    pool.give_back(pool.key(chan));
+    conns[chan.index()] = None;
+    eprintln!("mbbs-server: channel {chan} dropped (could not send output), hung up");
     Ok(())
 }
 
