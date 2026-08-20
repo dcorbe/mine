@@ -1193,6 +1193,13 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // implementation was written for it; see `crt`'s module doc for the
         // pass that once did write second bodies here.
         (CW3220MT, "_fputc", stream::fputc, Cleans::Caller, Evidence::Standard),
+        // `CW3220MT`, not `MAJORBBS`: no generation of MAJORBBS exported
+        // `getcwd`, and `registration_surface.rs` is what said so -- it was
+        // registered there first and could never have resolved. The one
+        // archive module that wants it imports it from `cw3220mt.DLL`, which
+        // is Borland's own, and nothing asks MAJORBBS for it, so it is on
+        // neither shared list.
+        (CW3220MT, "getcwd", crt::getcwd, Cleans::Caller, Evidence::Standard),
         // The C library this host was missing, all documented Borland/ISO
         // semantics. Each carries its own disclosure where the answer is a
         // convention rather than a measurement -- `getcwd`'s drive letter in
@@ -1201,7 +1208,6 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "memchr", crt::memchr, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "rmdir", crt::rmdir, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "setvbuf", crt::setvbuf, Cleans::Caller, Evidence::Standard),
-        (MAJORBBS, "getcwd", crt::getcwd, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "localtime", crt::localtime, Cleans::Caller, Evidence::Standard),
         // Drives `credit::scan`, the loop `sscanf` already uses, over a line
         // from the stream -- extracted rather than transcribed a second time.
@@ -1213,11 +1219,21 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // `read_raw` counterpart, and raw bytes cannot be reconstructed from
         // an already-translating read after the fact.
         (MAJORBBS, "_read", crt::_read, Cleans::Caller, Evidence::Standard),
-        // Galacticomm's own (`GCOMM.H`, ordinal 46), not Borland's: the
-        // in/out buffer contract -- directory prefix in, generated path
+        // Borland's, re-exported: `GCOMM.H:60` is a bare declaration --
+        // `INT creattemp(CHAR *,INT)`, Borland's own signature -- with no body
+        // anywhere in the vendor tree, which is what a re-exported runtime
+        // routine looks like. So it is on `CRT_SHARED` and answers under
+        // `cw3220mt.DLL` too, where three of the archive's PE32 builds import
+        // it. An earlier version of this comment called it "Galacticomm's own,
+        // not Borland's" on the strength of the `GCOMM.H` declaration alone;
+        // `crt_library_split.rs` is what disagreed, by noticing that real
+        // binaries ask the runtime for it.
+        //
+        // The in/out buffer contract -- directory prefix in, generated path
         // written back into the same buffer -- is measured off three call
-        // sites in `SRC/api/galmhs`. The generated spelling itself is
-        // invented, which is what the `Guessed` argument records.
+        // sites in `SRC/api/galmhs`, and matches Borland's documented
+        // behaviour. The generated spelling itself is invented, which is what
+        // the `Guessed` argument records.
         (MAJORBBS, "creattemp", crt::creattemp, Cleans::Caller,
          Evidence::Guessed("in/out buffer contract measured off three SRC/api/galmhs call \
                             sites; the TMnnnn.TMP spelling is invented, and no caller can \
@@ -1400,7 +1416,8 @@ const CRT_SHARED: &[&str] = &[
     "_streams", "fclose", "fflush", "fgetc", "fgets", "fopen", "fprintf", "fputc", "fread",
     "fseek", "ftell", "fwrite", "flushall", "rewind", "ungetc",
     // Descriptors and the file system.
-    "access", "close", "filelength", "getcwd", "lseek", "mkdir", "open", "read", "rename",
+    "access", "close", "creattemp", "filelength", "lseek", "mkdir", "open", "read",
+    "rename",
     "rmdir", "setvbuf", "tell", "unlink", "write",
     // The environment.
     "getenv",
