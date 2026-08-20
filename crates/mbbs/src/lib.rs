@@ -3881,6 +3881,23 @@ impl<A: Abi> Host<A> {
             // it. `None` skips the whole block, so a host without an
             // extension executes exactly the path it always did.
             //
+            // LOUD NOTE, because this has already produced one whole-branch
+            // review Critical that no single task's review caught: this
+            // `status == gsbl::Gsbl::CRSTG` guard is the ENTIRE gate. It is
+            // not "an in-game command line" -- `CRSTG` fires on every line a
+            // channel sends at every point in its session, including login,
+            // name entry, and password entry, because nothing here yet
+            // distinguishes those states from the game loop. A registered
+            // command name (`mmud.command("cash", ...)`, say) is a word this
+            // seam intercepts anywhere a player can type it, not only where
+            // a sysop imagined a command running -- a login name or password
+            // that happens to match one is swallowed here, before the module
+            // ever sees it. This is a known, deliberately deferred scope
+            // decision (see `.superpowers/sdd/2026-08-20-lua-command-seam/`
+            // and `crate::extension`'s own module doc, which carries the
+            // fuller account), not something to "fix" by narrowing this
+            // condition without the design discussion that belongs to.
+            //
             // `Handled` needs no channel-state cleanup beyond a bare
             // `continue` -- see `task-2-findings.md`, in full. Summarized:
             // `Gsbl::take_line` (`gsbl.rs:549`) already popped the line

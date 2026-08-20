@@ -1,7 +1,7 @@
 //! Script loading and command registration, exercised through `LuaExtension`.
 
 use mbbs::extension::Verdict;
-use mbbs::testing::Fixture;
+use mbbs::testing::{Fixture, module_bytes_exporting};
 use mbbs_lua::LuaExtension;
 
 /// Creates a fresh directory under this crate's `target/` scratch area (never
@@ -314,4 +314,137 @@ fn exp_against_a_module_with_no_export_disables_the_handler_and_names_get_player
     assert_eq!(notes.len(), 1, "got: {notes:?}");
     assert!(notes[0].contains("exp"), "got: {notes:?}");
     assert!(notes[0].contains("_GET_PLAYER"), "got: {notes:?}");
+}
+
+/// `_GET_PLAYER` returning null -- AX=0, DX=0, retf, the same fixture
+/// `crates/mbbs/tests/extension_seam.rs::player_record_is_an_error_when_get_player_returns_null`
+/// uses -- is what "no character loaded on this channel" looks like from a
+/// real, running export, as opposed to the "no such export" proxy the tests
+/// above use. This is Critical #1 from the whole-branch review: `cash` and
+/// `exp` used to propagate that failure through `mlua::Error::external`,
+/// which would disable the handler board-wide over a condition the seam's
+/// own scope (see the crate doc's "shadows any line" section) makes routine
+/// -- reachable any time `cash`/`exp` gets typed before a character has
+/// loaded, on a board with no per-channel state gating this seam yet. A test
+/// that only checked the printed message would have passed against that
+/// broken code too (`ctx.note` also produces a message, just not to the
+/// player) -- the assertion that actually catches the regression is that
+/// the handler is still enabled, and still answers correctly, on the second
+/// and third attempt.
+#[test]
+fn cash_with_no_character_loaded_reports_it_and_leaves_the_handler_enabled() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let code = [0xb8, 0x00, 0x00, 0xba, 0x00, 0x00, 0xcb];
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("_GET_PLAYER", &code)).expect("loads");
+    let chan = fixture.console();
+
+    for attempt in 0..3 {
+        let verdict = fixture.run_command(&mut ext, chan, "cash 100", &module);
+        assert_eq!(verdict, Verdict::Handled, "attempt {attempt}: no character loaded is a player mistake, not a reason to disable cash");
+        let out = fixture.host.gsbl_mut().drain_output(chan);
+        assert_eq!(String::from_utf8_lossy(&out), "no character loaded on this channel.\r\n", "attempt {attempt}");
+    }
+    assert!(fixture.host.notes().is_empty(), "must never disable cash over a routine 'no character loaded' condition, got: {:?}", fixture.host.notes());
+}
+
+/// `exp`'s mirror of the `cash` test above -- see its doc comment for why
+/// this specifically proves the handler survives, not just that it prints
+/// the right thing once.
+#[test]
+fn exp_with_no_character_loaded_reports_it_and_leaves_the_handler_enabled() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let code = [0xb8, 0x00, 0x00, 0xba, 0x00, 0x00, 0xcb];
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("_GET_PLAYER", &code)).expect("loads");
+    let chan = fixture.console();
+
+    for attempt in 0..3 {
+        let verdict = fixture.run_command(&mut ext, chan, "exp 100", &module);
+        assert_eq!(verdict, Verdict::Handled, "attempt {attempt}: no character loaded is a player mistake, not a reason to disable exp");
+        let out = fixture.host.gsbl_mut().drain_output(chan);
+        assert_eq!(String::from_utf8_lossy(&out), "no character loaded on this channel.\r\n", "attempt {attempt}");
+    }
+    assert!(fixture.host.notes().is_empty(), "must never disable exp over a routine 'no character loaded' condition, got: {:?}", fixture.host.notes());
+}
+
+/// Critical #2 from the whole-branch review, the `write_scratch` refusal
+/// half: any item name over `write_scratch`'s ~125-byte budget used to raise
+/// an `mlua` error and disable `summon` board-wide, over an input trivially
+/// reachable by pasting or holding a key. As with the `cash`/`exp` tests
+/// above, the load-bearing assertion is that the handler is still enabled on
+/// a second attempt, not just that the message is right once.
+#[test]
+fn summon_with_a_too_long_name_reports_it_and_leaves_the_handler_enabled() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+    // COMMAND_SCRATCH_BYTES is 128; `summon` packs `name` + NUL + a 2-byte
+    // count into that buffer, so anything over 125 bytes overflows it.
+    let too_long = "x".repeat(126);
+
+    for attempt in 0..2 {
+        let verdict = fixture.run_command(&mut ext, chan, &format!("summon {too_long}"), &module);
+        assert_eq!(verdict, Verdict::Handled, "attempt {attempt}: an over-long name is a player mistake, not a reason to disable summon");
+        let out = fixture.host.gsbl_mut().drain_output(chan);
+        assert_eq!(String::from_utf8_lossy(&out), "not a valid item name.\r\n", "attempt {attempt}");
+    }
+    assert!(fixture.host.notes().is_empty(), "must never disable summon over an over-long name, got: {:?}", fixture.host.notes());
+}
+
+/// Critical #2's other half: an embedded NUL byte in an item name used to
+/// raise an `mlua` error too. Exercised directly against `c:summon`, rather
+/// than through `scripts/summon.lua`'s own argument parsing, since a NUL
+/// byte cannot arrive via this test's own `run_command(..., line: &str,
+/// ...)` (a Rust `&str` embeds one just fine, but `split_command` and the
+/// line-to-args plumbing have no reason to strip it -- the point here is
+/// `c:summon`'s own defence, not how a NUL reaches it).
+#[test]
+fn summon_with_an_embedded_nul_reports_it_and_leaves_the_handler_enabled() {
+    let dir = tempdir_with(
+        "summon_with_an_embedded_nul_reports_it_and_leaves_the_handler_enabled",
+        &[(
+            "nul.lua",
+            r#"mmud.command("nultest", function(c)
+                local ok, reason = c:summon("a\0b")
+                c:print(reason .. ".\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut ext = LuaExtension::load(&dir).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    for attempt in 0..2 {
+        let verdict = fixture.run_command(&mut ext, chan, "nultest", &module);
+        assert_eq!(verdict, Verdict::Handled, "attempt {attempt}: an embedded NUL is a player/script-input mistake, not a reason to disable the handler");
+        let out = fixture.host.gsbl_mut().drain_output(chan);
+        assert_eq!(String::from_utf8_lossy(&out), "item name must not contain a NUL byte.\r\n", "attempt {attempt}");
+    }
+    assert!(fixture.host.notes().is_empty(), "must never disable the handler over an embedded NUL, got: {:?}", fixture.host.notes());
+}
+
+/// Important #4 from the whole-branch review: two scripts registering the
+/// same command name used to shadow silently -- `Extension::command` matches
+/// the *first* registration, so the second handler would simply never run,
+/// with no diagnostic anywhere. This asserts the load now fails outright and
+/// names both the offending command and the file that tried to re-register
+/// it.
+#[test]
+fn two_scripts_registering_the_same_command_name_fails_the_load() {
+    let dir = tempdir_with(
+        "two_scripts_registering_the_same_command_name_fails_the_load",
+        &[
+            ("10-first.lua", r#"mmud.command("dup", function(c) return mmud.HANDLED end)"#),
+            ("20-second.lua", r#"mmud.command("dup", function(c) return mmud.HANDLED end)"#),
+        ],
+    );
+
+    let err = LuaExtension::load(&dir).expect_err("a duplicate command name must fail the load");
+
+    assert!(err.to_string().contains("dup"), "got: {err}");
+    assert!(err.to_string().contains("20-second.lua"), "got: {err}");
 }

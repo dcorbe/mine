@@ -5,6 +5,22 @@
 //! channel, a line of input, a verdict -- so the dispatch contract can be
 //! tested with a plain Rust fake, and so `mbbs` never grows a dependency on
 //! whatever scripting layer sits above it.
+//!
+//! **This seam sees every line, not just in-game commands.** The call site
+//! that reaches [`Extension::command`] (`crate::Host::poll_with_chan`,
+//! guarded on `status == gsbl::Gsbl::CRSTG`) fires on *every* line a channel
+//! sends at *every* point in its session -- login, name entry, password
+//! entry, all of it -- because nothing here yet distinguishes "the module is
+//! at a prompt" from "the module is in the game loop." A registered command
+//! name is a word an extension can intercept anywhere a player can type,
+//! not only where a sysop imagined a command running. This is a known,
+//! deliberately deferred scope decision, not an oversight; see
+//! `mbbs-lua`'s own crate doc for the fuller account and what it means for
+//! a script author picking a command name.
+//!
+//! Where a new command's business logic should live -- `mbbs-lua` versus a
+//! `CommandCtx` method here -- is also written down, in `mbbs-lua`'s own
+//! crate doc, not repeated here.
 
 use std::io;
 
@@ -245,6 +261,42 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
     /// a silent no-op: a caller that went on to write through a null pointer
     /// would corrupt segment 0 of whatever the selector half happened to be.
     pub fn player_record(&mut self) -> io::Result<A::Ptr> {
+        self.get_player()?.ok_or_else(|| {
+            io::Error::other(format!("_GET_PLAYER({}) returned a null pointer -- no player loaded on this channel", self.chan))
+        })
+    }
+
+    /// [`CommandCtx::player_record`]'s sibling: a null `_GET_PLAYER` return
+    /// comes back as `Ok(None)` here instead of an `Err`.
+    ///
+    /// `player_record` is right that a null return deserves a loud, named
+    /// error for a caller with no plan for it -- that contract is unchanged,
+    /// and most callers should keep using it. This exists for the caller
+    /// that *does* have a plan: "no character loaded on this channel" is a
+    /// routine, player-reachable condition (nothing this seam does is
+    /// scoped to in-game input -- see the extension seam's own module doc),
+    /// not a sign of a broken script or a broken module, so a caller like
+    /// `mbbs-lua`'s `adjust_wealth`/`set_exp` needs to tell it apart from a
+    /// genuine failure (`_GET_PLAYER` itself unresolved, or the machine
+    /// stopping underneath it) in order to report the former to the player
+    /// instead of disabling itself over it. Both of those genuine failures
+    /// still come back `Err` here, exactly as [`CommandCtx::player_record`]
+    /// reports them -- only the null-pointer case changes shape.
+    ///
+    /// # Errors
+    ///
+    /// Anything other than a null return: as [`CommandCtx::player_record`]'s
+    /// own `# Errors`.
+    pub fn try_player_record(&mut self) -> io::Result<Option<A::Ptr>> {
+        self.get_player()
+    }
+
+    /// `_GET_PLAYER(usrnum)`, decoded into a far pointer, with the
+    /// null-vs-real-pointer decision left to the caller -- the one piece of
+    /// logic [`CommandCtx::player_record`] and [`CommandCtx::try_player_record`]
+    /// share, so the two public methods cannot drift apart on what counts as
+    /// "null" or how the far pointer is assembled.
+    fn get_player(&mut self) -> io::Result<Option<A::Ptr>> {
         let usrnum = A::Int::from(self.chan.number() as u16);
         let outcome = self.call_export("_GET_PLAYER", &[Arg::Int(usrnum)])?;
         let (lo, hi) = match outcome {
@@ -256,13 +308,7 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
         let mut bytes = (lo as u16).to_le_bytes().to_vec();
         bytes.extend_from_slice(&(hi as u16).to_le_bytes());
         let ptr = A::ptr_from_bytes(&bytes);
-        if ptr == A::null_ptr() {
-            return Err(io::Error::other(format!(
-                "_GET_PLAYER({}) returned a null pointer -- no player loaded on this channel",
-                self.chan
-            )));
-        }
-        Ok(ptr)
+        Ok(if ptr == A::null_ptr() { None } else { Some(ptr) })
     }
 
     /// Overwrite (not add to) the caller's own total experience.

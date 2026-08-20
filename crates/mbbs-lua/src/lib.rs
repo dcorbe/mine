@@ -6,6 +6,51 @@
 //! `mbbs` never depends on this crate -- see `crates/mbbs/src/extension.rs`,
 //! which is deliberately Lua-agnostic. The dependency runs one way:
 //! `mbbs-server -> mbbs-lua -> mbbs`.
+//!
+//! # A registered command name shadows *any* line, not just in-game input
+//!
+//! `crates/mbbs/src/lib.rs`'s dispatch site (search for `dispatch_command`)
+//! gives this seam first look at a line under one condition only: the
+//! channel's status is `Gsbl::CRSTG` and an extension is installed. That
+//! status fires on *every* line a channel types at *every* point in the
+//! session -- login, name entry, password entry, an in-game command, all of
+//! it -- because this host has no notion yet of "the module is at its login
+//! prompt" versus "the module is in the game loop." Milestone 1 shipped the
+//! seam this coarse on purpose, as a deliberately deferred, spec-level
+//! decision (see the design docs under
+//! `.superpowers/sdd/2026-08-20-lua-command-seam/`), not an oversight this
+//! crate can fix on its own.
+//!
+//! The consequence for a script author: `mmud.command("cash", ...)` does not
+//! mean "the word `cash` typed as a game command." It means "the word `cash`
+//! typed as the *entire contents of any line this channel sends*, whatever
+//! the module was about to do with it" -- including a player whose login
+//! name or password happens to be `cash`. Pick command names accordingly,
+//! and see `LuaExtension::load`'s duplicate-registration refusal for the
+//! related failure mode of two scripts silently shadowing each other.
+//!
+//! # Where a command's business logic goes
+//!
+//! `mbbs-lua`'s two coin/experience commands set two different precedents
+//! for where the WCCMMUD-specific recipe lives, and nothing technical forced
+//! either choice -- both are built on the same primitives
+//! (`CommandCtx::call_export`, `read_at`/`write_at`, `player_record`).
+//! `adjust_wealth`, in this file, keeps its offset-poke recipe entirely
+//! inside `mbbs-lua`. `set_exp` instead delegates to
+//! `mbbs::extension::CommandCtx::set_experience`, which carries the
+//! equivalent recipe -- and its ~90 lines of decompiled-C justification --
+//! in the Lua-agnostic `mbbs` crate.
+//!
+//! Absent a reason to do otherwise, put a new command's business logic here,
+//! in `mbbs-lua`, the way `adjust_wealth` does: it is the smaller, more
+//! honest surface for module-specific reasoning to live on, and it keeps
+//! `mbbs::extension::CommandCtx` limited to primitives any command could
+//! need rather than growing one bespoke method per command. Move logic into
+//! `CommandCtx` only when something *genuinely* needs `mbbs` itself to own
+//! it -- `set_experience` doesn't; it followed the plan for this branch, not
+//! a technical requirement, and stays where it is rather than being moved
+//! for its own sake this late. A future author who wants the `mbbs-lua`
+//! version of that logic should still find it, and know why it differs.
 
 mod api;
 
@@ -13,6 +58,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -159,8 +205,13 @@ fn expect_returned(name: &str, outcome: Outcome<Wg16>) -> mlua::Result<(u32, u32
 ///
 /// Returns `(true, nil)` on success, `(false, reason)` otherwise:
 /// `"no such item"`, `"ambiguous"` (the DLL has already prompted the player
-/// through its own output -- the caller must print nothing more), or `"too
-/// heavy or no free slot"` (`_ADD_ITEM_TO_INVENTORY` refused).
+/// through its own output -- the caller must print nothing more), `"too
+/// heavy or no free slot"` (`_ADD_ITEM_TO_INVENTORY` refused), `"item name
+/// must not contain a NUL byte"`, or `"item name too long"` (over
+/// `write_scratch`'s fixed budget). The last two are ordinary player
+/// mistakes -- a stray NUL, an over-long paste -- reported the same way as
+/// every other failure here, not thrown as an `mlua` error: see
+/// `Extension::command`'s error arm for why that distinction matters.
 ///
 /// `name`'s bytes go into guest memory verbatim, the same "whatever Lua
 /// handed us" contract [`CommandCtx::print`] already has for output --
@@ -173,8 +224,17 @@ fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result
     // of the one the player typed -- refuse outright rather than let that
     // happen quietly. Lua strings are byte strings and do not forbid an
     // embedded NUL the way `mlua::String::to_str()`/a Rust `&str` would.
+    //
+    // A player can reach this in the ordinary course of play -- pasting a
+    // stray NUL, or a client that pads a field with one -- so this is the
+    // same `(false, reason)` convention as `summon`'s other three failure
+    // modes, not an `mlua` error: the whole-branch review that found this
+    // (alongside the `write_scratch` refusal just below) is explicit that
+    // routing an ordinary player mistake through a thrown error disables
+    // `summon` board-wide after one bad line, exactly the concern
+    // `adjust_wealth`'s own doc comment raises about its `amount` parameter.
     if name.contains(&0) {
-        return Err(mlua::Error::RuntimeError("summon: item name must not contain a NUL byte".to_string()));
+        return Ok((false, Some("item name must not contain a NUL byte")));
     }
 
     // `[name][NUL][count: u16, zero]` in one allocation: the search
@@ -187,7 +247,19 @@ fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result
     let count_at = buf.len();
     buf.extend_from_slice(&0u16.to_le_bytes());
 
-    let base = ctx.borrow_mut().write_scratch(&buf).map_err(mlua::Error::external)?;
+    // `write_scratch` refuses outright (`io::ErrorKind::InvalidInput`) rather
+    // than truncate a name over its fixed budget -- see its own doc comment.
+    // An item name over ~125 bytes is trivially reachable by pasting or
+    // holding a key, so that refusal is a player mistake, not a script bug,
+    // and gets the same `(false, reason)` treatment as the NUL check above.
+    // Any other failure here (the buffer failing to allocate at all) is a
+    // real host problem, not something a player's input caused, and still
+    // propagates as an error.
+    let base = match ctx.borrow_mut().write_scratch(&buf) {
+        Ok(ptr) => ptr,
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Ok((false, Some("item name too long"))),
+        Err(e) => return Err(mlua::Error::external(e)),
+    };
     let count_ptr = Wg16::ptr_offset(base, count_at as u16);
 
     let outcome = ctx
@@ -315,8 +387,12 @@ fn add_with_carry(low: u16, carry: u16, amount: u32) -> (u16, u16) {
 ///
 /// Returns `(true, nil)` on success, `(false, reason)` otherwise:
 /// `"amount must be a whole number"`, `"amount is too large"` (the
-/// magnitude does not fit 32 bits), or `"insufficient funds"`
-/// (`_ADDON_ADJUST_USER_WEALTH` refused).
+/// magnitude does not fit 32 bits), `"insufficient funds"`
+/// (`_ADDON_ADJUST_USER_WEALTH` refused), or `"no character loaded on this
+/// channel"` (`_GET_PLAYER` found none) -- the last one no more a script bug
+/// than a bad `amount` is, since this seam sees every line typed on every
+/// channel, in-game or not (see `Extension::command`'s error arm, and the
+/// module doc's own note on where this fires).
 ///
 /// [`CommandCtx::player_record`]: mbbs::extension::CommandCtx::player_record
 fn adjust_wealth(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua::Result<(bool, Option<&'static str>)> {
@@ -333,7 +409,15 @@ fn adjust_wealth(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua:
             return Ok((false, Some("amount is too large")));
         };
 
-        let record = ctx.borrow_mut().player_record().map_err(mlua::Error::external)?;
+        // No character loaded on this channel is a routine condition, not a
+        // script bug -- see `try_player_record`'s own doc comment, and the
+        // whole-branch review this method's own doc comment above already
+        // cites for exactly this reasoning applied to `amount`. `player_record`
+        // itself still treats a null return as an error for callers with no
+        // plan for it; this caller has one.
+        let Some(record) = ctx.borrow_mut().try_player_record().map_err(mlua::Error::external)? else {
+            return Ok((false, Some("no character loaded on this channel")));
+        };
         let low_ptr = Wg16::ptr_offset(record, 0x613);
         let carry_ptr = Wg16::ptr_offset(record, 0x615);
 
@@ -394,8 +478,11 @@ fn adjust_wealth(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua:
 /// over one bad line of player input.
 ///
 /// Returns `(true, nil)` on success, `(false, reason)` otherwise:
-/// `"amount must be a whole number"`, `"amount must not be negative"`, or
-/// `"amount is too large"` (does not fit 32 bits).
+/// `"amount must be a whole number"`, `"amount must not be negative"`,
+/// `"amount is too large"` (does not fit 32 bits), or `"no character loaded
+/// on this channel"` (`_GET_PLAYER` found none) -- see [`adjust_wealth`]'s
+/// own doc comment for why that last one gets the same treatment as a bad
+/// `amount`.
 ///
 /// [`CommandCtx::set_experience`]: mbbs::extension::CommandCtx::set_experience
 fn set_exp(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua::Result<(bool, Option<&'static str>)> {
@@ -408,6 +495,20 @@ fn set_exp(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua::Resul
     let Ok(exp) = u32::try_from(amount as i64) else {
         return Ok((false, Some("amount is too large")));
     };
+
+    // Same reasoning as `adjust_wealth`'s own `try_player_record` check:
+    // "no character loaded" is a player-reachable condition, not a script
+    // bug, and must not disable `exp` board-wide. Checked explicitly, ahead
+    // of `set_experience`, because `set_experience` resolves the player
+    // record itself and has no player-mistake handling of its own to do --
+    // every error out of it (an unwritable record, `_SAVE_PLAYER` stopping
+    // the machine) is a genuine failure this seam has no better answer for
+    // than disabling the handler. This does mean `_GET_PLAYER` runs twice
+    // on the success path; a second read call, not a second allocation, so
+    // it costs nothing this seam's constraints care about.
+    if ctx.borrow_mut().try_player_record().map_err(mlua::Error::external)?.is_none() {
+        return Ok((false, Some("no character loaded on this channel")));
+    }
 
     ctx.borrow_mut().set_experience(exp).map_err(mlua::Error::external)?;
     Ok((true, None))

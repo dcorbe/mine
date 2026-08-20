@@ -27,6 +27,8 @@ mmud.command("summon", function(c)
       -- saying anything more here would talk over that prompt.
     elseif reason == "no such item" then
       c:print("no such item.\r\n")
+    elseif reason == "item name too long" or reason == "item name must not contain a NUL byte" then
+      c:print("not a valid item name.\r\n")
     else
       c:print("too heavy, or no room in your inventory.\r\n")
     end

@@ -22,6 +22,22 @@ pub(crate) fn install(lua: &Lua, handlers: Handlers) -> LuaResult<()> {
     mmud.set("HANDLED", HANDLED)?;
 
     let command = lua.create_function(move |_, (name, handler): (String, Function)| {
+        // A second script (or the same script, twice) registering a name
+        // already taken would otherwise shadow silently: `Extension::command`
+        // matches the *first* registration
+        // (`self.handlers.borrow().iter().find(...)`), so the second
+        // handler would simply never run, with no diagnostic anywhere --
+        // and since the seam sees every line on every channel, including
+        // login and password entry (see this crate's own module doc), a
+        // registered name can shadow more than just another script's
+        // command. Raising here fails the load with a named error, through
+        // the same path a syntax error already takes
+        // (`LuaExtension::load`'s `.exec()` -> `LoadError`), rather than
+        // leaving a sysop to discover the shadow by noticing a command that
+        // quietly does nothing.
+        if handlers.borrow().iter().any(|(registered, _)| registered == &name) {
+            return Err(mlua::Error::RuntimeError(format!("command {name:?} is already registered")));
+        }
         handlers.borrow_mut().push((name, handler));
         Ok(())
     })?;
