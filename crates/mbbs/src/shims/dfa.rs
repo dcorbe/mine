@@ -1136,6 +1136,14 @@ pub fn dfaDelete<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     file.delete(position).map_err(|e| ShimError::Failed(e.to_string()))?;
+    // The same cursor invalidation `btv::delbtv` and `btrieve::btrcall`'s op-4
+    // dispatch both do, and for the reason `crates/btrieve/src/btrcall.rs:576`
+    // states outright: so a deleted record does not stay reachable as
+    // "current". This was the one of the three delete paths that omitted it,
+    // which left the block positioned on a record that no longer existed --
+    // and a second `dfaDelete` would then act on that stale position instead
+    // of refusing. `dfadelete_leaves_the_file_positioned_nowhere` pins it.
+    file.seek_to(Cursor::Nowhere);
     Ok(abi::Ret::Void)
 }
 
@@ -2466,6 +2474,33 @@ mod tests {
         open(&mut g, "SAMPLE.DAT", 64);
         assert!(!acquire(&mut g, Some(5), 0, 5, 0), "gone from disk, not just from memory");
         assert_eq!(g.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(6));
+    }
+
+    /// After a delete the file must be positioned [`Cursor::Nowhere`], the
+    /// same decision `btv::delbtv` and `btrieve::btrcall`'s own op-4 dispatch
+    /// both take -- `crates/btrieve/src/btrcall.rs:576-583` says why in
+    /// as many words: "so a deleted record does not stay reachable as
+    /// current".
+    ///
+    /// `dfaDelete` was the one of the three delete paths that did not, so the
+    /// block stayed positioned on a record that no longer existed. Asserted
+    /// through a second `dfaDelete`, which must refuse for want of a position
+    /// rather than act on the stale one.
+    #[test]
+    fn dfadelete_leaves_the_file_positioned_nowhere() {
+        let dir = crate::testing::scratch_with("dfa-delete-cursor", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(5), 0, 5, 0), "equal to 5, which is Troll");
+        f.invoke(dfaDelete, &[]).expect("deletes");
+
+        let e = f
+            .invoke(dfaDelete, &[])
+            .expect_err("the cursor is Nowhere, so there is nothing to delete");
+        assert!(
+            e.to_string().contains("not positioned on a record"),
+            "a delete must not leave the deleted record current: {e}"
+        );
     }
 
     #[test]
