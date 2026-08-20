@@ -264,6 +264,119 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
         }
         Ok(ptr)
     }
+
+    /// Overwrite (not add to) the caller's own total experience.
+    ///
+    /// # No export sets experience -- the 591-entry table was searched
+    ///
+    /// The spec's tier-1 rule prefers a module accessor over an offset poke.
+    /// One does not exist here: every export touching experience was
+    /// checked (case-insensitively, for `EXP`/`XP`/`ADJUST`/`ADDON_`/`GAIN`/
+    /// `AWARD`/`LEVEL`/`SET`; `GAIN` and `AWARD` have zero matches anywhere
+    /// in the whole table). What exists instead:
+    ///
+    /// - `_ADD_EXPERIENCE` (ordinal 12), `_ADD_QUEST_EXP` (572),
+    ///   `_DISTRIBUTE_EXPERIENCE` (383) -- all additive, taking a delta, not
+    ///   a total.
+    /// - `_CALC_EXP_NEEDED` (63), `_NEW_CALC_EXP_NEEDED` (564) -- pure
+    ///   calculators, no side effect.
+    /// - `_CMD_EXPERIENCE` (469) -- only displays.
+    /// - `_RESTRUCTURE_EXPERIENCE` (565) -- writes the field, but takes only
+    ///   a player pointer, no amount: a migration routine, not a setter.
+    ///
+    /// So writing by offset is the correct route here, not a shortcut
+    /// around the rule -- it is what the rule's own escape hatch is for
+    /// once the search comes up empty. Do not repeat this search; if a
+    /// setter is ever added to the module, this comment is now wrong and
+    /// should be replaced with a call to it.
+    ///
+    /// # Four words, not two -- both copies, always
+    ///
+    /// The record stores experience TWICE: `0x3c`/`0x3e` and `0x46f`/`0x471`,
+    /// each a 32-bit total, low word first (`_RESTRUCTURE_EXPERIENCE`,
+    /// `re/exports/WCCMMUD_named.c:72423-72425`, states the layout plainly).
+    /// **Neither copy is authoritative on its own:**
+    /// `_RESTRUCTURE_EXPERIENCE` copies `0x3c`/`0x3e` INTO `0x46f`/`0x471`,
+    /// and runs from five places -- `_LOAD_PLAYER` itself (`:318-320`, the
+    /// load-bearing one: every character load runs it), `_SHOW_STATUS`
+    /// (`:32438`), `_CMD_EXPERIENCE` (`:54425`), `_CMD_SYSOP` (`:63219`),
+    /// `_GENERATE_TOP_LIST` (`:76200`) -- each guarded by a per-record flag
+    /// (`base + 0x7b8` bit `0x20`) that is set once restructuring has run.
+    /// So: on a record whose flag is still clear, writing only
+    /// `0x46f`/`0x471` is silently reverted back to `0x3c`/`0x3e` the next
+    /// time the character loads. On a record whose flag is already set,
+    /// writing only `0x3c`/`0x3e` does nothing live -- the module never
+    /// rereads it. Writing both is correct in either state, which is why
+    /// this writes all four words unconditionally rather than branching on
+    /// the flag.
+    ///
+    /// A prior session's own live-board measurement
+    /// (`majormud-character-record-layout` memory, verified twice against
+    /// real characters) independently reaches the same requirement from the
+    /// opposite direction: "`0x46f` -- the live value `st` displays...
+    /// [p]atching only `0x03c` silently fails."
+    ///
+    /// # What this does NOT do: recompute a level threshold
+    ///
+    /// `_ADD_EXPERIENCE`'s own additive path is not a plain mirror of these
+    /// two fields once the restructure flag is set -- past that point it
+    /// treats `0x46f`/`0x471` as a running "progress within the current
+    /// auto-level bracket" accumulator: it adds the delta, then a `while`
+    /// loop drains whole per-level thresholds out of it, incrementing a
+    /// separate level-bonus counter (`0x46b`/`0x46d`) each time
+    /// (`re/exports/WCCMMUD_named.c:1378-1401`). This method does not
+    /// replicate that: it sets `0x46f`/`0x471` to the SAME raw total as
+    /// `0x3c`/`0x3e`, the same seeding `_RESTRUCTURE_EXPERIENCE` itself
+    /// performs on a fresh migration, not a delta-and-wrap. Consequence: a
+    /// call here never grants (or owes) a bonus level through that
+    /// counter, and never touches `0x46b`/`0x46d` at all -- the module's
+    /// own leveling-from-training path (`majormud-character-record-layout`
+    /// memory: "Experience alone does NOT raise level") is unaffected
+    /// either way. What is genuinely left un-reconciled: if a later
+    /// `_ADD_EXPERIENCE` call reads `0x46f`/`0x471` as "progress since the
+    /// last bonus level" rather than "the same total as `0x3c`/`0x3e`,
+    /// restated," a `set_exp` that jumps the total by a large amount could
+    /// hand that next `_ADD_EXPERIENCE` call an oversized delta to
+    /// pre-process through its own wrap loop the next time the player earns
+    /// any experience at all -- not on save, not on the next load, only on
+    /// the next `_ADD_EXPERIENCE`. Nothing in this fixture can exercise
+    /// that call to confirm or rule it out; see `task-8-report.md`'s "what
+    /// is untestable" section.
+    ///
+    /// # Persistence
+    ///
+    /// A raw offset write with no save leaves the change in memory only, so
+    /// this ends with `_SAVE_PLAYER(usrnum)` -- the same export
+    /// [`CommandCtx::player_record`]'s own caller (`cash`'s grant path,
+    /// Task 7) already relies on for exactly this reason.
+    ///
+    /// # Errors
+    ///
+    /// As [`CommandCtx::player_record`], if the caller's own record cannot
+    /// be resolved. As [`CommandCtx::write_at`], if any of the four writes
+    /// runs off the resolved record (should never happen against a real
+    /// 1998-byte record, but never silently skipped either way). As
+    /// [`CommandCtx::call_export`]/[`CommandCtx::player_record`]'s own
+    /// pattern, if `_SAVE_PLAYER` is not an export the module answers for,
+    /// or stops the machine.
+    pub fn set_experience(&mut self, exp: u32) -> io::Result<()> {
+        let record = self.player_record()?;
+        let lo = (exp & 0xffff) as u16;
+        let hi = (exp >> 16) as u16;
+
+        self.write_at(A::ptr_offset(record, 0x3c), &lo.to_le_bytes())?;
+        self.write_at(A::ptr_offset(record, 0x3e), &hi.to_le_bytes())?;
+        self.write_at(A::ptr_offset(record, 0x46f), &lo.to_le_bytes())?;
+        self.write_at(A::ptr_offset(record, 0x471), &hi.to_le_bytes())?;
+
+        let usrnum = A::Int::from(self.chan.number() as u16);
+        match self.call_export("_SAVE_PLAYER", &[Arg::Int(usrnum)])? {
+            crate::Outcome::Returned { .. } => Ok(()),
+            crate::Outcome::Stopped(poison) => {
+                Err(io::Error::other(format!("_SAVE_PLAYER stopped the machine: {poison}")))
+            }
+        }
+    }
 }
 
 /// Something that participates in the host's events.

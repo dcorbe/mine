@@ -233,3 +233,85 @@ fn cash_a_negative_amount_against_a_module_with_no_export_names_addon_adjust_use
         "a deduct must never touch _GET_PLAYER -- _ADDON_ADJUST_USER_WEALTH loads and saves the player itself; got: {notes:?}"
     );
 }
+
+#[test]
+fn the_shipped_exp_script_loads_and_registers() {
+    let ext = LuaExtension::load(&shipped_scripts()).expect("scripts/ must load");
+    assert!(ext.command_names().contains(&"exp".to_owned()), "got: {:?}", ext.command_names());
+}
+
+#[test]
+fn exp_with_no_amount_prints_a_prompt_and_never_calls_into_the_module() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "exp", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "exp <total>\r\n");
+    assert!(fixture.host.notes().is_empty(), "a usage message must not touch the module at all");
+}
+
+#[test]
+fn exp_with_a_fractional_amount_reports_it_honestly_and_never_calls_into_the_module() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "exp 1.5", &module);
+
+    assert_eq!(verdict, Verdict::Handled, "a bad amount is the player's mistake, not a reason to disable the command");
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "amount must be a whole number.\r\n");
+    assert!(
+        fixture.host.notes().is_empty(),
+        "a fractional amount must be refused before ever reaching call_export"
+    );
+}
+
+#[test]
+fn exp_with_a_negative_amount_reports_it_honestly_and_never_calls_into_the_module() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "exp -50", &module);
+
+    assert_eq!(verdict, Verdict::Handled, "a bad amount is the player's mistake, not a reason to disable the command");
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "amount must not be negative.\r\n");
+    assert!(
+        fixture.host.notes().is_empty(),
+        "a negative amount must be refused before ever reaching call_export -- exp sets a total, never a delta"
+    );
+}
+
+/// `minimal_module` exports nothing at all, so `c:set_exp`'s own
+/// `CommandCtx::set_experience` -- which calls `player_record()` first,
+/// before it ever writes a byte -- fails at exactly the "unresolvable
+/// `_GET_PLAYER`" path `call_export` refuses. As close as this fixture gets
+/// to exercising `exp.lua`'s real Rust glue without a real, code-bearing
+/// module (see `task-6-report.md`'s "untestable" section for the general
+/// shape of this gap, and `task-8-report.md` for what this task's own
+/// `setting_experience_writes_both_copies` proves instead, against a real
+/// two-export module).
+#[test]
+fn exp_against_a_module_with_no_export_disables_the_handler_and_names_get_player() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "exp 100", &module);
+
+    assert_eq!(verdict, Verdict::Pass, "a broken handler must never swallow the line");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("exp"), "got: {notes:?}");
+    assert!(notes[0].contains("_GET_PLAYER"), "got: {notes:?}");
+}

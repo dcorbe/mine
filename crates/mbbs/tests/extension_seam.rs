@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use mbbs::Chan;
 use mbbs::Outcome;
-use mbbs::abi::Wg16;
+use mbbs::abi::{Abi, ModuleMem, Wg16};
 use mbbs::extension::{CommandCtx, Extension, Verdict};
-use mbbs::testing::{Fixture, module_bytes_exporting};
+use mbbs::testing::{Fixture, module_bytes_exporting, module_bytes_exporting_many};
 
 /// Records every line it is shown and always passes.
 #[derive(Default)]
@@ -384,9 +384,15 @@ fn player_record_names_the_symbol_when_get_player_is_unresolvable() {
 #[test]
 fn player_record_returns_the_far_pointer_get_player_answers_with() {
     let mut f = Fixture::new();
-    // AX=1, DX=1, retf -- a nonzero far pointer, so player_record does not
-    // treat this as "player not loaded."
-    let code = [0xb8, 0x01, 0x00, 0xba, 0x01, 0x00, 0xcb];
+    // AX=0x1234, DX=0x5678, retf -- deliberately ASYMMETRIC, so a decode
+    // that swapped offset and selector would fail this assertion. A prior
+    // review of Task 7 (AX=1,DX=1 here, AX=0,DX=0 for the null case below)
+    // pointed out that symmetric register values cannot distinguish a lo/hi
+    // swap bug: `FarPtr { offset: 1, selector: 1 }` looks identical either
+    // way. `player_record` is exactly the primitive Task 8's four
+    // experience writes depend on, so a swap here would silently corrupt
+    // whatever byte a wrong address happened to name.
+    let code = [0xb8, 0x34, 0x12, 0xba, 0x78, 0x56, 0xcb];
     let module = f.host.load(&mut f.machine, &module_bytes_exporting("_GET_PLAYER", &code)).expect("loads");
     let chan = f.console();
     let result = Arc::new(Mutex::new(None));
@@ -395,7 +401,7 @@ fn player_record_returns_the_far_pointer_get_player_answers_with() {
     f.run_command(&mut ext, chan, "anything", &module);
 
     let ptr = result.lock().expect("lock").take().expect("command ran").expect("player_record must resolve");
-    assert_eq!(ptr, mbbs_machine::m16::FarPtr { offset: 1, selector: 1 });
+    assert_eq!(ptr, mbbs_machine::m16::FarPtr { offset: 0x1234, selector: 0x5678 });
 }
 
 #[test]
@@ -417,4 +423,96 @@ fn player_record_is_an_error_when_get_player_returns_null() {
         .expect("command ran")
         .expect_err("a null _GET_PLAYER return must be an error, never a silent no-op");
     assert!(err.to_string().contains("_GET_PLAYER"), "got: {err}");
+}
+
+/// Machine code for a `_GET_PLAYER`-shaped export that returns a specific,
+/// real far pointer -- `mov ax, offset` / `mov dx, selector` / `retf`, the
+/// same three-instruction shape [`player_record_returns_the_far_pointer_get_player_answers_with`]
+/// already uses, parameterised on the pointer so [`setting_experience_writes_both_copies`]
+/// can point it at real backing memory (obtained independently, via
+/// [`ModuleMem::alloc_region`], before the module is even built) rather
+/// than a fabricated value nothing ever reads through.
+fn get_player_code(ptr: mbbs_machine::m16::FarPtr) -> Vec<u8> {
+    let mut code = vec![0xb8];
+    code.extend_from_slice(&ptr.offset.to_le_bytes());
+    code.push(0xba);
+    code.extend_from_slice(&ptr.selector.to_le_bytes());
+    code.push(0xcb);
+    code
+}
+
+/// [`SetExperienceCaller::result`]'s shape: whether `set_experience` itself
+/// succeeded, and -- only when it did -- the four words read back afterward.
+/// Named so clippy's `type_complexity` lint (and a human reader) sees one
+/// name instead of a nested `Option<(Result<...>, Option<...>)>` at the use
+/// site.
+type SetExperienceResult = (io::Result<()>, Option<[u16; 4]>);
+
+/// Calls [`CommandCtx::set_experience`], then reads all four words the
+/// double-write is supposed to leave behind -- `0x3c`/`0x3e` and
+/// `0x46f`/`0x471` -- straight out of the same record `_GET_PLAYER` hands
+/// back, through a second, independent `player_record()` this struct's own
+/// `command` makes itself. Never trusts `set_experience`'s own `Ok(())`
+/// alone -- that only proves it ran to completion, not that it wrote what
+/// it claims.
+struct SetExperienceCaller {
+    exp: u32,
+    result: Arc<Mutex<Option<SetExperienceResult>>>,
+}
+
+impl Extension<Wg16> for SetExperienceCaller {
+    fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
+        let outcome = ctx.set_experience(self.exp);
+        let words = if outcome.is_ok() {
+            let record = ctx.player_record().expect("player_record must resolve a second time");
+            let word = |ctx: &mut CommandCtx<'_, Wg16>, delta: u16| -> u16 {
+                let bytes = ctx.read_at(Wg16::ptr_offset(record, delta), 2).expect("read_at must resolve");
+                u16::from_le_bytes([bytes[0], bytes[1]])
+            };
+            Some([word(ctx, 0x3c), word(ctx, 0x3e), word(ctx, 0x46f), word(ctx, 0x471)])
+        } else {
+            None
+        };
+        *self.result.lock().expect("lock") = Some((outcome, words));
+        Verdict::Handled
+    }
+}
+
+/// Experience is stored TWICE in the character record, at `0x3c`/`0x3e` and
+/// `0x46f`/`0x471` (both 32-bit, low word first -- see
+/// `task-8-findings.md`'s reading of `_RESTRUCTURE_EXPERIENCE`). Writing one
+/// pair and not the other leaves the character internally inconsistent:
+/// this asserts BOTH read back as the new value, against a genuine
+/// `_GET_PLAYER` returning real, resolvable backing memory (not a fixture
+/// stub) and a genuine `_SAVE_PLAYER` call afterward.
+///
+/// This is the test the plan's own mutation step exists to prove has real
+/// teeth: deleting either pair of writes from `set_experience` must fail
+/// this exact assertion (both mutations are run and quoted in
+/// `task-8-report.md`, not merely described).
+#[test]
+fn setting_experience_writes_both_copies() {
+    let mut f = Fixture::new();
+    // Real backing memory, allocated independently of the module itself --
+    // 2000 bytes is comfortably past 0x471+2=0x473, the same margin
+    // `task-8-findings.md` measures against the real 1998-byte record.
+    let record_ptr = Wg16::mem(&mut f.machine).alloc_region(2000).expect("alloc real backing memory");
+    let get_player = get_player_code(record_ptr);
+    let save_player = [0xcbu8]; // retf -- a no-op stub; set_experience discards its return.
+    let module_bytes = module_bytes_exporting_many(&[("_GET_PLAYER", &get_player), ("_SAVE_PLAYER", &save_player)]);
+    let module = f.host.load(&mut f.machine, &module_bytes).expect("loads");
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = SetExperienceCaller { exp: 0x1234_5678, result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let (outcome, words) = result.lock().expect("lock").take().expect("command ran");
+    outcome.expect("set_experience must succeed against a real _GET_PLAYER/_SAVE_PLAYER");
+    let words = words.expect("must have read back all four words");
+    assert_eq!(
+        words,
+        [0x5678, 0x1234, 0x5678, 0x1234],
+        "both the 0x3c/0x3e copy and the 0x46f/0x471 copy must read back the new value; got {words:x?}"
+    );
 }

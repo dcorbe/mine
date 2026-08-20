@@ -376,6 +376,43 @@ fn adjust_wealth(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua:
     }
 }
 
+/// `c:set_exp(n)` -- overwrite (not add to) the caller's own total
+/// experience, through [`CommandCtx::set_experience`].
+///
+/// All of the risk this command carries -- the double-write, the search for
+/// (and absence of) a module setter, why neither stored copy is
+/// authoritative alone -- is documented once, on `set_experience` itself,
+/// not repeated here: this wrapper's only job is turning an untrusted Lua
+/// number into the `u32` that method wants, or refusing honestly.
+///
+/// `amount` is `f64`, the same reason [`adjust_wealth`]'s own amount
+/// parameter is: a fractional, negative, or absurdly large typed value is a
+/// player mistake -- `exp` sets a total, and a character's total experience
+/// is never negative -- not a script bug, so it is reported through this
+/// function's own `(false, reason)` convention instead of an `mlua`
+/// argument-conversion error, which would disable the whole `exp` command
+/// over one bad line of player input.
+///
+/// Returns `(true, nil)` on success, `(false, reason)` otherwise:
+/// `"amount must be a whole number"`, `"amount must not be negative"`, or
+/// `"amount is too large"` (does not fit 32 bits).
+///
+/// [`CommandCtx::set_experience`]: mbbs::extension::CommandCtx::set_experience
+fn set_exp(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua::Result<(bool, Option<&'static str>)> {
+    if !amount.is_finite() || amount.fract() != 0.0 {
+        return Ok((false, Some("amount must be a whole number")));
+    }
+    if amount < 0.0 {
+        return Ok((false, Some("amount must not be negative")));
+    }
+    let Ok(exp) = u32::try_from(amount as i64) else {
+        return Ok((false, Some("amount is too large")));
+    };
+
+    ctx.borrow_mut().set_experience(exp).map_err(mlua::Error::external)?;
+    Ok((true, None))
+}
+
 impl Extension<Wg16> for LuaExtension {
     fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
         let line = ctx.line().to_string();
@@ -418,9 +455,13 @@ impl Extension<Wg16> for LuaExtension {
                 let cell = Rc::clone(&cell);
                 scope.create_function(move |_, (_this, name): (mlua::Table, mlua::String)| summon(&cell, &name.as_bytes()))?
             })?;
+            t.set("adjust_wealth", {
+                let cell = Rc::clone(&cell);
+                scope.create_function(move |_, (_this, amount): (mlua::Table, f64)| adjust_wealth(&cell, amount))?
+            })?;
             t.set(
-                "adjust_wealth",
-                scope.create_function(move |_, (_this, amount): (mlua::Table, f64)| adjust_wealth(&cell, amount))?,
+                "set_exp",
+                scope.create_function(move |_, (_this, amount): (mlua::Table, f64)| set_exp(&cell, amount))?,
             )?;
             handler.call::<Value>(t)
         });

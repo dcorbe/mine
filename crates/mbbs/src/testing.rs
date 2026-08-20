@@ -627,6 +627,132 @@ pub fn module_bytes_exporting(name: &str, code: &[u8]) -> Vec<u8> {
     out
 }
 
+/// [`module_bytes_exporting`], generalised to more than one real export.
+///
+/// `set_experience`'s own test needs two genuine module calls to chain in
+/// one run -- `_GET_PLAYER`'s real far-pointer return, then `_SAVE_PLAYER`
+/// called against it -- and `module_bytes_exporting` can only ever build
+/// one. Each `(name, code)` pair in `exports` becomes its own fixed
+/// entry-table bundle entry, exported at consecutive ordinals starting at
+/// 1, with `code` placed at the next free offset in one shared code
+/// segment (segment 2) -- so a pointer computed from one export's own code
+/// never overlaps another's.
+///
+/// Everything else -- the autodata segment, the resident-name table's own
+/// leading `TESTMOD` entry, no imports -- is identical to
+/// `module_bytes_exporting`; see that function's own doc comment for why
+/// each piece is shaped the way it is.
+pub fn module_bytes_exporting_many(exports: &[(&str, &[u8])]) -> Vec<u8> {
+    const ALIGN: u16 = 4;
+    const SECTOR: usize = 1 << ALIGN;
+
+    fn pstring(name: &str, ordinal: u16) -> Vec<u8> {
+        let mut out = vec![name.len() as u8];
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&ordinal.to_le_bytes());
+        out
+    }
+
+    // No imports at all, so the table is only its own leading empty string.
+    let impnames = vec![0u8];
+
+    // The module's own name, then one export per entry, then a terminator.
+    let mut restab = pstring("TESTMOD", 0);
+    for (i, (name, _)) in exports.iter().enumerate() {
+        restab.extend_from_slice(&pstring(name, (i + 1) as u16));
+    }
+    restab.push(0);
+
+    // A description, then a terminator.
+    let mut nrtab = pstring("a test module", 0);
+    nrtab.push(0);
+
+    // One fixed bundle: count = the number of exports, indicator = segment
+    // 2 (the shared code segment below), then each entry's own flags (bit 0
+    // set: exported) and offset into that segment -- three bytes per entry,
+    // per `ne.rs`'s `parse_entry_table` non-moveable arm. A trailing zero
+    // count ends the table.
+    let mut entrytab = vec![exports.len() as u8, 2];
+    let mut offset = 0u16;
+    for (_, code) in exports {
+        entrytab.push(0x01);
+        entrytab.extend_from_slice(&offset.to_le_bytes());
+        offset += code.len() as u16;
+    }
+    entrytab.push(0);
+
+    let mut out = vec![0u8; 0x80];
+    out[0..2].copy_from_slice(b"MZ");
+    out[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    out[0x40..0x42].copy_from_slice(b"NE");
+
+    // Two segment rows -- data, then code -- filled in once their data is
+    // placed.
+    let segtab = 0x80;
+    out.resize(segtab + 16, 0);
+
+    let modtab = out.len(); // no imported modules, so nothing follows here
+    let imptab = out.len();
+    out.extend_from_slice(&impnames);
+    let restab_at = out.len();
+    out.extend_from_slice(&restab);
+    let entrytab_at = out.len();
+    out.extend_from_slice(&entrytab);
+    let nrtab_at = out.len();
+    out.extend_from_slice(&nrtab);
+
+    // Segment 1: the autodata segment, four zero bytes -- same as
+    // `module_bytes_exporting`.
+    while !out.len().is_multiple_of(SECTOR) {
+        out.push(0);
+    }
+    let sector1 = (out.len() / SECTOR) as u16;
+    let data = [0u8; 4];
+    out.extend_from_slice(&data);
+
+    // Segment 2: the code segment, every export's code concatenated in
+    // order -- the same order `entrytab`'s offsets above were computed in.
+    while !out.len().is_multiple_of(SECTOR) {
+        out.push(0);
+    }
+    let sector2 = (out.len() / SECTOR) as u16;
+    let mut code_len = 0u16;
+    for (_, code) in exports {
+        out.extend_from_slice(code);
+        code_len += code.len() as u16;
+    }
+
+    out[segtab..segtab + 2].copy_from_slice(&sector1.to_le_bytes());
+    out[segtab + 2..segtab + 4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    out[segtab + 4..segtab + 6].copy_from_slice(&0x0001u16.to_le_bytes()); // a data segment
+    out[segtab + 6..segtab + 8].copy_from_slice(&(data.len() as u16).to_le_bytes());
+
+    out[segtab + 8..segtab + 10].copy_from_slice(&sector2.to_le_bytes());
+    out[segtab + 10..segtab + 12].copy_from_slice(&code_len.to_le_bytes());
+    out[segtab + 12..segtab + 14].copy_from_slice(&0x0000u16.to_le_bytes()); // a code segment
+    out[segtab + 14..segtab + 16].copy_from_slice(&code_len.to_le_bytes());
+
+    let w = |out: &mut Vec<u8>, at: usize, v: u16| {
+        out[0x40 + at..0x40 + at + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    w(&mut out, 0x04, (entrytab_at - 0x40) as u16);
+    w(&mut out, 0x06, entrytab.len() as u16);
+    w(&mut out, 0x0c, 0x8001); // a single-data library
+    w(&mut out, 0x0e, 1); // autodata: segment 1
+    w(&mut out, 0x1c, 2); // segment count
+    w(&mut out, 0x1e, 0); // imported module count
+    w(&mut out, 0x20, nrtab.len() as u16);
+    w(&mut out, 0x22, (segtab - 0x40) as u16);
+    w(&mut out, 0x26, (restab_at - 0x40) as u16);
+    w(&mut out, 0x28, (modtab - 0x40) as u16);
+    w(&mut out, 0x2a, (imptab - 0x40) as u16);
+    w(&mut out, 0x32, ALIGN);
+    out[0x40 + 0x2c..0x40 + 0x30].copy_from_slice(&(nrtab_at as u32).to_le_bytes());
+    out[0x40 + 0x36] = 0x02;
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,5 +773,17 @@ mod tests {
             .expect("loads");
         assert_eq!(module.segment_count(), 2);
         assert!(module.entry_by_name("SUMMONTEST").is_some());
+    }
+
+    #[test]
+    fn the_multi_exporting_module_resolves_every_export_by_name() {
+        let mut f = Fixture::new();
+        let module = f
+            .host
+            .load(&mut f.machine, &module_bytes_exporting_many(&[("FIRST", &[0xcb]), ("SECOND", &[0xcb])]))
+            .expect("loads");
+        assert_eq!(module.segment_count(), 2);
+        assert!(module.entry_by_name("FIRST").is_some());
+        assert!(module.entry_by_name("SECOND").is_some());
     }
 }
