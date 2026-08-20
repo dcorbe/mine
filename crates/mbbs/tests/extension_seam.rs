@@ -392,7 +392,13 @@ fn player_record_returns_the_far_pointer_get_player_answers_with() {
     // way. `player_record` is exactly the primitive Task 8's four
     // experience writes depend on, so a swap here would silently corrupt
     // whatever byte a wrong address happened to name.
-    let code = [0xb8, 0x34, 0x12, 0xba, 0x78, 0x56, 0xcb];
+    // Real backing memory, so the loaded-flag byte at `+0x1e` can exist at all:
+    // `get_player` now reads it, and an unmapped literal address has nothing to
+    // read. Offset and selector still differ (the allocator hands back selector
+    // != offset), so a decode that swapped them still fails this assertion.
+    let record_ptr = Wg16::mem(&mut f.machine).alloc_region(2000).expect("alloc real backing memory");
+    Wg16::mem(&mut f.machine).write(Wg16::ptr_offset(record_ptr, 0x1e), &[1]).expect("mark loaded");
+    let code = get_player_code(record_ptr);
     let module = f.host.load(&mut f.machine, &module_bytes_exporting("_GET_PLAYER", &code)).expect("loads");
     let chan = f.console();
     let result = Arc::new(Mutex::new(None));
@@ -401,7 +407,7 @@ fn player_record_returns_the_far_pointer_get_player_answers_with() {
     f.run_command(&mut ext, chan, "anything", &module);
 
     let ptr = result.lock().expect("lock").take().expect("command ran").expect("player_record must resolve");
-    assert_eq!(ptr, mbbs_machine::m16::FarPtr { offset: 0x1234, selector: 0x5678 });
+    assert_eq!(ptr, record_ptr, "player_record must hand back exactly the pointer _GET_PLAYER answered with");
 }
 
 #[test]
@@ -514,6 +520,12 @@ fn setting_experience_writes_both_copies() {
     // 2000 bytes is comfortably past 0x471+2=0x473, the same margin
     // `task-8-findings.md` measures against the real 1998-byte record.
     let record_ptr = Wg16::mem(&mut f.machine).alloc_region(2000).expect("alloc real backing memory");
+    // Mark the slot LOADED. `_GET_PLAYER` is `ptrtile` -- an array index that
+    // answers for every in-range channel -- so a non-null pointer alone never
+    // meant "a character is here". The module gates on a flag byte at `+0x1e`
+    // (`_ADDON_ADJUST_USER_WEALTH`, `WCCMMUD_named.c:73421`) and so do we; a
+    // record of zeroes is an EMPTY slot, which is what this fixture was before.
+    Wg16::mem(&mut f.machine).write(Wg16::ptr_offset(record_ptr, 0x1e), &[1]).expect("mark loaded");
     let get_player = get_player_code(record_ptr);
     let save_player = [0xcbu8]; // retf -- a no-op stub; set_experience discards its return.
     let module_bytes = module_bytes_exporting_many(&[("_GET_PLAYER", &get_player), ("_SAVE_PLAYER", &save_player)]);
@@ -554,6 +566,12 @@ fn setting_experience_writes_both_copies() {
 fn setting_experience_past_a_billion_writes_the_reduced_remainder_and_billions_count() {
     let mut f = Fixture::new();
     let record_ptr = Wg16::mem(&mut f.machine).alloc_region(2000).expect("alloc real backing memory");
+    // Mark the slot LOADED. `_GET_PLAYER` is `ptrtile` -- an array index that
+    // answers for every in-range channel -- so a non-null pointer alone never
+    // meant "a character is here". The module gates on a flag byte at `+0x1e`
+    // (`_ADDON_ADJUST_USER_WEALTH`, `WCCMMUD_named.c:73421`) and so do we; a
+    // record of zeroes is an EMPTY slot, which is what this fixture was before.
+    Wg16::mem(&mut f.machine).write(Wg16::ptr_offset(record_ptr, 0x1e), &[1]).expect("mark loaded");
     let get_player = get_player_code(record_ptr);
     let save_player = [0xcbu8];
     let module_bytes = module_bytes_exporting_many(&[("_GET_PLAYER", &get_player), ("_SAVE_PLAYER", &save_player)]);
@@ -606,5 +624,45 @@ fn a_line_with_arguments_reaches_the_seam_whole() {
         &["summon a rusty sword".to_owned()],
         "the seam must see the whole line; truncation at the first word is \
          `parsin`'s in-place tokenisation leaking through"
+    );
+}
+
+/// An empty slot is "no character loaded", even though `_GET_PLAYER` answers
+/// with a perfectly good pointer to it.
+///
+/// The regression guard for a bug a live board found on 2026-08-20. Typing
+/// `exp 5000` at the "Enter your user ID:" prompt answered "done." and wrote
+/// four words into an unloaded slot, because the only guard was a null-pointer
+/// check and `_GET_PLAYER` never returns null for an in-range channel: it is
+/// `ptrtile` into the module's own `alctile(nterms, 1998)` table
+/// (`WCCMMUD_named.c:29982`), an array index that answers for every channel
+/// whether or not anybody is playing on it. So the guard could not fire.
+///
+/// The module's own gate is a flag byte at record `+0x1e` --
+/// `_ADDON_ADJUST_USER_WEALTH` (`WCCMMUD_named.c:73421`) tests it before it
+/// will touch the record or save it -- and that is what is checked now.
+#[test]
+fn an_unloaded_slot_is_no_character_even_though_get_player_answers_with_a_pointer() {
+    let mut f = Fixture::new();
+    // Real backing memory, left entirely zeroed: a slot nobody is playing on.
+    // Deliberately NOT marking `+0x1e`, which is the whole point.
+    let record_ptr = Wg16::mem(&mut f.machine).alloc_region(2000).expect("alloc real backing memory");
+    let code = get_player_code(record_ptr);
+    let module = f.host.load(&mut f.machine, &module_bytes_exporting("_GET_PLAYER", &code)).expect("loads");
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = PlayerRecordCaller { result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let err = result
+        .lock()
+        .expect("lock")
+        .take()
+        .expect("command ran")
+        .expect_err("an unloaded slot must NOT be reported as a usable record");
+    assert!(
+        err.to_string().contains("no player loaded"),
+        "the error must say the slot is empty rather than blaming the pointer; got: {err}"
     );
 }

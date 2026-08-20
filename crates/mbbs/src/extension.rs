@@ -308,7 +308,29 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
         let mut bytes = (lo as u16).to_le_bytes().to_vec();
         bytes.extend_from_slice(&(hi as u16).to_le_bytes());
         let ptr = A::ptr_from_bytes(&bytes);
-        Ok(if ptr == A::null_ptr() { None } else { Some(ptr) })
+        if ptr == A::null_ptr() {
+            return Ok(None);
+        }
+
+        // A non-null pointer does NOT mean a character is loaded. `_GET_PLAYER`
+        // is `ptrtile` into the module's own `alctile(nterms, 1998)` table
+        // (`WCCMMUD_named.c:29982`), i.e. a bounds-checked array index -- it
+        // answers with this channel's SLOT, and every in-range channel has one
+        // whether or not anybody is playing on it. Treating non-null as "loaded"
+        // means a command typed at the login prompt writes into an empty slot.
+        //
+        // The module's own guard is a separate flag byte at record `+0x1e`:
+        // `_ADDON_ADJUST_USER_WEALTH` (`WCCMMUD_named.c:73421`) tests
+        // `pcVar3[0x1e] != '\0'` before it will touch the record or save it.
+        // Use the same flag, so "no character loaded" is a real answer rather
+        // than a check that can never fire.
+        //
+        // Measured on a live board 2026-08-20: without this, `exp 5000` typed
+        // at "Enter your user ID:" answered "done." and wrote four words into an
+        // unloaded slot.
+        const LOADED_FLAG: usize = 0x1e;
+        let flag = self.read_at(A::ptr_offset(ptr, LOADED_FLAG as u16), 1)?;
+        Ok(if flag.first().copied().unwrap_or(0) == 0 { None } else { Some(ptr) })
     }
 
     /// Overwrite (not add to) the caller's own total experience.
