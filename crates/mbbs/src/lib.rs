@@ -3856,6 +3856,32 @@ impl<A: Abi> Host<A> {
                     .map(|outcome| Some((outcome, chan)));
             }
 
+            // The command seam. The line is in `input` and the module has not
+            // been told about it yet, which makes this the one place an
+            // extension can answer a command without the module also seeing
+            // it. `None` skips the whole block, so a host without an
+            // extension executes exactly the path it always did.
+            //
+            // `Handled` needs no channel-state cleanup beyond a bare
+            // `continue` -- see `task-2-findings.md`, in full. Summarized:
+            // `Gsbl::take_line` (`gsbl.rs:549`) already popped the line
+            // inside `get_input`, above, before this seam runs; popping it
+            // *is* the clearing. Everything else the `CRSTG` path touches
+            // (`status`, `usrnum`/`usrptr`/`usaptr`/`vdaptr`, `margv`/`margn`)
+            // is wholesale-overwritten by the next line's own `get_input`
+            // and `point_curusr_mem`, never appended to. And the `sttrou`
+            // TRUE/FALSE "did you consume it" contract
+            // (`MAJORBBS.C:2703`, `hdlcri()`) needs no emulation: this host
+            // does not implement it at all (no `go2mnu`, no `substt` reset,
+            // no `hdlcri` equivalent -- see this same function's own R24
+            // comment on the `entry == None` fallback, further down), so
+            // there is nothing for `Handled` to fake.
+            if status == gsbl::Gsbl::CRSTG && self.extension.is_some() {
+                if let extension::Verdict::Handled = self.dispatch_command(machine, chan)? {
+                    continue;
+                }
+            }
+
             // `MAJORBBS.C:2703` keys both of these on the channel's own state:
             // `sttrou` through `(*(module[usrptr->state]->sttrou))()` and
             // `stsrou` beside it. Same borrow trap as `connect` -- the pointer
@@ -3915,6 +3941,47 @@ impl<A: Abi> Host<A> {
             return self
                 .run(machine, module, entry, &[], Some(chan))
                 .map(|outcome| Some((outcome, chan)));
+        }
+    }
+
+    /// Give the installed extension first look at a `CRSTG` line, before the
+    /// module is told about it.
+    ///
+    /// `Ok(Verdict::Pass)` with no extension installed, unconditionally --
+    /// [`Host::poll_with_chan`]'s own `self.extension.is_some()` guard means
+    /// this is only reached when there is one, but the fallback keeps the
+    /// contract right even if that guard is ever lifted.
+    ///
+    /// Takes the extension out of `self` for the call, the same borrow trap
+    /// [`Host::poll_with_chan`] already documents for `connect`:
+    /// [`extension::CommandCtx`] borrows `self` mutably to let a handler ask
+    /// the host questions, which is only legal while `self.extension` itself
+    /// is not also borrowed. Taking it out and putting it back is what makes
+    /// that legal, and it also means a handler cannot re-enter itself
+    /// through the host.
+    fn dispatch_command(&mut self, machine: &mut A::Cpu, chan: Chan) -> io::Result<extension::Verdict> {
+        let Some(mut ext) = self.extension.take() else {
+            return Ok(extension::Verdict::Pass);
+        };
+        let line = self.input_line(A::mem(machine));
+        let mut ctx = extension::CommandCtx { chan, line, host: self };
+        let verdict = ext.command(&mut ctx);
+        self.extension = Some(ext);
+        Ok(verdict)
+    }
+
+    /// The `input` global, as the line it holds -- the same bytes
+    /// [`Host::get_input_mem`] just wrote there, NUL-terminated, read back
+    /// out as a `String`. Lossy: a line is whatever the terminal sent through
+    /// [`gsbl::Gsbl::take_line`]'s translate table, not guaranteed UTF-8, and
+    /// a malformed byte here is not a reason to poison the machine.
+    fn input_line(&self, mem: &A::Mem) -> String {
+        let Some(input) = self.globals().address("input") else {
+            return String::new();
+        };
+        match input.read_cstr(mem) {
+            Ok(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            Err(_) => String::new(),
         }
     }
 
