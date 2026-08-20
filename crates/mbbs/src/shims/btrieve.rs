@@ -2140,10 +2140,35 @@ pub(crate) fn take_lock<A: Abi>(host: &mut Host<A>, block: A::Ptr, lock: i16) ->
 fn push<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, block: A::Ptr) -> Result<(), ShimError> {
     let previous = current(call, host)?;
     if let Some(dropped) = host.btrieve.set(previous) {
-        host.note(format!(
-            "the setbtv stack is ten deep and overflowed, so {dropped} fell off \
-             the bottom -- exactly as it would have on the real host"
-        ));
+        // `note_once`, not `note`. This overflow is not a fault: the stack is
+        // ten deep and shifts, and reproducing that is the whole point of the
+        // "matching the original beats refusing" section at the top of this
+        // file. A module built against the limit hits it continuously -- one
+        // measured session into the Realm recorded 4,962 of this one note --
+        // so reporting every occurrence buries every other note the host has
+        // to make. Once per run says the same thing.
+        //
+        // The key is the condition, not the message, so the FIRST file to
+        // fall off names itself and later ones stay silent. That is
+        // `note_once`'s documented behaviour and it is the right trade here:
+        // which file was dropped is a detail of a defined, expected outcome,
+        // and a caller who needs the full sequence wants `Btrieve::set`'s
+        // return value, not the note channel.
+        //
+        // Not the bare routine name, which is what `note_no_file` keys on for
+        // every other routine in this file. `setbtv` is not in that set today
+        // -- it is the routine that makes a file current, so it has no
+        // "no file current" case -- but two unrelated conditions sharing one
+        // key would mean the first to fire silences the other, and that is a
+        // trap to design out rather than to rely on staying true.
+        host.note_once(
+            "setbtv-overflow",
+            format!(
+                "the setbtv stack is ten deep and overflowed, so {dropped} fell off \
+                 the bottom -- exactly as it would have on the real host (reported \
+                 once per run; it recurs by design)"
+            ),
+        );
     }
     set_current(call, host, block)
 }

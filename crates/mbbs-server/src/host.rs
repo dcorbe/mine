@@ -586,6 +586,14 @@ fn describe_stop(chan: Option<Chan>) -> String {
 /// overflow. Printed one per line that buries the twenty-odd distinct notes
 /// around it, which is the same as not reporting them at all.
 ///
+/// That particular note has since moved to `note_once` (see `shims::btrieve`'s
+/// `push`), because it recurs *by design* rather than in one burst, and this
+/// function deliberately cannot help with that -- runs collapse within a batch
+/// only, so a note arriving a few times per driver turn still prints every
+/// turn. The measurement above is kept because it is still what justifies
+/// collapsing at all: any note reached from inside a module loop behaves that
+/// way, and most call sites are still plain `note`.
+///
 /// Runs are collapsed **within one batch and never across batches**, so a
 /// line's count is always the whole run and nothing has to be remembered
 /// between calls. The cost is that a note repeating once per driver turn
