@@ -216,8 +216,6 @@ pub struct Boot<A: Abi> {
     pub bturno: Option<String>,
     /// Poll dispatches granted per driver wake. See [`Host::refill_polls`].
     pub polls_per_wake: usize,
-    /// Passes made per [`Host::cycle`] call.
-    pub passes: usize,
     /// Where this thread reports its own [`Host::clock_reads`] after every
     /// `cycle` call, for a caller outside the thread to sample.
     ///
@@ -355,6 +353,23 @@ fn wake(wait: Wait, rx: &std::sync::mpsc::Receiver<In>) -> Woke {
             Err(TryRecvError::Disconnected) => Woke::Gone,
         },
         Wait::Stop => Woke::Gone,
+    }
+}
+
+/// Downgrade a wait when a message is already in hand.
+///
+/// `Host::cycle`'s interrupt predicate receives messages out of the mailbox
+/// and parks them in a one-slot buffer, so `rx` can be empty while a message
+/// is still unread. `Ended::Idle`/`Waiting` are honest about the *module* --
+/// it has no work -- but acting on them here would block on `recv()` with
+/// input already taken, and the board would hang holding a keystroke.
+///
+/// `Wait::Stop` is left alone: the module stopped, and nothing in the mailbox
+/// changes that.
+fn wait_with_peek(wait: Wait, peeked: bool) -> Wait {
+    match wait {
+        Wait::Blocked | Wait::Until(_) if peeked => Wait::Now,
+        other => other,
     }
 }
 
@@ -805,6 +820,11 @@ fn life<A: Abi>(
     let mut turns = 0u64;
     let mut refills = 0u64;
     let mut worst_turn = Duration::ZERO;
+    // Messages `Host::cycle`'s interrupt took out of the mailbox and has not
+    // handed to `apply` yet. At most one: the predicate stops filling it as
+    // soon as it is occupied, because one waiting message is all the answer
+    // "should I come back?" needs.
+    let mut peeked: Option<In> = None;
 
     loop {
         // 0. Tell the bell what to ring for -- see `arm`'s own doc -- then
@@ -814,7 +834,13 @@ fn life<A: Abi>(
         //    success could not tell "waiting correctly" from "stopped
         //    turning at all", which is exactly the distinction this meter
         //    exists to make.
-        arm(wait, deadline);
+        // A peeked message is a message already received: this turn must not
+        // block on `rx` regardless of what the last `cycle` asked for, or the
+        // board would hang holding a keystroke (see `wait_with_peek`'s doc).
+        // `wait` itself -- the strategy the *next* turn inherits -- is left
+        // alone; only `armed`, this turn's own arm/wake value, is downgraded.
+        let armed = wait_with_peek(wait, peeked.is_some());
+        arm(armed, deadline);
         if let Some(age) = &boot.wake_age_ms {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -823,7 +849,7 @@ fn life<A: Abi>(
         }
 
         // 1. Sleep according to what the previous cycle told us to do.
-        let first = match wake(wait, rx) {
+        let first = match wake(armed, rx) {
             Woke::Message(msg) => Some(msg),
             Woke::Nothing => None,
             Woke::Gone => return Ok(LifeEnd::Gone),
@@ -835,10 +861,16 @@ fn life<A: Abi>(
         //    still has to pass through `apply` so a driver here behaves
         //    exactly like `apply`'s other callers -- `saw_input` is what
         //    tells step 3 apart from a bare bell.
+        //
+        //    `peeked` goes first: it was received before anything `wake`
+        //    returns this turn, and draining it out of order would answer
+        //    messages younger than it before it is even applied.
         let mut saw_input = false;
         let mut stopping = None;
-        for msg in first
+        for msg in peeked
+            .take()
             .into_iter()
+            .chain(first)
             .chain(std::iter::from_fn(|| rx.try_recv().ok()))
         {
             // Taken here rather than in `apply`, because this is the one
@@ -886,14 +918,27 @@ fn life<A: Abi>(
 
         // 4. Turn the world.
         //
-        // Timed because this is exactly how long a keystroke can sit unread.
-        // Step 1 is the only place this loop looks at `rx`, so input arriving
-        // one instruction after `cycle` was entered waits for the whole call
-        // to finish -- every pass of it. The felt "it will echo when it is
-        // good and ready" is this number, and nothing else in the loop can
-        // shorten it.
+        // Timed because this is exactly how long a keystroke can sit unread
+        // in the worst case. The interrupt closure below also polls `rx`, so
+        // input arriving mid-cycle no longer waits for the whole burst to
+        // finish -- it cuts the current pass short instead. What this timing
+        // still bounds is the single pass in progress when input arrives:
+        // `cycle` only consults the predicate between passes, so the felt
+        // "it will echo when it is good and ready" is one pass's worth of
+        // work, not the whole burst as before.
+        //
+        // The closure is scoped to this block so its borrow of `peeked` and
+        // `rx` ends before step 2 of the *next* turn needs to drain them.
         let turn_start = Instant::now();
-        let cycles = host.cycle(&mut machine, &module, &mut || false)?;
+        let cycles = {
+            let mut interrupted = || {
+                if peeked.is_none() {
+                    peeked = rx.try_recv().ok();
+                }
+                peeked.is_some()
+            };
+            host.cycle(&mut machine, &module, &mut interrupted)?
+        };
         let spent = turn_start.elapsed();
         turns += 1;
         if spent > worst_turn {
@@ -1173,7 +1218,7 @@ mod tests {
 
     use crate::pool::{MachineId, Pool};
 
-    use super::{Woke, collapse, wake};
+    use super::{Woke, collapse, wait_with_peek, wake};
     use crate::msg::{In, Out};
     use mbbs::Wait;
 
@@ -1269,6 +1314,22 @@ mod tests {
             wake(Wait::Until(Duration::from_secs(1)), &rx),
             Woke::Message(In::Alarm)
         ));
+    }
+
+    /// A message peeked out of the mailbox mid-cycle is a message already
+    /// received. `Ended::Idle` asks the driver to block, and blocking on top
+    /// of one would hang the board with input in hand -- so a full slot
+    /// downgrades the wait to `Wait::Now`.
+    #[test]
+    fn a_peeked_message_downgrades_a_blocking_wait() {
+        assert_eq!(wait_with_peek(Wait::Blocked, true), Wait::Now);
+        assert_eq!(wait_with_peek(Wait::Until(Duration::from_secs(5)), true), Wait::Now);
+        assert_eq!(wait_with_peek(Wait::Blocked, false), Wait::Blocked);
+        assert_eq!(
+            wait_with_peek(Wait::Until(Duration::from_secs(5)), false),
+            Wait::Until(Duration::from_secs(5))
+        );
+        assert_eq!(wait_with_peek(Wait::Stop, true), Wait::Stop);
     }
 
     /// `apply`'s `Connect` arm, stripped of the `Host`/`Module` it would

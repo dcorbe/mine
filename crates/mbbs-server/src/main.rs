@@ -73,61 +73,6 @@ const DEFAULT_WG32_ARENA_BYTES: usize = 0x0100_0000;
 /// a second may not be a playable game.
 const DEFAULT_POLLS_PER_WAKE: usize = 512;
 
-/// Passes made per `Host::cycle` call -- `--passes`'s default. **Unbounded.**
-///
-/// A cycle turns until the board goes idle. There is no clock bound and no
-/// default count bound: `syscyc` and the pass loop run at whatever rate the
-/// module can sustain, which is the shape the vendor's own main loop has
-/// (`MAJORBBS.C:419-424` spins as fast as it can).
-///
-/// # Why the bounds came off
-///
-/// Both of them were tuning that made the board slower.
-///
-/// `--passes` was 1024, then 32, chosen because `host.rs`'s `life` reads the
-/// socket in exactly one place, so a keystroke arriving one instruction after
-/// `cycle` was entered waits for that whole call. Measured then on the 16-bit
-/// board, nobody else connected:
-///
-/// ```text
-/// --passes 1024   worst cycle 279ms, 2s, 4s, 4s            3-5 driver turns / 10s
-/// --passes 32     worst cycle 104ms, 131ms, 243ms, 352ms   55-210 turns / 10s
-/// ```
-///
-/// A 250ms wall-clock budget was then added on top, because on the 32-bit
-/// module those same 32 passes took 4-7 seconds -- each pass drove the
-/// module's realtime engine through roughly 60,000 shim dispatches.
-///
-/// **That premise no longer holds.** The per-pass cost that justified both
-/// bounds was overwhelmingly this host's own dispatch overhead, not the
-/// module's work: routine memoisation, the `shims::entry` scan cache, the
-/// per-thunk resolution cache and `traced()`'s `OnceLock` took dispatch from
-/// about 25% of CPU to 0.3%, and `ptrblok` alone had been 1,918,319 calls in
-/// one session, 99.7% of the traffic. With that gone, a cycle reaches idle
-/// long before either bound binds.
-///
-/// Measured on the live 32-bit board with the clock off: **genuinely faster**,
-/// reported by the operator playing it. That result is what retired the
-/// budget. Bounding the loop was capping the module's own realtime engine
-/// mid-sweep and making its world run slow, which is the same failure the
-/// per-second `syscyc` call in `Host::cycle` exists to prevent.
-///
-/// # What this costs, said out loud
-///
-/// Input latency is now bounded by how long a full cycle takes, not by a
-/// clock or a count. `Ended::Bound` and with it `Wait::Now` are unreachable
-/// at this default, so a burst is not interruptible -- the guard rail that
-/// `the_pass_bound_sits_below_the_poll_budget_so_a_burst_stays_interruptible`
-/// used to pin, removed deliberately and on request.
-///
-/// `--passes N` is the way back: any finite N restores the count bound, and
-/// sweeping it against `worst cycle` is the seam that found all of this.
-///
-/// **Only half-measured.** The operator's "faster" was measured at
-/// `--passes 32` with the clock off, not at an unbounded count. Unbounded
-/// passes is an extrapolation from that result, not the result itself.
-const DEFAULT_PASSES: usize = usize::MAX;
-
 // Every rejection (an unknown flag, a missing required one, a number that
 // does not parse) is a clear message to stderr and a non-zero exit, never a
 // fallback to a default the operator did not ask for -- that would be
@@ -191,10 +136,6 @@ struct Cli {
     /// Poll dispatches granted per driver wake
     #[arg(long, default_value_t = DEFAULT_POLLS_PER_WAKE)]
     polls_per_wake: usize,
-
-    /// Passes made per Host::cycle call
-    #[arg(long, default_value_t = DEFAULT_PASSES)]
-    passes: usize,
 
     /// Connection keys handed to a new player [default: DEMO,NORMAL,USER]
     #[arg(long, value_delimiter = ',', value_parser = parse_key)]
@@ -561,7 +502,6 @@ async fn main() -> ExitCode {
             terms,
             bturno: cli.bturno.clone(),
             polls_per_wake: cli.polls_per_wake,
-            passes: cli.passes,
             clock_reads: None,
             wake_age_ms: None,
             dispatched_total: None,
@@ -584,7 +524,6 @@ async fn main() -> ExitCode {
             terms,
             bturno: cli.bturno32.clone().or_else(|| cli.bturno.clone()),
             polls_per_wake: cli.polls_per_wake,
-            passes: cli.passes,
             clock_reads: None,
             wake_age_ms: None,
             dispatched_total: None,
@@ -711,7 +650,7 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, DEFAULT_MODULE, DEFAULT_PASSES, DEFAULT_POLLS_PER_WAKE, MachineId,
+        Cli, DEFAULT_MODULE, DEFAULT_POLLS_PER_WAKE, MachineId,
         check_module32_count, listeners, plan,
     };
 
@@ -778,7 +717,6 @@ mod tests {
         assert!(cli.listen_raw.is_empty(), "no default period port -- opt in with --listen-raw");
         assert_eq!(cli.terms, 2);
         assert_eq!(cli.polls_per_wake, DEFAULT_POLLS_PER_WAKE);
-        assert_eq!(cli.passes, DEFAULT_PASSES);
         assert!(cli.keys.is_empty(), "no --keys given, so main falls back to default_keys()");
     }
 
