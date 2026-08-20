@@ -353,7 +353,8 @@ struct Plan {
     wg32: Option<Wg32Plan>,
 }
 
-/// Decide which machines a command line boots, and with what. Three rules:
+/// Decide which machines a command line boots, and with what. Three rules
+/// for which machines boot, plus one flag-compatibility check:
 ///
 /// 1. `--module` given (one or more) -- boot `Wg16` with those. Requires
 ///    `--root`.
@@ -363,12 +364,20 @@ struct Plan {
 ///    binary has always done. Requires `--root`. This is deliberate backward
 ///    compatibility: `mbbs-server --root tmp` must keep booting MajorMUD
 ///    unchanged, so the default cannot simply be removed.
+/// 4. `--scripts` given but rules 1-3 leave no `Wg16` machine booting
+///    (a `Wg32`-only board, rule 2) -- refused. `--scripts` only ever
+///    reaches a `Wg16` machine (see its own doc comment); left unchecked,
+///    a `--module32`-only command line that also passes `--scripts` would
+///    silently come up unscriptable despite being told to script -- the
+///    same failure mode `--scripts`'s own doc names ("a board that
+///    silently came up without its scripts"), just caused one flag earlier.
 ///
 /// Every rejection is a plain, named `Err(String)` -- never a panic, and
 /// never a silent no-op the way the `if let (Some(a), Some(b))` pattern this
 /// replaced was: `--module32` without `--root32` used to fall through that
 /// `if let` and boot a `Wg16`-only board with no message at all, despite
-/// `--root32`'s own doc comment calling itself required.
+/// `--root32`'s own doc comment calling itself required. Rule 4 above is the
+/// same mistake shape, caught the same way.
 ///
 /// `MachineId(0)` for `Wg16` and `MachineId(1)` for `Wg32` are assigned here,
 /// fixed, never computed from presence: `pool.rs`'s module doc explains that
@@ -413,6 +422,26 @@ fn plan(cli: &Cli) -> Result<Plan, String> {
         }
         None => None,
     };
+
+    if wg16.is_none() && cli.scripts.is_some() {
+        // Rule 4 (implicit in the doc list above, made explicit here):
+        // `--scripts` only ever reaches a `Wg16` machine (see its own doc
+        // comment) -- refusing this the same way `--module32` without
+        // `--root32` is refused, rather than letting a `--module32`-only
+        // board silently come up unscriptable despite being told to
+        // script. That is the same failure mode `--scripts`'s own doc
+        // comment already names: a board that silently comes up without
+        // the behaviour it was asked for, just with the mistake made one
+        // flag earlier.
+        return Err(
+            "--scripts was given but no Wg16 machine is booting -- --scripts only ever \
+             reaches a Wg16 machine (see its own doc comment), and this command line \
+             boots a Wg32-only board (--module32 with no --module). Give --module (or \
+             drop --module32) to boot a Wg16 machine, or drop --scripts for a Wg32-only \
+             board"
+                .to_string(),
+        );
+    }
 
     if wg16.is_none() && wg32.is_none() {
         // Defensive: rule 3's fallback should make this unreachable, since
@@ -852,6 +881,42 @@ mod tests {
             err.contains("--root32"),
             "error should name the flag that is missing: {err}"
         );
+    }
+
+    /// `--scripts` together with a `--module32`-only command line (no
+    /// `--module`, so no `Wg16` machine boots at all) parses cleanly at the
+    /// clap layer -- the same shape as `--module32` without `--root32`
+    /// above -- but `plan` must refuse it: `--scripts` only ever reaches a
+    /// `Wg16` machine, so honouring this command line would silently boot
+    /// a board that came up unscriptable despite being told to script.
+    #[test]
+    fn scripts_without_wg16_parses_but_plan_refuses_it() {
+        let cli = Cli::try_parse_from(args(&[
+            "--module32",
+            "LUNATIX.EXE",
+            "--root32",
+            "tmp32",
+            "--scripts",
+            "scripts",
+        ]))
+        .expect("parses; --scripts needing a Wg16 machine is plan's problem, not clap's");
+        let err = plan(&cli).expect_err("plan must refuse --scripts with no Wg16 machine");
+        assert!(err.contains("--scripts"), "error should name the flag: {err}");
+        assert!(
+            err.contains("Wg16") || err.contains("16-bit"),
+            "error should say why: no Wg16 machine is booting: {err}"
+        );
+    }
+
+    /// `--scripts` together with a `Wg16` machine (the default, plain
+    /// `--root` case) parses and plans cleanly -- the refusal above is
+    /// specific to a `Wg32`-only board, not to `--scripts` itself.
+    #[test]
+    fn scripts_with_wg16_present_plans_cleanly() {
+        let cli =
+            Cli::try_parse_from(args(&["--root", "tmp", "--scripts", "scripts"])).expect("parses");
+        let plan = plan(&cli).expect("--scripts with a Wg16 machine present is a valid plan");
+        assert!(plan.wg16.is_some(), "the default rule still boots a Wg16 machine");
     }
 
     /// `--module32` together with `--root32` parses cleanly, and without
