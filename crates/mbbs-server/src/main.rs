@@ -9,7 +9,7 @@ use clap::Parser;
 use mbbs::Terms;
 use mbbs::abi::{Wg16, Wg32, Wg32Cpu};
 use mbbs_server::conn::{self, Listener, Machine, default_keys};
-use mbbs_server::host::Boot;
+use mbbs_server::host::{Boot, ExtensionBuilder};
 use mbbs_server::msg::In;
 use mbbs_server::pool::MachineId;
 use mbbs_server::termcompat::Stack;
@@ -220,6 +220,21 @@ struct Cli {
     /// convenience.
     #[arg(long, value_name = "DIGITS")]
     bturno32: Option<String>,
+
+    /// A directory of `*.lua` scripts (`mbbs-lua`'s `LuaExtension`) to load
+    /// above the module at startup, for QoL commands the module itself
+    /// never had -- `mbbs-lua`'s own crate doc has the full seam.
+    ///
+    /// **`Wg16` only.** MajorMUD is the 16-bit machine; extending scripting
+    /// to a `--module32` (LunatiX) board is a separate decision nobody has
+    /// asked for, so this flag has no effect there.
+    ///
+    /// A directory that fails to load is a startup error, not a warning: a
+    /// board that silently came up without its scripts is exactly the
+    /// failure mode this refuses to be. `None` (the default) leaves this
+    /// binary running exactly as it did before this flag existed.
+    #[arg(long, value_name = "DIR")]
+    scripts: Option<PathBuf>,
 }
 
 /// Range-check `--terms` before it ever reaches `Terms::new`, which panics
@@ -442,6 +457,25 @@ fn build_wg32_cpu(module_path: PathBuf) -> impl Fn() -> io::Result<Wg32Cpu> + Se
     }
 }
 
+/// Build [`Boot::extension`]'s closure for `--scripts`: load `dir` as an
+/// `mbbs_lua::LuaExtension`, boxed as the ABI-erased `Extension<Wg16>` the
+/// field expects.
+///
+/// A directory that fails to load names both the directory and the
+/// underlying reason -- see [`Boot::extension`]'s own doc comment for why
+/// this must be a startup error, never a silent, unscripted board.
+///
+/// `Fn`, not `FnOnce`, the same way [`build_wg32_cpu`] is: [`host::run`]'s
+/// restart loop calls this once per life, so a restarted machine gets its
+/// scripts freshly loaded rather than losing them after the first restart.
+fn build_lua_extension(dir: PathBuf) -> ExtensionBuilder<Wg16> {
+    Box::new(move || {
+        let ext = mbbs_lua::LuaExtension::load(&dir)
+            .map_err(|e| io::Error::other(format!("loading scripts from {}: {e}", dir.display())))?;
+        Ok(Box::new(ext) as Box<dyn mbbs::extension::Extension<Wg16>>)
+    })
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -515,6 +549,7 @@ async fn main() -> ExitCode {
             dispatched_total: None,
             calls_total: None,
             survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
+            extension: cli.scripts.clone().map(build_lua_extension),
         };
         machines.push(Machine {
             id: wg16.machine,
@@ -537,6 +572,10 @@ async fn main() -> ExitCode {
             dispatched_total: None,
             calls_total: None,
             survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
+            // `--scripts` is `Wg16` only -- see its own doc comment. LunatiX
+            // (the 32-bit board) has no scripting story; scripting it is a
+            // separate decision nobody has asked for.
+            extension: None,
         };
         machines.push(Machine {
             id: wg32.machine,
@@ -1070,6 +1109,25 @@ mod tests {
         assert!(
             err.to_string().contains("--terms"),
             "error should name the flag missing its value: {err}"
+        );
+    }
+
+    /// `--scripts` with nothing after it is refused with a named error, the
+    /// same way `--terms` is above -- not silently left at `None`, and not
+    /// merely reported as "unrecognised argument" (which would pass even if
+    /// `--scripts` had never been wired up as a real flag at all).
+    #[test]
+    fn scripts_without_a_directory_is_an_error() {
+        let err = Cli::try_parse_from(args(&["--root", "tmp", "--scripts"])).unwrap_err();
+        assert!(
+            err.to_string().contains("--scripts"),
+            "error should name the flag missing its value: {err}"
+        );
+        assert!(
+            !err.to_string().to_lowercase().contains("unrecognized")
+                && !err.to_string().to_lowercase().contains("unexpected"),
+            "this must fail because --scripts needs a value, not because clap does not \
+             know the flag: {err}"
         );
     }
 

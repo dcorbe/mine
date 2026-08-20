@@ -67,6 +67,13 @@ use tokio::sync::watch;
 use crate::msg::{In, Out};
 use crate::pool::{MachineId, Pool};
 
+/// The type [`Boot::extension`] carries -- named so the field itself does
+/// not have to spell out four levels of nesting, and public so a caller
+/// building one (`main.rs`'s `--scripts` wiring today) can name it too. See
+/// that field's own doc for why this is a builder, not the extension
+/// itself.
+pub type ExtensionBuilder<A> = Box<dyn Fn() -> io::Result<Box<dyn mbbs::extension::Extension<A>>> + Send>;
+
 /// Everything the host thread needs, all of it `Send`. `A::Cpu` is not
 /// here and cannot be: it is `!Send`, and the thread builds its own -- see
 /// [`Boot::build`].
@@ -290,6 +297,28 @@ pub struct Boot<A: Abi> {
     /// the same file, so the survey a SIGINT interrupts is the whole
     /// process's, not just its last life's.
     pub survey: Option<PathBuf>,
+
+    /// Build this machine's own extension, called on the host thread itself,
+    /// once per life -- the same shape as [`Boot::build`], and for the same
+    /// reason.
+    ///
+    /// A `Box<dyn Extension<A>>` cannot simply be handed in ready-made: an
+    /// extension is participant, general behaviour above the module, so
+    /// nothing here says its own state is `Send` -- `mbbs-lua`'s
+    /// `LuaExtension`, this seam's first and so far only implementation,
+    /// embeds an `mlua::Lua` VM that is not (its handle is `Rc`-based, not
+    /// `Arc`-based, since nothing about the extension seam needs it to
+    /// cross a thread). [`Boot`] itself must stay entirely `Send` -- it
+    /// moves into [`crate::conn::spawn_machine`]'s `std::thread::spawn` --
+    /// so, exactly like `A::Cpu`, a `!Send` extension is never built until
+    /// it is already on the one thread it will ever run on. `Fn`, not
+    /// `FnOnce`, so a restart (see the module doc, "Surviving a module
+    /// stop") rebuilds a fresh extension for the fresh `Host` it is
+    /// installed on, the same way `Boot::build` rebuilds a fresh `A::Cpu`.
+    ///
+    /// `None` is the supported default: a board given no builder here runs
+    /// exactly as it did before this field existed.
+    pub extension: Option<ExtensionBuilder<A>>,
 }
 
 /// What one wake yielded.
@@ -754,8 +783,11 @@ fn report_notes<A: Abi>(host: &mut Host<A>) {
 ///
 /// If the machine cannot be built, `boot.modules` is empty, any module
 /// cannot be loaded or relocated, any module's ordinal 1 (the init routine)
-/// itself stops, or `finish_init` fails, this returns `Err` -- a broken
-/// deployment, which [`run`] does not retry (see the module doc). Every one
+/// itself stops, `finish_init` fails, or [`Boot::extension`] is present and
+/// fails to build, this returns `Err` -- a broken deployment, which [`run`]
+/// does not retry (see the module doc). A script directory that fails to
+/// load belongs in this same bucket, not a warning: a board that silently
+/// came up without its scripts is the failure this refuses to be. Every one
 /// of those errors names the module's own path, the way [`LoadError::Globals`]
 /// names the symbol it refuses -- with `N` modules "the module failed to
 /// load" is not an answer an operator can act on. Once the steady state
@@ -788,6 +820,15 @@ fn life<A: Abi>(
     //    be handed in.
     let mut machine = (boot.build)()?;
     let mut host = Host::<A>::new(&mut machine, boot.root.clone(), boot.terms)?;
+    // Build and install this life's own extension, on this thread, the way
+    // `boot.build` builds this life's own `A::Cpu` above -- see
+    // `Boot::extension`'s own doc for why this cannot be handed in
+    // ready-made. A directory that fails to load is this life's own boot
+    // failure, reported and *not* retried, exactly like a module that
+    // cannot load (see this function's own doc, "Errors").
+    if let Some(build_ext) = &boot.extension {
+        host.set_extension(build_ext()?);
+    }
     // `MAJORBBS.C:999` -- the real `WGSERVER.EXE` opens its own generic data
     // file and publishes `genbb` before any module initialises, and modules
     // dereference that global without ever assigning it. A board is exactly the

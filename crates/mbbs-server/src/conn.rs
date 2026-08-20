@@ -700,6 +700,7 @@ mod tests {
             dispatched_total: None,
             calls_total: None,
             survey: None,
+            extension: None,
         };
 
         let bound = super::serve(boot, default_keys(), &[("127.0.0.1:0", super::Stack::modern)])
@@ -1141,6 +1142,7 @@ mod tests {
             dispatched_total: None,
             calls_total: None,
             survey: None,
+            extension: None,
         };
 
         let bound = super::serve(

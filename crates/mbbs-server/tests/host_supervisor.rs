@@ -626,6 +626,7 @@ fn boot_many(modules: Vec<PathBuf>, root_name: &str, terms: u16) -> Boot<Wg16> {
         dispatched_total: None,
         calls_total: None,
         survey: None,
+        extension: None,
     }
 }
 
@@ -774,6 +775,44 @@ async fn a_module_that_faults_during_boot_is_not_restarted() {
     assert!(
         text.contains("ordinal 1") || text.contains("init"),
         "the error should say boot failed at the init routine, not something else: {text:?}"
+    );
+}
+
+/// `Boot::extension`, when it fails to build, is the same kind of broken
+/// deployment a module that cannot load is -- `host::run` must return `Err`
+/// immediately, with no restart attempted, and the message must be the
+/// builder's own reason, not a generic failure.
+///
+/// The module path here (`/nonexistent/DOES-NOT-EXIST.DLL`) is never read:
+/// `life` builds and installs the extension *before* it ever touches
+/// `boot.modules` (see `host.rs`'s own ordering), so a real module is not
+/// needed to prove this half of the contract, exactly as `host.rs`'s own
+/// `Boot::extension` doc says an extension failure belongs in the same
+/// "startup error, not a warning" bucket a module-load failure does.
+#[tokio::test]
+async fn an_extension_that_fails_to_build_is_a_boot_failure_not_restarted() {
+    let mut b = boot(
+        PathBuf::from("/nonexistent/DOES-NOT-EXIST.DLL"),
+        "mbbs-server-host-supervisor-extension-boot-fault-root",
+        1,
+    );
+    b.extension = Some(Box::new(|| {
+        Err(std::io::Error::other("stub extension refuses to build, on purpose"))
+    }));
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || mbbs_server::host::run(b, rx, no_bell())),
+    )
+    .await
+    .expect("boot failing must return promptly, not hang the host thread")
+    .expect("the host thread did not panic");
+
+    let err = result.expect_err("an extension that fails to build must not boot successfully");
+    assert!(
+        err.to_string().contains("stub extension refuses to build, on purpose"),
+        "the error should be the builder's own reason, not a generic failure: {err}"
     );
 }
 

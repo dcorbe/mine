@@ -558,6 +558,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "mbbs",
+ "mbbs-lua",
  "mbbs-machine",
  "mud-core",
  "textscreen",
