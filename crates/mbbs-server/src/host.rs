@@ -1070,18 +1070,7 @@ fn life<A: Abi>(
             // catch-up. See `Host::cycle`'s own comments at both call sites,
             // and `MBBS_TRACE_TURNS` for the measurement that found it.
             let mut emit = |gsbl: &mut mbbs::gsbl::Gsbl| {
-                for chan in terms.all() {
-                    let bytes = gsbl.drain_output(chan);
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    let Some(sender) = &conns[chan.index()] else {
-                        continue;
-                    };
-                    if sender.try_send(Out::Bytes(bytes)).is_err() {
-                        undeliverable.push(chan);
-                    }
-                }
+                emit_pending(gsbl, &conns, terms, &mut undeliverable);
             };
             host.cycle(&mut machine, &module, &mut interrupted, &mut emit)?
         };
@@ -1346,6 +1335,43 @@ fn flush<A: Abi>(
     Ok(())
 }
 
+/// Hand every channel's pending output to its connection, recording any
+/// channel that could not take it.
+///
+/// `flush`'s in-cycle counterpart, and deliberately not `flush` itself: this
+/// runs while `Host::cycle` holds `host` mutably, so it can neither hang a
+/// channel up nor clear its `conns` slot. It records instead, and `life`
+/// sweeps what it recorded once the cycle has returned.
+fn emit_pending(
+    gsbl: &mut mbbs::gsbl::Gsbl,
+    conns: &[Option<Sender<Out>>],
+    terms: Terms,
+    undeliverable: &mut Vec<Chan>,
+) {
+    for chan in terms.all() {
+        // Already known dead this cycle. `flush` does not need this test --
+        // it clears `conns[chan]` the moment a send fails, so its own loop
+        // skips the channel and it visits each one once anyway. Here the slot
+        // cannot be cleared: `conns` is held immutably while `host` is
+        // borrowed by `cycle`. So this is what stops a second failure being
+        // recorded, and with it a second `drop_channel` -- which would
+        // dispatch the module's `huprou` again for one disconnect.
+        if undeliverable.contains(&chan) {
+            continue;
+        }
+        let bytes = gsbl.drain_output(chan);
+        if bytes.is_empty() {
+            continue;
+        }
+        let Some(sender) = &conns[chan.index()] else {
+            continue;
+        };
+        if sender.try_send(Out::Bytes(bytes)).is_err() {
+            undeliverable.push(chan);
+        }
+    }
+}
+
 /// Hang up a channel whose output could not be handed to its connection.
 ///
 /// Full (a client that cannot keep up) or Closed (the connection task is
@@ -1415,6 +1441,39 @@ mod tests {
 
     /// A run of identical notes collapses to one line carrying the count,
     /// and the count is the length of the run rather than of the batch.
+    /// One dead channel is one hang-up, however many times the emitter runs.
+    ///
+    /// `Host::cycle` calls the emitter twice a pass and runs many passes, and
+    /// the emitter cannot clear a dead channel's `conns` slot the way `flush`
+    /// does -- it holds `conns` immutably while `host` is borrowed by `cycle`.
+    /// Without a guard every later call retried the same dead channel and
+    /// recorded it again, and `life` calls `drop_channel` once per record --
+    /// which dispatches the module's `huprou` every time. Observed on a live
+    /// board as ~90 `channel 0 dropped` lines for a single disconnect.
+    #[test]
+    fn a_channel_that_cannot_take_its_output_is_recorded_once_however_often_the_emitter_runs() {
+        let terms = Terms::new(1);
+        let chan = terms.chan(0).expect("channel 0 exists at one terminal");
+        let mut gsbl = mbbs::gsbl::Gsbl::new(terms);
+
+        // A connection whose task is gone: every `try_send` answers Closed.
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Out>(4);
+        drop(out_rx);
+        let conns = vec![Some(out_tx)];
+
+        let mut undeliverable = Vec::new();
+        for _ in 0..10 {
+            gsbl.transmit_raw(chan, b"ECHO");
+            super::emit_pending(&mut gsbl, &conns, terms, &mut undeliverable);
+        }
+
+        assert_eq!(
+            undeliverable,
+            vec![chan],
+            "a dead channel must be recorded once, not once per emitter call"
+        );
+    }
+
     #[test]
     fn collapse_folds_a_run_into_one_line_with_its_count() {
         let got = collapse(&lines(&["a", "b", "b", "b", "c"]));
