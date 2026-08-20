@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/mbbs",
+    "crates/mbbs-lua",
     "crates/mbbs-machine",
     "crates/btrieve",
     "crates/btrieve-oracle",
