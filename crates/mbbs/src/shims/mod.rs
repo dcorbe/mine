@@ -274,7 +274,7 @@ impl<A: Abi> Copy for Entry<A> {}
 /// `tools/cargo-serial.sh test -p mbbs --test evidence_manifest` fails loudly
 /// if this table's count ever rises above. This number went stale once
 /// already, by exactly two hundred and two.
-fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evidence)> {
+pub(crate) fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evidence)> {
     vec![
         // Strings, numbers and the print buffer.
         (MAJORBBS, "spr", text::spr, Cleans::Caller, Evidence::Unclassified),
@@ -1866,11 +1866,22 @@ pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
     // scan it twice for `memcpy`, `strcpy` and `strlen` -- the names a module
     // calls most. See [`CRT_SHARED`].
     let dll = crt_home(dll, symbol).unwrap_or(dll);
-    if let Some((_, _, shim, cleans, _)) = routines::<A>()
-        .into_iter()
-        .find(|(d, n, _, _, _)| *d == dll && *n == symbol)
-    {
+    // The memoised table when this ABI has one -- see `Abi::routine_map` for
+    // why that matters on a path this hot. The linear rebuild stays as the
+    // fallback so an ABI that has not opted in still resolves.
+    if let Some((shim, cleans)) = A::routine_lookup(dll, symbol) {
         return Entry::Routine(shim, cleans);
+    }
+    // The rebuild-and-scan fallback, for an `Abi` with no memoised table. Kept
+    // rather than made mandatory so a new `Abi` resolves correctly before it
+    // opts in -- slowly, but correctly.
+    if !A::HAS_ROUTINE_LOOKUP {
+        if let Some((_, _, shim, cleans, _)) = routines::<A>()
+            .into_iter()
+            .find(|(d, n, _, _, _)| *d == dll && *n == symbol)
+        {
+            return Entry::Routine(shim, cleans);
+        }
     }
     if let Some((_, _, value)) = ABSOLUTES.iter().find(|(d, n, _)| *d == dll && *n == symbol) {
         return Entry::Absolute(*value);

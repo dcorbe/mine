@@ -119,6 +119,26 @@ impl Abi for Wg16 {
         crate::shims::wg16_native(dll, symbol)
     }
 
+    const HAS_ROUTINE_LOOKUP: bool = true;
+
+    fn routine_lookup(dll: &str, symbol: &str) -> Option<(crate::shims::Shim<Self>, crate::shims::Cleans)> {
+        static MAP: std::sync::OnceLock<
+            std::collections::HashMap<(&'static str, &'static str), (crate::shims::Shim<Wg16>, crate::shims::Cleans)>,
+        > = std::sync::OnceLock::new();
+        let map = MAP.get_or_init(|| {
+            // First registration wins, matching the linear scan's `find`:
+            // `entry` answered the first matching row, so a duplicate key has
+            // to resolve the same way here or the two paths disagree.
+            let mut map = std::collections::HashMap::new();
+            for (dll, name, shim, cleans, _) in crate::shims::routines::<Wg16>() {
+                map.entry((dll, name)).or_insert((shim, cleans));
+            }
+            map
+        });
+        map.get(&(dll, symbol)).copied()
+    }
+
+
     type Poison = mbbs_machine::m16::Poison;
 
     /// Encode `args` into the words `mbbs_machine::m16::Machine::call` takes,

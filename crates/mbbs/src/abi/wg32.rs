@@ -201,6 +201,26 @@ impl Abi for Wg32 {
         crate::shims::wg32_native(dll, symbol)
     }
 
+    const HAS_ROUTINE_LOOKUP: bool = true;
+
+    fn routine_lookup(dll: &str, symbol: &str) -> Option<(crate::shims::Shim<Self>, crate::shims::Cleans)> {
+        static MAP: std::sync::OnceLock<
+            std::collections::HashMap<(&'static str, &'static str), (crate::shims::Shim<Wg32>, crate::shims::Cleans)>,
+        > = std::sync::OnceLock::new();
+        let map = MAP.get_or_init(|| {
+            // First registration wins, matching the linear scan's `find`:
+            // `entry` answered the first matching row, so a duplicate key has
+            // to resolve the same way here or the two paths disagree.
+            let mut map = std::collections::HashMap::new();
+            for (dll, name, shim, cleans, _) in crate::shims::routines::<Wg32>() {
+                map.entry((dll, name)).or_insert((shim, cleans));
+            }
+            map
+        });
+        map.get(&(dll, symbol)).copied()
+    }
+
+
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
         mbbs_machine::m32::Flat32Ptr(u32::from_le_bytes(
             bytes.try_into().expect("PTR_WIDTH bytes"),

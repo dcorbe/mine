@@ -449,6 +449,57 @@ pub trait Abi {
         None
     }
 
+    /// `crate::shims::routines` for this ABI, built once and keyed for lookup.
+    ///
+    /// # Why this exists
+    ///
+    /// `crate::shims::entry` runs on every shim **call**, not just at load
+    /// time, and it used to rebuild the whole 445-row routine table -- a `Vec`
+    /// of tuples -- and linear-scan it, per call. Measured at 17.6us per
+    /// lookup in a debug build, which is what the board actually runs.
+    ///
+    /// MajorMUD calls `ptrtile` 141,326 times in one init pass (measured with
+    /// `MBBS_TRACE_SHIMS`: 90% of all its shim traffic, because `ptrtile` is
+    /// the arithmetic helper that reaches tile *n* of a tiled region and the
+    /// module walks its big tables element by element). At 17.6us that is
+    /// **2.5 seconds of symbol lookup for one routine**, against a 5-second
+    /// watchdog -- so the host was spending half the budget deciding which
+    /// function to call, and a `finrou` over a played-in board blew through
+    /// it. That is the watchdog firing on correct behaviour, which
+    /// `m16::DEFAULT_BUDGET`'s own doc comment names as worse than no watchdog
+    /// at all.
+    ///
+    /// A per-ABI `OnceLock` rather than one cache inside `entry`, because the
+    /// value type is `Shim<Self>` and a generic `static` cannot exist. This is
+    /// the same shape [`Abi::native`] already uses: one hook, two concrete
+    /// implementations.
+    ///
+    /// Returns the pair by value rather than lending the map out, so no
+    /// `'static` reference escapes and `entry` needs no `A: 'static` bound --
+    /// which would otherwise ripple through every generic `Host<A>` method that
+    /// resolves a symbol.
+    ///
+    /// The default is `None`, meaning "no cache, fall back to rebuilding" --
+    /// so an `Abi` that has not opted in still resolves correctly, just
+    /// slowly. `crate::shims::entry` is the only caller.
+    /// Whether [`Abi::routine_lookup`] is authoritative -- that is, whether a
+    /// `None` from it means "not registered" rather than "not cached".
+    ///
+    /// Without this, `entry` would have to run the linear rebuild after every
+    /// cached *miss* to stay correct, and a miss is the common case: every
+    /// `Datum`, every `Absolute`, and every genuinely unimplemented symbol
+    /// misses the routine table. That would have left the hot path exactly as
+    /// slow as before for the lookups that reach `GLOBALS`.
+    const HAS_ROUTINE_LOOKUP: bool = false;
+
+    fn routine_lookup(dll: &str, symbol: &str) -> Option<(crate::shims::Shim<Self>, crate::shims::Cleans)>
+    where
+        Self: Sized,
+    {
+        let _ = (dll, symbol);
+        None
+    }
+
     /// Why this ABI's machine refuses to run again -- `mbbs_machine::m16::Poison`
     /// for `Wg16`, `mbbs_machine::m32::Poison` for `Wg32`.
     ///
