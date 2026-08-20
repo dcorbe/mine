@@ -1152,6 +1152,131 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
     ]
 }
 
+/// The C library that `MAJORBBS` and `cw3220mt.DLL` **both** export, served
+/// under both names whichever one this host happens to have keyed it under.
+///
+/// # The regression this exists to close
+///
+/// `cw3220mt.DLL` was an alias of `MAJORBBS` until `2913cfb5` gave Borland's
+/// runtime a library of its own -- correctly: they are genuinely two files.
+/// But that commit treated the shared namespace as something to *move* out
+/// of, and only moved the seventeen names that are Borland-internal
+/// (`_startup`, `@_catchcleanup$qv`, `_ftol` and the rest) -- symbols no
+/// generation of `MAJORBBS` ever exported. The C library proper stayed
+/// keyed `MAJORBBS`, so a 32-bit module importing `atol` from `cw3220mt.DLL`
+/// -- which is where a Worldgroup NT module gets it -- stopped resolving.
+/// MajorMUD NT died in init on exactly that: `cw3220mt.DLL.atol is not
+/// implemented`.
+///
+/// A move was never the right shape. 16-bit modules import these names
+/// *from* `MAJORBBS.DLL`, which re-exported Borland's 16-bit runtime; 32-bit
+/// modules import the same routines from Borland's own DLL. Both callers are
+/// right about their own library, so both library names have to answer, and
+/// with one body between them -- which is why this is a list of names
+/// [`entry`] pairs up and not a second set of table rows that could drift.
+///
+/// # It runs in both directions, because the split broke both
+///
+/// The move also went the other way for three names. `_localeconvention`,
+/// `_fgetc` and `_write` are keyed `CW3220MT`, and **16-bit NE** modules
+/// import them from `MAJORBBS` -- measured, in the committed corpus tables:
+/// three NE rows for `_localeconvention` (LunatiX's NE build and SFAELF) and
+/// one each for the other two, against zero PE32 rows for all three. A
+/// 16-bit module has nowhere else to get its C runtime, so `MAJORBBS` has to
+/// answer, and `crates/mbbs/tests/corpus_coverage.rs` was red on exactly
+/// this. So the pairing is symmetric and which table a row sits in is not
+/// the caller's business.
+///
+/// The other fourteen names the split moved stay `CW3220MT`-only, and the
+/// same measurement is why: thirteen of them carry PE32 rows in the corpus
+/// and **zero** NE rows, and none of the fourteen carries an NE row at all.
+/// Nothing shows 16-bit `MAJORBBS.DLL` exporting `_ftol` or
+/// `@_catchcleanup$qv`, so nothing here invents it --
+/// `the_borland_runtime_resolves_under_its_own_library_not_majorbbs` still
+/// holds.
+///
+/// # Why an allowlist and not a fallback
+///
+/// Falling back from `CW3220MT` to `MAJORBBS` on every miss would re-merge
+/// the two namespaces the split separated, and would answer a C runtime
+/// import with a *game API* routine that happens to share its name. A name
+/// not on this list stays [`Entry::Unimplemented`] under `CW3220MT`, which
+/// is what an unserved runtime import should be.
+///
+/// # Where the list came from
+///
+/// Measured, not assumed: `objdump -p` over every `.dll` and `.exe` under
+/// `archive/`, committed as `crates/mbbs/tests/data/cw3220mt-imports.tsv` and
+/// enforced by `crates/mbbs/tests/crt_library_split.rs`. 264 distinct names
+/// (after `c_name`) are imported from `cw3220mt.DLL` by some real binary, and
+/// they partition exactly:
+///
+/// * **68** some `MAJORBBS` registration already answers -- the 67 in this
+///   list, plus `_fgetc`, which travels the other way (see below).
+/// * **13** are Borland-internal and keyed `CW3220MT` in [`routines`]
+///   directly: `_startup`, `_ftol`, `@_catchcleanup$qv` and the rest. No
+///   generation of `MAJORBBS` ever exported them.
+/// * **183** are C++ runtime, iostreams and `string` symbols this host
+///   implements nowhere. Untouched: aliasing maps a name, it does not invent
+///   an entry, so they stay [`Entry::Unimplemented`] under both names.
+///
+/// Two of the sixty-seven are **data**, not routines (`_ctype`, `_streams`).
+/// That is the other reason this is a rewrite in [`entry`] rather than a
+/// second set of table rows: a global resolves to [`Entry::Datum`] out of
+/// [`GLOBALS`], and duplicating a row there would allocate the table twice.
+///
+/// `setjmp` and `longjmp` are on the list deliberately. Both are structural
+/// refusals (see [`crt::setjmp`]), and a refusal that names the missing
+/// register API is a better answer to a runtime import than "not
+/// implemented" -- it is the same answer a 16-bit caller already gets.
+const CRT_SHARED: &[&str] = &[
+    // Strings and memory.
+    "memcmp", "memcpy", "memmove", "memset", "strcat", "strchr", "strcmp", "strcpy", "stricmp",
+    "strlen", "strlwr", "strncat", "strncmp", "strncpy", "strnicmp", "strstr", "strtok", "strupr",
+    // Conversion and formatting.
+    "atol", "itoa", "sprintf", "sscanf", "strtol", "ultoa", "vsprintf",
+    // Character classification. `_ctype` keeps its one leading underscore for
+    // the reason `_localeconvention` does: `c_name` strips exactly one, so a
+    // module's `__ctype` arrives here already spelled this way.
+    "_ctype", "tolower", "toupper",
+    // Buffered stdio, and `_streams` -- the `FILE` table itself.
+    "_streams", "fclose", "fflush", "fgetc", "fgets", "fopen", "fprintf", "fputc", "fread",
+    "fseek", "ftell", "fwrite", "flushall", "rewind", "ungetc",
+    // Descriptors and the file system.
+    "access", "close", "filelength", "lseek", "mkdir", "open", "read", "rename", "tell",
+    "unlink", "write",
+    // The environment.
+    "getenv",
+    // Random numbers.
+    "rand", "srand",
+    // Time. `dostounix`, `getdate`, `getftime` and `gettime` are Borland
+    // extensions rather than C standard, and are on this list for the same
+    // reason as everything else: real modules import them from this file.
+    "dostounix", "getdate", "getftime", "gettime", "time",
+    // Non-local jumps, both structural refusals -- see this list's own doc.
+    "longjmp", "setjmp",
+    // Standard output. `printf` bottoms out in this process's own stdout,
+    // following Borland's own plumbing -- see `crt::printf`.
+    "printf",
+    // Ending the process. `abort` is a genuine `MAJORBBS` export too
+    // (`_ABORT` @52 in both ordinal tables), which is why it stays registered
+    // there -- and why it belongs here as well: it is Borland's `abort`, the
+    // one body serves both, and 41 of the archive's builds import it from
+    // `cw3220mt.DLL`.
+    "abort", "exit",
+];
+
+/// The three that travel the other way: keyed `CW3220MT` in [`routines`], and
+/// imported from `MAJORBBS` by **16-bit** modules, which have nowhere else to
+/// get a C runtime from. Measured in the committed corpus tables -- three NE
+/// rows for `_localeconvention` (LunatiX's NE build and SFAELF) and one each
+/// for the other two, against zero PE32 rows for all three.
+///
+/// A list of their own rather than a `(name, home)` pair on every one of
+/// [`CRT_SHARED`]'s sixty-seven: which list a name is in *is* its home, so
+/// nothing is repeated and [`crt_home`] still answers in one pass.
+const CRT_SHARED_16: &[&str] = &["_localeconvention", "_fgetc", "_write"];
+
 /// The second door: routines that answer only for `Wg16`. See
 /// [`Abi::native`]'s own doc comment for why these twenty-seven are here and
 /// not in [`routines`].
@@ -1497,6 +1622,14 @@ pub(crate) fn gbool_arg<A: Abi>(v: A::Int) -> bool {
 /// neither needs its own copy of the alias.
 pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
     let dll = canonical_dll(dll);
+    // A C runtime name both files export answers under whichever of the two
+    // this host keyed it under, so rewrite to that one. Deliberately a
+    // rewrite and not a lookup-then-fall-back: this function runs on every
+    // shim *call* (`Host::run`'s dispatch loop, `crate::lib`), already
+    // rebuilding the whole of `routines` each time, and a fallback would
+    // scan it twice for `memcpy`, `strcpy` and `strlen` -- the names a module
+    // calls most. See [`CRT_SHARED`].
+    let dll = crt_home(dll, symbol).unwrap_or(dll);
     if let Some((_, _, shim, cleans, _)) = routines::<A>()
         .into_iter()
         .find(|(d, n, _, _, _)| *d == dll && *n == symbol)
@@ -1514,6 +1647,26 @@ pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
     }
     Entry::Unimplemented
 }
+
+/// Which of the two library names this host actually keyed a shared C runtime
+/// `symbol` under, when `dll` is either one of the pair.
+///
+/// `None` for a symbol that is not shared, or a `dll` that is not one of the
+/// two -- in both cases the caller's own `dll` stands unchanged, which is why
+/// this cannot hand a game-API routine to a runtime import.
+fn crt_home(dll: &str, symbol: &str) -> Option<&'static str> {
+    if dll != MAJORBBS && dll != CW3220MT {
+        return None;
+    }
+    if CRT_SHARED.contains(&symbol) {
+        return Some(MAJORBBS);
+    }
+    if CRT_SHARED_16.contains(&symbol) {
+        return Some(CW3220MT);
+    }
+    None
+}
+
 
 /// Whether [`crate::Host::run`]'s survey mode (see `crate::survey`) may
 /// safely fabricate a return and resume the module past a call to an
@@ -1766,6 +1919,125 @@ mod tests {
             matches!(entry::<crate::abi::Wg32>(MAJORBBS, "_ftol"), Entry::Unimplemented),
             "the C runtime must stop wearing MAJORBBS's name"
         );
+    }
+
+    /// The other half of the split, which the split itself missed: the C
+    /// library proper is exported by *both* files, so both names must answer.
+    ///
+    /// Full set equality over [`CRT_SHARED`], not a spot check -- the
+    /// regression this guards was one name (`atol`) standing in for
+    /// sixty-six, and a sample would have passed while sixty-five stayed
+    /// broken. It also fails on a name in the list that `MAJORBBS` does not
+    /// answer: the redirect is silent by construction, so a typo would serve
+    /// nothing rather than error.
+    #[test]
+    fn the_shared_c_library_answers_under_both_library_names() {
+        for name in CRT_SHARED {
+            assert!(
+                !matches!(entry::<crate::abi::Wg32>(MAJORBBS, name), Entry::Unimplemented),
+                "{name} is in CRT_SHARED but MAJORBBS does not answer it, so the redirect \
+                 lands on nothing"
+            );
+            assert!(
+                !matches!(entry::<crate::abi::Wg32>("cw3220mt.DLL", name), Entry::Unimplemented),
+                "{name} is imported from cw3220mt.DLL by a real module and must resolve there"
+            );
+        }
+    }
+
+    /// The pairing runs the other way too. These three are keyed `CW3220MT`,
+    /// and a **16-bit** module has nowhere but `MAJORBBS` to get its C
+    /// runtime from -- the corpus carries NE rows for all three and PE32 rows
+    /// for none. The split moved them out of `MAJORBBS` and broke those
+    /// modules; `corpus_coverage.rs` names `_localeconvention` for LunatiX's
+    /// NE build and SFAELF.
+    #[test]
+    fn the_sixteen_bit_runtime_names_answer_under_majorbbs_again() {
+        // Spelled out rather than iterating `CRT_SHARED_16`: a test that
+        // reads the list it is checking cannot see a name deleted from it,
+        // which is the exact shape of the bug this whole change repairs.
+        for name in ["_localeconvention", "_fgetc", "_write"] {
+            assert!(
+                !matches!(entry::<Wg16>("cw3220mt.DLL", name), Entry::Unimplemented),
+                "{name} is keyed CW3220MT and must resolve there"
+            );
+            assert!(
+                !matches!(entry::<Wg16>(MAJORBBS, name), Entry::Unimplemented),
+                "{name} is imported from MAJORBBS by a real NE module"
+            );
+        }
+    }
+
+    /// And the thirteen the split moved that have no 16-bit evidence stay
+    /// where they were put. Serving them under `MAJORBBS` would be inventing
+    /// an export no recovered table and no real module shows.
+    #[test]
+    fn the_pe32_only_runtime_names_stay_out_of_majorbbs() {
+        for name in ["_ftol", "@_catchcleanup$qv", "_startup", "_free_heaps", "searchpath"] {
+            assert!(
+                matches!(entry::<crate::abi::Wg32>(MAJORBBS, name), Entry::Unimplemented),
+                "{name} is PE32-only in the corpus; MAJORBBS must not answer it"
+            );
+        }
+    }
+
+    /// The pairing is between those two libraries and no others. `GALGSBL`
+    /// is a Galacticomm library that has never exported a C runtime, and a
+    /// module asking it for `strcpy` has asked for something that does not
+    /// exist -- answering would invent an export and hide the module's real
+    /// bug. `crt_home`'s first line is what refuses; without it every
+    /// library on the host would inherit the C runtime.
+    #[test]
+    fn only_the_two_libraries_that_share_the_c_runtime_answer_for_it() {
+        for dll in [crate::exports::GALGSBL, crate::exports::GALME, KERNEL32] {
+            assert!(
+                matches!(entry::<crate::abi::Wg32>(dll, "strcpy"), Entry::Unimplemented),
+                "{dll} does not export the C runtime and must not answer for it"
+            );
+        }
+    }
+
+    /// The redirect carries data as well as routines. `__ctype` is Borland's
+    /// character-class table, imported by eleven of the archive's builds from
+    /// `cw3220mt.DLL`, and it resolves to an address rather than a call --
+    /// which is why the redirect lives in [`entry`] instead of duplicating
+    /// rows, where a second [`GLOBALS`] entry would allocate the table twice.
+    #[test]
+    fn a_shared_global_resolves_under_the_runtime_name_too() {
+        assert!(matches!(entry::<crate::abi::Wg32>(MAJORBBS, "_ctype"), Entry::Datum));
+        assert!(matches!(entry::<crate::abi::Wg32>("cw3220mt.DLL", "_ctype"), Entry::Datum));
+    }
+
+    /// `CRT_SHARED` is an allowlist, not a fallback. A game-API routine must
+    /// not become reachable through the C runtime's name just because the
+    /// runtime is missing something.
+    #[test]
+    fn a_majorbbs_routine_not_in_the_shared_list_stays_unserved_under_the_runtime() {
+        // `l2as` is the host's own long-to-ASCII, in the MAJORBBS table and
+        // imported from `WGSERVER.EXE` by real PE modules -- never from
+        // Borland's runtime, which spells its own `ltoa`.
+        assert!(matches!(entry::<crate::abi::Wg32>(MAJORBBS, "l2as"), Entry::Routine(..)));
+        assert!(
+            matches!(entry::<crate::abi::Wg32>("cw3220mt.DLL", "l2as"), Entry::Unimplemented),
+            "the runtime's namespace must not fall back to the game API"
+        );
+    }
+
+    /// One body, two names. A derived registration that pointed at a
+    /// different shim would be worse than no registration at all.
+    #[test]
+    fn both_registrations_of_a_shared_name_are_the_same_routine() {
+        let (
+            Entry::Routine(from_mbbs, mbbs_cleans),
+            Entry::Routine(from_crt, crt_cleans),
+        ) = (
+            entry::<crate::abi::Wg32>(MAJORBBS, "atol"),
+            entry::<crate::abi::Wg32>("cw3220mt.DLL", "atol"),
+        ) else {
+            panic!("both library names answer atol");
+        };
+        assert!(std::ptr::fn_addr_eq(from_mbbs, from_crt), "one body under both names");
+        assert_eq!(mbbs_cleans, crt_cleans, "and cleaned up the same way");
     }
 
     #[test]

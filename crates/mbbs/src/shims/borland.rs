@@ -558,9 +558,18 @@ mod tests {
             !matches!(entry::<Wg32>(crate::exports::MAJORBBS, "abort"), Entry::Unimplemented),
             "abort must still resolve under MAJORBBS"
         );
+        // ...and under Borland's name as well, which this test used to
+        // assert the opposite of. The claim was that `abort` "must not wear
+        // the Borland runtime's name" because `_ABORT` @52 makes it a genuine
+        // MAJORBBS export. Both halves of that are true and the conclusion
+        // still does not follow: MAJORBBS exported it *because* it
+        // re-exported Borland's runtime, the body here is documented as "the
+        // C runtime's abort()", and 41 of the archive's 254 PE32 builds
+        // import `_abort` from `cw3220mt.DLL`. Refusing it there served no
+        // identity and broke every one of them. See `shims::CRT_SHARED`.
         assert!(
-            matches!(entry::<Wg32>("cw3220mt.DLL", "abort"), Entry::Unimplemented),
-            "abort must not wear the Borland runtime's name"
+            !matches!(entry::<Wg32>("cw3220mt.DLL", "abort"), Entry::Unimplemented),
+            "abort is Borland's too -- one body, both library names"
         );
     }
 
