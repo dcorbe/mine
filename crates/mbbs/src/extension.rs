@@ -13,6 +13,14 @@ use mbbs_machine::ptr::ModulePtr;
 use crate::Chan;
 use crate::abi::{Abi, Arg, ModuleMem};
 
+/// The most bytes [`CommandCtx::write_scratch`] will ever place. `mbbs-lua`'s
+/// `summon`, this seam's only caller today, needs an item search name plus
+/// a trailing NUL plus a 2-byte OUT match count; 128 bytes is generous
+/// headroom over any real `WCCITEMS.VIR` item name. See `write_scratch`'s
+/// own doc comment for why this is a fixed, reused buffer rather than an
+/// unbounded allocation per call.
+const COMMAND_SCRATCH_BYTES: usize = 128;
+
 /// What an extension decided about an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -114,27 +122,56 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
         self.host.run(self.machine, self.module, entry, args, Some(self.chan))
     }
 
-    /// Give the module a fresh block of memory holding `bytes`, and return a
+    /// Give the module `bytes`, written into this seam's own persistent
+    /// scratch buffer ([`crate::Host::command_scratch`]), and return a
     /// pointer to it -- for a handler that needs to pass
     /// [`CommandCtx::call_export`] something the module has to be able to
     /// read, such as a search string.
     ///
-    /// One-shot, with no matching free: [`crate::abi::ModuleMem::alloc_region`]
-    /// offers no way to give a region back, only to hand out more (see its
-    /// own doc comment). A handler that calls this on every invocation
-    /// grows the module's address space by one region per call for as long
-    /// as the board runs -- acceptable for a command a player types
-    /// occasionally, not for anything on a hot path.
+    /// One buffer for the seam's whole lifetime, not one allocation per
+    /// call: [`crate::abi::ModuleMem::alloc_region`]'s `Wg16` backing is
+    /// `Machine::alloc_segment`, a real LDT descriptor -- a finite, shared
+    /// resource [`crate::heap::Heap::reserve`] also draws from to grow the
+    /// module's own heap. A command a player can retype as often as they
+    /// like must not cost the board one of those every time it runs; this
+    /// reuses the same region on every call instead, allocated once on
+    /// first use, the same pattern [`crate::Host::fsd_scratch`] and
+    /// [`crate::Host::cnc_statics`] already establish for exactly this
+    /// reason. See those two fields' own doc comments for why reuse, not a
+    /// matching free, is the right shape here -- `ModuleMem` offers no free
+    /// at all, and none is needed once nothing allocates more than once.
     ///
     /// # Errors
     ///
-    /// If there is no room left to place `bytes`, or the write itself runs
-    /// off the region just allocated (which would mean `alloc_region`
-    /// answered a region smaller than it was asked for).
+    /// If `bytes` is longer than [`COMMAND_SCRATCH_BYTES`] -- refused
+    /// outright rather than silently truncated or served by a fresh,
+    /// unbounded allocation, since either of those would either corrupt
+    /// what the module reads or reopen the exhaustion this buffer exists to
+    /// close.
+    ///
+    /// Otherwise, if there is no room to allocate the buffer at all (the
+    /// first call only), or the write itself runs off it.
     pub fn write_scratch(&mut self, bytes: &[u8]) -> io::Result<A::Ptr> {
-        let ptr = A::mem(self.machine)
-            .alloc_region(bytes.len())
-            .map_err(|e| io::Error::other(format!("write_scratch: {e}")))?;
+        if bytes.len() > COMMAND_SCRATCH_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write_scratch: {} bytes does not fit the {COMMAND_SCRATCH_BYTES}-byte \
+                     command scratch buffer",
+                    bytes.len()
+                ),
+            ));
+        }
+        let ptr = match self.host.command_scratch {
+            Some(ptr) => ptr,
+            None => {
+                let ptr = A::mem(self.machine)
+                    .alloc_region(COMMAND_SCRATCH_BYTES)
+                    .map_err(|e| io::Error::other(format!("write_scratch: {e}")))?;
+                self.host.command_scratch = Some(ptr);
+                ptr
+            }
+        };
         ptr.write(A::mem(self.machine), bytes)
             .map_err(|e| io::Error::other(format!("write_scratch: {e}")))?;
         Ok(ptr)

@@ -1416,6 +1416,24 @@ pub struct Host<A: Abi> {
     /// storage is a plain `static` rather than anything per-channel either.
     pub(crate) cnc_statics: Option<A::Ptr>,
 
+    /// The extension seam's own scratch buffer -- see
+    /// [`crate::extension::CommandCtx::write_scratch`]'s own doc comment for
+    /// what it holds, how big it is, and why it is allocated once and reused
+    /// rather than once per call. `None` until the first call that needs it.
+    ///
+    /// Same shape and same justification as [`Host::fsd_scratch`] and
+    /// [`Host::cnc_statics`] just above: only one channel's command line is
+    /// ever being handled at a time, this host being single-threaded by
+    /// force, so one persistent allocation serves every call. That matters
+    /// here specifically because `ModuleMem::alloc_region`'s `Wg16` backing
+    /// is `Machine::alloc_segment` -- a real, finite LDT descriptor, the
+    /// same shared resource [`Heap::reserve`](crate::heap::Heap::reserve)
+    /// draws from to grow the module's own heap. A fresh one per call, for
+    /// a command a player can type as often as they like, would degrade
+    /// every other subsystem that needs a new segment for the rest of the
+    /// board's uptime -- not just this one.
+    pub(crate) command_scratch: Option<A::Ptr>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap<A>,
 
@@ -1802,6 +1820,7 @@ impl<A: Abi> Host<A> {
             fsd_ascii: std::collections::HashMap::new(),
             fsd_scratch: None,
             cnc_statics: None,
+            command_scratch: None,
             heap,
             users,
             asked: Vec::new(),

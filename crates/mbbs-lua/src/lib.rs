@@ -154,6 +154,15 @@ fn to_verdict(value: Value) -> Verdict {
 ///
 /// [`CommandCtx::print`]: mbbs::extension::CommandCtx::print
 fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result<(bool, Option<&'static str>)> {
+    // A NUL inside `name` would truncate the C string the module reads at
+    // that byte, silently searching for a shorter (and wrong) name instead
+    // of the one the player typed -- refuse outright rather than let that
+    // happen quietly. Lua strings are byte strings and do not forbid an
+    // embedded NUL the way `mlua::String::to_str()`/a Rust `&str` would.
+    if name.contains(&0) {
+        return Err(mlua::Error::RuntimeError("summon: item name must not contain a NUL byte".to_string()));
+    }
+
     // `[name][NUL][count: u16, zero]` in one allocation: the search
     // string `_GET_ITEM_FROM_NAME` reads, immediately followed by the real
     // 2-byte scratch its OUT match-count parameter must point at -- the
@@ -213,6 +222,13 @@ fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result
         // A `char` return: only the low byte (AL) is meaningful, so mask
         // rather than compare `lo` whole -- AH is whatever a `char`-typed
         // Borland routine's caller-saved half happened to hold.
+        //
+        // TODO: verify against a real module. The findings file documents
+        // the return as "char: 1 success, 0 failure" but does not say which
+        // bits of `Outcome::Returned.lo` carry it -- this masking is my own
+        // interpretation of ordinary Borland `char`-return convention, not
+        // something measured off `WCCMMUD.DLL` itself (task-6-report.md's
+        // "Concerns" section says the same).
         Outcome::Returned { lo, .. } if lo & 0xff != 0 => Ok((true, None)),
         Outcome::Returned { .. } => Ok((false, Some("too heavy or no free slot"))),
         Outcome::Stopped(poison) => Err(mlua::Error::RuntimeError(format!(

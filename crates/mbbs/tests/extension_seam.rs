@@ -234,3 +234,80 @@ fn call_export_names_the_symbol_when_unresolvable() {
     let err = result.lock().expect("lock").take().expect("command ran").expect_err("must refuse an unknown export");
     assert!(err.to_string().contains("NOSUCHTHING"), "got: {err}");
 }
+
+/// One `write_scratch` result, as [`ScratchTwice`] and [`ScratchTooBig`]
+/// share it -- named so clippy's `type_complexity` lint has nothing to say
+/// about either struct's own `result` field.
+type ScratchResult = io::Result<mbbs_machine::m16::FarPtr>;
+
+/// Calls `write_scratch` twice with small, distinct payloads when
+/// dispatched, and records both results -- proving reuse (the same pointer
+/// both times) is what `CommandCtx::write_scratch`'s persistent buffer
+/// promises, not a fresh `alloc_region`, and therefore a fresh LDT segment,
+/// per call. See `task-6-report.md`'s fix-report addendum for why this
+/// matters: `summon` is player-retypable, and `ModuleMem::alloc_region`'s
+/// `Wg16` backing is a real, finite, shared descriptor other subsystems
+/// (`Heap::reserve`, `Host::fsd_scratch`) also draw from.
+struct ScratchTwice {
+    result: Arc<Mutex<Option<(ScratchResult, ScratchResult)>>>,
+}
+
+impl Extension<Wg16> for ScratchTwice {
+    fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
+        let first = ctx.write_scratch(b"one");
+        let second = ctx.write_scratch(b"two");
+        *self.result.lock().expect("lock") = Some((first, second));
+        Verdict::Handled
+    }
+}
+
+#[test]
+fn write_scratch_reuses_the_same_buffer_across_calls() {
+    let mut f = Fixture::new();
+    let module = f.minimal_module();
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = ScratchTwice { result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let (first, second) = result.lock().expect("lock").take().expect("command ran");
+    let first = first.expect("first write_scratch call must succeed");
+    let second = second.expect("second write_scratch call must succeed");
+    assert_eq!(
+        first, second,
+        "a second call must reuse the first call's buffer, not allocate a fresh LDT segment"
+    );
+}
+
+/// Calls `write_scratch` with a payload larger than the seam's own scratch
+/// buffer -- refused, not silently truncated and not served by falling back
+/// to a fresh, unbounded allocation (which would reopen the exhaustion the
+/// fixed-size buffer exists to close).
+struct ScratchTooBig {
+    result: Arc<Mutex<Option<ScratchResult>>>,
+}
+
+impl Extension<Wg16> for ScratchTooBig {
+    fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
+        // Comfortably past extension.rs's own `COMMAND_SCRATCH_BYTES` (128,
+        // at the time of writing) without hard-coding that private constant
+        // in a test outside its crate module.
+        *self.result.lock().expect("lock") = Some(ctx.write_scratch(&vec![0u8; 4096]));
+        Verdict::Handled
+    }
+}
+
+#[test]
+fn write_scratch_refuses_a_payload_too_big_for_the_scratch_buffer() {
+    let mut f = Fixture::new();
+    let module = f.minimal_module();
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = ScratchTooBig { result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let err = result.lock().expect("lock").take().expect("command ran").expect_err("must refuse an oversized payload");
+    assert!(err.to_string().contains("4096"), "got: {err}");
+}
