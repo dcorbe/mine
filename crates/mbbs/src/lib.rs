@@ -146,6 +146,15 @@ pub enum Outcome<A: Abi> {
     Stopped(A::Poison),
 }
 
+/// What [`Host::poll_next_channel`] found.
+pub enum Polled<A: Abi> {
+    /// A channel's polling routine ran. The `Chan` is who.
+    Dispatched(Outcome<A>, Chan),
+    /// No channel has a `polrou` at all. The caller should stop asking for
+    /// this second rather than rescan every channel on every pass.
+    NobodyPolls,
+}
+
 impl<A: Abi> Clone for Outcome<A> {
     fn clone(&self) -> Self {
         match self {
@@ -1296,6 +1305,15 @@ pub struct Host<A: Abi> {
     /// construction: a host nobody is driving polls nothing.
     pub(crate) polls_left: usize,
 
+    /// Where the next poll round starts, so the channels take turns.
+    ///
+    /// Polling used to ride the GSBL status queue, and `Gsbl::scan`'s own
+    /// rotation supplied this fairness for free. With the queue gone (a
+    /// standing intention is state, not an event) the rotation has to live
+    /// here, or a grant cut short by the interrupt would re-serve channel 0
+    /// every time and starve the rest.
+    poll_cursor: u16,
+
     /// Every form `fsdroom` has sized, keyed by the `(message number, amode)`
     /// it was compiled from. See [`Host::forms`].
     ///
@@ -1825,6 +1843,7 @@ impl<A: Abi> Host<A> {
             stdio_modes: [false; 5],
             tfscan: shims::tfscan::TfScan::default(),
             polls_left: 0,
+            poll_cursor: 0,
             census: PollCensus::default(),
             forms: HashMap::new(),
             fsdscb: vec![None; usize::from(terms.count())],
@@ -3519,6 +3538,45 @@ impl<A: Abi> Host<A> {
         self.get_input_mem(A::mem(machine), chan)
     }
 
+    /// Run the next polling routine, taking channels in turn.
+    ///
+    /// **`polrou` is the intention.** The vendor re-queued a `POLSTS` after
+    /// every call (`MAJORBBS.C:3258`) because its status queue was the only
+    /// place it had to record "poll me again". This host reads the intention
+    /// instead -- the same fresh read of emulated memory the vendor itself
+    /// makes after each call, so a routine that zeroed its own `polrou` stops
+    /// being polled without any bookkeeping to keep in sync.
+    fn poll_next_channel(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+    ) -> io::Result<Polled<A>> {
+        // `Terms` is a `Copy` newtype over `u16`; `count()` takes `self` by
+        // value and returns `u16`. Keep the arithmetic in `u16`, the way
+        // `Gsbl::scan` does with its own cursor -- `poll_cursor < count`, so
+        // `poll_cursor + step` cannot overflow at any channel count this host
+        // supports.
+        let count = self.users.terms().count();
+        if count == 0 {
+            return Ok(Polled::NobodyPolls);
+        }
+        for step in 0..count {
+            let index = (self.poll_cursor + step) % count;
+            let Some(chan) = self.users.terms().chan(index as i16) else {
+                continue;
+            };
+            let rou = match self.users.polrou_mem(A::mem(machine), chan) {
+                Ok(Some(rou)) => rou,
+                Ok(None) => continue,
+                Err(e) => return self.shim_stop(machine, "poll_next_channel", e).map(|o| Polled::Dispatched(o, chan)),
+            };
+            self.poll_cursor = (index + 1) % count;
+            let outcome = self.dispatch_poll(machine, module, chan, rou)?;
+            return Ok(Polled::Dispatched(outcome, chan));
+        }
+        Ok(Polled::NobodyPolls)
+    }
+
     /// `dopoll()` -- call a channel's polling routine now. `MAJORBBS.C:3258`.
     ///
     ///
@@ -3546,30 +3604,7 @@ impl<A: Abi> Host<A> {
             Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
         };
 
-        self.inpolr = Some(chan);
-        // Bracketing `run` rather than the whole function so the census counts
-        // what the module's own routine did, not this host's bookkeeping
-        // around it. See `PollCensus`.
-        let before = self.calls();
-        let outcome = self.run(machine, module, rou, &[], Some(chan));
-        // Cleared before the `?`, so a machine that malfunctioned does not leave
-        // `inpolr` naming a channel that is no longer running anything. The
-        // original does the same from the `longjmp` landings at
-        // `MAJORBBS.C:2488` and `:4150`.
-        self.inpolr = None;
-
-        // Counted before the `?`, so a poll that ended the machine is still
-        // counted -- it is the most expensive one there is, and losing it
-        // would bias the census towards the dispatches that went well.
-        let spent = self.calls().saturating_sub(before);
-        self.census.polls += 1;
-        self.census.calls += spent;
-        self.census.worst = self.census.worst.max(spent);
-        if spent == 0 {
-            self.census.barren += 1;
-        }
-
-        let outcome = outcome?;
+        let outcome = self.dispatch_poll(machine, module, chan, rou)?;
 
         // One dispatch, one token. Saturating because the budget may already
         // be zero: when it runs out, up to `nterms` injections are still
@@ -3595,6 +3630,48 @@ impl<A: Abi> Host<A> {
             }
         }
         Ok(Some(outcome))
+    }
+
+    /// Call one channel's polling routine and count it. No re-arming: see
+    /// [`Host::poll_next_channel`] for why the intention is read rather than
+    /// re-queued.
+    fn dispatch_poll(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        chan: Chan,
+        rou: A::Ptr,
+    ) -> io::Result<Outcome<A>> {
+        // **The module reads `status`.** `poll_with_chan` writes it before
+        // every dispatch (`lib.rs:3913`); a poll that arrives from the clock
+        // rather than from the status queue must write it too, or the module
+        // reads whatever the last dispatch left. Presenting a status and
+        // queueing one are different things -- only the first is contractual,
+        // and this is it.
+        self.globals()
+            .write_int_mem(A::mem(machine), "status", gsbl::Gsbl::POLSTS as i32 as u32)?;
+        self.inpolr = Some(chan);
+        // Bracketing `run` rather than the whole function so the census counts
+        // what the module's own routine did, not this host's bookkeeping
+        // around it. See `PollCensus`.
+        let before = self.calls();
+        let outcome = self.run(machine, module, rou, &[], Some(chan));
+        // Cleared before the `?`, so a machine that malfunctioned does not leave
+        // `inpolr` naming a channel that is no longer running anything. The
+        // original does the same from the `longjmp` landings at
+        // `MAJORBBS.C:2488` and `:4150`.
+        self.inpolr = None;
+        // Counted before the `?`, so a poll that ended the machine is still
+        // counted -- it is the most expensive one there is, and losing it
+        // would bias the census towards the dispatches that went well.
+        let spent = self.calls().saturating_sub(before);
+        self.census.polls += 1;
+        self.census.calls += spent;
+        self.census.worst = self.census.worst.max(spent);
+        if spent == 0 {
+            self.census.barren += 1;
+        }
+        outcome
     }
 
     /// `prcrtk()` -- one second's worth of the kicktable. `RTKICK.C:59`:
@@ -5485,7 +5562,7 @@ mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
     use crate::{
-        Clock, Dispatch, Duration, Ended, Host, Kick, Native, Outcome, PollCensus, Registration, Terms,
+        Clock, Dispatch, Duration, Ended, Host, Kick, Native, Outcome, PollCensus, Polled, Registration, Terms,
         gsbl, stall_note, testing, users,
     };
     use mbbs_machine::m16::{FarPtr, Machine, Poison, Ret};
@@ -7449,6 +7526,70 @@ mod tests {
             f.host.notes().len(),
             notes,
             "and it is not noted -- this is the normal path, not an anomaly"
+        );
+    }
+
+    /// The cursor rotates, so a burst cut short does not always re-serve
+    /// channel 0. `Gsbl::scan` earns its own rotation the same way
+    /// (`gsbl.rs`'s "scan rotates, so no channel can starve another"); this
+    /// is that property for polling, which no longer rides the status queue.
+    #[test]
+    fn poll_next_channel_rotates_across_the_channels_that_poll() {
+        let (mut f, module, rou) = polling_fixture_with(3);
+        let terms = f.host.users.terms();
+        for i in 0..3u16 {
+            let chan = terms.chan(i as i16).expect("channel");
+            f.host
+                .users
+                .set_polrou_mem(f.machine.mem_mut(), chan, Some(rou))
+                .expect("polrou set");
+        }
+
+        let mut served = Vec::new();
+        for _ in 0..4 {
+            match f.host.poll_next_channel(&mut f.machine, &module).expect("polled") {
+                Polled::Dispatched(_, chan) => served.push(chan.index()),
+                Polled::NobodyPolls => panic!("three channels poll"),
+            }
+        }
+
+        assert_eq!(served, vec![0usize, 1, 2, 0], "round robin, wrapping");
+    }
+
+    /// With no `polrou` anywhere, the answer is `NobodyPolls` -- and the
+    /// caller uses that to stop asking for the rest of the second rather
+    /// than rescanning every channel on every pass.
+    #[test]
+    fn poll_next_channel_says_so_when_nobody_polls() {
+        let (mut f, module, _rou) = polling_fixture_with(3);
+        assert!(matches!(
+            f.host.poll_next_channel(&mut f.machine, &module).expect("polled"),
+            Polled::NobodyPolls
+        ));
+    }
+
+    /// A clock-granted poll must leave `status` reading `POLSTS`, because the
+    /// module reads that global. `poll_writes_the_status_global_on_the_crstg_path_too`
+    /// pins the same property for the queue-driven path.
+    #[test]
+    fn a_clock_granted_poll_writes_the_status_global() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host
+            .users
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
+            .expect("channel 0");
+        f.host
+            .globals()
+            .write_int_mem(f.machine.mem_mut(), "status", 0)
+            .expect("status is a placed global");
+
+        let _ = f.host.poll_next_channel(&mut f.machine, &module).expect("polled");
+
+        assert_eq!(
+            f.host.globals().word(&f.machine, "status").expect("read"),
+            gsbl::Gsbl::POLSTS as u16,
+            "the module reads `status`; a clock-granted poll must set it"
         );
     }
 
