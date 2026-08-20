@@ -18,6 +18,7 @@ pub mod gsbl;
 pub mod memory;
 pub mod misc;
 pub mod mlt;
+pub mod math;
 pub mod msg;
 pub mod mudmisc;
 pub mod mudtext;
@@ -1603,6 +1604,21 @@ pub(crate) fn wg16_native(dll: &str, symbol: &str) -> Option<(Shim<Wg16>, Cleans
 /// preceded by `fld`/`fild`/`fmul` with nothing pushed.
 const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans, Evidence)] = &[
     (CW3220MT, "_ftol", ftol::ftol, Cleans::Caller, Evidence::Unclassified),
+    // The five math routines, and the reason they are HERE rather than in the
+    // generic table: each returns its result in the x87 `ST(0)` through
+    // `abi::Ret::F64`, and only the 32-bit machine can deliver that --
+    // `mbbs_machine::m32::Machine::arm_st0_return`. `Wg16` has no FPU path at
+    // all, which is what makes these `Abi::native`'s business.
+    //
+    // Bare names, not `_sqrt`: real PE modules import `_sqrt`/`_pow`/`_sin`/
+    // `_atan`/`_atan2`, and `library::c_name` strips exactly one leading
+    // underscore before a symbol reaches `entry`. The import counts in
+    // `tests/data/cw3220mt-imports.tsv` are 12/6/11/3/3 binaries respectively.
+    (CW3220MT, "sqrt", math::sqrt, Cleans::Caller, Evidence::Standard),
+    (CW3220MT, "pow", math::pow, Cleans::Caller, Evidence::Standard),
+    (CW3220MT, "sin", math::sin, Cleans::Caller, Evidence::Standard),
+    (CW3220MT, "atan", math::atan, Cleans::Caller, Evidence::Standard),
+    (CW3220MT, "atan2", math::atan2, Cleans::Caller, Evidence::Standard),
     // The block allocator, `Wg32` half. Same C export names as the `Wg16`
     // entries in `WG16_ROUTINES` -- this is deliberate, not the duplicate
     // registration `6d8af77` cleaned up. One symbol, two ABI-concrete bodies,

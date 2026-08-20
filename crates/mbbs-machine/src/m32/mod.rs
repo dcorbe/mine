@@ -118,6 +118,21 @@ const RETURN_THUNK_SLOT: u16 = MAX_THUNKS;
 /// needs the FPU's full 80-bit extended range to survive intact.
 const ST0_SCRATCH_LEN: usize = 8;
 
+/// Bytes reserved past [`Machine::arm_st0_capture`]'s own scratch qword for a
+/// second one: the `f64` a host call is handing the module back through
+/// `ST0`, on the way *out* rather than in. Same width, same reasoning as
+/// [`ST0_SCRATCH_LEN`] -- an `m64fp` `fld`/`fstp` operand is always 8 bytes --
+/// just the mirror direction. See [`Machine::run`]'s [`Ret::F64`] handling
+/// for what reads and writes this.
+const ST0_RETURN_SCRATCH_LEN: usize = 8;
+
+/// Bytes reserved for the return-path stub [`Machine::run`] builds fresh on
+/// every crossing that hands the module a [`Ret::F64`]: one `fld qword ptr
+/// [scratch]` (`DD 05` + disp32, 6 bytes) and one `jmp rel32` (`E9` + rel32, 5
+/// bytes) -- 11 bytes, rounded up to 16 for the same headroom-and-hex-dump-
+/// legibility reason [`THUNK_STRIDE`]'s own doc comment gives.
+const ST0_RETURN_STUB_LEN: usize = 16;
+
 /// What kind of thunk reached the trampoline, carried in `ECX` --
 /// [`asm::Ctx::out_ecx`].
 ///
@@ -276,7 +291,13 @@ impl std::fmt::Display for Poison {
 /// the same choice `crate::m16::Ret` makes, for the same reason: a table of
 /// several hundred shims wants the choice explicit at the one place it is
 /// made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `#[derive(..)]`s `Debug`/`Clone`/`Copy`/`PartialEq` but **not** `Eq`: once
+/// [`Ret::F64`] existed, a derived `Eq` would claim `f64::NAN` is equal to
+/// itself, which IEEE 754 says it is not. `PartialEq` alone tells the truth;
+/// nothing here has ever needed `Ret` as a map key or in a `HashSet`, so
+/// there is nothing `Eq`'s absence costs.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Ret {
     /// Nothing to return. Both halves are cleared, so a module that reads
     /// `EDX` anyway -- mistaking a 32-bit result for a 64-bit one -- sees
@@ -290,6 +311,19 @@ pub enum Ret {
     /// A 64-bit result, split `EDX:EAX` with the high half in `EDX`. What a
     /// `long long` comes back as under cdecl.
     U64(u64),
+
+    /// An `f64` result, delivered through the x87 `ST0` register rather than
+    /// through `EAX`/`EDX` -- what Borland cdecl (Evidence::Standard: ISO C /
+    /// the Intel ABI, not a measurement) hands back for a `double`-returning
+    /// function. `EAX`/`EDX` are cleared exactly as [`Ret::Void`]'s are (see
+    /// [`Ret::registers`]): the value lives nowhere a module reading those two
+    /// registers would ever find it.
+    ///
+    /// [`Machine::run`] is what actually places this in `ST0` -- see its own
+    /// doc comment for the return-path stub it builds fresh on every crossing
+    /// that carries one, and [`Machine::arm_st0_capture`]'s doc comment for
+    /// the *inbound* mirror this variant completes.
+    F64(f64),
 }
 
 impl Ret {
@@ -299,6 +333,12 @@ impl Ret {
             Self::Void => (0, 0),
             Self::U32(v) => (v, 0),
             Self::U64(v) => (v as u32, (v >> 32) as u32),
+            // The value lives in ST0, not here -- see `Ret::F64`'s own doc
+            // comment. Cleared exactly like `Void` rather than left at
+            // whatever the caller's `ret` happened to carry, so a module that
+            // (wrongly) reads EAX/EDX for a double result sees a
+            // deterministic zero rather than noise.
+            Self::F64(_) => (0, 0),
         }
     }
 }
@@ -442,6 +482,19 @@ pub struct Machine {
     /// panics against that, rather than silently handing back whatever
     /// garbage happens to sit in the scratch qword.
     st0_capture_slot: Option<u16>,
+
+    /// Where the *outbound* `ST0` scratch qword sits within [`Machine::bridge`]
+    /// -- the mirror of [`Machine::st0_scratch_off`], for a value the host is
+    /// handing the module rather than one the module handed the host. See
+    /// [`Machine::run`]'s [`Ret::F64`] handling.
+    st0_return_scratch_off: usize,
+
+    /// Where the return-path `fld`/`jmp` stub sits within [`Machine::bridge`].
+    /// Rewritten fresh on every crossing that carries a [`Ret::F64`] -- unlike
+    /// [`Machine::arm_st0_capture`]'s thunk, which is armed once per import
+    /// slot, this stub's destination changes on every resume, so there is
+    /// nothing to arm in advance. See [`Machine::run`].
+    st0_return_stub_off: usize,
 }
 
 impl Machine {
@@ -463,7 +516,9 @@ impl Machine {
     pub fn new() -> io::Result<Self> {
         let tramp = trampoline();
         let st0_scratch_off = TRAMPOLINE_OFFSET + tramp.len();
-        let mut bridge = Mapping::new(st0_scratch_off + ST0_SCRATCH_LEN)?;
+        let st0_return_scratch_off = st0_scratch_off + ST0_SCRATCH_LEN;
+        let st0_return_stub_off = st0_return_scratch_off + ST0_RETURN_SCRATCH_LEN;
+        let mut bridge = Mapping::new(st0_return_stub_off + ST0_RETURN_STUB_LEN)?;
 
         let cs64 = current_cs();
         fault::arm(cs64)?;
@@ -538,6 +593,8 @@ impl Machine {
             poisoned: None,
             st0_scratch_off,
             st0_capture_slot: None,
+            st0_return_scratch_off,
+            st0_return_stub_off,
         })
     }
 
@@ -815,6 +872,96 @@ impl Machine {
     /// address it with a plain `disp32`.
     fn st0_scratch_addr(&self) -> u32 {
         self.bridge.base() as usize as u32 + self.st0_scratch_off as u32
+    }
+
+    /// The linear address of [`Machine::arm_st0_return`]'s outbound scratch
+    /// qword. See [`Machine::st0_scratch_addr`] for why this is safely
+    /// `disp32`-addressable.
+    fn st0_return_scratch_addr(&self) -> u32 {
+        self.bridge.base() as usize as u32 + self.st0_return_scratch_off as u32
+    }
+
+    /// The linear address of the return-path stub [`Machine::arm_st0_return`]
+    /// rewrites on every use.
+    fn st0_return_stub_addr(&self) -> u32 {
+        self.bridge.base() as usize as u32 + self.st0_return_stub_off as u32
+    }
+
+    /// Build (or rebuild) the return-path stub so that entering it loads
+    /// `value` onto the x87 stack, then falls through to `dest` -- the
+    /// outbound counterpart to [`Machine::arm_st0_capture`]. Returns the
+    /// stub's own address: what [`Machine::run`] should enter instead of
+    /// `dest` directly.
+    ///
+    /// # Why a stub in the bridge, not a patch to the module's own code
+    ///
+    /// `dest` is the instruction right after the module's own `call` -- real
+    /// module code this crate does not own and has no business overwriting,
+    /// and which a second outstanding call could re-enter before this one's
+    /// `fld` ever needed to run again. A stub living in [`Machine::bridge`],
+    /// rebuilt fresh on every crossing that needs one, sidesteps both
+    /// problems: nothing about the module's own memory is touched, and the
+    /// stub's *content* -- which scratch qword, which `dest` -- is data this
+    /// method controls completely, current for exactly one crossing.
+    ///
+    /// # Why the bridge, not the shared 64-bit trampoline
+    ///
+    /// Same reasoning [`Machine::arm_st0_capture`]'s own doc comment gives for
+    /// the inbound side, read in the outbound direction: the `fld` has to run
+    /// while this machine is still in 32-bit compat mode, before any 64-bit
+    /// Rust code -- which cannot touch `ST0` at all, `f64`/`f32` being `XMM`-
+    /// resident under System V -- gets a chance to run between the crossing
+    /// and the module seeing its result. Putting the `fld` in the stub this
+    /// method writes, entered directly off the far jump in [`Machine::enter`],
+    /// closes that question completely rather than resting on "no Rust code
+    /// happens to touch x87 today".
+    ///
+    /// Unlike `arm_st0_capture`, this is not "arm once, use across many
+    /// calls": `dest` is a different address on every resume (wherever the
+    /// module's `call` to whichever import returned a `double` happened to
+    /// sit), so there is nothing to arm in advance. [`Machine::run`] calls
+    /// this immediately before every crossing that carries a [`Ret::F64`].
+    ///
+    /// # Panics
+    ///
+    /// If the encoding below somehow outgrew [`ST0_RETURN_STUB_LEN`] (it does
+    /// not: 6 + 5 = 11 bytes against a 16-byte reservation) -- mirrors
+    /// [`Machine::arm_st0_capture`]'s own `assert!`, checked at the point of
+    /// construction rather than trusted.
+    fn arm_st0_return(&mut self, value: f64, dest: u32) -> u32 {
+        let scratch_addr = self.st0_return_scratch_addr();
+        let stub_addr = self.st0_return_stub_addr();
+
+        let scratch_off = self.st0_return_scratch_off;
+        self.bridge.as_mut_slice()[scratch_off..scratch_off + ST0_RETURN_SCRATCH_LEN]
+            .copy_from_slice(&value.to_le_bytes());
+
+        let mut stub = Vec::with_capacity(ST0_RETURN_STUB_LEN);
+        // fld qword ptr [scratch_addr] -- DD /0, ModRM 00_000_101 (disp32, no
+        // base/index), then the disp32 -- the identical encoding
+        // `st0_tests::arm_st0_capture_delivers_the_module_s_fld_across_the_crossing`
+        // builds for its test guest, just executed here by this crate's own
+        // stub rather than by the module.
+        stub.push(0xdd);
+        stub.push(0x05);
+        stub.extend_from_slice(&scratch_addr.to_le_bytes());
+        // jmp rel32 -- E9 id, target computed from the address right after
+        // this instruction: the ordinary near-jump encoding, `call_rel32`'s
+        // own reasoning in `register_tests` minus the implicit push a `call`
+        // would make.
+        stub.push(0xe9);
+        let next_ip = stub_addr + 6 + 5; // the fld (6 bytes) then this jmp (5 bytes)
+        stub.extend_from_slice(&dest.wrapping_sub(next_ip).to_le_bytes());
+
+        assert!(
+            stub.len() <= ST0_RETURN_STUB_LEN,
+            "the ST0-return stub needs {} bytes and the reservation is {ST0_RETURN_STUB_LEN}",
+            stub.len(),
+        );
+        let off = self.st0_return_stub_off;
+        self.bridge.as_mut_slice()[off..off + stub.len()].copy_from_slice(&stub);
+
+        stub_addr
     }
 
     /// Rewrite thunk `slot`'s bytes so that, once bound to an import site,
@@ -1349,9 +1496,20 @@ impl Machine {
     }
 
     /// Cross into 32-bit mode and come back, handing the module `ret` in
-    /// `EAX`/`EDX:EAX` on the way in.
+    /// `EAX`/`EDX:EAX` on the way in -- or, for [`Ret::F64`], in `ST0`
+    /// instead, by entering [`Machine::arm_st0_return`]'s stub rather than
+    /// `entry` directly. The stub itself falls through to `entry` once the
+    /// `fld` has run, so every crossing still lands the module at the same
+    /// place it always would; only the very first instruction executed
+    /// differs.
     fn run(&mut self, entry: u32, sp: u32, ret: Ret) -> io::Result<Exit> {
         let (eax, edx) = ret.registers();
+
+        let entry = if let Ret::F64(value) = ret {
+            self.arm_st0_return(value, entry)
+        } else {
+            entry
+        };
 
         self.ctx.target_offset = entry;
         self.ctx.esp = sp;
@@ -1553,6 +1711,142 @@ mod st0_tests {
     fn take_st0_refuses_to_answer_before_a_slot_is_armed() {
         let machine = Machine::new().expect("a fresh machine");
         let _ = machine.take_st0();
+    }
+
+    /// The return-path mirror of
+    /// [`arm_st0_capture_delivers_the_module_s_fld_across_the_crossing`]: a
+    /// module calls out, the host answers with [`Ret::F64`], and the module
+    /// -- resumed at the instruction right after its own `call`, same as any
+    /// other host answer -- pops `ST0` with an ordinary `fstp` and stores it
+    /// to memory this test can read back. This is the deliverable: proof the
+    /// value crosses through the real x87 register, not merely that
+    /// [`Machine::arm_st0_return`]'s Rust arithmetic is correct.
+    #[test]
+    fn resume_with_ret_f64_delivers_the_value_into_the_module_s_st0() {
+        const VALUE: f64 = 98765.25; // exactly representable in f64
+        const SLOT: u16 = 4;
+        const RESULT_OFF: usize = 512;
+
+        let mut machine = Machine::new().expect("a fresh machine");
+
+        let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+        let base = code_mapping.base() as usize as u32;
+        let result_addr = base + RESULT_OFF as u32;
+
+        let target = machine.thunk_addr(SLOT);
+
+        // call rel32 -- the module reaches the host, exactly the ordinary
+        // Exit::Call path; nothing about the call site itself is special.
+        let mut code = vec![0xe8_u8];
+        let next_ip = base + 5;
+        code.extend_from_slice(&target.wrapping_sub(next_ip).to_le_bytes());
+
+        // fstp qword ptr [result_addr] -- DD /3, ModRM 00_011_101 (disp32, no
+        // base/index): the module's own instruction, run only *after*
+        // Machine::resume re-enters it, storing whatever is on ST0 at that
+        // moment. If the host's answer never reached ST0, this stores
+        // whatever the (empty) FPU stack happens to fault or hold instead --
+        // never a value that could pass this test's assertion by accident.
+        code.push(0xdd);
+        code.push(0x1d);
+        code.extend_from_slice(&result_addr.to_le_bytes());
+
+        // ret -- the module's entry point is over. Lands on the return
+        // thunk `Machine::call` planted beneath this call's own frame,
+        // giving `Exit::Returned` exactly like any other module that
+        // finishes normally.
+        code.push(0xc3);
+
+        code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let exit = machine
+            .call(base, &[])
+            .expect("the module traps into the call thunk");
+        assert_eq!(exit, Exit::Call { index: SLOT }, "stopped at the host call");
+
+        let exit = machine
+            .resume(Ret::F64(VALUE))
+            .expect("the module resumes with an F64 answer");
+        assert_eq!(
+            exit,
+            Exit::Returned { eax: 0, edx: 0 },
+            "Ret::F64 must clear EAX/EDX exactly as Ret::Void does -- the value lives in ST0"
+        );
+
+        let bytes: [u8; 8] = code_mapping.as_slice()[RESULT_OFF..RESULT_OFF + 8]
+            .try_into()
+            .expect("eight bytes");
+        assert_eq!(
+            f64::from_le_bytes(bytes),
+            VALUE,
+            "ST0 did not survive the host -> module crossing intact"
+        );
+
+        drop(code_mapping);
+    }
+
+    /// A second crossing after an `F64` answer must not still be pointed at
+    /// the stub from the first -- `arm_st0_return` has to rebuild it (new
+    /// scratch value, new `dest`) on every call, unlike `arm_st0_capture`'s
+    /// one-time arming. Two different values through two different call
+    /// sites is what would catch a stub that got left stale (e.g. only the
+    /// scratch qword rewritten, not the `jmp` target).
+    #[test]
+    fn arm_st0_return_rebuilds_the_stub_for_each_resume_not_only_the_first() {
+        const SLOT: u16 = 5;
+        const RESULT_OFF: usize = 512;
+        const FIRST: f64 = 1.5;
+        const SECOND: f64 = -204.75;
+
+        let mut machine = Machine::new().expect("a fresh machine");
+        let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+        let base = code_mapping.base() as usize as u32;
+        let result_addr = base + RESULT_OFF as u32;
+        let thunk = machine.thunk_addr(SLOT);
+
+        // call thunk; fstp [result]; call thunk; fstp [result]; ret
+        let mut code = Vec::new();
+        for _ in 0..2 {
+            let call_at = base + code.len() as u32;
+            code.push(0xe8);
+            let next_ip = call_at + 5;
+            code.extend_from_slice(&thunk.wrapping_sub(next_ip).to_le_bytes());
+            code.push(0xdd);
+            code.push(0x1d);
+            code.extend_from_slice(&result_addr.to_le_bytes());
+        }
+        code.push(0xc3);
+        code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let exit = machine.call(base, &[]).expect("first call thunk trap");
+        assert_eq!(exit, Exit::Call { index: SLOT });
+
+        // Resuming the first call's F64 answer runs the module past its own
+        // `fstp` (storing FIRST) and straight into the second `call thunk`,
+        // so this same `resume` is what reports the second trap too.
+        let exit = machine
+            .resume(Ret::F64(FIRST))
+            .expect("first resume, running into the second call site");
+        assert_eq!(exit, Exit::Call { index: SLOT }, "stopped at the second call site");
+        let bytes: [u8; 8] = code_mapping.as_slice()[RESULT_OFF..RESULT_OFF + 8]
+            .try_into()
+            .expect("eight bytes");
+        assert_eq!(f64::from_le_bytes(bytes), FIRST, "the first call's own value");
+
+        let exit = machine
+            .resume(Ret::F64(SECOND))
+            .expect("second resume");
+        assert_eq!(exit, Exit::Returned { eax: 0, edx: 0 }, "the module's own `ret`");
+        let bytes: [u8; 8] = code_mapping.as_slice()[RESULT_OFF..RESULT_OFF + 8]
+            .try_into()
+            .expect("eight bytes");
+        assert_eq!(
+            f64::from_le_bytes(bytes),
+            SECOND,
+            "a stale stub would still show the first call's value here"
+        );
+
+        drop(code_mapping);
     }
 }
 

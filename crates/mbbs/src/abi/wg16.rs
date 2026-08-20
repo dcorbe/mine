@@ -376,6 +376,27 @@ impl From<Ret<Wg16>> for mbbs_machine::m16::Ret {
             Ret::Int(v) => mbbs_machine::m16::Ret::U16(v),
             Ret::Long(v) => mbbs_machine::m16::Ret::U32(v),
             Ret::Ptr(v) => mbbs_machine::m16::Ret::Far(v),
+            // Structural, not unfinished work -- the same refusal shape
+            // `crt::setjmp` uses, stated here because `abi::Ret<A>`'s own
+            // `F64` variant is generic over every `Abi` and this `From` is
+            // infallible, so there is no `Result` for a refusal to live in.
+            // `mbbs_machine::m16::Machine` has no counterpart to
+            // `mbbs_machine::m32::Machine::arm_st0_return`: no ST0 scratch
+            // qword, no bridge-mapped stub, nothing that ever touches the
+            // FPU -- so a 16-bit routine can never honestly produce this. In
+            // practice nothing ever does: `Ret::F64`'s own producers
+            // (`crate::shims::math`) are registered only against `CW3220MT`,
+            // which `crates/mbbs-machine/src/library.rs` documents as
+            // Wg32-exclusive ("a Worldgroup NT module links"), so no
+            // `Wg16`-bound shim is ever in a position to build one. If that
+            // convention is ever violated, this is the loud failure instead
+            // of a silent, plausible-looking `0.0`.
+            Ret::F64(v) => panic!(
+                "Ret::F64({v}) reached the 16-bit boundary: mbbs_machine::m16::Machine has \
+                 no x87 ST0 injection -- no scratch qword, no bridge-mapped return stub, \
+                 nothing that touches the FPU at all -- so a 16-bit shim cannot honestly \
+                 produce Ret::F64. See abi::Ret::F64's own doc comment."
+            ),
         }
     }
 }
@@ -579,6 +600,25 @@ mod tests {
             mbbs_machine::m16::Ret::Far(ptr),
             "offset (AX) and selector (DX) must land unswapped"
         );
+    }
+
+    /// `Ret::F64` is the fifth variant `ret_wg16_converts_to_mbbs16_ret_for_all_four_variants`
+    /// (deliberately still named "four": nothing about that test's own scope
+    /// changed) does not cover, because it cannot honestly answer -- see
+    /// `abi::Ret::F64`'s own doc comment and `mbbs_machine::m16::Machine`'s
+    /// total lack of any x87 counterpart to
+    /// `mbbs_machine::m32::Machine::arm_st0_return`. Nothing in this crate
+    /// ever constructs `Ret::<Wg16>::F64` in production -- `crate::shims::math`
+    /// is registered against `Wg32` alone -- so without this test the panic
+    /// arm below would be unexercised code, the exact "a trap documented in
+    /// memory but never actually verified" gap this crate's own conduct
+    /// rules warn about. Mirrors `crt::setjmp`'s own refusal test
+    /// (`shims/crt.rs::tests::setjmp_refuses_and_names_the_missing_register_api`):
+    /// assert the panic fires, and that its message names what is missing.
+    #[test]
+    #[should_panic(expected = "no x87 ST0 injection")]
+    fn ret_f64_reaching_the_16_bit_boundary_panics_naming_the_missing_capability() {
+        let _ = mbbs_machine::m16::Ret::from(Ret::<Wg16>::F64(1.0));
     }
 
     /// The reverse direction: `Ret<A>` has no `PartialEq` (see `abi.rs`'s own

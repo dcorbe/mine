@@ -893,6 +893,32 @@ impl<'a, A: Abi> Call<'a, A> {
     pub fn long(&mut self) -> u32 {
         A::long_from_bytes(self.take(A::LONG_WIDTH))
     }
+
+    /// The next argument, as a C `double`: eight raw bytes, decoded
+    /// little-endian, with no `Abi`-varying width the way [`Call::ptr`]/
+    /// [`Call::int`] have.
+    ///
+    /// Evidence::Standard, not measured: a cdecl `double` argument is pushed
+    /// as the IEEE 754 bit pattern occupies memory -- `sub esp, 8; fstp qword
+    /// ptr [esp]` is the shape a compiler emits for it, the same instruction
+    /// [`Machine::arm_st0_return`](mbbs_machine::m32::Machine) uses on the
+    /// *return* side -- so there is nothing here for an `Abi::LONG_WIDTH`-style
+    /// associated constant to name: it is 8 bytes in every ABI a `double`
+    /// exists in at all, both the ones this crate has so far (`Wg16`'s
+    /// Borland huge model and `Wg32`'s flat cdecl agree at 8, unlike
+    /// `Abi::INT_WIDTH`, which is where the two actually diverge).
+    ///
+    /// # Panics
+    ///
+    /// If fewer than 8 bytes remain -- the same contract every other read on
+    /// `Call` carries.
+    pub fn double(&mut self) -> f64 {
+        let bytes: [u8; 8] = self
+            .take(8)
+            .try_into()
+            .expect("take(8) always returns exactly 8 bytes");
+        f64::from_le_bytes(bytes)
+    }
 }
 
 /// What a host call hands back to the module, generic over the ABI's width
@@ -927,6 +953,30 @@ pub enum Ret<A: Abi> {
 
     /// A pointer, in this ABI's own representation.
     Ptr(A::Ptr),
+
+    /// An `f64` result, delivered through the FPU's `ST(0)` register rather
+    /// than through the general-purpose registers `Int`/`Long`/`Ptr` use.
+    /// Evidence::Standard, not measured: ISO C / the Intel ABI say a
+    /// `double`-returning function leaves its result on the x87 stack for
+    /// the caller, the same convention `cw3220mt.DLL!__ftol`'s *argument*
+    /// side already measures at 13 call sites
+    /// ([`mbbs_machine::m32::Machine::arm_st0_capture`]'s own doc comment).
+    ///
+    /// **`Wg32` only.** [`mbbs_machine::m32::Machine::run`] has a return-path
+    /// stub -- [`mbbs_machine::m32::Machine::arm_st0_return`], the outbound
+    /// counterpart to `arm_st0_capture` -- that can honestly place this
+    /// value in `ST0` before the module resumes. `mbbs_machine::m16::Machine`
+    /// has no such counterpart: no scratch qword, no bridge-mapped stub to
+    /// build one in, nothing that ever touches the FPU at all, so a 16-bit
+    /// shim can never honestly construct this. No `CW3220MT`-linked routine
+    /// (the only library this variant's producers -- `crate::shims::math` --
+    /// are registered against) is ever bound to `Wg16`, so in practice this
+    /// variant is never built at `A = Wg16`; if that convention were ever
+    /// violated, `abi/wg16.rs`'s `From<Ret<Wg16>> for mbbs_machine::m16::Ret`
+    /// panics naming the same missing capability
+    /// [`crate::shims::crt::setjmp`]'s own refusal does, rather than
+    /// pretending a 16-bit machine can do this.
+    F64(f64),
 }
 
 // Manual, not `#[derive(..)]`. The derive macro's generated bound is `A:
@@ -956,6 +1006,7 @@ where
             Self::Int(v) => f.debug_tuple("Int").field(v).finish(),
             Self::Long(v) => f.debug_tuple("Long").field(v).finish(),
             Self::Ptr(v) => f.debug_tuple("Ptr").field(v).finish(),
+            Self::F64(v) => f.debug_tuple("F64").field(v).finish(),
         }
     }
 }
@@ -1342,6 +1393,24 @@ mod tests {
         assert_eq!(call.int(), unum, "byte 0: unum, matching the cursor's word 0");
         assert_eq!(call.long(), amt, "byte 2: amt, matching the cursor's word 1");
         assert_eq!(call.int(), real, "byte 6: real, matching the cursor's word 3");
+    }
+
+    /// `double sqrt(double x)` -- the shape `crate::shims::math`'s routines
+    /// all share: an 8-byte argument with no `Abi`-varying width. Two doubles
+    /// back to back, mirroring `call_reads_otstcrds_frame_...`'s own "a read
+    /// after the one under test" discipline: a mutation to `double`'s advance
+    /// would leave the second `PI` read misaligned and this would fail on
+    /// the second assertion rather than pass by never being checked.
+    #[test]
+    fn call_reads_two_back_to_back_doubles_at_byte_offsets_0_and_8() {
+        let x: f64 = 2.0;
+        let y: f64 = std::f64::consts::PI;
+        let frame = [x.to_le_bytes(), y.to_le_bytes()].concat();
+
+        let mut cpu = ();
+        let mut call = Call::<FixtureAbi>::new(&mut cpu, &frame);
+        assert_eq!(call.double(), x, "byte 0");
+        assert_eq!(call.double(), y, "byte 8");
     }
 
     // `call_reads_a_real_machines_frame_for_stzcpy` and the `Ret<Wg16>`

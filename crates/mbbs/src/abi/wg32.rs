@@ -543,7 +543,13 @@ impl Abi for Wg32 {
 /// the same way as `Ret::Int`: both are [`Abi::LONG_WIDTH`]/[`Abi::INT_WIDTH`]
 /// bytes wide (4, agreeing under `Wg32`), so there is no wider `U64` case to
 /// reach here -- see `Ret`'s own doc comment ("`Void` and the 32-bit `Long`
-/// do not vary").
+/// do not vary"). `Ret::F64` is the one variant that is not a same-name
+/// passthrough of an integer: both sides carry an `f64`, but `Wg32` is the
+/// ABI [`abi::Ret::F64`]'s own doc comment names as the only one that can
+/// honestly deliver it, through [`mbbs_machine::m32::Machine::run`]'s
+/// `Ret::F64` handling (`arm_st0_return`), not through this `From`'s target
+/// type's `registers()` -- see that method for why the general-purpose
+/// registers are cleared exactly as `Void`'s are for this variant too.
 impl From<Ret<Wg32>> for mbbs_machine::m32::Ret {
     fn from(ret: Ret<Wg32>) -> Self {
         match ret {
@@ -551,6 +557,7 @@ impl From<Ret<Wg32>> for mbbs_machine::m32::Ret {
             Ret::Int(v) => mbbs_machine::m32::Ret::U32(v),
             Ret::Long(v) => mbbs_machine::m32::Ret::U32(v),
             Ret::Ptr(p) => mbbs_machine::m32::Ret::U32(p.0),
+            Ret::F64(v) => mbbs_machine::m32::Ret::F64(v),
         }
     }
 }
