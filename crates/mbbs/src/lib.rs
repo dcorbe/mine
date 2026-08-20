@@ -290,12 +290,16 @@ pub enum Ended<A: Abi> {
     /// next whole second, and no other source of work exists, because the
     /// 16-bit world only advances when this host dispatches into it.
     ///
-    /// `polls_cut` is whether this second's poll grant ran out while channels
-    /// were still polling. It is a meter, not a control input: the module has
-    /// no way to say "I am done", so a `true` here does not mean the grant is
-    /// too small. `false` -- the grant outlived the work -- is the only cheap
-    /// evidence it is more than enough.
-    Waiting { next_kick: u32, polls_cut: bool },
+    /// This variant used to carry a second field, `polls_cut`: whether the
+    /// poll grant ran out while channels were still polling. It is gone
+    /// (2026-08-20). The exit gate that gets a pass here at all is
+    /// `!pending() && polls_left == 0`, so `polls_left == 0` was true on
+    /// every path that could ever construct this variant -- `polls_cut`
+    /// could read `true` and nothing else, whether the grant was genuinely
+    /// spent by dispatches or zeroed instantly because nothing was polling.
+    /// A meter that cannot vary is not a meter, so it was removed rather
+    /// than left lying with a doc promising a `false` it could not produce.
+    Waiting { next_kick: u32 },
 
     /// `max` passes were made and there is still work queued. A driver calls
     /// straight back.
@@ -315,10 +319,7 @@ impl<A: Abi> Clone for Ended<A> {
     fn clone(&self) -> Self {
         match self {
             Self::Idle => Self::Idle,
-            Self::Waiting { next_kick, polls_cut } => Self::Waiting {
-                next_kick: *next_kick,
-                polls_cut: *polls_cut,
-            },
+            Self::Waiting { next_kick } => Self::Waiting { next_kick: *next_kick },
             Self::Bound { next_kick } => Self::Bound { next_kick: *next_kick },
             Self::Stopped(poison, chan) => Self::Stopped(poison.clone(), *chan),
         }
@@ -329,11 +330,7 @@ impl<A: Abi> std::fmt::Debug for Ended<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Idle => write!(f, "Idle"),
-            Self::Waiting { next_kick, polls_cut } => f
-                .debug_struct("Waiting")
-                .field("next_kick", next_kick)
-                .field("polls_cut", polls_cut)
-                .finish(),
+            Self::Waiting { next_kick } => f.debug_struct("Waiting").field("next_kick", next_kick).finish(),
             Self::Bound { next_kick } => f.debug_struct("Bound").field("next_kick", next_kick).finish(),
             Self::Stopped(poison, chan) => f.debug_tuple("Stopped").field(poison).field(chan).finish(),
         }
@@ -344,10 +341,7 @@ impl<A: Abi> PartialEq for Ended<A> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Idle, Self::Idle) => true,
-            (
-                Self::Waiting { next_kick, polls_cut },
-                Self::Waiting { next_kick: nk2, polls_cut: pc2 },
-            ) => next_kick == nk2 && polls_cut == pc2,
+            (Self::Waiting { next_kick }, Self::Waiting { next_kick: nk2 }) => next_kick == nk2,
             (Self::Bound { next_kick }, Self::Bound { next_kick: nk2 }) => next_kick == nk2,
             (Self::Stopped(poison, chan), Self::Stopped(poison2, chan2)) => poison == poison2 && chan == chan2,
             _ => false,
@@ -390,8 +384,8 @@ pub enum Wait {
 /// whether the module has anything left to do, and a poll routine with
 /// nothing left to do simply falls through -- which still costs a full
 /// emulated far call. So the budget cannot be judged from the outside by
-/// whether it was consumed (it always is, see [`Ended::Waiting`]'s
-/// `polls_cut`), only by what the dispatches it paid for actually did.
+/// whether it was consumed -- a grant this host hands out is always spent,
+/// one way or another -- only by what the dispatches it paid for actually did.
 ///
 /// `barren` is the number that answers that. A poll that made no host call
 /// at all did nothing this host can observe -- it took the far call, tested
@@ -4376,10 +4370,7 @@ impl<A: Abi> Host<A> {
                     iterations,
                     dispatched,
                     ended: match next_kick {
-                        Some(next_kick) => Ended::Waiting {
-                            next_kick,
-                            polls_cut: self.polls_left == 0,
-                        },
+                        Some(next_kick) => Ended::Waiting { next_kick },
                         None => Ended::Idle,
                     },
                 });
@@ -6593,10 +6584,9 @@ mod tests {
     ///    unconditional push, right before `fsd_cycle`'s final `Ok(())`).
     ///    `Host::cycle` only reports `Ended::Idle` off an *empty*
     ///    `self.kicks`; with one left behind it reports
-    ///    `Ended::Waiting { next_kick: 3, polls_cut: true }` on the very
-    ///    first iteration instead, which the assertion below catches
-    ///    cleanly: `Cycles { iterations: 1, dispatched: 0, ended: Waiting {
-    ///    next_kick: 3, polls_cut: true } }`.
+    ///    `Ended::Waiting { next_kick: 3 }` on the very first iteration
+    ///    instead, which the assertion below catches cleanly:
+    ///    `Cycles { iterations: 1, dispatched: 0, ended: Waiting { next_kick: 3 } }`.
     ///
     /// So this test's own assertion cannot discriminate the specific
     /// "spins on CYCLE" shape the design doc's prose describes -- that shape
@@ -8203,8 +8193,8 @@ mod tests {
 
         assert_eq!(
             cycles.ended,
-            Ended::Waiting { next_kick: 60, polls_cut: true },
-            "no refill was ever granted, so the budget reads exhausted"
+            Ended::Waiting { next_kick: 60 },
+            "no grant was ever configured, and a kick is still outstanding"
         );
         assert_eq!(
             cycles.iterations, 1,
@@ -8236,7 +8226,7 @@ mod tests {
 
         assert_eq!(
             cycles.ended,
-            Ended::Waiting { next_kick: 7, polls_cut: true },
+            Ended::Waiting { next_kick: 7 },
             "the soonest of the three, not the last pushed and not the largest"
         );
     }
@@ -8269,46 +8259,6 @@ mod tests {
         );
     }
 
-    /// The meter that calibrates the grant rate in production.
-    ///
-    /// **Both scenarios below read `polls_cut: true`.** That is not a
-    /// copy-paste error. The exit gate this task added to `Host::cycle`
-    /// (`!pending() && polls_left == 0`, so the grant can never be silently
-    /// dropped -- see the gate's own doc) is only ever reached once
-    /// `polls_left` has already hit zero, whether a dispatch spent it down to
-    /// nothing or `Polled::NobodyPolls` zeroed it outright because nothing
-    /// was left to poll. Both paths land on the identical `polls_left == 0`
-    /// this field reads, so `polls_cut` can no longer distinguish "the grant
-    /// ran out" from "nothing needed it" the way `dopoll`'s re-arm let it --
-    /// that discrimination retired with the re-arm. `false` is unreachable
-    /// under the new gate; this measures the coarser fact that replaced it
-    /// rather than asserting a value the code cannot produce.
-    #[test]
-    fn polls_cut_says_the_grant_gate_was_reached() {
-        let (mut f, module, rou) = polling_fixture();
-        let console = f.console();
-        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
-        f.host.kicks.push(Kick { delay: 60, dstrou: rou });
-        f.host.set_polls_per_second(2);
-
-        f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
-        f.host.set_clock(Clock::pinned(1_135_952_406));
-        let cut = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
-        assert_eq!(cut.ended, Ended::Waiting { next_kick: 59, polls_cut: true }, "spent by real dispatches");
-
-        // Nothing polling: `NobodyPolls` zeroes the grant on the very first
-        // pass of the elapsed second, before it dispatches anything.
-        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, None).expect("channel 0");
-        f.host.set_clock(Clock::pinned(1_135_952_407));
-        let also_cut = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
-        assert_eq!(
-            also_cut.ended,
-            Ended::Waiting { next_kick: 58, polls_cut: true },
-            "zeroed by NobodyPolls, not by dispatches -- and `polls_cut` cannot tell the difference"
-        );
-    }
-
     /// The whole sleep policy, in one place, so that the socket driver and any
     /// other driver cannot answer this question differently.
     #[test]
@@ -8317,11 +8267,11 @@ mod tests {
         use crate::abi::Wg16;
         assert_eq!(Ended::<Wg16>::Idle.wait(), Wait::Blocked);
         assert_eq!(
-            Ended::<Wg16>::Waiting { next_kick: 1, polls_cut: false }.wait(),
+            Ended::<Wg16>::Waiting { next_kick: 1 }.wait(),
             Wait::Until(std::time::Duration::from_secs(1))
         );
         assert_eq!(
-            Ended::<Wg16>::Waiting { next_kick: 60, polls_cut: true }.wait(),
+            Ended::<Wg16>::Waiting { next_kick: 60 }.wait(),
             Wait::Until(std::time::Duration::from_secs(60))
         );
         assert_eq!(Ended::<Wg16>::Bound { next_kick: None }.wait(), Wait::Now);
@@ -8345,10 +8295,12 @@ mod tests {
     /// all, and no test anywhere in this file pinned the wiring `cycle`
     /// added: `Ended::Stopped(poison, None)` -- silently dropping which
     /// channel it was -- would compile and pass every other test in this
-    /// crate unchanged, because `polls_cut_says_the_budget_was_the_thing_
-    /// that_stopped_it` and `ended_tells_a_driver_what_to_wait_on` above
-    /// only ever exercise `Waiting`/`Bound`/a hand-built `Stopped`, never
-    /// one `cycle` produced from a real dispatch.
+    /// crate unchanged, because none of `nothing_pending_returns_at_once_
+    /// instead_of_spinning_to_the_bound`, `next_kick_is_the_soonest_of_
+    /// several_and_not_merely_one_of_them` or `ended_tells_a_driver_what_
+    /// to_wait_on` above ever exercises `Ended::Stopped` from a real
+    /// dispatch -- they build `Waiting`/`Bound` from `cycle`'s kick-sweep
+    /// path or by hand, never the poll-sourced stop this test pins.
     #[test]
     fn cycle_names_the_channel_a_poll_sourced_stop_happened_on() {
         let mut f = Fixture::new();

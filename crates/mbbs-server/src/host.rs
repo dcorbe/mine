@@ -440,12 +440,6 @@ struct Drain {
     /// returned this turn), then `first`, then the rest of `rx`'s backlog.
     /// Never contains `In::Shutdown` -- see `stopping`.
     apply: Vec<In>,
-    /// Whether anything in `apply` was real input rather than a bare
-    /// `In::Alarm`. `life` no longer reads this: the poll-refill step it fed
-    /// (`saw_input || expected_kick`) was deleted 2026-08-20, when polling
-    /// moved to a clock-driven grant in `Host::cycle` instead of the pump's
-    /// own wakes.
-    saw_input: bool,
     /// The first `In::Shutdown` drained, pulled out of `apply`'s batch
     /// because ending the loop is `life`'s job, not `apply`'s -- see
     /// `apply`'s own doc for what happens if one reaches it directly.
@@ -476,7 +470,6 @@ fn drain_turn(
     woke_gone: bool,
 ) -> Drain {
     let mut apply = Vec::new();
-    let mut saw_input = false;
     let mut stopping = None;
     for msg in peeked
         .into_iter()
@@ -487,11 +480,10 @@ fn drain_turn(
             stopping = Some(done);
             continue;
         }
-        saw_input |= !matches!(msg, In::Alarm);
         apply.push(msg);
     }
     let ends_gone = woke_gone && stopping.is_none();
-    Drain { apply, saw_input, stopping, ends_gone }
+    Drain { apply, stopping, ends_gone }
 }
 
 /// How often to report [`mbbs::PollCensus`], from `MBBS_POLL_CENSUS` -- a
@@ -1235,8 +1227,8 @@ fn apply<A: Abi>(
             Ok(())
         }
         // Nothing to apply -- see `In::Alarm`'s own doc. It exists purely to
-        // unblock `wake`'s `rx.recv()`; `life`'s own loop is what reads it
-        // apart from the other variants (`saw_input`), not this function.
+        // unblock `wake`'s `rx.recv()`; `drain_turn` is what tells it apart
+        // from the other variants, not this function.
         In::Alarm => Ok(()),
         // `life` takes this out of the batch before `apply` is called, because
         // it ends the loop rather than acting on it. Reaching here means a

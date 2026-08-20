@@ -56,12 +56,16 @@ const DEFAULT_WG32_ARENA_BYTES: usize = 0x0100_0000;
 /// budget every wake, and the host thread's clock reads came back as
 /// `budget + 1` -- 33, 129 and 513 at budgets of 32, 128 and 512.
 ///
-/// It cannot be calibrated from inside the host. `Ended::Waiting`'s
-/// `polls_cut` is `true` at every budget (see its doc), because `dopoll`
-/// re-arms until the budget runs out and the chain has no way to say "done".
-/// Whether the number is big enough is a question about the module's own
-/// amortised work -- for MajorMUD, whether monsters act at the rate they
-/// should -- and answering it needs someone to play the game.
+/// It cannot be calibrated from inside the host. At the time this was
+/// measured, `Ended::Waiting` carried a `polls_cut` field that was `true` at
+/// every budget, because `dopoll` re-armed until the budget ran out and the
+/// chain had no way to say "done". `polls_cut` was removed 2026-08-20 -- once
+/// polling moved to a clock-driven grant, the field could only ever read
+/// `true`, which is not a meter -- but the underlying fact it was trying to
+/// report stands: the host still has no way to see whether the module is
+/// keeping up. Whether the number is big enough is a question about the
+/// module's own amortised work -- for MajorMUD, whether monsters act at the
+/// rate they should -- and answering it needs someone to play the game.
 ///
 /// 512 is provisional, and chosen for the asymmetry rather than from a
 /// measurement of the game: MajorMUD's polling routine advances ONE monster
