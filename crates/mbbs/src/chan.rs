@@ -9,10 +9,11 @@
 //!
 //! Before this module those three agreed *by convention*: `Host::new` handed
 //! the same constant to each of them and nothing checked the result. The
-//! convention held, and it was invisible. Two call sites depended on it without
-//! saying so -- `begin_polling` and `Host::dopoll` each resolve a channel
-//! through `Users` and then inject a status into `Gsbl`, which is only the same
-//! channel if the two tables are the same length.
+//! convention held, and it was invisible. One call site depended on it without
+//! saying so -- `begin_polling` resolves a channel through `Users` and then
+//! injects a status into `Gsbl`, which is only the same channel if the two
+//! tables are the same length. (`Host::dopoll` used to be a second such call
+//! site; it is gone, 2026-08-20, along with the re-arm it existed for.)
 //!
 //! It was measured rather than argued. Building `Gsbl` one channel *shorter*
 //! than `Users` failed 22 unit tests. Building it one channel *longer* passed

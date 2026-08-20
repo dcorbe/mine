@@ -4280,15 +4280,47 @@ impl<A: Abi> Host<A> {
                         ended: Ended::Stopped(poison, None),
                     });
                 }
-                // **The second's poll grant.** Here, beside `syscyc` and the
-                // kick sweep, because polling is time work: the module's
-                // world advances by firings, and a second that grants none is
-                // a second the world did not move. It used to be granted by
-                // `refill_polls` from the driver's wake loop, under
+                // **The second's poll grant -- a level, not a queue.** Here,
+                // beside `syscyc` and the kick sweep, because polling is time
+                // work: the module's world advances by firings. It used to be
+                // granted by `refill_polls` from the driver's wake loop, under
                 // `saw_input || expected_kick` -- so the poll rate was a
                 // property of socket traffic rather than of the clock, which
                 // is the same defect `syscyc`'s deleted scan-gated call had.
-                self.polls_left = self.polls_per_second;
+                //
+                // **Only when the previous grant is fully spent.** Granting
+                // unconditionally would top the allotment back up while a slow
+                // drain was still spending the last one, so `polls_left` could
+                // never reach zero and the exit gate below could never be
+                // satisfied -- an unbreakable loop on the one thread that owns
+                // the machine. Measured: polls run at 51-154/s on a live
+                // board, so a 512 grant takes several seconds to drain, and
+                // `Clock::system()` reads the real wall clock on every pass,
+                // so several more elapsed seconds land mid-drain every time --
+                // this is production behaviour at the planned default, not a
+                // test artefact.
+                //
+                // Dropping a missed grant rather than accumulating it is also
+                // what the module itself does. MajorMUD's own sweep request is
+                // clamped exactly this way -- `_SLOW_UPDATE_MONSTERS` does
+                // `if (DAT_1128_0012 < 1) { DAT_1128_0012++; }` -- so a sweep
+                // that overruns its second is dropped, not queued, and the
+                // world runs slow rather than the host falling behind forever.
+                //
+                // **The trade-off, stated plainly.** A `cycle` call that
+                // catches up N > 1 elapsed seconds in one pass (a driver that
+                // slept too long, or a slow pass) grants the drain ONCE, not N
+                // times, even though `tick_ticker`/`syscyc`/`prcrtk` below
+                // still run N times each -- polling is not conserved the way
+                // the tick counter and kick countdowns are. The alternative is
+                // an unbounded backlog: accumulating N missed grants is
+                // exactly the hang above, just deferred rather than avoided.
+                // So a second that grants none because the last grant has not
+                // finished draining is, by design, a second the world did not
+                // move for polling purposes -- not an omission.
+                if self.polls_left == 0 {
+                    self.polls_left = self.polls_per_second;
+                }
                 if let Some(poison) = self.prcrtk(machine, module, &mut dispatched)? {
                     // Written back before the early return: the rounds already
                     // run must not run again on the next `cycle`.
@@ -7537,6 +7569,62 @@ mod tests {
 
         assert_eq!(first.dispatched, 4, "one second's grant, spent");
         assert_eq!(second.dispatched, 4, "the next second grants again");
+    }
+
+    /// The regression review caught: a slow drain spanning real elapsed
+    /// seconds must not make the grant line re-top `polls_left` mid-drain,
+    /// or the exit gate (`!pending() && polls_left == 0`) can never be
+    /// satisfied and `cycle` never returns -- an unbreakable spin on the one
+    /// thread that owns the machine, with other channels never served and no
+    /// shutdown ever seen.
+    ///
+    /// `Clock::stepped` here is not the mistake it would be in
+    /// `the_poll_grant_arrives_once_per_elapsed_second` just above -- it is
+    /// the point. Draining `POLLS_PER_SECOND` firings takes that many passes
+    /// (one firing a pass), and `stepped`'s step is large enough that every
+    /// single one of those passes reads a "new" elapsed second, which is
+    /// exactly the production shape this bug needs: measured live, polls run
+    /// at 51-154/s, so at the planned 512/s default a drain takes several
+    /// real seconds under `Clock::system()` (which reads the real wall clock
+    /// on every pass) and several more seconds land mid-drain every time.
+    ///
+    /// Before the fix -- `Host::cycle`'s grant line assigning unconditionally
+    /// rather than only when `polls_left == 0` -- this hung. Watched it
+    /// happen under a bounded `timeout` rather than actually letting it spin
+    /// forever; see this task's fix report for the transcript. `&mut ||
+    /// false` is deliberate: an interrupt would cut the loop short before it
+    /// had the chance to spin forever, and would have hidden the bug.
+    #[test]
+    fn a_slow_drain_across_several_elapsed_seconds_does_not_hang() {
+        const POLLS_PER_SECOND: usize = 50;
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host
+            .users
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
+            .expect("channel 0");
+        f.host.set_polls_per_second(POLLS_PER_SECOND);
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.cycle(&mut f.machine, &module, &mut || false).expect("first call syncs tcklst");
+
+        // Every read of this clock looks like a fresh elapsed second --
+        // draining `POLLS_PER_SECOND` firings takes that many passes, and
+        // this clock guarantees every one of them sees "a new second has
+        // ticked over," the way a real, slow drain under `Clock::system()`
+        // would.
+        f.host.set_clock(Clock::stepped(1_135_952_406, 1_000));
+
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+
+        assert_eq!(
+            cycles.dispatched, POLLS_PER_SECOND,
+            "the grant drains exactly once, not once per elapsed second that ticked over mid-drain"
+        );
+        assert_eq!(
+            cycles.ended,
+            Ended::Idle,
+            "and the pump can tell the driver it is safe to sleep -- the one thing the hang made impossible"
+        );
     }
 
     /// A clock-granted poll must leave `status` reading `POLSTS`, because the

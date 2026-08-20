@@ -1239,12 +1239,16 @@ pub fn dfsthn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// for channel `unum` every time the host comes round. `MAJORBBS.C:1183`:
 ///
 ///
-/// The `inpolr` half of that guard is the one worth understanding.
-/// [`Host::dopoll`] re-injects `POLSTS` when a polling routine returns still
-/// polling, so a `begin_polling` issued from *inside* a polling routine would,
-/// without it, queue a second status for the same tick -- and then two, and
-/// then four. The queue is deliberately unbounded (`gsbl::Channel::status`), so
-/// the failure mode is the machine, not a wrong answer.
+/// The `inpolr` half of that guard is vendor-faithful -- `MAJORBBS.C`'s own
+/// `polrou == NULL && unum != inpolr` -- and stops a status being queued for a
+/// channel that is currently inside its own poll routine: a `begin_polling`
+/// issued from inside one would otherwise queue a redundant `POLSTS` for the
+/// same tick, on top of whatever `Host::poll_next_channel`'s own fresh read
+/// already intends to do next pass. There is no re-arm to escalate the way
+/// there used to be -- `Host::dopoll` and its `POLSTS` re-injection are gone
+/// (2026-08-20) -- so this guard now only ever prevents one redundant status,
+/// not a runaway chain, but it is still one more than the module asked for
+/// and still worth refusing by name.
 ///
 /// # Errors
 ///
@@ -1288,9 +1292,11 @@ pub fn begin_polling<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<a
 /// `void stop_polling(int unum)` -- `user[unum].polrou=NULL`.
 /// `MAJORBBS.C:1194`, which is that one line.
 ///
-/// No status is withdrawn. A `POLSTS` already queued arrives with nothing to
-/// call, and [`Host::dopoll`] does nothing with it -- which is the original's
-/// entire handling of that case.
+/// No status is withdrawn. A `POLSTS` already queued (from `begin_polling`'s
+/// own injection, or from the module's own `btuinj`) arrives with nothing to
+/// call: `Host::poll_with_chan`'s `PollTarget::Poll` arm reads `polrou`,
+/// finds `None`, and moves on -- which is the original's entire handling of
+/// that case.
 ///
 /// # Errors
 ///
@@ -2341,9 +2347,11 @@ mod tests {
         assert_eq!(f.host.gsbl_mut().next_status(console), None, "exactly one");
     }
 
-    /// The guard that keeps the status queue from doubling every tick.
-    /// `dopoll` re-injects on return, so a `begin_polling` from *inside* a
-    /// polling routine must not inject as well.
+    /// The guard that keeps a channel's own polling routine from queuing
+    /// itself a redundant status. `Host::poll_next_channel`'s own fresh read,
+    /// next pass, already covers whatever `polrou` names by the time this
+    /// call returns, so a `begin_polling` issued from *inside* a polling
+    /// routine must not inject on top of that.
     #[test]
     fn begin_polling_injects_nothing_while_that_channel_is_inside_its_poll_routine() {
         let mut f = Fixture::new();
@@ -2362,7 +2370,7 @@ mod tests {
         assert_eq!(
             f.host.gsbl_mut().next_status(console),
             None,
-            "but nothing is injected -- dopoll will do that on return"
+            "but nothing is injected -- poll_next_channel's fresh read next pass already covers it"
         );
     }
 

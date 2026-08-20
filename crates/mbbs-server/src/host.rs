@@ -1227,8 +1227,10 @@ fn apply<A: Abi>(
             Ok(())
         }
         // Nothing to apply -- see `In::Alarm`'s own doc. It exists purely to
-        // unblock `wake`'s `rx.recv()`; `drain_turn` is what tells it apart
-        // from the other variants, not this function.
+        // unblock `wake`'s `rx.recv()`, and this arm is the whole of how that
+        // shows up here: nothing upstream singles it out any more --
+        // `drain_turn` used to (`saw_input`), before that field lost its last
+        // reader and was deleted.
         In::Alarm => Ok(()),
         // `life` takes this out of the batch before `apply` is called, because
         // it ends the loop rather than acting on it. Reaching here means a
