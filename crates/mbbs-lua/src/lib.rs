@@ -129,6 +129,20 @@ fn to_verdict(value: Value) -> Verdict {
     }
 }
 
+/// Turns a [`CommandCtx::call_export`] outcome this seam doesn't care about
+/// the *return value* of into a plain error if the machine stopped --
+/// shared by every call site below that just needs "did it run," not "what
+/// did it return." `name` is the export that was called, for the error
+/// message only.
+///
+/// [`CommandCtx::call_export`]: mbbs::extension::CommandCtx::call_export
+fn expect_returned(name: &str, outcome: Outcome<Wg16>) -> mlua::Result<(u32, u32)> {
+    match outcome {
+        Outcome::Returned { lo, hi } => Ok((lo, hi)),
+        Outcome::Stopped(poison) => Err(mlua::Error::RuntimeError(format!("{name} stopped the machine: {poison:?}"))),
+    }
+}
+
 /// `c:summon(name)` -- look `name` up via `_GET_ITEM_FROM_NAME` and, on a
 /// match, hand it to `_ADD_ITEM_TO_INVENTORY`.
 ///
@@ -183,14 +197,7 @@ fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result
             &[Arg::Ptr(base), Arg::Ptr(Wg16::null_ptr()), Arg::Ptr(count_ptr)],
         )
         .map_err(mlua::Error::external)?;
-    let (lo, hi) = match outcome {
-        Outcome::Returned { lo, hi } => (lo, hi),
-        Outcome::Stopped(poison) => {
-            return Err(mlua::Error::RuntimeError(format!(
-                "_GET_ITEM_FROM_NAME stopped the machine: {poison:?}"
-            )));
-        }
-    };
+    let (lo, hi) = expect_returned("_GET_ITEM_FROM_NAME", outcome)?;
 
     // The far pointer DX:AX came back in -- offset (AX) then selector (DX),
     // the same order `Abi::ptr_to_bytes` writes one in.
@@ -199,7 +206,7 @@ fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result
     let item = Wg16::ptr_from_bytes(&ptr_bytes);
 
     if item == Wg16::null_ptr() {
-        let count_bytes = ctx.borrow().read_scratch(count_ptr, 2).map_err(mlua::Error::external)?;
+        let count_bytes = ctx.borrow().read_at(count_ptr, 2).map_err(mlua::Error::external)?;
         let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]);
         // Nonzero: several items matched and the DLL already told the
         // player so through its own output. Zero: nothing matched at all.
@@ -218,22 +225,154 @@ fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result
             &[Arg::Int(usrnum), Arg::Int(0), Arg::Int(0), Arg::Int(0xfffe), Arg::Ptr(item)],
         )
         .map_err(mlua::Error::external)?;
-    match add_outcome {
-        // A `char` return: only the low byte (AL) is meaningful, so mask
-        // rather than compare `lo` whole -- AH is whatever a `char`-typed
-        // Borland routine's caller-saved half happened to hold.
-        //
-        // TODO: verify against a real module. The findings file documents
-        // the return as "char: 1 success, 0 failure" but does not say which
-        // bits of `Outcome::Returned.lo` carry it -- this masking is my own
-        // interpretation of ordinary Borland `char`-return convention, not
-        // something measured off `WCCMMUD.DLL` itself (task-6-report.md's
-        // "Concerns" section says the same).
-        Outcome::Returned { lo, .. } if lo & 0xff != 0 => Ok((true, None)),
-        Outcome::Returned { .. } => Ok((false, Some("too heavy or no free slot"))),
-        Outcome::Stopped(poison) => Err(mlua::Error::RuntimeError(format!(
-            "_ADD_ITEM_TO_INVENTORY stopped the machine: {poison:?}"
-        ))),
+    // A `char` return: only the low byte (AL) is meaningful, so mask
+    // rather than compare `lo` whole -- AH is whatever a `char`-typed
+    // Borland routine's caller-saved half happened to hold.
+    //
+    // TODO: verify against a real module. The findings file documents
+    // the return as "char: 1 success, 0 failure" but does not say which
+    // bits of `Outcome::Returned.lo` carry it -- this masking is my own
+    // interpretation of ordinary Borland `char`-return convention, not
+    // something measured off `WCCMMUD.DLL` itself (task-6-report.md's
+    // "Concerns" section says the same).
+    let (lo, _hi) = expect_returned("_ADD_ITEM_TO_INVENTORY", add_outcome)?;
+    if lo & 0xff != 0 {
+        Ok((true, None))
+    } else {
+        Ok((false, Some("too heavy or no free slot")))
+    }
+}
+
+/// Splits a 32-bit value into its low and high 16-bit words, low word
+/// first -- the shape `_ADDON_ADJUST_USER_WEALTH(usrnum, lo, hi)` wants for
+/// its `CONCAT22(param_3, param_2)` amount (see [`adjust_wealth`]'s own doc
+/// comment). A pure function so the word order can be tested directly,
+/// without a module in the loop.
+fn split_u32(value: u32) -> (u16, u16) {
+    (value as u16, (value >> 16) as u16)
+}
+
+/// Adds `amount` to a two-word (`low`, `carry`) 16-bit accumulator,
+/// propagating a 16-bit overflow of `low` into `carry` -- exactly what the
+/// module's own `_SELL_ITEM`/`_WITHDRAW_GOLD`/`_BORROW_GOLD` bodies do to
+/// their copper accumulator (`re/exports/WCCMMUD_named.c:5462-5466` et al.):
+///
+/// ```text
+/// uVar3 = *low;
+/// *low = *low + amount_lo;
+/// *carry = *carry + amount_hi + CARRY2(uVar3, amount_lo);
+/// ```
+///
+/// `CARRY2(a, b)` is 1 exactly when `a + b` overflowed 16 bits, which is
+/// what [`u16::overflowing_add`] answers directly. A pure function so the
+/// carry propagation can be tested directly -- [`adjust_wealth`]'s own grant
+/// path cannot be exercised end to end in this fixture, since it needs a
+/// real player record behind `_GET_PLAYER` to write into (see
+/// `task-7-report.md`'s "untestable" section).
+fn add_with_carry(low: u16, carry: u16, amount: u32) -> (u16, u16) {
+    let amount_lo = amount as u16;
+    let amount_hi = (amount >> 16) as u16;
+    let (new_low, overflowed) = low.overflowing_add(amount_lo);
+    let new_carry = carry.wrapping_add(amount_hi).wrapping_add(u16::from(overflowed));
+    (new_low, new_carry)
+}
+
+/// `c:adjust_wealth(amount)` -- grant (`amount >= 0`) or deduct
+/// (`amount < 0`) `amount` copper from the caller's own coin purse.
+///
+/// **Asymmetric on purpose.** The task's original plan called
+/// `_ADDON_ADJUST_USER_WEALTH` for both directions, on the claim that the
+/// amount "round-trips as a signed value." That is false: the export's
+/// whole body (`re/exports/WCCMMUD_named.c:73399-73424`) forwards to
+/// `_DEDUCT_CURRENCY`, gated on an affordability check, every coin write a
+/// decrement -- there is no path through it that credits a player. See
+/// `.superpowers/sdd/2026-08-20-lua-command-seam/task-7-findings.md`.
+///
+/// - `amount >= 0` grants, the way the module's own `_SELL_ITEM`,
+///   `_WITHDRAW_GOLD`, `_BORROW_GOLD` and `_CMD_GET` all credit a player:
+///   direct field arithmetic (see [`add_with_carry`]) on
+///   [`CommandCtx::player_record`]'s copper accumulator -- low word at
+///   offset `0x613`, carry word at `0x615` -- then
+///   `_CLEANUP_CURRENCY(usrnum)` to normalise into higher denominations,
+///   then `_SAVE_PLAYER(usrnum)`. `_CLEANUP_CURRENCY` mints
+///   highest-denomination-first, which is already the minimum-coin-count
+///   (and, since `_GET_COIN_WEIGHT` sums `floor(count/3)` per drawer,
+///   minimum-*weight*) representation -- granting copper and letting it
+///   normalise needs no manual denomination choice.
+/// - `amount < 0` deducts via `_ADDON_ADJUST_USER_WEALTH(usrnum, lo, hi)`
+///   (see [`split_u32`]) -- the low and high 16-bit words of
+///   `amount.unsigned_abs()`, low word first, matching its own
+///   `CONCAT22(param_3, param_2)`. It saves the player itself; this branch
+///   does not call `_SAVE_PLAYER` again.
+///
+/// `amount` is `f64`, not `i64`: a fractional or absurdly large typed
+/// amount is a player mistake, not a script bug, so it is reported through
+/// this function's own `(false, reason)` convention instead of an `mlua`
+/// argument-conversion error -- which would disable the whole `cash`
+/// command (see `Extension::command`'s error arm below) over one bad line
+/// of player input, exactly the "silence must never be mistaken for
+/// consent" concern [`to_verdict`]'s own doc comment raises, one layer up.
+///
+/// Returns `(true, nil)` on success, `(false, reason)` otherwise:
+/// `"amount must be a whole number"`, `"amount is too large"` (the
+/// magnitude does not fit 32 bits), or `"insufficient funds"`
+/// (`_ADDON_ADJUST_USER_WEALTH` refused).
+///
+/// [`CommandCtx::player_record`]: mbbs::extension::CommandCtx::player_record
+fn adjust_wealth(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua::Result<(bool, Option<&'static str>)> {
+    if !amount.is_finite() || amount.fract() != 0.0 {
+        return Ok((false, Some("amount must be a whole number")));
+    }
+
+    // `usrnum` is exactly this channel's number -- see `summon`'s own
+    // comment on the same read.
+    let usrnum = ctx.borrow().chan().number() as u16;
+
+    if amount >= 0.0 {
+        let Ok(copper) = u32::try_from(amount as i64) else {
+            return Ok((false, Some("amount is too large")));
+        };
+
+        let record = ctx.borrow_mut().player_record().map_err(mlua::Error::external)?;
+        let low_ptr = Wg16::ptr_offset(record, 0x613);
+        let carry_ptr = Wg16::ptr_offset(record, 0x615);
+
+        let low_bytes = ctx.borrow().read_at(low_ptr, 2).map_err(mlua::Error::external)?;
+        let carry_bytes = ctx.borrow().read_at(carry_ptr, 2).map_err(mlua::Error::external)?;
+        let low = u16::from_le_bytes([low_bytes[0], low_bytes[1]]);
+        let carry = u16::from_le_bytes([carry_bytes[0], carry_bytes[1]]);
+        let (new_low, new_carry) = add_with_carry(low, carry, copper);
+
+        ctx.borrow_mut().write_at(low_ptr, &new_low.to_le_bytes()).map_err(mlua::Error::external)?;
+        ctx.borrow_mut().write_at(carry_ptr, &new_carry.to_le_bytes()).map_err(mlua::Error::external)?;
+
+        let outcome = ctx.borrow_mut().call_export("_CLEANUP_CURRENCY", &[Arg::Int(usrnum)]).map_err(mlua::Error::external)?;
+        expect_returned("_CLEANUP_CURRENCY", outcome)?;
+
+        let outcome = ctx.borrow_mut().call_export("_SAVE_PLAYER", &[Arg::Int(usrnum)]).map_err(mlua::Error::external)?;
+        expect_returned("_SAVE_PLAYER", outcome)?;
+
+        Ok((true, None))
+    } else {
+        let Ok(magnitude) = u32::try_from((-amount) as i64) else {
+            return Ok((false, Some("amount is too large")));
+        };
+        let (lo, hi) = split_u32(magnitude);
+
+        let outcome = ctx
+            .borrow_mut()
+            .call_export("_ADDON_ADJUST_USER_WEALTH", &[Arg::Int(usrnum), Arg::Int(lo), Arg::Int(hi)])
+            .map_err(mlua::Error::external)?;
+        let (lo_ret, _hi_ret) = expect_returned("_ADDON_ADJUST_USER_WEALTH", outcome)?;
+
+        // A `char` return, the same convention `summon`'s own
+        // `_ADD_ITEM_TO_INVENTORY` call uses above: only the low byte (AL)
+        // is meaningful.
+        if lo_ret & 0xff != 0 {
+            Ok((true, None))
+        } else {
+            Ok((false, Some("insufficient funds")))
+        }
     }
 }
 
@@ -275,9 +414,13 @@ impl Extension<Wg16> for LuaExtension {
                     Ok(())
                 })?
             })?;
+            t.set("summon", {
+                let cell = Rc::clone(&cell);
+                scope.create_function(move |_, (_this, name): (mlua::Table, mlua::String)| summon(&cell, &name.as_bytes()))?
+            })?;
             t.set(
-                "summon",
-                scope.create_function(move |_, (_this, name): (mlua::Table, mlua::String)| summon(&cell, &name.as_bytes()))?,
+                "adjust_wealth",
+                scope.create_function(move |_, (_this, amount): (mlua::Table, f64)| adjust_wealth(&cell, amount))?,
             )?;
             handler.call::<Value>(t)
         });
@@ -308,7 +451,7 @@ impl Extension<Wg16> for LuaExtension {
 
 #[cfg(test)]
 mod tests {
-    use super::split_command;
+    use super::{add_with_carry, split_command, split_u32};
 
     #[test]
     fn splits_the_first_word_from_the_rest() {
@@ -333,5 +476,43 @@ mod tests {
     #[test]
     fn trailing_whitespace_after_the_only_word_leaves_args_empty() {
         assert_eq!(split_command("cash   "), ("cash", ""));
+    }
+
+    #[test]
+    fn split_u32_puts_the_low_word_first() {
+        assert_eq!(split_u32(0x1234_5678), (0x5678, 0x1234));
+    }
+
+    #[test]
+    fn split_u32_of_a_value_under_64k_has_a_zero_high_word() {
+        assert_eq!(split_u32(50), (50, 0));
+    }
+
+    #[test]
+    fn add_with_carry_below_the_word_boundary_leaves_the_carry_word_untouched() {
+        assert_eq!(add_with_carry(10, 0, 5), (15, 0));
+    }
+
+    #[test]
+    fn add_with_carry_propagates_a_16_bit_overflow_into_the_carry_word() {
+        // 0xfffe + 5 overflows a 16-bit word by 3, carrying 1 into the next.
+        assert_eq!(add_with_carry(0xfffe, 0, 5), (3, 1));
+    }
+
+    #[test]
+    fn add_with_carry_adds_the_amounts_own_high_word_too() {
+        assert_eq!(add_with_carry(0, 0, 0x1_0000), (0, 1));
+    }
+
+    #[test]
+    fn add_with_carry_combines_an_existing_carry_a_high_word_and_an_overflow() {
+        // low: 0xffff + 1 overflows to 0, carrying 1.
+        // carry: 2 (existing) + 1 (amount's high word) + 1 (the overflow) = 4.
+        assert_eq!(add_with_carry(0xffff, 2, 0x1_0001), (0, 4));
+    }
+
+    #[test]
+    fn add_with_carry_wraps_the_carry_word_like_the_module_itself_does() {
+        assert_eq!(add_with_carry(0, 0xffff, 0x1_0000), (0, 0));
     }
 }

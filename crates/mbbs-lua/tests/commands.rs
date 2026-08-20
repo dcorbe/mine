@@ -146,3 +146,90 @@ fn summon_against_a_module_with_no_export_disables_the_handler_and_names_the_sym
     assert!(notes[0].contains("summon"), "got: {notes:?}");
     assert!(notes[0].contains("_GET_ITEM_FROM_NAME"), "got: {notes:?}");
 }
+
+#[test]
+fn the_shipped_cash_script_loads_and_registers() {
+    let ext = LuaExtension::load(&shipped_scripts()).expect("scripts/ must load");
+    assert!(ext.command_names().contains(&"cash".to_owned()), "got: {:?}", ext.command_names());
+}
+
+#[test]
+fn cash_with_no_amount_prints_a_prompt_and_never_calls_into_the_module() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "cash", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "cash <copper>\r\n");
+    assert!(fixture.host.notes().is_empty(), "a usage message must not touch the module at all");
+}
+
+#[test]
+fn cash_with_a_fractional_amount_reports_it_honestly_and_never_calls_into_the_module() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "cash 1.5", &module);
+
+    assert_eq!(verdict, Verdict::Handled, "a bad amount is the player's mistake, not a reason to disable the command");
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "amount must be a whole number.\r\n");
+    assert!(
+        fixture.host.notes().is_empty(),
+        "a fractional amount must be refused before ever reaching call_export"
+    );
+}
+
+/// `minimal_module` exports nothing, so a positive `cash` amount's very
+/// first module call -- `CommandCtx::player_record`'s own `_GET_PLAYER` --
+/// is exactly the "unresolvable name" path `call_export` refuses. This is
+/// real integration coverage that the grant branch (not the deduct branch)
+/// is the one a positive amount takes: if it ever called
+/// `_ADDON_ADJUST_USER_WEALTH` first instead, this note would name that
+/// symbol, not `_GET_PLAYER`.
+#[test]
+fn cash_a_positive_amount_against_a_module_with_no_export_names_get_player() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "cash 100", &module);
+
+    assert_eq!(verdict, Verdict::Pass, "a broken handler must never swallow the line");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("cash"), "got: {notes:?}");
+    assert!(notes[0].contains("_GET_PLAYER"), "got: {notes:?}");
+}
+
+/// The deduct branch's mirror of the test above: a negative amount's only
+/// module call is `_ADDON_ADJUST_USER_WEALTH` -- it never touches
+/// `_GET_PLAYER` at all (the findings file's whole point: that export loads
+/// the player record itself and saves it itself). Against a module that
+/// exports neither, the symbol this note names proves which branch ran.
+#[test]
+fn cash_a_negative_amount_against_a_module_with_no_export_names_addon_adjust_user_wealth() {
+    let mut ext = LuaExtension::load(&shipped_scripts()).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "cash -50", &module);
+
+    assert_eq!(verdict, Verdict::Pass, "a broken handler must never swallow the line");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("cash"), "got: {notes:?}");
+    assert!(notes[0].contains("_ADDON_ADJUST_USER_WEALTH"), "got: {notes:?}");
+    assert!(
+        !notes[0].contains("_GET_PLAYER"),
+        "a deduct must never touch _GET_PLAYER -- _ADDON_ADJUST_USER_WEALTH loads and saves the player itself; got: {notes:?}"
+    );
+}

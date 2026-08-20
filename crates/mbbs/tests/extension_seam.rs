@@ -311,3 +311,110 @@ fn write_scratch_refuses_a_payload_too_big_for_the_scratch_buffer() {
     let err = result.lock().expect("lock").take().expect("command ran").expect_err("must refuse an oversized payload");
     assert!(err.to_string().contains("4096"), "got: {err}");
 }
+
+/// Writes through `write_at` at a pointer this test obtained from
+/// `write_scratch` (the one way to get a real, resolvable pointer without
+/// building a whole module), then reads it back through `read_at` -- proving
+/// both work against an arbitrary already-known pointer, not only the
+/// persistent scratch buffer's own address. `CommandCtx::player_record`
+/// (Task 7) needs exactly this: a pointer *into the module*, not one this
+/// seam allocated.
+struct WriteThenReadAt {
+    result: Arc<Mutex<Option<io::Result<Vec<u8>>>>>,
+}
+
+impl Extension<Wg16> for WriteThenReadAt {
+    fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
+        let outcome = (|| {
+            let ptr = ctx.write_scratch(b"....")?;
+            ctx.write_at(ptr, &[1, 2, 3, 4])?;
+            ctx.read_at(ptr, 4)
+        })();
+        *self.result.lock().expect("lock") = Some(outcome);
+        Verdict::Handled
+    }
+}
+
+#[test]
+fn write_at_then_read_at_round_trips_through_an_explicit_pointer() {
+    let mut f = Fixture::new();
+    let module = f.minimal_module();
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = WriteThenReadAt { result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let bytes = result.lock().expect("lock").take().expect("command ran").expect("write_at/read_at must both succeed");
+    assert_eq!(bytes, vec![1, 2, 3, 4]);
+}
+
+/// Calls [`CommandCtx::player_record`] when dispatched and records the
+/// result.
+struct PlayerRecordCaller {
+    result: Arc<Mutex<Option<io::Result<mbbs_machine::m16::FarPtr>>>>,
+}
+
+impl Extension<Wg16> for PlayerRecordCaller {
+    fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
+        *self.result.lock().expect("lock") = Some(ctx.player_record());
+        Verdict::Handled
+    }
+}
+
+#[test]
+fn player_record_names_the_symbol_when_get_player_is_unresolvable() {
+    let mut f = Fixture::new();
+    let module = f.minimal_module();
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = PlayerRecordCaller { result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let err = result
+        .lock()
+        .expect("lock")
+        .take()
+        .expect("command ran")
+        .expect_err("must refuse an unresolvable _GET_PLAYER");
+    assert!(err.to_string().contains("_GET_PLAYER"), "got: {err}");
+}
+
+#[test]
+fn player_record_returns_the_far_pointer_get_player_answers_with() {
+    let mut f = Fixture::new();
+    // AX=1, DX=1, retf -- a nonzero far pointer, so player_record does not
+    // treat this as "player not loaded."
+    let code = [0xb8, 0x01, 0x00, 0xba, 0x01, 0x00, 0xcb];
+    let module = f.host.load(&mut f.machine, &module_bytes_exporting("_GET_PLAYER", &code)).expect("loads");
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = PlayerRecordCaller { result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let ptr = result.lock().expect("lock").take().expect("command ran").expect("player_record must resolve");
+    assert_eq!(ptr, mbbs_machine::m16::FarPtr { offset: 1, selector: 1 });
+}
+
+#[test]
+fn player_record_is_an_error_when_get_player_returns_null() {
+    let mut f = Fixture::new();
+    // AX=0, DX=0, retf -- the far-pointer encoding of "player not loaded."
+    let code = [0xb8, 0x00, 0x00, 0xba, 0x00, 0x00, 0xcb];
+    let module = f.host.load(&mut f.machine, &module_bytes_exporting("_GET_PLAYER", &code)).expect("loads");
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = PlayerRecordCaller { result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let err = result
+        .lock()
+        .expect("lock")
+        .take()
+        .expect("command ran")
+        .expect_err("a null _GET_PLAYER return must be an error, never a silent no-op");
+    assert!(err.to_string().contains("_GET_PLAYER"), "got: {err}");
+}

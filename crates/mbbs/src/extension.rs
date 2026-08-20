@@ -177,18 +177,92 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
         Ok(ptr)
     }
 
-    /// Read `len` bytes back out of module memory at `ptr` -- the read half
-    /// of [`CommandCtx::write_scratch`], for an OUT parameter a call just
-    /// wrote through (a match count, say).
+    /// Read `len` bytes out of module memory at `ptr`.
+    ///
+    /// Generic over `ptr`'s origin -- unlike [`CommandCtx::write_scratch`],
+    /// which always writes through this seam's own persistent buffer, this
+    /// resolves *any* pointer, module-owned or seam-owned alike: the read
+    /// half of `write_scratch` for an OUT parameter a call just wrote
+    /// through (a match count, say), and equally the way
+    /// [`CommandCtx::player_record`]'s caller reads a coin field out of the
+    /// player record itself.
     ///
     /// # Errors
     ///
     /// If `ptr`, or `ptr` plus `len`, resolves against no memory this
     /// module owns.
-    pub fn read_scratch(&self, ptr: A::Ptr, len: usize) -> io::Result<Vec<u8>> {
+    pub fn read_at(&self, ptr: A::Ptr, len: usize) -> io::Result<Vec<u8>> {
         ptr.resolve(A::mem_ref(self.machine), len)
             .map(<[u8]>::to_vec)
-            .map_err(|e| io::Error::other(format!("read_scratch: {e}")))
+            .map_err(|e| io::Error::other(format!("read_at: {e}")))
+    }
+
+    /// Write `bytes` into module memory at `ptr` -- [`CommandCtx::read_at`]'s
+    /// write counterpart, and [`CommandCtx::write_scratch`]'s generic
+    /// sibling: `write_scratch` always targets this seam's own persistent
+    /// buffer, while this targets whatever pointer the caller already has in
+    /// hand, such as a field inside [`CommandCtx::player_record`]'s record.
+    ///
+    /// # Errors
+    ///
+    /// If `ptr`, or `ptr` plus `bytes.len()`, resolves against no memory
+    /// this module owns.
+    pub fn write_at(&mut self, ptr: A::Ptr, bytes: &[u8]) -> io::Result<()> {
+        ptr.write(A::mem(self.machine), bytes).map_err(|e| io::Error::other(format!("write_at: {e}")))
+    }
+
+    /// The calling channel's own player record: `_GET_PLAYER(usrnum)`,
+    /// through [`CommandCtx::call_export`].
+    ///
+    /// Introduced here because two tasks need the same base pointer --
+    /// `cash`'s coin-field arithmetic and a later task's own read of the
+    /// same record -- and a pointer this fundamental should be derived once,
+    /// not re-derived per caller.
+    ///
+    /// # `_GET_PLAYER` takes one argument, not two
+    ///
+    /// `re/exports/WCCMMUD_named.c:29982` declares it
+    /// `_GET_PLAYER(int param_1)` -- one parameter -- and its body only ever
+    /// reads `param_1`. Most call sites in the same file render as
+    /// `_GET_PLAYER(param_1,0x1280)`, but several do not
+    /// (`re/exports/WCCMMUD_named.c:1802,1839,2853,4483`, each a bare
+    /// `_GET_PLAYER(param_1)`), against the same binary and the same
+    /// definition -- a real second argument could not be optional call site
+    /// to call site. `0x1280` is also identical at every two-argument call
+    /// site regardless of context, which is not how a real per-call-site
+    /// argument behaves. Both facts point the same way: `0x1280` is a
+    /// decompiler artefact (most likely a data-segment value Ghidra
+    /// misattributed as a pushed argument ahead of a far call), not a
+    /// genuine parameter. This method calls it with one argument, `usrnum`.
+    ///
+    /// # Errors
+    ///
+    /// As [`CommandCtx::call_export`], if `_GET_PLAYER` is not an export the
+    /// module's own tables answer for, or if the call stops the machine.
+    ///
+    /// If `_GET_PLAYER` answers with a null far pointer -- the player is not
+    /// loaded on this channel -- that is an error naming the channel, never
+    /// a silent no-op: a caller that went on to write through a null pointer
+    /// would corrupt segment 0 of whatever the selector half happened to be.
+    pub fn player_record(&mut self) -> io::Result<A::Ptr> {
+        let usrnum = A::Int::from(self.chan.number() as u16);
+        let outcome = self.call_export("_GET_PLAYER", &[Arg::Int(usrnum)])?;
+        let (lo, hi) = match outcome {
+            crate::Outcome::Returned { lo, hi } => (lo, hi),
+            crate::Outcome::Stopped(poison) => {
+                return Err(io::Error::other(format!("_GET_PLAYER stopped the machine: {poison}")));
+            }
+        };
+        let mut bytes = (lo as u16).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&(hi as u16).to_le_bytes());
+        let ptr = A::ptr_from_bytes(&bytes);
+        if ptr == A::null_ptr() {
+            return Err(io::Error::other(format!(
+                "_GET_PLAYER({}) returned a null pointer -- no player loaded on this channel",
+                self.chan
+            )));
+        }
+        Ok(ptr)
     }
 }
 
