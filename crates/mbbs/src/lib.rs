@@ -44,6 +44,7 @@ pub mod btrieve;
 pub mod chan;
 pub mod clock;
 pub mod dos;
+pub mod extension;
 mod exports;
 mod fmt;
 pub mod fsd;
@@ -926,6 +927,13 @@ pub struct Host<A: Abi> {
     /// and in whatever case it likes.
     pub root: PathBuf,
 
+    /// Behaviour installed above this host -- see [`crate::extension`].
+    ///
+    /// `None` is the supported default and must remain one: a board with no
+    /// extension behaves exactly as it did before the seam existed, which is
+    /// what lets the whole existing suite go on running unmodified.
+    extension: Option<Box<dyn extension::Extension<A>>>,
+
     /// `spr`'s rotating buffers, and which one is next.
     spr: A::Ptr,
     spr_next: usize,
@@ -1739,6 +1747,7 @@ impl<A: Abi> Host<A> {
                 .expect("the anchor names a real profile"),
             globals,
             root: root.into(),
+            extension: None,
             spr: A::ptr_offset(base, 0),
             spr_next: 0,
             l2as: A::ptr_offset(base, spr_bytes as u16 + 64 + 1),
@@ -2479,6 +2488,16 @@ impl<A: Abi> Host<A> {
     /// How many host calls this host has serviced.
     pub fn calls(&self) -> u64 {
         self.calls
+    }
+
+    /// Install behaviour above this host. Replaces any previous extension.
+    pub fn set_extension(&mut self, ext: Box<dyn extension::Extension<A>>) {
+        self.extension = Some(ext);
+    }
+
+    /// Whether an extension is installed.
+    pub fn extension(&self) -> Option<&dyn extension::Extension<A>> {
+        self.extension.as_deref()
     }
 
     /// Print every host call as it is serviced, numbered.
