@@ -934,6 +934,20 @@ pub struct Host<A: Abi> {
     /// what lets the whole existing suite go on running unmodified.
     extension: Option<Box<dyn extension::Extension<A>>>,
 
+    /// The last line [`Host::get_input_mem`] took from a channel, kept whole.
+    ///
+    /// Exists because `parsin` tokenises the `input` global IN PLACE, writing a
+    /// NUL over every separator, so by the time the command seam runs there is
+    /// no way to read the player's arguments back out of `input` -- a C-string
+    /// read there returns the first token and nothing else. This is captured
+    /// before `parsin` and is the seam's only honest source for the line.
+    ///
+    /// One field, not one per channel, is sufficient and correct: the host is
+    /// single-threaded, and `poll_with_chan` calls `get_input` and then the
+    /// seam for the same channel inside one loop iteration, with nothing
+    /// interleaved.
+    pub(crate) last_line: String,
+
     /// `spr`'s rotating buffers, and which one is next.
     spr: A::Ptr,
     spr_next: usize,
@@ -1766,6 +1780,7 @@ impl<A: Abi> Host<A> {
             globals,
             root: root.into(),
             extension: None,
+            last_line: String::new(),
             spr: A::ptr_offset(base, 0),
             spr_next: 0,
             l2as: A::ptr_offset(base, spr_bytes as u16 + 64 + 1),
@@ -2808,6 +2823,20 @@ impl<A: Abi> Host<A> {
         let mut bytes = line[..take].to_vec();
         bytes.push(0);
         input.write(mem, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+
+        // Keep the whole line before `parsin` takes it apart. `parsin_mem`
+        // tokenises IN PLACE, overwriting each separator in `input` with a NUL
+        // (its own doc walks through it), so after it runs a C-string read of
+        // `input` yields the FIRST TOKEN ONLY -- `summon` out of
+        // `summon rusty sword`. The command seam runs after this point and
+        // needs the line the player actually typed, so the only correct moment
+        // to take it is here, before `parsin`.
+        //
+        // Measured on a live board 2026-08-20: reading `input` at the seam gave
+        // every handler an empty argument string, and every test missed it
+        // because they all used single-word lines, which have no separator for
+        // `parsin` to overwrite.
+        self.last_line = String::from_utf8_lossy(&line[..take]).into_owned();
 
         shims::text::parsin_mem(mem, self)?;
 
@@ -4005,26 +4034,11 @@ impl<A: Abi> Host<A> {
         let Some(mut ext) = self.extension.take() else {
             return Ok(extension::Verdict::Pass);
         };
-        let line = self.input_line(A::mem(machine));
+        let line = self.last_line.clone();
         let mut ctx = extension::CommandCtx { chan, line, host: self, machine, module };
         let verdict = ext.command(&mut ctx);
         self.extension = Some(ext);
         Ok(verdict)
-    }
-
-    /// The `input` global, as the line it holds -- the same bytes
-    /// [`Host::get_input_mem`] just wrote there, NUL-terminated, read back
-    /// out as a `String`. Lossy: a line is whatever the terminal sent through
-    /// [`gsbl::Gsbl::take_line`]'s translate table, not guaranteed UTF-8, and
-    /// a malformed byte here is not a reason to poison the machine.
-    fn input_line(&self, mem: &A::Mem) -> String {
-        let Some(input) = self.globals().address("input") else {
-            return String::new();
-        };
-        match input.read_cstr(mem) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            Err(_) => String::new(),
-        }
     }
 
     /// Grant `n` poll dispatches and arm every channel that polls.

@@ -574,3 +574,37 @@ fn setting_experience_past_a_billion_writes_the_reduced_remainder_and_billions_c
          billion, and 0x46b/0x46d must hold the billions count; got {words:x?}"
     );
 }
+
+/// A line with arguments arrives at the seam WHOLE, not cut at its first word.
+///
+/// The regression guard for a bug a live board found on 2026-08-20 and that
+/// every test until now missed. `Host::get_input_mem` writes the line into the
+/// `input` global and then runs `parsin`, which tokenises IN PLACE by
+/// overwriting each separator with a NUL. The seam used to read the line back
+/// out of `input` with a C-string read, which therefore stopped at the first
+/// NUL and handed every handler the first word alone -- `summon` out of
+/// `summon rusty sword`, with the arguments silently gone.
+///
+/// Nothing caught it because every other test here drives a SINGLE-WORD line
+/// (`look`, `!mine`, `anything`), which has no separator for `parsin` to
+/// overwrite, and the Lua-side tests build a `CommandCtx` directly through
+/// `Fixture::run_command`, which never touches the `input` global at all.
+/// A test of this specifically has to go through `poll`, with a space in it.
+#[test]
+fn a_line_with_arguments_reaches_the_seam_whole() {
+    let mut f = Fixture::new();
+    let module = f.minimal_module();
+    let chan = f.console();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    f.host.set_extension(Box::new(Swallow { seen: seen.clone() }));
+
+    f.host.gsbl_mut().push_input(chan, b"summon a rusty sword\r");
+    f.host.poll(&mut f.machine, &module).expect("polled");
+
+    assert_eq!(
+        seen.lock().expect("lock").as_slice(),
+        &["summon a rusty sword".to_owned()],
+        "the seam must see the whole line; truncation at the first word is \
+         `parsin`'s in-place tokenisation leaking through"
+    );
+}
