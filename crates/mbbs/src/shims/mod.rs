@@ -1753,10 +1753,72 @@ const ABSOLUTES: &[(&str, &str, u16)] = &[(
 /// are served. Kept as a footnote rather than deleted: it is the reason this
 /// alias shipped one commit ahead of full coverage instead of waiting for it.
 
+
+/// Every library spelling this host answers for, mapped to its canonical name.
+///
+/// [`canonical_dll`] walks `LIBRARIES` comparing `eq_ignore_ascii_case` against
+/// each name and every alias. That showed up at 2.5% of total host CPU under
+/// `perf` -- `canonical_dll` plus `make_ascii_lowercase` -- because `entry`
+/// runs on every shim call and every call starts by canonicalising.
+///
+/// Keyed on the spelling exactly as written, so a caller using the canonical
+/// name or a known alias -- which is every real caller, since the spelling
+/// comes from an import table -- is one hash lookup. Anything else falls back
+/// to the case-insensitive walk, which is the only part that needed to be slow.
+fn library_spellings() -> &'static std::collections::HashMap<&'static str, &'static str> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, &'static str>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        for lib in mbbs_machine::library::LIBRARIES {
+            map.insert(lib.name, lib.name);
+            for alias in lib.aliases {
+                map.insert(*alias, lib.name);
+            }
+        }
+        map
+    })
+}
+
+/// [`CRT_SHARED`] and [`CRT_SHARED_16`] as sets.
+///
+/// `crt_home` ran `CRT_SHARED.contains(&symbol)` on every call that named
+/// either library -- 67 string comparisons, then 3 more -- and `perf` put that
+/// linear scan at 4.9% of total host CPU (`slice_contains` plus its closure).
+/// The lists stay lists because they are read by people; the sets exist because
+/// they are read by `entry`.
+fn crt_shared_sets() -> &'static (
+    std::collections::HashSet<&'static str>,
+    std::collections::HashSet<&'static str>,
+) {
+    static SETS: std::sync::OnceLock<(
+        std::collections::HashSet<&'static str>,
+        std::collections::HashSet<&'static str>,
+    )> = std::sync::OnceLock::new();
+    SETS.get_or_init(|| {
+        (CRT_SHARED.iter().copied().collect(), CRT_SHARED_16.iter().copied().collect())
+    })
+}
+
+/// [`GLOBALS`] keyed for lookup.
+///
+/// `entry` asked `GLOBALS.iter().any(..)` -- 88 rows, two string comparisons
+/// each -- on every call that was not a routine hit, which is most of them.
+/// `perf` put it at 5.6% of total host CPU.
+fn global_keys() -> &'static std::collections::HashSet<(&'static str, &'static str)> {
+    static KEYS: std::sync::OnceLock<std::collections::HashSet<(&'static str, &'static str)>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| GLOBALS.iter().map(|g| (g.dll, g.name)).collect())
+}
+
 /// Still a list of named aliases, not a general suffix-stripping rule.
 /// Case-insensitive because PE import directory names are conventionally
 /// upper-cased but nothing in the format requires it.
 fn canonical_dll(dll: &str) -> &str {
+    // The exact-spelling fast path; see `library_spellings`.
+    if let Some(name) = library_spellings().get(dll) {
+        return name;
+    }
     mbbs_machine::library::library(dll).map_or(dll, |lib| lib.name)
 }
 
@@ -1886,7 +1948,7 @@ pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
     if let Some((_, _, value)) = ABSOLUTES.iter().find(|(d, n, _)| *d == dll && *n == symbol) {
         return Entry::Absolute(*value);
     }
-    if GLOBALS.iter().any(|g| g.dll == dll && g.name == symbol) {
+    if global_keys().contains(&(dll, symbol)) {
         return Entry::Datum;
     }
     if let Some((shim, cleans)) = A::native(dll, symbol) {
@@ -1905,10 +1967,11 @@ fn crt_home(dll: &str, symbol: &str) -> Option<&'static str> {
     if dll != MAJORBBS && dll != CW3220MT {
         return None;
     }
-    if CRT_SHARED.contains(&symbol) {
+    let (shared, shared_16) = crt_shared_sets();
+    if shared.contains(symbol) {
         return Some(MAJORBBS);
     }
-    if CRT_SHARED_16.contains(&symbol) {
+    if shared_16.contains(symbol) {
         return Some(CW3220MT);
     }
     None
