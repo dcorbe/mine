@@ -797,6 +797,15 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // because only MajorMUD NT was known to import it. HVSTW imports it
         // off the NE side too, so the same shim is registered here rather
         // than a second one written -- see its own doc comment.
+        //
+        // The `WG32_ROUTINES` row is gone rather than left beside this one.
+        // `entry` searches `routines` *before* `Abi::native`, so this generic
+        // row answered both ABIs the moment it landed and the ABI-concrete
+        // one became unreachable -- dead code that read as the live
+        // registration. `alcblok`/`ptrblok`/`freblok` look like the same
+        // shape and are not: those have no generic row at all, only a
+        // `Wg16`/`Wg32` pair in the two native tables, which is why both
+        // halves of *those* are reachable.
         (MAJORBBS, "paccit", user::paccit, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         // Task 2.7's channel/user pair. `usridx` inverts the `channel`
@@ -1397,7 +1406,6 @@ const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans, Evidence)] =
     // WGNT host services. Only the PE32 builds import these -- MajorMUD NT
     // for the first five, Rose 3.0NT for the rest.
     (MAJORBBS, "getfiletm", system::getfiletm, Cleans::Caller, Evidence::Unclassified),
-    (MAJORBBS, "paccit", user::paccit, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "samepatu", user::samepatu, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "vtmsend", system::vtmsend, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "vtmsndok", system::vtmsndok, Cleans::Caller, Evidence::Unclassified),

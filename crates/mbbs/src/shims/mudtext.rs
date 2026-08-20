@@ -244,14 +244,6 @@ pub fn c2bcpy<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Void)
 }
 
-/// C's `isspace`, the ASCII subset every byte a Btrieve `CHAR` field or a
-/// module's own input line can hold falls into: `' '`, `'\t'`, `'\n'`,
-/// vertical tab (`0x0B`), form feed (`0x0C`), `'\r'`. Used by [`b2ccpy`]
-/// exactly where `B2CCPY.C:31` calls the real `isspace`.
-fn is_c_isspace(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
-}
-
 /// `void b2ccpy(char *dest, char *src, unsigned length)` -- `GCOMM.H:331`
 /// (wg1) / `re/wg33src/SRC/api/gcommlib/B2CCPY.C:20-42` -- the other
 /// direction from [`c2bcpy`]: trim a fixed-width, space-padded field down to
@@ -301,7 +293,11 @@ pub fn b2ccpy<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
         if b == 0 {
             break;
         }
-        if !is_c_isspace(b) {
+        // C's `isspace`, which `B2CCPY.C:31` calls here.
+        // `crate::strings::is_white` *is* that set, derived from the
+        // measured `_ctype` table -- this file used to carry a second,
+        // byte-identical copy under its own name.
+        if !crate::strings::is_white(b) {
             last = i;
             if first.is_none() {
                 first = Some(i);

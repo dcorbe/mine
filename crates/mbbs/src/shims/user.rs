@@ -265,6 +265,43 @@ pub fn hasmkey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     gen_haskey(call, host, &lock)
 }
 
+/// The tail every key check shares once it knows which channel to ask about:
+/// evaluate the lock against that channel's key set, fall back to class for a
+/// channel that exists but never logged on, record the question, and hand back
+/// the C `int`.
+///
+/// `chan` is an `Option` rather than a `Chan` because the three callers differ
+/// only in what an unresolvable channel number means to them, and one of the
+/// three ([`gen_haskey`]) has to answer `false` rather than fail -- see its own
+/// comment for why an idle board must not stop the module. The other two have
+/// already refused by the time they call this, so they pass `Some`.
+///
+/// Extracted because all three had copied it: `LOCKNKEY.C`'s decision is one
+/// decision, and three transcriptions of it could disagree after an edit to
+/// any one of them without anything noticing.
+fn key_answer<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    chan: Option<crate::Chan>,
+    unum: i16,
+    lock: &str,
+) -> Result<abi::Ret<A>, ShimError> {
+    let answer = match chan {
+        None => false,
+        Some(chan) => match host.users().keys(chan) {
+            Some(keys) => keys.evaluate(lock),
+            // A channel that exists but never logged on -- `keys == NULL`.
+            // Answered by class, and `usrcls` is 0 here, so it refuses; the
+            // comparison is written out rather than folded away so that it
+            // starts telling the truth on its own the day this host grows an
+            // internal channel.
+            None => host.class_mem(call.mem(), chan)? == BBSPRV,
+        },
+    };
+    host.asked_for_key(unum, lock, answer);
+    Ok(abi::Ret::Int(A::Int::from(u16::from(answer))))
+}
+
 /// `gen_haskey(lock,usrnum,usrptr)` -- [`haskey`] and [`hasmkey`]'s shared
 /// tail, once the lock expression is in hand as a host-side string.
 ///
@@ -286,20 +323,8 @@ fn gen_haskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, lock: &str) -> Res
     // sentinels exist for exactly that value), and there is nobody to hold a
     // key. **Not** an error: asking `Host::class` there would stop the module
     // over a state the real host was in whenever the board was idle.
-    let answer = match host.users().terms().chan(unum) {
-        None => false,
-        Some(chan) => match host.users().keys(chan) {
-            Some(keys) => keys.evaluate(lock),
-            // A channel that exists but never logged on -- `keys == NULL`.
-            // Answered by class, and `usrcls` is 0 here, so it refuses; the
-            // comparison is written out rather than folded away so that it
-            // starts telling the truth on its own the day this host grows an
-            // internal channel.
-            None => host.class_mem(call.mem(), chan)? == BBSPRV,
-        },
-    };
-    host.asked_for_key(unum, lock, answer);
-    Ok(abi::Ret::Int(A::Int::from(answer as u16)))
+    let chan = host.users().terms().chan(unum);
+    key_answer(call, host, chan, unum, lock)
 }
 
 /// `INVISB`, `MAJORBBS.H:274` -- bit `0x4000` of `user.flags`. A channel with
@@ -575,12 +600,7 @@ pub fn gen_haskey_shim<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result
         )));
     }
 
-    let answer = match host.users().keys(chan) {
-        Some(keys) => keys.evaluate(&lock),
-        None => host.class_mem(call.mem(), chan)? == BBSPRV,
-    };
-    host.asked_for_key(unum, &lock, answer);
-    Ok(abi::Ret::Int(A::Int::from(u16::from(answer))))
+    key_answer(call, host, Some(chan), unum, &lock)
 }
 
 /// `INT uhskey(const CHAR *uid, const CHAR *lock)` -- `LOCKNKEY.H:197`.
@@ -645,12 +665,7 @@ fn othkey_for<A: Abi>(
         .chan(othusn)
         .ok_or_else(|| ShimError::Failed(format!("othkey: othusn {othusn} names no channel")))?;
 
-    let answer = match host.users().keys(chan) {
-        Some(keys) => keys.evaluate(&lock),
-        None => host.class_mem(call.mem(), chan)? == BBSPRV,
-    };
-    host.asked_for_key(othusn, &lock, answer);
-    Ok(abi::Ret::Int(A::Int::from(u16::from(answer))))
+    key_answer(call, host, Some(chan), othusn, &lock)
 }
 
 /// `INT uidkey(const CHAR *uid, const CHAR *lock)` -- `LOCKNKEY.H:210`
