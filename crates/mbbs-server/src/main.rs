@@ -71,6 +71,14 @@ const DEFAULT_WG32_ARENA_BYTES: usize = 0x0100_0000;
 /// through one branch -- while undershoot makes the world visibly slow. 513
 /// clock reads a second is a rounding error of CPU; sixteen monster updates
 /// a second may not be a playable game.
+///
+/// **This is the operator's dial now; `--passes` is gone.** `--passes`
+/// bounded `Host::cycle`'s pass count -- a proxy for "has input arrived?",
+/// and a bad one: it fired when nothing was waiting and stayed silent when
+/// something was. It was retired 2026-08-20 in favour of an interrupt
+/// predicate the pump supplies by peeking its own mailbox, which is the
+/// signal itself. See
+/// `docs/superpowers/specs/2026-08-20-cycle-interrupt-and-syscyc-design.md`.
 const DEFAULT_POLLS_PER_WAKE: usize = 512;
 
 // Every rejection (an unknown flag, a missing required one, a number that

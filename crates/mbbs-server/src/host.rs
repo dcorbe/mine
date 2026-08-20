@@ -217,6 +217,13 @@ pub struct Boot<A: Abi> {
     pub bturno: Option<String>,
     /// Poll dispatches granted per driver wake. See [`Host::refill_polls`].
     pub polls_per_wake: usize,
+    // This struct used to carry `passes: usize` here too, `Host::cycle`'s
+    // pass-count bound. Retired 2026-08-20 alongside `--passes`: a count is
+    // a proxy for "has input arrived?", and a bad one -- see
+    // `docs/superpowers/specs/2026-08-20-cycle-interrupt-and-syscyc-design.md`.
+    // `cycle` now takes an interrupt predicate instead ([`life`]'s own
+    // `interrupted` closure, below); `polls_per_wake` above is the only
+    // tuning dial left.
     /// Where this thread reports its own [`Host::clock_reads`] after every
     /// `cycle` call, for a caller outside the thread to sample.
     ///
@@ -367,6 +374,21 @@ fn wake(wait: Wait, rx: &std::sync::mpsc::Receiver<In>) -> Woke {
 ///
 /// `Wait::Stop` is left alone: the module stopped, and nothing in the mailbox
 /// changes that.
+///
+/// **The `Blocked`/`Until` downgrade is unreachable via [`life`]'s real
+/// control flow today.** `peeked` becomes `Some` in exactly one place --
+/// [`life`]'s `interrupted` closure -- and every call that sets it also
+/// makes `interrupted` return `true` on that same call, which is what
+/// `Host::cycle` checks to decide whether to return `Ended::Bound` right
+/// there. `Ended::Bound::wait()` is always `Wait::Now`, and `life`'s `wait`
+/// variable is assigned only from the previous turn's `cycles.ended.wait()`
+/// (or `Wait::Now` initially) -- so whenever this function is called with
+/// `peeked == true`, `wait` is already `Wait::Now`, and the `if peeked`
+/// guard on `Blocked`/`Until` never fires. Kept anyway, not removed: it is
+/// the guard that keeps this invariant true if `Host::cycle`'s exit checks
+/// are ever reordered, and its own direct unit test
+/// (`a_peeked_message_downgrades_a_blocking_wait`) exercises it without
+/// going through `life` at all.
 fn wait_with_peek(wait: Wait, peeked: bool) -> Wait {
     match wait {
         Wait::Blocked | Wait::Until(_) if peeked => Wait::Now,
