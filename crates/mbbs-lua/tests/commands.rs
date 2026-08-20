@@ -1,5 +1,7 @@
 //! Script loading and command registration, exercised through `LuaExtension`.
 
+use mbbs::extension::Verdict;
+use mbbs::testing::Fixture;
 use mbbs_lua::LuaExtension;
 
 /// Creates a fresh directory under this crate's `target/` scratch area (never
@@ -44,4 +46,27 @@ fn a_syntax_error_names_the_file_and_fails_the_load() {
     let dir = tempdir_with("a_syntax_error_names_the_file_and_fails_the_load", &[("bad.lua", "this is not lua")]);
     let err = LuaExtension::load(&dir).expect_err("must not load");
     assert!(err.to_string().contains("bad.lua"), "got: {err}");
+}
+
+#[test]
+fn a_throwing_handler_is_disabled_after_one_report() {
+    let dir = tempdir_with(
+        "a_throwing_handler_is_disabled_after_one_report",
+        &[("bad.lua", r#"mmud.command("boom", function(c) error("nope") end)"#)],
+    );
+    let mut ext = LuaExtension::load(&dir).expect("loads");
+    let mut fixture = Fixture::new();
+    let chan = fixture.console();
+
+    for _ in 0..3 {
+        let verdict = fixture.run_command(&mut ext, chan, "boom");
+        // A broken handler must never swallow the player's line.
+        assert_eq!(verdict, Verdict::Pass);
+    }
+
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("boom"), "got: {notes:?}");
+    assert!(notes[0].contains("bad.lua"), "got: {notes:?}");
+    assert!(notes[0].contains("nope"), "got: {notes:?}");
 }

@@ -231,6 +231,32 @@ impl Fixture {
         [at.offset, at.selector]
     }
 
+    /// Run `line` through `ext`'s `command` handler, on this fixture's own
+    /// host and channel.
+    ///
+    /// `CommandCtx`'s fields stay `pub(crate)` to the `mbbs` crate -- a Lua
+    /// (or any other) extension crate cannot build one itself, only call
+    /// [`crate::extension::Extension::command`] on one this crate handed it.
+    /// This is that hand-off, so a test in another crate can invoke a real
+    /// handler without `mbbs` ever depending back on that crate.
+    ///
+    /// Takes no `module` parameter yet. `CommandCtx` will likely grow one
+    /// once handlers can call module exports; adding it here is that
+    /// change's problem, not this one's.
+    pub fn run_command(
+        &mut self,
+        ext: &mut dyn crate::extension::Extension<Wg16>,
+        chan: crate::Chan,
+        line: &str,
+    ) -> crate::extension::Verdict {
+        let mut ctx = crate::extension::CommandCtx {
+            chan,
+            line: line.to_owned(),
+            host: &mut self.host,
+        };
+        ext.command(&mut ctx)
+    }
+
     /// Load [`minimal_module_bytes`] into this fixture's host.
     ///
     /// `Host::connect` and `Host::poll` both take a `&mbbs_machine::m16::Module`, whether

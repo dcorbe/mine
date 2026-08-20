@@ -10,6 +10,7 @@
 mod api;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -30,6 +31,11 @@ type Handlers = Rc<RefCell<Vec<(String, Function)>>>;
 pub struct LuaExtension {
     lua: Lua,
     handlers: Handlers,
+    /// Command names a handler has already thrown from. Checked before
+    /// `handlers` is even consulted, so a disabled handler costs one hash
+    /// lookup and nothing else -- see `Extension::command`'s error arm for
+    /// why a handler ends up here.
+    disabled: HashSet<String>,
 }
 
 impl fmt::Debug for LuaExtension {
@@ -86,7 +92,7 @@ impl LuaExtension {
                 .map_err(|source| LoadError(format!("{file_name}: {source}")))?;
         }
 
-        Ok(LuaExtension { lua, handlers })
+        Ok(LuaExtension { lua, handlers, disabled: HashSet::new() })
     }
 
     /// Registered command names, in registration order (the order scripts
@@ -127,6 +133,10 @@ impl Extension<Wg16> for LuaExtension {
         let line = ctx.line().to_string();
         let (name, args) = split_command(&line);
 
+        if self.disabled.contains(name) {
+            return Verdict::Pass;
+        }
+
         let handler = self.handlers.borrow().iter().find(|(n, _)| n == name).map(|(_, f)| f.clone());
         let Some(handler) = handler else {
             return Verdict::Pass;
@@ -151,12 +161,26 @@ impl Extension<Wg16> for LuaExtension {
             handler.call::<Value>(t)
         });
 
-        // Task 5 owns turning a handler error into "disabled and reported
-        // once"; for now a throwing handler just passes the line through,
-        // same as one that returns nothing.
         match result {
             Ok(value) => to_verdict(value),
-            Err(_) => Verdict::Pass,
+            Err(err) => {
+                // Disable the handler and report exactly once, never once
+                // per call. `note`, not `note_once` -- see a53bc964
+                // (`shims::btrieve::push`), where a note reached from inside
+                // a loop the module runs to completion recorded 4,962 lines
+                // of the same overflow before it moved to `note_once`. A
+                // command handler has the identical shape from the other
+                // side: a player who keeps retyping a broken command drives
+                // this same call site once per line, and without disabling
+                // the handler first, every retry would report again. The
+                // "exactly once" guarantee has to come from `disabled`
+                // itself, not from the note channel, precisely so a mutation
+                // that deletes the bookkeeping is the one thing that can
+                // still make this fail.
+                self.disabled.insert(name.to_string());
+                ctx.note(format!("lua: command {name:?} disabled after an error in its handler: {err}"));
+                Verdict::Pass
+            }
         }
     }
 }

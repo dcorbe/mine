@@ -53,6 +53,16 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
     pub fn print(&mut self, bytes: &[u8]) {
         self.host.gsbl_mut().transmit(self.chan, bytes);
     }
+
+    /// Report something the module cannot be told. See [`crate::Host::notes`].
+    ///
+    /// Forwards to the host's own note channel rather than keeping a private
+    /// list here, so a test (or an operator's log) reads a handler's reports
+    /// the same way it reads every other note the host makes -- one channel,
+    /// not two.
+    pub fn note(&mut self, message: String) {
+        self.host.note(message);
+    }
 }
 
 /// Something that participates in the host's events.
