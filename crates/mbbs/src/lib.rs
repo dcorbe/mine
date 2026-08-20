@@ -153,10 +153,11 @@ pub enum Polled<A: Abi> {
     /// No channel has a `polrou` at all. The caller should stop asking for
     /// this second rather than rescan every channel on every pass.
     NobodyPolls,
-    /// Reading the channel's `polrou` failed and the machine was stopped.
-    /// **Not** a dispatch: no routine ran, nothing was censused, and the
-    /// cursor did not advance -- so a caller tallying dispatches must not
-    /// count this.
+    /// Something [`Host::poll_next_channel`] had to do before it could run
+    /// the channel's routine -- reading `polrou`, or pointing `chan` current
+    /// -- failed, and the machine was stopped. **Not** a dispatch: no
+    /// routine ran, nothing was censused, and the cursor did not advance --
+    /// so a caller tallying dispatches must not count this.
     Errored(Outcome<A>, Chan),
 }
 
@@ -3573,8 +3574,24 @@ impl<A: Abi> Host<A> {
             let rou = match self.users.polrou_mem(A::mem(machine), chan) {
                 Ok(Some(rou)) => rou,
                 Ok(None) => continue,
-                Err(e) => return self.shim_stop(machine, "poll_next_channel", e).map(|o| Polled::Errored(o, chan)),
+                Err(e) => {
+                    return self
+                        .shim_stop(machine, "poll_next_channel", e)
+                        .map(|o| Polled::Errored(o, chan));
+                }
             };
+            // Point `chan` current *before* the cursor moves and *before*
+            // `dispatch_poll` runs anything -- so this fault, like the
+            // `polrou_mem` one above it, leaves `Errored` telling the truth
+            // about the cursor, and is reported as a fault rather than as a
+            // dispatch that never happened. `dispatch_poll` itself has no
+            // fault path before its own `run()`, once this precondition
+            // holds -- see its own doc comment.
+            if let Err(e) = self.point_curusr_mem(A::mem(machine), chan) {
+                return self
+                    .shim_stop(machine, "poll_next_channel: point_curusr", e)
+                    .map(|o| Polled::Errored(o, chan));
+            }
             self.poll_cursor = (index + 1) % count;
             let outcome = self.dispatch_poll(machine, module, chan, rou)?;
             return Ok(Polled::Dispatched(outcome, chan));
@@ -3640,6 +3657,13 @@ impl<A: Abi> Host<A> {
     /// Call one channel's polling routine and count it. No re-arming: see
     /// [`Host::poll_next_channel`] for why the intention is read rather than
     /// re-queued.
+    ///
+    /// **The caller must have made `chan` current.** `poll_with_chan` does it
+    /// at `lib.rs:4001`, and [`Host::poll_next_channel`] does it before
+    /// advancing its cursor; the vendor's own loop does `curusr(usrnum)`
+    /// before the dispatch (`MAJORBBS.C:629`). This function only runs the
+    /// routine and counts it -- a fault that means "the routine never ran"
+    /// belongs to the caller, which is the one constructing a [`Polled`].
     fn dispatch_poll(
         &mut self,
         machine: &mut A::Cpu,
@@ -3647,19 +3671,6 @@ impl<A: Abi> Host<A> {
         chan: Chan,
         rou: A::Ptr,
     ) -> io::Result<Outcome<A>> {
-        // **The module reads `usrnum`/`usrptr`/`usaptr`/`vdaptr`.**
-        // `poll_with_chan` points them at `chan` before every dispatch
-        // (`lib.rs:3992`), mirroring the vendor's `curusr(usrnum)` ahead of
-        // channel service (`MAJORBBS.C:629`). A poll that arrives from the
-        // clock rather than from the status queue must point them too, or
-        // the routine runs against whatever channel was current last --
-        // MajorMUD's in-Realm poller indexes its own per-channel workspace
-        // off `usrnum`, so a stale one reads and writes another player's
-        // state. On the `dopoll` path this is a harmless second call:
-        // `poll_with_chan` already pointed the same channel moments before.
-        if let Err(e) = self.point_curusr_mem(A::mem(machine), chan) {
-            return self.shim_stop(machine, "dispatch_poll", e);
-        }
         // **The module reads `status`.** `poll_with_chan` writes it before
         // every dispatch (`lib.rs:3913`); a poll that arrives from the clock
         // rather than from the status queue must write it too, or the module
@@ -7615,13 +7626,14 @@ mod tests {
     /// A clock-granted poll must point `usrnum` (and `usrptr`/`usaptr`/
     /// `vdaptr` with it) at the channel being served, exactly as
     /// `poll_with_chan` does before every queue-driven dispatch
-    /// (`lib.rs:3992`) and as the vendor's `curusr(usrnum)` does before
+    /// (`lib.rs:4001`) and as the vendor's `curusr(usrnum)` does before
     /// channel service (`MAJORBBS.C:629`). Channel 1, not the console: at one
     /// channel, "current" and "channel zero" coincide by accident and this
     /// would not discriminate a missing `point_curusr_mem` call from one that
-    /// never ran. Before `dispatch_poll` pointed curusr, `usrnum` was still
-    /// -1 (nobody current since construction -- `Fixture` never points it),
-    /// so this also fails honestly rather than silently if the call is lost.
+    /// never ran. Before `poll_next_channel` pointed curusr, `usrnum` was
+    /// still -1 (nobody current since construction -- `Fixture` never points
+    /// it), so this also fails honestly rather than silently if the call is
+    /// lost.
     #[test]
     fn a_clock_granted_poll_points_curusr_at_the_polled_channel() {
         let (mut f, module, rou) = polling_fixture_with(3);
@@ -7662,6 +7674,38 @@ mod tests {
             }
             Polled::Dispatched(..) => panic!("a segment fault is not a dispatch -- nothing ran"),
             Polled::NobodyPolls => panic!("the fault happens before this host can say nobody polls"),
+        }
+    }
+
+    /// The other fault `poll_next_channel` can hit before a routine runs:
+    /// `point_curusr_mem` failing rather than `polrou_mem`. Forced the same
+    /// way -- a real segment fault, not a mock -- but on `Globals`' own
+    /// dedicated region (`Globals::new` gives it one fresh
+    /// `ModuleMem::alloc_region`, `globals.rs:1001`, distinct from the user
+    /// table's segment the sibling test frees) rather than the user table's,
+    /// so `polrou_mem` still succeeds and this isolates the second fault
+    /// site specifically. Must still answer `Errored`, not `Dispatched` --
+    /// the reorder that made `point_curusr_mem` run before the cursor moves
+    /// is exactly what this pins.
+    #[test]
+    fn poll_next_channel_reports_errored_when_curusr_cannot_be_pointed() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host
+            .users
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
+            .expect("channel 0");
+        let usrnum = f.host.globals().address("usrnum").expect("usrnum is a placed global");
+        f.machine
+            .free_segment(usrnum.selector)
+            .expect("the globals region can be freed out from under it");
+
+        match f.host.poll_next_channel(&mut f.machine, &module).expect("polled") {
+            Polled::Errored(_, chan) => {
+                assert_eq!(chan, console, "the channel that could not be made current");
+            }
+            Polled::Dispatched(..) => panic!("a curusr fault is not a dispatch -- nothing ran"),
+            Polled::NobodyPolls => panic!("polrou was set; the fault happens after that check"),
         }
     }
 
