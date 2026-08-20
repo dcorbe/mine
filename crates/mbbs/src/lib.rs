@@ -2919,6 +2919,21 @@ impl<A: Abi> Host<A> {
         out
     }
 
+    /// The ordinal tables this host resolves `dll`-and-number imports
+    /// against, for the generation it was built for.
+    ///
+    /// Exists for `src/bin/gaps.rs`, which needs to put a *name* on an
+    /// unresolved ordinal import so a gap report reads `prfmsg` rather than
+    /// `#476`. Deliberately a borrow of the host's own table rather than
+    /// letting the caller build one: which generation applies is
+    /// `Exports::for_profile`'s decision, and a survey that picked its own
+    /// would be one more copy of a host rule living outside the host -- the
+    /// exact failure `gaps.rs` exists to retire.
+    #[must_use]
+    pub fn exports(&self) -> &Exports {
+        &self.exports
+    }
+
     pub fn load(&mut self, cpu: &mut A::Cpu, file: &[u8]) -> Result<A::Module, LoadError> {
         self.load_with_precedence(cpu, file, &[])
     }
