@@ -3458,6 +3458,23 @@ mod tests {
         }
     }
 
+    /// Puts the real `STDIN_FILENO` back. See [`RestoreStderr`].
+    struct RestoreStdin(std::os::fd::RawFd);
+
+    impl Drop for RestoreStdin {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a valid fd this same test duplicated from
+            // the real `STDIN_FILENO` and has not yet closed (see
+            // `underscore_read_through_the_real_shim_does_not_translate_stdin`'s
+            // own body) -- `dup2` onto `STDIN_FILENO` and closing the
+            // now-spare duplicate are both well-defined for it.
+            unsafe {
+                libc::dup2(self.0, libc::STDIN_FILENO);
+                libc::close(self.0);
+            }
+        }
+    }
+
     #[test]
     #[ignore = "swaps the process's real stderr fd via dup2 -- process-global, must run \
                 alone: tools/cargo-serial.sh test -p mbbs --lib \
@@ -3724,5 +3741,394 @@ mod tests {
             int_of(f.invoke(open, &[named.offset, named.selector, O_RDONLY]).expect("open")),
             0xFFFF
         );
+    }
+
+    // ---- _read ----------------------------------------------------------
+
+    #[test]
+    #[ignore = "swaps the process's real stdin fd via dup2 -- process-global, must run alone"]
+    fn underscore_read_through_the_real_shim_does_not_translate_stdin() {
+        // Every other `_read` test above reaches `read_from` directly or
+        // stops before the stdin path runs at all (`read_from`'s own doc
+        // comment: a real blocking `stdin().read()` hangs this test binary
+        // forever with nothing piped to it) -- so none of them exercise the
+        // one line inside the *real* `_read` shim that hands `read_from` a
+        // hardcoded `true` rather than `host.stdio_modes[0]`. This drives
+        // `_read` itself -- not `read_from` -- with the process's real
+        // `STDIN_FILENO` redirected to a scratch file holding a `\r\n` and a
+        // `^Z`, the same two constructs `read_from_translates_in_text_mode...`
+        // already proves `read` (unlike `_read`) would touch.
+        //
+        // Mirrors `write_through_the_real_shim_actually_translates_by_mode`'s
+        // own dup2 technique exactly, on fd 0 instead of fd 2. Run alone:
+        // `tools/cargo-serial.sh test -p mbbs --lib \
+        //   underscore_read_through_the_real_shim -- --ignored --test-threads=1`
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd;
+
+        let root = scratch("crt-underscore-read-real-fd");
+        let source_path = root.join("source.bin");
+        std::fs::File::create(&source_path)
+            .and_then(|mut f| f.write_all(b"a\r\n\x1abcd"))
+            .expect("scratch source file");
+        let source_file = std::fs::File::open(&source_path).expect("reopen for reading");
+
+        // SAFETY: duplicates a definitely-valid, open fd (the process's own
+        // stdin). Owned by `_restore` from here on and closed exactly once,
+        // in `RestoreStdin::drop`.
+        let saved = unsafe { libc::dup(libc::STDIN_FILENO) };
+        assert!(saved >= 0, "dup(STDIN_FILENO) failed");
+        let _restore = RestoreStdin(saved);
+
+        // SAFETY: replaces fd 0 with a duplicate of `source_file`'s own fd;
+        // both descriptors stay independently valid afterward, so dropping
+        // `source_file` right after closes only its own number, never fd 0.
+        let rc = unsafe { libc::dup2(source_file.as_raw_fd(), libc::STDIN_FILENO) };
+        assert!(rc >= 0, "dup2 onto STDIN_FILENO failed");
+        drop(source_file);
+
+        let mut f = Fixture::new();
+        let buf = f.buffer(16);
+        let got = f
+            .invoke(_read, &[0, buf.offset, buf.selector, 7])
+            .expect("_read from the real (redirected) stdin");
+
+        drop(_restore); // real fd 0 back before any later test needs it
+
+        assert_eq!(int_of(got), 7, "no bytes dropped or stopped-at, unlike `read`");
+        assert_eq!(
+            &f.machine.resolve(buf, 7).expect("the buffer")[..],
+            b"a\r\n\x1abcd",
+            "physically unchanged -- the \\r kept and the ^Z read straight through, \
+             through the real `_read` shim, not `read_from` called directly"
+        );
+    }
+
+    #[test]
+    fn underscore_read_refuses_a_raw_descriptor() {
+        let root = scratch("crt-underscore-read-fd");
+        std::fs::write(root.join("IN.DAT"), b"payload").expect("a file to read");
+        let mut f = Fixture::rooted(root);
+        let fp = opened(&mut f, "IN.DAT", "rb");
+        let image = f.machine.resolve(fp, crate::stream::FILE_SIZE).expect("a FILE").to_vec();
+        let at = usize::from(Wg16::FILE_FD_OFFSET);
+        let width = usize::from(Wg16::FILE_FD_WIDTH);
+        let mut raw = [0u8; 4];
+        raw[..width].copy_from_slice(&image[at..at + width]);
+        let fd = u32::from_le_bytes(raw);
+
+        let buf = f.buffer(16);
+        let e = f
+            .invoke(_read, &[fd as u16, buf.offset, buf.selector, 4])
+            .expect_err("no raw read exists for a descriptor");
+        assert!(
+            format!("{e}").contains("no untranslated read"),
+            "should name exactly the missing capability: {e}"
+        );
+    }
+
+    #[test]
+    fn underscore_read_refuses_stdout_and_stderr() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(4);
+        for handle in [1u16, 2, 3, 4] {
+            f.invoke(_read, &[handle, buf.offset, buf.selector, 1])
+                .expect_err(&format!("handle {handle} is not open for reading"));
+        }
+    }
+
+    // ---- strrchr ----------------------------------------------------------
+
+    #[test]
+    fn strrchr_finds_the_last_occurrence() {
+        let mut f = Fixture::new();
+        let s = f.text("abcabc");
+        let ret = f.invoke(strrchr, &[s.offset, s.selector, u16::from(b'b')]).expect("strrchr");
+        let at = pointer(ret);
+        assert_eq!(at.offset, s.offset + 4, "the second 'b', not the first");
+    }
+
+    #[test]
+    fn strrchr_of_an_absent_byte_answers_null() {
+        let mut f = Fixture::new();
+        let s = f.text("abcabc");
+        let ret = f.invoke(strrchr, &[s.offset, s.selector, u16::from(b'z')]).expect("strrchr");
+        assert_eq!(pointer(ret), FarPtr { offset: 0, selector: 0 });
+    }
+
+    #[test]
+    fn strrchr_of_the_terminator_answers_a_pointer_to_it() {
+        // "The null-terminator is considered to be part of the string" --
+        // `STRRCHR.C`'s own doc comment.
+        let mut f = Fixture::new();
+        let s = f.text("abc");
+        let ret = f.invoke(strrchr, &[s.offset, s.selector, 0]).expect("strrchr");
+        assert_eq!(pointer(ret).offset, s.offset + 3, "one past the last real byte");
+    }
+
+    #[test]
+    fn strrchr_only_the_low_byte_of_c_counts() {
+        let mut f = Fixture::new();
+        let s = f.text("abcabc");
+        // 0x1662: high byte 0x16 is garbage, low byte 0x62 is 'b'.
+        let ret = f.invoke(strrchr, &[s.offset, s.selector, 0x1662]).expect("strrchr");
+        assert_eq!(pointer(ret).offset, s.offset + 4);
+    }
+
+    // ---- memchr -------------------------------------------------------------
+
+    #[test]
+    fn memchr_finds_a_byte_within_n() {
+        let mut f = Fixture::new();
+        let s = f.bytes(b"abcabc", false);
+        let ret = f.invoke(memchr, &[s.offset, s.selector, u16::from(b'c'), 6]).expect("memchr");
+        assert_eq!(pointer(ret).offset, s.offset + 2, "the first 'c'");
+    }
+
+    #[test]
+    fn memchr_does_not_look_past_n_bytes() {
+        let mut f = Fixture::new();
+        let s = f.bytes(b"aaaZaaa", false);
+        // 'Z' sits at index 3; asking for only the first 3 bytes must not
+        // find it.
+        let ret = f.invoke(memchr, &[s.offset, s.selector, u16::from(b'Z'), 3]).expect("memchr");
+        assert_eq!(pointer(ret), FarPtr { offset: 0, selector: 0 });
+    }
+
+    #[test]
+    fn memchr_of_zero_bytes_answers_null_without_resolving_s() {
+        let mut f = Fixture::new();
+        // A pointer this host cannot resolve at all -- if `memchr` touched
+        // it despite `n == 0`, this would fail with a resolve error instead
+        // of answering NULL.
+        let poison = FarPtr { offset: 0, selector: 0xFFFF };
+        let ret = f
+            .invoke(memchr, &[poison.offset, poison.selector, u16::from(b'a'), 0])
+            .expect("n == 0 never touches s");
+        assert_eq!(pointer(ret), FarPtr { offset: 0, selector: 0 });
+    }
+
+    #[test]
+    fn memchr_only_the_low_byte_of_val_counts() {
+        let mut f = Fixture::new();
+        let s = f.bytes(b"abc", false);
+        let ret = f.invoke(memchr, &[s.offset, s.selector, 0x1662, 3]).expect("memchr");
+        assert_eq!(pointer(ret).offset, s.offset + 1, "'b' at index 1");
+    }
+
+    // ---- rmdir ----------------------------------------------------------
+
+    #[test]
+    fn rmdir_removes_an_empty_directory() {
+        let root = scratch("crt-rmdir-empty");
+        std::fs::create_dir(root.join("EMPTYDIR")).expect("a directory to remove");
+        let mut f = Fixture::rooted(root.clone());
+        let named = f.text("EMPTYDIR");
+        assert_eq!(word(f.invoke(rmdir, &Fixture::far(named)).expect("rmdir")), 0);
+        assert!(!root.join("EMPTYDIR").exists());
+    }
+
+    #[test]
+    fn rmdir_of_a_missing_directory_answers_minus_one() {
+        let mut f = Fixture::rooted(scratch("crt-rmdir-missing"));
+        let named = f.text("NOSUCH");
+        assert_eq!(word(f.invoke(rmdir, &Fixture::far(named)).expect("rmdir")), 0xFFFF);
+    }
+
+    #[test]
+    fn rmdir_of_a_nonempty_directory_answers_minus_one() {
+        let root = scratch("crt-rmdir-nonempty");
+        std::fs::create_dir(root.join("FULLDIR")).expect("a directory");
+        std::fs::write(root.join("FULLDIR").join("X.TXT"), b"x").expect("a file inside it");
+        let mut f = Fixture::rooted(root.clone());
+        let named = f.text("FULLDIR");
+        assert_eq!(word(f.invoke(rmdir, &Fixture::far(named)).expect("rmdir")), 0xFFFF);
+        assert!(root.join("FULLDIR").exists(), "left alone, not force-removed");
+    }
+
+    #[test]
+    fn rmdir_cannot_escape_the_sandbox() {
+        let mut f = Fixture::rooted(scratch("crt-rmdir-sandbox"));
+        let named = f.text("C:\\ESCAPE");
+        let e = f.invoke(rmdir, &Fixture::far(named)).expect_err("a drive letter is refused");
+        assert!(format!("{e}").contains("outside this host's own"), "{e}");
+    }
+
+    // ---- setvbuf ----------------------------------------------------------
+
+    #[test]
+    fn setvbuf_with_valid_arguments_answers_zero() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "SAMPLE.DAT", "rb");
+        let buf = f.buffer(64);
+        let ret = f
+            .invoke(setvbuf, &[fp.offset, fp.selector, buf.offset, buf.selector, 0, 64])
+            .expect("setvbuf");
+        assert_eq!(word(ret), 0);
+    }
+
+    #[test]
+    fn setvbuf_with_an_invalid_type_answers_eof() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "SAMPLE.DAT", "rb");
+        let buf = f.buffer(64);
+        let ret = f
+            .invoke(setvbuf, &[fp.offset, fp.selector, buf.offset, buf.selector, 3, 64])
+            .expect("setvbuf");
+        assert_eq!(word(ret), 0xFFFF);
+    }
+
+    #[test]
+    fn setvbuf_with_too_large_a_size_answers_eof() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "SAMPLE.DAT", "rb");
+        let buf = f.buffer(64);
+        let ret = f
+            .invoke(setvbuf, &[fp.offset, fp.selector, buf.offset, buf.selector, 0, 0x8000])
+            .expect("setvbuf");
+        assert_eq!(word(ret), 0xFFFF);
+    }
+
+    #[test]
+    fn setvbuf_on_an_unknown_stream_is_refused() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(64);
+        let e = f
+            .invoke(setvbuf, &[0x1234, 0x5678, buf.offset, buf.selector, 0, 64])
+            .expect_err("no such stream");
+        assert!(format!("{e}").contains("setvbuf"), "{e}");
+    }
+
+    // ---- getcwd ----------------------------------------------------------
+
+    #[test]
+    fn getcwd_answers_the_root_drive() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(64);
+        let ret = f.invoke(getcwd, &[buf.offset, buf.selector, 64]).expect("getcwd");
+        assert_eq!(pointer(ret), buf, "writes into the caller's own buffer");
+        assert_eq!(f.read(buf), "C:\\");
+    }
+
+    #[test]
+    fn getcwd_with_too_small_a_buffer_answers_null() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(64);
+        // "C:\" needs 4 bytes including the terminator; 2 is not enough.
+        let ret = f.invoke(getcwd, &[buf.offset, buf.selector, 2]).expect("getcwd");
+        assert_eq!(pointer(ret), FarPtr { offset: 0, selector: 0 });
+    }
+
+    #[test]
+    fn getcwd_with_a_null_buffer_allocates_its_own() {
+        let mut f = Fixture::new();
+        let ret = f.invoke(getcwd, &[0, 0, 64]).expect("getcwd");
+        let at = pointer(ret);
+        assert_ne!(at, FarPtr { offset: 0, selector: 0 }, "a real allocation, not NULL");
+        assert_eq!(f.read(at), "C:\\");
+    }
+
+    // ---- localtime ----------------------------------------------------------
+
+    #[test]
+    fn localtime_breaks_down_a_pinned_instant() {
+        // The same instant `gettime`'s own test pins to: 2005-12-30 14:20:05
+        // UTC, a Friday, the 364th day of a non-leap year (`tm_yday` is
+        // zero-based, so 363).
+        let mut f = Fixture::new();
+        f.host.set_clock(crate::Clock::pinned(1_135_952_405));
+
+        let timer = f.words(&long_arg(1_135_952_405));
+        let ret = f.invoke(localtime, &Fixture::far(timer)).expect("localtime");
+        let at = pointer(ret);
+        let raw = f.machine.resolve(at, 18).expect("struct tm").to_vec();
+
+        let field = |i: usize| i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+        let fields: Vec<i16> = (0..9).map(field).collect();
+        assert_eq!(
+            fields,
+            vec![5, 20, 14, 30, 11, 105, 5, 363, -1],
+            "tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst"
+        );
+    }
+
+    #[test]
+    fn localtime_applies_the_clocks_own_offset() {
+        // Same instant, five hours east -- carries the civil date to the
+        // next day, the same way `clock.rs`'s own
+        // `an_offset_can_carry_the_breakdown_into_the_next_day` pins it, but
+        // reached through the shim rather than `Civil` directly.
+        let mut f = Fixture::new();
+        f.host.set_clock(crate::Clock::pinned(1_135_952_405).with_offset(10 * 3600));
+
+        let timer = f.words(&long_arg(1_135_952_405));
+        let ret = f.invoke(localtime, &Fixture::far(timer)).expect("localtime");
+        let raw = f.machine.resolve(pointer(ret), 18).expect("struct tm").to_vec();
+        let field = |i: usize| i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+        assert_eq!((field(2), field(3), field(4)), (0, 31, 11), "hour, mday, mon roll to Dec 31");
+    }
+
+    // ---- creattemp --------------------------------------------------------
+
+    #[test]
+    fn creattemp_creates_a_file_and_rewrites_the_buffer() {
+        let root = scratch("crt-creattemp");
+        let mut f = Fixture::rooted(root.clone());
+        f.host.random = crate::random::Random::new(42);
+
+        // `TM38D0.TMP` is `Random::new(42)`'s own first draw, formatted the
+        // way `creattemp` formats it -- computed once, offline, against the
+        // same LCG `random.rs` documents (`state = state * 22695477 + 1`,
+        // then `(state >> 16) & 0x7fff`), not asserted on faith.
+        let fname = f.bytes(b"", true);
+        let ret = f.invoke(creattemp, &[fname.offset, fname.selector, 0]).expect("creattemp");
+        let fd = word(ret);
+        assert!(fd >= u16::from(crate::stream::FIRST_FD), "a real descriptor");
+
+        assert_eq!(f.read(fname), "TM38D0.TMP", "the buffer holds the generated name");
+        assert!(root.join("TM38D0.TMP").exists());
+    }
+
+    #[test]
+    fn creattemp_retries_past_a_name_already_taken() {
+        let root = scratch("crt-creattemp-collision");
+        // Pre-occupy the name a seed-42 draw would generate first, so
+        // `creattemp` must draw again.
+        std::fs::write(root.join("TM38D0.TMP"), b"already here").expect("a collision");
+        let mut f = Fixture::rooted(root.clone());
+        f.host.random = crate::random::Random::new(42);
+
+        let fname = f.bytes(b"", true);
+        f.invoke(creattemp, &[fname.offset, fname.selector, 0]).expect("creattemp");
+
+        assert_eq!(f.read(fname), "TM5DF8.TMP", "the second draw, not the taken first one");
+        assert_eq!(
+            std::fs::read(root.join("TM38D0.TMP")).expect("untouched"),
+            b"already here",
+            "the pre-existing file was not overwritten"
+        );
+    }
+
+    #[test]
+    fn creattemp_writes_under_the_given_directory_prefix() {
+        let root = scratch("crt-creattemp-prefix");
+        std::fs::create_dir(root.join("OUTBOX")).expect("a subdirectory");
+        let mut f = Fixture::rooted(root.clone());
+        f.host.random = crate::random::Random::new(42);
+
+        let fname = f.text("OUTBOX/");
+        f.invoke(creattemp, &[fname.offset, fname.selector, 0]).expect("creattemp");
+        assert_eq!(f.read(fname), "OUTBOX/TM38D0.TMP");
+        assert!(root.join("OUTBOX").join("TM38D0.TMP").exists());
+    }
+
+    #[test]
+    fn creattemp_cannot_escape_the_sandbox() {
+        let mut f = Fixture::rooted(scratch("crt-creattemp-sandbox"));
+        let fname = f.text("C:\\ESCAPE\\");
+        let e = f
+            .invoke(creattemp, &[fname.offset, fname.selector, 0])
+            .expect_err("a drive letter is refused");
+        assert!(format!("{e}").contains("outside this host's own"), "{e}");
     }
 }

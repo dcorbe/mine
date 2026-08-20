@@ -3226,4 +3226,347 @@ mod tests {
             f.host.notes()
         );
     }
+
+    // # Task 8: the twelve-symbol corpus survey gap
+    //
+    // See this file's own "Task 8" section comment, above `btuhwh`, for the
+    // classification each routine below is tested against: two real
+    // implementations (`btuerp`, `btubsz`), three unconditional hardware
+    // refusals (`btuhwh`, `btubrt`, `btux29`), one data-refusal (`btuhdr`),
+    // and six software features narrowed to "the documented default already
+    // matches this host's hardcoded behaviour, everything else refuses"
+    // (`btuolk`, `btutrm`, `btulfd`, `btubse`, `btutrs`) plus one `void`
+    // no-return no-op (`btuxlt`).
+
+    #[test]
+    fn btuhwh_with_inpcut_zero_answers_ok_because_that_is_already_the_only_state() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btuhwh, &[0, 0]).expect("btuhwh"), Ret::U16(0));
+    }
+
+    #[test]
+    fn btuhwh_refuses_a_nonzero_inpcut_and_says_why() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.invoke(btuhwh, &[0, 16]).expect("btuhwh"),
+            Ret::U16(NO_HANDSHAKE_HARDWARE)
+        );
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("RTS/CTS")),
+            "a refusal nobody can read is a silent failure: {:?}",
+            f.host.notes()
+        );
+    }
+
+    #[test]
+    fn btuhwh_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(f.invoke(btuhwh, &[past, 16]).expect("btuhwh"), Ret::U16(OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn btubrt_always_answers_bad_baud_rate_there_is_no_uart_at_any_rate() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btubrt, &[0, 2400]).expect("btubrt"), Ret::U16(BAD_BAUD_RATE));
+        // Even the guide's own documented reset default -- no rate is
+        // achievable on a socket, not even the one real GSBL calls "default".
+        assert_eq!(f.invoke(btubrt, &[0, 300]).expect("btubrt"), Ret::U16(BAD_BAUD_RATE));
+    }
+
+    #[test]
+    fn btubrt_says_why_in_the_host_log() {
+        let mut f = Fixture::new();
+        f.invoke(btubrt, &[0, 2400]).expect("btubrt");
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("no UART")),
+            "{:?}",
+            f.host.notes()
+        );
+    }
+
+    #[test]
+    fn btubrt_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(f.invoke(btubrt, &[past, 2400]).expect("btubrt"), Ret::U16(OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn btux29_always_answers_x25clo_there_is_no_x25_hardware() {
+        let mut f = Fixture::new();
+        let data = f.bytes(&[1, 2, 2, 3], false);
+        assert_eq!(
+            f.invoke(btux29, &[0, 4, data.offset, data.selector]).expect("btux29"),
+            Ret::U16(X25CLO)
+        );
+    }
+
+    #[test]
+    fn btux29_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        let data = f.bytes(&[1, 2], false);
+        assert_eq!(
+            f.invoke(btux29, &[past, 2, data.offset, data.selector]).expect("btux29"),
+            Ret::U16(OUT_OF_RANGE)
+        );
+    }
+
+    #[test]
+    fn btux29_still_validates_its_pointer_on_a_valid_channel() {
+        // R12's own shape: a bad pointer must fail the call, not be silently
+        // ignored on the way to an always-the-same X25CLO answer.
+        let mut f = Fixture::new();
+        let ret = f.invoke(btux29, &[0, 4, 0, 0xdead]);
+        assert!(ret.is_err(), "a destination that resolves to nothing must fail");
+    }
+
+    #[test]
+    fn btuhdr_refuses_and_names_the_gap() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(4);
+        let e = f
+            .invoke(btuhdr, &[0, 4, buf.offset, buf.selector])
+            .expect_err("no X.25 or LAN state exists to capture");
+        let msg = e.to_string();
+        assert!(msg.contains("btuhdr"), "{msg}");
+        // "X.25" and "LAN" each appear twice in the real message (once
+        // naming what this host lacks, once again in the closing "until
+        // this host has real X.25 or LAN..." sentence) -- checking only for
+        // those two words would still pass against a message that dropped
+        // the *specific* missing structures (`ECB`, `x25hdr`) and kept only
+        // the generic closing sentence, which is not the same thing as
+        // actually naming the gap. `ECB` and `x25hdr` each appear exactly
+        // once, so they are what actually pins this down.
+        assert!(msg.contains("ECB"), "{msg}");
+        assert!(msg.contains("x25hdr"), "{msg}");
+    }
+
+    #[test]
+    fn btuhdr_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        let buf = f.buffer(4);
+        assert_eq!(
+            f.invoke(btuhdr, &[past, 4, buf.offset, buf.selector]).expect("btuhdr"),
+            Ret::U16(OUT_OF_RANGE),
+            "a channel out of range is not this host's missing capability"
+        );
+    }
+
+    #[test]
+    fn btuerp_is_a_genuine_no_op_that_answers_ok_for_either_onoff() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btuerp, &[0, 1]).expect("btuerp"), Ret::U16(0));
+        assert_eq!(f.invoke(btuerp, &[0, 0]).expect("btuerp"), Ret::U16(0));
+    }
+
+    #[test]
+    fn btuerp_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(f.invoke(btuerp, &[past, 1]).expect("btuerp"), Ret::U16(OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn btubsz_clears_the_input_and_output_buffers_on_a_valid_power_of_two_pair() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().push_input(console, b"half-typed");
+        f.host.gsbl_mut().transmit(console, b"queued output");
+
+        assert_eq!(f.invoke(btubsz, &[0, 256, 2048]).expect("btubsz"), Ret::U16(0));
+
+        assert!(f.host.gsbl().channel(console).line.is_empty(), "input side cleared");
+        assert!(
+            f.host.gsbl_mut().drain_output(console).is_empty(),
+            "output side cleared"
+        );
+    }
+
+    #[test]
+    fn btubsz_clears_the_wrapped_flag_a_soft_cr_relied_on() {
+        // Mirrors `btuclo_clears_the_wrapped_flag_a_soft_cr_relied_on`: the
+        // guide's CAUTIONS say btubsz clears the data buffers the same way
+        // btuclo does, so it must reset the same column/wrapped state or a
+        // soft CR on the next line wrongly degrades to a SPACE.
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).width = 10;
+        f.invoke(btuscr, &[0, b'|' as u16]).expect("ok");
+
+        f.host.gsbl_mut().transmit(console, b"aaaaaaaaaaaa");
+        f.invoke(btubsz, &[0, 256, 2048]).expect("btubsz");
+
+        f.host.gsbl_mut().transmit(console, b"ab|");
+        assert_eq!(
+            f.host.gsbl_mut().drain_output(console),
+            b"ab\r\n".to_vec(),
+            "btubsz must reset `wrapped`, or this soft CR wrongly degrades to a SPACE"
+        );
+    }
+
+    #[test]
+    fn btubsz_refuses_a_size_that_is_not_a_power_of_two_and_clears_nothing() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().push_input(console, b"untouched");
+
+        assert_eq!(
+            f.invoke(btubsz, &[0, 300, 2048]).expect("btubsz"),
+            Ret::U16(BAD_SIZES),
+            "300 is not a power of two"
+        );
+        assert_eq!(
+            f.host.gsbl().channel(console).line,
+            b"untouched".to_vec(),
+            "a refused call must not have cleared anything"
+        );
+    }
+
+    #[test]
+    fn btubsz_refuses_a_zero_size_which_is_not_a_power_of_two_either() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.invoke(btubsz, &[0, 0, 2048]).expect("btubsz"),
+            Ret::U16(BAD_SIZES),
+            "0 is not 2^n for any n"
+        );
+    }
+
+    #[test]
+    fn btubsz_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(
+            f.invoke(btubsz, &[past, 256, 2048]).expect("btubsz"),
+            Ret::U16(OUT_OF_RANGE)
+        );
+    }
+
+    #[test]
+    fn btuolk_with_onoff_zero_answers_ok_nothing_can_be_paused_here() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btuolk, &[0, 0]).expect("btuolk"), Ret::U16(0));
+    }
+
+    #[test]
+    fn btuolk_refuses_a_nonzero_onoff_and_names_the_missing_field() {
+        let mut f = Fixture::new();
+        let e = f.invoke(btuolk, &[0, 1]).expect_err("no paused flag exists to honour this");
+        let msg = e.to_string();
+        assert!(msg.contains("btuolk"), "{msg}");
+        assert!(msg.contains("paused"), "{msg}");
+    }
+
+    #[test]
+    fn btuolk_refuses_a_channel_out_of_range_ahead_of_the_capability_question() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(
+            f.invoke(btuolk, &[past, 1]).expect("must not stop the machine"),
+            Ret::U16(OUT_OF_RANGE)
+        );
+    }
+
+    #[test]
+    fn btutrm_with_the_documented_default_answers_ok() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btutrm, &[0, 13]).expect("btutrm"), Ret::U16(0));
+    }
+
+    #[test]
+    fn btutrm_refuses_a_non_default_terminator() {
+        let mut f = Fixture::new();
+        let e = f.invoke(btutrm, &[0, 0]).expect_err("Channel::take's terminator is hardcoded");
+        assert!(e.to_string().contains("btutrm"));
+    }
+
+    #[test]
+    fn btutrm_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(f.invoke(btutrm, &[past, 13]).expect("btutrm"), Ret::U16(OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn btulfd_with_the_documented_default_answers_ok() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btulfd, &[0, 10]).expect("btulfd"), Ret::U16(0));
+    }
+
+    #[test]
+    fn btulfd_refuses_disabling_it_or_replacing_it() {
+        let mut f = Fixture::new();
+        assert!(f.invoke(btulfd, &[0, 0]).is_err(), "disabling it needs a field this host lacks");
+        assert!(f.invoke(btulfd, &[0, 65]).is_err(), "replacing it needs a field this host lacks");
+    }
+
+    #[test]
+    fn btulfd_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(f.invoke(btulfd, &[past, 10]).expect("btulfd"), Ret::U16(OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn btubse_with_the_documented_default_answers_ok() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btubse, &[0, 8]).expect("btubse"), Ret::U16(0));
+    }
+
+    #[test]
+    fn btubse_refuses_the_no_special_handling_and_custom_echo_forms() {
+        let mut f = Fixture::new();
+        assert!(f.invoke(btubse, &[0, 0]).is_err(), "00 needs a field this host lacks");
+        assert!(f.invoke(btubse, &[0, 7]).is_err(), "a custom NN echo needs a field this host lacks");
+    }
+
+    #[test]
+    fn btubse_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(f.invoke(btubse, &[past, 8]).expect("btubse"), Ret::U16(OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn btutrs_with_onoff_zero_answers_ok_status_six_can_never_fire_here() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btutrs, &[0, 0]).expect("btutrs"), Ret::U16(0));
+    }
+
+    #[test]
+    fn btutrs_refuses_a_nonzero_onoff_and_names_the_missing_mechanism() {
+        let mut f = Fixture::new();
+        let e = f.invoke(btutrs, &[0, 1]).expect_err("trunch's abort detection is not implemented");
+        let msg = e.to_string();
+        assert!(msg.contains("btutrs"), "{msg}");
+        assert!(msg.contains("trunch"), "{msg}");
+    }
+
+    #[test]
+    fn btutrs_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(f.invoke(btutrs, &[past, 1]).expect("btutrs"), Ret::U16(OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn btuxlt_notes_the_remap_it_cannot_perform_and_returns_void() {
+        let mut f = Fixture::new();
+        f.invoke(btuxlt, &[0x7f, 0x08]).expect("void");
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("btuxlt")),
+            "a no-op nobody can read is a silent failure: {:?}",
+            f.host.notes()
+        );
+    }
+
+    #[test]
+    fn btuxlt_notes_rather_than_stops_the_machine_on_an_oversized_argument() {
+        let mut f = Fixture::new();
+        f.invoke(btuxlt, &[300, 0x08]).expect("void routines note and continue");
+        assert!(f.host.notes().iter().any(|n| n.contains("does not fit a byte")));
+    }
 }

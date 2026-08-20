@@ -163,6 +163,19 @@ const fn s(name: &'static str, size: u16) -> Global {
     }
 }
 
+/// A `GALGSBL` global declared `INT`, and so [`Abi::INT_WIDTH`] bytes wide
+/// rather than a fixed number of them -- [`gi`]'s counterpart one library
+/// over. `EXPGSBLV(INT)` is the macro `BRKTHU.H` declares these with, and an
+/// `INT` is 2 bytes under `Wg16` and 4 under `Wg32`, so [`s`]'s fixed
+/// `Width::Bytes` would be right for exactly one of the two ABIs.
+const fn si(name: &'static str) -> Global {
+    Global {
+        dll: crate::exports::GALGSBL,
+        name,
+        size: Width::Int,
+    }
+}
+
 /// `GALMSG` has no constructor here, and one symbol is the reason it stays
 /// that way.
 ///
@@ -572,6 +585,24 @@ pub const GLOBALS: &[Global] = &[
     // that rule, and it is the same append-only convention `ictact`'s own
     // comment already established.
     s("ticker", 2),
+    // `EXPGSBLV(INT) btux25; /* flag indicating X.25 support in GSBL */`
+    // (`BRKTHU.H:109`), exported `_btux25 @67`. DATA, not a routine: the
+    // vendor's own use is `if (btux25)` at `MAJORBBS.C:941`, and it is the
+    // sole missing import of two modules.
+    //
+    // At the tail beside `ticker` rather than threaded in beside `bturno`,
+    // following the convention `ictact` and `ticker` set: an append cannot
+    // move any existing global's offset, and `BRKTHU.H`'s own declaration
+    // order still holds -- `btux25` is at :109, after both of them.
+    //
+    // Zero is not a placeholder here, it is the answer. The flag says whether
+    // GSBL has X.25 support; this host has none and never will behind a TCP
+    // socket, so false is what the real value would be. That is what
+    // separates it from `GALMSG!msgbyts` and `MAJORBBS!mnubb`, the two other
+    // data exports this survey turned up: those need values only a subsystem
+    // this host lacks could produce, so they stay unplaced rather than
+    // invented.
+    si("btux25"),
 ];
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
@@ -1512,7 +1543,7 @@ mod tests {
             .filter(|g| g.size == Width::Int)
             .map(|g| g.name)
             .collect();
-        assert_eq!(ints.len(), 25, "the int globals: {ints:?}");
+        assert_eq!(ints.len(), 26, "the int globals: {ints:?}");
         assert!(ints.contains(&"usrnum") && ints.contains(&"margc") && ints.contains(&"nglobs"));
         assert!(ints.contains(&"errcod"), "REMOTE.H:11 declares errcod an int");
 
@@ -1650,7 +1681,12 @@ mod tests {
         // global's own comment for why (declaration order in `BRKTHU.H`
         // still holds: `ticker` is after `ictact` there too). No new
         // alignment byte: 2 is even -- 4032 + 2 = 4034.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 4034);
+        //
+        // The module-import survey then appended `btux25`, GALGSBL's X.25
+        // support flag -- an `INT`, so two bytes here and four under `Wg32`,
+        // which is why it is `si` and not `s`. Still even, still no alignment
+        // byte: 4034 + 2 = 4036.
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 4036);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as

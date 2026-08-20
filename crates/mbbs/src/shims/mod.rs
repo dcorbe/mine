@@ -308,6 +308,34 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // with `__OLDSEND`, which are two different symbols.
         (CW3220MT, "_localeconvention", crt::localeconvention, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "dfsthn", misc::dfsthn, Cleans::Caller, Evidence::Unclassified),
+        // The misc host-API family, each with its vendor body cited in its
+        // own doc comment. `fndcls` is a permanent NULL because
+        // `ACCOUNT.C:214-216` is the vendor's own `clshead == NULL` branch and
+        // this host has no class database at all -- its real state, not
+        // fabricated data. `cnvd2s` refuses: no body survives and the five
+        // measured call sites use four visibly different prefix grammars,
+        // with nothing to arbitrate between them.
+        (MAJORBBS, "register_pseudok", misc::register_pseudok, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/LOCKNKEY.C")),
+        (MAJORBBS, "alldgs", misc::alldgs, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "unpad", misc::unpad, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/UNPAD.C")),
+        (MAJORBBS, "findmod", misc::findmod, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        (MAJORBBS, "prntim", misc::prntim, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/DNTAPI.C")),
+        (MAJORBBS, "prndat", misc::prndat, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/DNTAPI.C")),
+        (MAJORBBS, "rsvnam", misc::rsvnam, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/FIOAPI.C")),
+        (MAJORBBS, "onbbs", misc::onbbs, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        (MAJORBBS, "fndcls", misc::fndcls, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/ACCOUNT.C")),
+        (MAJORBBS, "cnvd2s", misc::cnvd2s, Cleans::Caller,
+         Evidence::Guessed("refuses: no surviving body, and the five measured call sites use \
+                            four different developer-form grammars with nothing to arbitrate \
+                            how they map onto struct saunam's five fields")),
         (MAJORBBS, "hrtval", misc::hrtval, Cleans::Caller, Evidence::Unclassified),
         // Both MajorMUD NT builds and Rose 3.0NT import hrtval from GALGSBL,
         // not MAJORBBS -- see `hrtval_resolves_from_galgsbl_as_well_as_majorbbs`.
@@ -1017,6 +1045,55 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // `gsbl::btuxmn`'s own doc comment for the prototype, the call-site
         // arity check, and the one property it does not yet reproduce.
         (GALGSBL, "btuxmn", gsbl::btuxmn, Cleans::Caller, Evidence::Unclassified),
+        // The rest of the GSBL terminal-control family. Each answer comes
+        // from the GSBL Programmer's Guide's own RETURNS section where it has
+        // one -- `btubrt`'s -3 "bad baud rate" and `btux29`'s X25CLO are the
+        // vendor's codes, not invented ones -- and `Guessed` records the
+        // cases where the guide documents no failure value and the refusal is
+        // therefore this host's choice. There is no UART, no RTS/CTS pair and
+        // no X.25 link behind a TCP socket, and none of these pretends
+        // otherwise. See each routine's own doc comment.
+        (GALGSBL, "btuerp", gsbl::btuerp, Cleans::Caller,
+         Evidence::Guessed("a UART parity/framing/overrun setting nothing behind a socket \
+                            can ever consult, so the no-op is unconditional")),
+        (GALGSBL, "btubsz", gsbl::btubsz, Cleans::Caller,
+         Evidence::Guessed("power-of-two validation and the buffer-clearing side effect are \
+                            the guide's; the btusiz/btulsz capacity half cannot be checked \
+                            because this host implements neither and its buffers are unbounded")),
+        (GALGSBL, "btuhwh", gsbl::btuhwh, Cleans::Caller,
+         Evidence::Guessed("inpcut==0 is a socket's only possible state and answers 0; the \
+                            guide enumerates no failure code, so the non-zero refusal is \
+                            this host's choice -- see NO_HANDSHAKE_HARDWARE")),
+        (GALGSBL, "btubrt", gsbl::btubrt, Cleans::Caller,
+         Evidence::Guessed("answers the guide's own -3 'bad baud rate' unconditionally: no \
+                            UART exists behind a socket at any rate")),
+        (GALGSBL, "btux29", gsbl::btux29, Cleans::Caller,
+         Evidence::Guessed("answers the guide's own X25CLO -- 'hardware refuses' -- which is \
+                            literally true here, after validating the pointer and length")),
+        (GALGSBL, "btuhdr", gsbl::btuhdr, Cleans::Caller,
+         Evidence::Guessed("refuses rather than answering: the guide has no 'nothing to \
+                            report' value, and zeroed X.25/LAN structures would fabricate \
+                            plausible hardware state")),
+        (GALGSBL, "btuolk", gsbl::btuolk, Cleans::Caller,
+         Evidence::Guessed("the guide's documented default is this host's hardcoded \
+                            behaviour and answers 0; anything else needs a Channel::paused \
+                            field crate::gsbl does not have")),
+        (GALGSBL, "btutrm", gsbl::btutrm, Cleans::Caller,
+         Evidence::Guessed("13 is the default and answers 0; Channel::take's b'\\r' arm is \
+                            hardcoded, so any other terminator is refused")),
+        (GALGSBL, "btulfd", gsbl::btulfd, Cleans::Caller,
+         Evidence::Guessed("10 is the default and answers 0; emit_one's newline push is \
+                            hardcoded, unlike hardcr/softcr which are already parameterised")),
+        (GALGSBL, "btubse", gsbl::btubse, Cleans::Caller,
+         Evidence::Guessed("8 is the default and answers 0; take's 0x08 arm hardcodes the \
+                            echo")),
+        (GALGSBL, "btutrs", gsbl::btutrs, Cleans::Caller,
+         Evidence::Guessed("onoff==0 is true forever -- Channel::trunch's own doc comment \
+                            says the abort mechanism does not exist -- so it answers 0 and \
+                            refuses anything else")),
+        (GALGSBL, "btuxlt", gsbl::btuxlt, Cleans::Caller,
+         Evidence::Guessed("returns void, so no refusal is possible; notes instead that \
+                            translate() is a hardcoded match and not a mutable table")),
         (GALGSBL, "btuoes", gsbl::btuoes, Cleans::Caller, Evidence::Unclassified),
         (GALGSBL, "btuclo", gsbl::btuclo, Cleans::Caller, Evidence::Unclassified),
         (GALGSBL, "btulok", gsbl::btulok, Cleans::Caller, Evidence::Unclassified),
@@ -1109,6 +1186,39 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "tell", crt::tell, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "filelength", crt::filelength, Cleans::Caller, Evidence::Standard),
         (CW3220MT, "_write", crt::_write, Cleans::Caller, Evidence::Standard),
+        // Borland's `__fputc`, which exists only to decrement `fp->level`
+        // before calling `fputc` -- `_FPUTC.C`/`PUTC.C`: "this function is
+        // only called by the putc() macro". The same routine, so the same
+        // body, exactly as `_fgetc` above is `stream::fgetc`. No second
+        // implementation was written for it; see `crt`'s module doc for the
+        // pass that once did write second bodies here.
+        (CW3220MT, "_fputc", stream::fputc, Cleans::Caller, Evidence::Standard),
+        // The C library this host was missing, all documented Borland/ISO
+        // semantics. Each carries its own disclosure where the answer is a
+        // convention rather than a measurement -- `getcwd`'s drive letter in
+        // particular.
+        (MAJORBBS, "strrchr", crt::strrchr, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "memchr", crt::memchr, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "rmdir", crt::rmdir, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "setvbuf", crt::setvbuf, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "getcwd", crt::getcwd, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "localtime", crt::localtime, Cleans::Caller, Evidence::Standard),
+        // Borland's `__read`: a direct MS-DOS read with no text-mode
+        // translation, distinct from `read` the way `_write` is from `write`
+        // (`READ.CAS`'s own comment). The descriptor branch refuses rather
+        // than faking: `Streams` has `write_raw`/`write_raw_fd` and no
+        // `read_raw` counterpart, and raw bytes cannot be reconstructed from
+        // an already-translating read after the fact.
+        (MAJORBBS, "_read", crt::_read, Cleans::Caller, Evidence::Standard),
+        // Galacticomm's own (`GCOMM.H`, ordinal 46), not Borland's: the
+        // in/out buffer contract -- directory prefix in, generated path
+        // written back into the same buffer -- is measured off three call
+        // sites in `SRC/api/galmhs`. The generated spelling itself is
+        // invented, which is what the `Guessed` argument records.
+        (MAJORBBS, "creattemp", crt::creattemp, Cleans::Caller,
+         Evidence::Guessed("in/out buffer contract measured off three SRC/api/galmhs call \
+                            sites; the TMnnnn.TMP spelling is invented, and no caller can \
+                            observe it because the routine hands the name back")),
         // The time family, and exit. No oracle for any of the four time
         // routines: the genuine ones trap to DOS/BIOS and fault when called
         // (tests/oracle_gate.rs records the measurement), so these are
@@ -1274,8 +1384,9 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
 /// implemented" -- it is the same answer a 16-bit caller already gets.
 const CRT_SHARED: &[&str] = &[
     // Strings and memory.
-    "memcmp", "memcpy", "memmove", "memset", "strcat", "strchr", "strcmp", "strcpy", "stricmp",
-    "strlen", "strlwr", "strncat", "strncmp", "strncpy", "strnicmp", "strstr", "strtok", "strupr",
+    "memchr", "memcmp", "memcpy", "memmove", "memset", "strcat", "strchr", "strcmp", "strcpy",
+    "stricmp", "strlen", "strlwr", "strncat", "strncmp", "strncpy", "strnicmp", "strrchr",
+    "strstr", "strtok", "strupr",
     // Conversion and formatting.
     "atol", "itoa", "sprintf", "sscanf", "strtol", "ultoa", "vsprintf",
     // Character classification. `_ctype` keeps its one leading underscore for
@@ -1286,8 +1397,8 @@ const CRT_SHARED: &[&str] = &[
     "_streams", "fclose", "fflush", "fgetc", "fgets", "fopen", "fprintf", "fputc", "fread",
     "fseek", "ftell", "fwrite", "flushall", "rewind", "ungetc",
     // Descriptors and the file system.
-    "access", "close", "filelength", "lseek", "mkdir", "open", "read", "rename", "tell",
-    "unlink", "write",
+    "access", "close", "filelength", "getcwd", "lseek", "mkdir", "open", "read", "rename",
+    "rmdir", "setvbuf", "tell", "unlink", "write",
     // The environment.
     "getenv",
     // Random numbers.
@@ -1295,7 +1406,7 @@ const CRT_SHARED: &[&str] = &[
     // Time. `dostounix`, `getdate`, `getftime` and `gettime` are Borland
     // extensions rather than C standard, and are on this list for the same
     // reason as everything else: real modules import them from this file.
-    "dostounix", "getdate", "getftime", "gettime", "time",
+    "dostounix", "getdate", "getftime", "gettime", "localtime", "time",
     // Non-local jumps, both structural refusals -- see this list's own doc.
     "longjmp", "setjmp",
     // Standard output. `printf` bottoms out in this process's own stdout,
@@ -1318,7 +1429,7 @@ const CRT_SHARED: &[&str] = &[
 /// A list of their own rather than a `(name, home)` pair on every one of
 /// [`CRT_SHARED`]'s sixty-seven: which list a name is in *is* its home, so
 /// nothing is repeated and [`crt_home`] still answers in one pass.
-const CRT_SHARED_16: &[&str] = &["_localeconvention", "_fgetc", "_write"];
+const CRT_SHARED_16: &[&str] = &["_localeconvention", "_fgetc", "_fputc", "_write"];
 
 /// The second door: routines that answer only for `Wg16`. See
 /// [`Abi::native`]'s own doc comment for why these twenty-seven are here and
