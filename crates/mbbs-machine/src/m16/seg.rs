@@ -378,23 +378,43 @@ mod tests {
         table[bytes - LDT_ENTRY_SIZE..].try_into().unwrap()
     }
 
+    /// The linear base a raw LDT descriptor names.
+    ///
+    /// The CPU's own field layout, which `user_desc` does not share: base
+    /// `15:0` in bytes 2-3, `23:16` in byte 4, `31:24` in byte 7.
+    fn descriptor_base(desc: [u8; LDT_ENTRY_SIZE]) -> u32 {
+        u32::from(desc[2])
+            | u32::from(desc[3]) << 8
+            | u32::from(desc[4]) << 16
+            | u32::from(desc[7]) << 24
+    }
+
     #[test]
     fn a_dropped_segment_leaves_no_live_descriptor() {
         let _guard = SERIALISE.lock().unwrap_or_else(PoisonError::into_inner);
 
         let segment = Segment::new(4096, false).expect("a segment");
         let entry = segment.entry();
-        assert_ne!(
-            descriptor(entry),
-            [0u8; LDT_ENTRY_SIZE],
-            "a live segment has a live descriptor"
-        );
+        let base = descriptor_base(descriptor(entry));
+        assert_ne!(base, 0, "a live segment's descriptor names its mapping");
 
         drop(segment);
 
-        assert_eq!(
-            descriptor(entry),
-            [0u8; LDT_ENTRY_SIZE],
+        // Asserted on *identity*, not on emptiness. The slot really is
+        // cleared, but the LDT is a process resource and `SERIALISE` only
+        // covers this file's own tests -- every `Machine::new` elsewhere in
+        // the crate allocates descriptors too, so a concurrent one can claim
+        // this freed slot before the read below. This test asserted the
+        // descriptor was all-zero and failed roughly one workspace run in
+        // seven for exactly that reason, which is worse than useless: a flake
+        // makes every green run mean less.
+        //
+        // What must never be true is that the slot still names the memory that
+        // was just unmapped, and that survives reuse.
+        let after = descriptor(entry);
+        assert_ne!(
+            descriptor_base(after),
+            base,
             "the descriptor still names the memory that was just unmapped"
         );
     }
