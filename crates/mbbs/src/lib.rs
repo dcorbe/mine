@@ -3945,8 +3945,11 @@ impl<A: Abi> Host<A> {
         }
         for chan in self.users.terms().all() {
             // Already armed: either `dopoll` re-injected before the budget ran
-            // out, or the last burst hit `cycle`'s pass bound with statuses
-            // still queued. Injecting again would add a dispatch per wake.
+            // out, or the last burst ended with statuses still queued --
+            // which is what `cycle`'s interrupt does when the pump's mailbox
+            // has input waiting. Injecting again would add a dispatch per
+            // wake, and the pump refills on every wake that saw input, so
+            // that is a queue growing without bound.
             if self.gsbl.polling_armed(chan) {
                 continue;
             }
@@ -7888,7 +7891,7 @@ mod tests {
         f.host.refill_polls(&mut f.machine, 5).expect("armed");
         let cycles = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
 
-        assert_eq!(cycles.dispatched, 5, "the budget, not the pass bound");
+        assert_eq!(cycles.dispatched, 5, "the budget is what stopped it -- nothing else bounds a cycle");
         assert_eq!(
             cycles.ended,
             Ended::Idle,
@@ -7919,9 +7922,20 @@ mod tests {
     }
 
     /// A refill while the chain is still armed must not add a second status.
-    /// `cycle` hitting its pass bound leaves one queued, the driver refills on
-    /// every wake, and a queue that grows by one per wake is a leak no
-    /// single-burst test can see.
+    ///
+    /// `cycle` returning on its interrupt -- the pump's mailbox has input
+    /// waiting -- leaves a status queued with budget to spare. The pump then
+    /// refills on that same wake, and a queue that grows by one per wake is a
+    /// leak no single-burst test can see.
+    ///
+    /// **The interrupt is load-bearing here.** Cutting the cycle short is the
+    /// only way to reach the `polling_armed` guard: left to run, `cycle`
+    /// drains to budget exhaustion and `dopoll` stops re-arming, so the
+    /// channel is not armed when the refill lands and the guard is never
+    /// consulted. This test used to rely on the pass bound for that early
+    /// exit; when the bound was deleted 2026-08-20 the test kept passing and
+    /// stopped testing anything -- measured: the guard could be deleted
+    /// outright with all 1,932 tests still green.
     #[test]
     fn a_refill_does_not_arm_a_channel_that_is_already_armed() {
         let (mut f, module, rou) = polling_fixture();
@@ -7929,9 +7943,11 @@ mod tests {
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
         f.host.refill_polls(&mut f.machine, 100).expect("armed");
-        // One pass: dispatches one poll, and `dopoll` re-arms because budget
-        // remains. So a status is queued when the refill below runs.
-        let _ = f.host.cycle(&mut f.machine, &module, &mut || false).expect("cycled");
+        // Interrupt on the first pass, as the pump does when input is waiting.
+        // One poll dispatched, 99 of the budget left, so `dopoll` re-armed --
+        // a status is queued when the refill below runs. `&mut || false` here
+        // would drain the whole budget and leave nothing armed to guard.
+        let _ = f.host.cycle(&mut f.machine, &module, &mut || true).expect("cycled");
         f.host.refill_polls(&mut f.machine, 100).expect("refilled while armed");
 
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(gsbl::Gsbl::POLSTS));
