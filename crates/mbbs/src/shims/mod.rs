@@ -591,7 +591,8 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "pltile", memory::pltile, Cleans::Caller,
          Evidence::VendorBody("SRC/api/galme/galfoman/PROTSTUF.C")),
         (MAJORBBS, "alczer", memory::alczer, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "galfree", memory::galfree, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "galfree", memory::galfree, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/GALMEMDB.C")),
         (MAJORBBS, "farcoreleft", memory::farcoreleft, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "setmem", memory::setmem, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "movmem", memory::movmem, Cleans::Caller, Evidence::Unclassified),
@@ -1151,7 +1152,45 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // Allocation. `alcblok`/`ptrblok`/`freblok` are NOT here -- the two
         // vendor branches have structurally different headers, so they are
         // ABI-concrete in both native tables below.
-        (MAJORBBS, "galmalloc", memory::galmalloc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "galmalloc", memory::galmalloc, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/GALMEMDB.C")),
+        // Three same-slot renames across the MAJORBBS generations, from
+        // `re/ordinal-renames.tsv`: mbbs625 exported `_MALLOC` @400, `_FREE`
+        // @230 and `_BGNEDT` @88 where wg101/wg2 export `_GALMALLOC`,
+        // `_GALFREE` and `_OLDBGNEDT` at the same ordinals. One export slot,
+        // two names, so one body each -- no new code, and
+        // `tests/ordinal_identity.rs` holds them to it.
+        //
+        // These are the four ordinals `Host::load` reports as
+        // `AmbiguousProfile` when two admissible generations disagree, which
+        // is how they were found: the discriminator list and the rename list
+        // are the same data seen from two directions.
+        // `Unclassified`, not `VendorBody`, and `evidence_manifest.rs` is why:
+        // `GALMEMDB.C` defines `galmalloc` and `galfree`, not `malloc` and
+        // `free`, so citing it under these names is a claim the manifest
+        // cannot confirm -- and it refused. The body is cited on the
+        // `galmalloc`/`galfree` rows, which are the names the vendor file
+        // actually spells; these two are the same slot's other spelling and
+        // carry the argument in this comment instead.
+        //
+        // The `Evidence` taxonomy has no class for "same export slot, body
+        // cited under its other name". `Guessed` would be wrong -- nothing
+        // here is guessed -- and `VendorBody` is unconfirmable, so this is the
+        // honest remaining option.
+        (MAJORBBS, "malloc", memory::galmalloc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "free", memory::galfree, Cleans::Caller, Evidence::Unclassified),
+        // `bgnedt` is NOT registered here, and `nothing_is_in_two_tables_at_once`
+        // is what said so: it is already served as a `PTR` global
+        // (`globals.rs`, `g("bgnedt", PTR)`). `MAJORBBS.H:73` declares it
+        // `EXPWGSF(INT,bgnedt)(...)` -- the WGServer *function* macro, which
+        // under NT makes the export a function POINTER a module calls
+        // indirectly rather than a routine it calls directly. So the slot is
+        // covered, by the other table.
+        //
+        // Worth a look one day that `oldbgnedt`, the same ordinal's other
+        // name, is a routine while this one is a datum. Not churned here:
+        // both currently resolve, and deciding which shape @88 really has
+        // needs a module that calls it.
         (MAJORBBS, "sizmem", memory::sizmem, Cleans::Caller, Evidence::Unclassified),
         // Borland's runtime, re-exported through MAJORBBS. `_fgetc` points at
         // `stream::fgetc` deliberately: Borland's `_fgetc` is
@@ -1421,6 +1460,14 @@ const CRT_SHARED: &[&str] = &[
     "rmdir", "setvbuf", "tell", "unlink", "write",
     // The environment.
     "getenv",
+    // The heap. Borland's `malloc`/`free` and Galacticomm's
+    // `galmalloc`/`galfree` are different allocators in the vendor's world --
+    // `GALMEMDB.C` is `alcmem` plus two debug counters -- but this host has
+    // exactly one heap (`crate::heap`), so there is no second thing for
+    // Borland's spelling to allocate out of. Serving both names from it is the
+    // only answer available; the alternative is that 117 of the archive's
+    // binaries cannot resolve an allocator at all.
+    "malloc", "free",
     // Random numbers.
     "rand", "srand",
     // Time. `dostounix`, `getdate`, `getftime` and `gettime` are Borland

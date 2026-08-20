@@ -16,11 +16,18 @@
 //!
 //! # The ordinal space, and the trap in it
 //!
-//! `re/ordinal-renames.tsv` is derived from the MAJORBBS ordinal space as
-//! numbered by MAJORBBS (mbbs625/wg101/wg2) against the *same* space as
-//! numbered by the wg2-era `WGSERVER` import library. Those two really are one
-//! numbering -- `__WRITE` is `@48` in both -- and 38 slots carry different
-//! names between them.
+//! `re/ordinal-renames.tsv` holds two comparisons, both **within a single
+//! numbering**. First, the MAJORBBS space as numbered by MAJORBBS (wg2) against
+//! the same space as numbered by the wg2-era `WGSERVER` import library: those
+//! two really are one numbering -- `__WRITE` is `@48` in both -- and 38 slots
+//! differ. Second, the MAJORBBS generations against each other, where six more
+//! do: `free`/`galfree` at `@230`, `malloc`/`galmalloc` at `@400`,
+//! `bgnedt`/`oldbgnedt` at `@88` and three others.
+//!
+//! That second set is the same four ordinals `Host::load` reports as
+//! `AmbiguousProfile` when two admissible generations disagree, plus two more.
+//! The discriminator list and the rename list are one dataset seen from two
+//! directions, and only one of them was being read.
 //!
 //! The committed `wgserver_wg300`/`wg312`/`wg33` tables are a **different**
 //! space and must never be merged with these: `@48` is `_FFLUSH` there and
@@ -120,7 +127,11 @@ fn renames() -> Vec<(String, u16, String, String)> {
             continue;
         }
         let f: Vec<&str> = line.split('\t').collect();
-        assert_eq!(f.len(), 4, "every row is library/ordinal/name/name: {line:?}");
+        assert_eq!(
+            f.len(),
+            5,
+            "every row is library/ordinal/name/name/source: {line:?}"
+        );
         out.push((
             f[0].to_owned(),
             f[1].parse().expect("ordinal is a number"),
