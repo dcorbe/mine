@@ -186,7 +186,9 @@ use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
+use crate::clock::Civil;
 use crate::fmt::{Spec, integer};
+use crate::shims::text::at;
 use crate::shims::{ShimError, sign_extend};
 use crate::stream::Whence;
 
@@ -1928,6 +1930,627 @@ pub fn write<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     // The logical count `WRITE.C` promises, not `physical.len()` -- see this
     // routine's own doc comment.
     Ok(abi::Ret::Int(A::int_from_u32(raw.len() as u32)))
+}
+
+/// `int _read(int handle, void *buf, unsigned len)` -- read `len` bytes
+/// **without** the text-mode translation [`read`] applies.
+///
+/// `SOURCE/RTL/SOURCE/IO/COMMON16/READ.CAS`'s own doc comment: "`_read` is a
+/// direct call to the MS-DOS read system call. For a file opened in text
+/// mode, `read` removes carriage returns and reports end-of-file when a
+/// Ctrl-Z character is read. No such removal or reporting is performed by
+/// `_read`." The internal name is `__read` -- "NOTE: This function is named
+/// `__read` for internal library use. The user entry point is in
+/// `readu.asm`" -- which is the public `read` [`read`] already serves; the
+/// two-underscore/one-underscore pair here is the same shape
+/// [`doserror`]'s own doc comment measures for `__DOSERROR`/`_ERROR`, and the
+/// same *kind* of pair (one routine wrapping a second, undecorated one) this
+/// file's own module doc already establishes for `_fgetc`/`fgetc` --
+/// except that here the two routines genuinely behave differently, the way
+/// [`_write`]'s own doc comment explains `write`/`_write` do.
+///
+/// # Standard handles: raw, faithfully
+///
+/// For handle `0` (stdin -- see [`read`]'s own doc comment for why that is
+/// this host's one real source for it), this always reads through
+/// [`read_from`] with `binary` forced `true`, bypassing
+/// `host.stdio_modes[0]` entirely -- exactly what "no such removal... is
+/// performed by `_read`" means: unlike [`setmode`], a handle's text/binary
+/// mode is not even consulted here.
+///
+/// # A raw descriptor from `open`/`creat`/`fileno` is refused, not faked
+///
+/// A genuinely raw read of a descriptor `open`/`creat`/`fileno(fopen(...))`
+/// issued would need to bypass [`crate::stream::Streams::read_fd`]'s own
+/// translation the way [`_write`] bypasses [`crate::stream::Streams::write_fd`]'s
+/// through [`crate::stream::Streams::write_raw_fd`] -- but `Streams` has no
+/// `read_raw_fd` (nor does the private `Stream` type it wraps have a
+/// `read_raw` beside its own `write_raw`), and this file cannot add one
+/// (`stream.rs` is out of its scope; see this file's own module doc). Unlike
+/// `write`'s translation, which happens to the bytes as they go *out* and can
+/// be skipped by writing raw bytes to the same `File`, `read`'s translation
+/// (`\r`-squeeze, soft `^Z` end-of-file) happens as bytes come *off* the
+/// file and changes how many physical bytes one logical byte costs -- there
+/// is no way to reconstruct the raw run from what a translating read already
+/// consumed. Rather than hand back bytes this host cannot promise are the
+/// physical ones DOS's own `AH=3Fh` would have handed back, this refuses and
+/// names exactly the missing capability, per this crate's "diagnosable
+/// failure beats a wrong answer that looks like data" rule.
+///
+/// # Errors
+///
+/// If `handle` is a descriptor `open`/`creat`/`fileno` issued (see above); if
+/// `handle` is not `0` among the five standard ones (see [`read`]'s own doc
+/// comment for why only stdin is open for reading here); if the physical
+/// read fails; if `buf` does not resolve.
+///
+/// Registers as `_read` -- raw import `__READ`, `MAJORBBS.DEF`'s own internal-
+/// RTL-helper cluster (this file's own module doc: "`__OPEN`, `__READ`,
+/// `__CLOSE`, `__CREAT`"), `c_name` strips exactly one leading underscore.
+pub fn _read<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `int _read(int handle, void *buf, unsigned len)` -- Borland's; no
+    // Galacticomm header redeclares it.
+    let handle = sign_extend::<A>(call.int().into());
+    let buf = call.ptr();
+    let len = Into::<u32>::into(call.int()) as usize;
+
+    if descriptor(handle).is_some() {
+        return Err(ShimError::Failed(format!(
+            "_read({handle}, .., {len}): this host has no untranslated read for a \
+             descriptor from open/creat/fileno -- Streams::read_fd (and the Stream::read \
+             it calls) always applies that handle's own text-mode translation, and there is \
+             no Streams::read_raw_fd/Stream::read_raw counterpart to write_raw_fd/write_raw \
+             for _read to call instead. See this routine's own doc comment"
+        )));
+    }
+
+    let idx = standard_handle(handle)?;
+    if idx != 0 {
+        return Err(ShimError::Failed(format!(
+            "_read({handle}, ...): only handle 0 (stdin) is open for reading on this host"
+        )));
+    }
+
+    // Always raw, whatever `host.stdio_modes[0]` says -- see this routine's
+    // own doc comment for why `_read` does not even consult it.
+    let bytes = read_from(&mut std::io::stdin(), len, true)
+        .map_err(|e| ShimError::Failed(format!("_read(0, ...): {e}")))?;
+
+    buf.write(call.mem(), &bytes)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::int_from_u32(bytes.len() as u32)))
+}
+
+/// `char *strrchr(const char *s, int c)` -- the last occurrence of `c` in
+/// `s`, scanning backward.
+///
+/// `SOURCE/RTL/SOURCE/CSTRINGS/COMMON16/STRRCHR.C`, in full for the body:
+///
+///
+/// # The terminator is scanned too, same as `strchr`
+///
+/// "The null-terminator is considered to be part of the string" (the same
+/// file's own doc comment) -- the loop starts at `s + strlen(s) + 1` and its
+/// first `--ss` lands on the terminator itself, so `strrchr(s, 0)` answers a
+/// pointer to it rather than `NULL`, exactly the rule
+/// [`crate::shims::text::strchr`]'s own doc comment already gives for the
+/// forward search (a different routine -- MAJORBBS's own ordinal export, not
+/// this Borland one -- reaching the identical rule from the other direction).
+///
+/// # Only the low byte of `c` counts
+///
+/// `(char)c` truncates whatever full `int` the caller passed, the same
+/// narrowing `strchr`'s own doc comment measures off its assembly
+/// (`mov bl,[bp+0xa]`) for the identical argument shape.
+///
+/// Registers as `strrchr` -- `_STRRCHR`, one leading underscore.
+pub fn strrchr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `char *strrchr(const char *s, int c)` -- Borland's; no Galacticomm
+    // header redeclares it.
+    let s = call.ptr();
+    let want = Into::<u32>::into(call.int()) as u8;
+    let text = s
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    // `i` runs from `strlen(s) + 1` down to `1` in the source above, and each
+    // iteration looks at `s[i-1]` -- the terminator when `i-1 == text.len()`,
+    // a real byte otherwise. Walked here as a plain reverse range over the
+    // same indices for the same effect.
+    for i in (0..=text.len()).rev() {
+        let byte = if i == text.len() { 0u8 } else { text[i] };
+        if byte == want {
+            return Ok(abi::Ret::Ptr(at::<A>(s, i)?));
+        }
+    }
+    Ok(abi::Ret::Ptr(A::null_ptr()))
+}
+
+/// `void *memchr(const void *s, int val, size_t n)` -- the first byte in the
+/// first `n` bytes of `s` equal to `val`'s low byte, or `NULL`.
+///
+/// `SOURCE/RTL/SOURCE/CSTRINGS/COMMON16/MEMCHR.CAS`, the assembly translated
+/// straight rather than reproduced instruction by instruction:
+///
+/// ```text
+/// mov cx, n
+/// jcxz mch_NULL        -- n == 0 answers NULL without touching *s at all
+/// mov al, val
+/// repne scasb           -- scan up to cx bytes for al, stop on the first hit
+/// je mch_OK             -- found: answer the address just past it, minus one
+/// mch_NULL: ...          -- not found (or n == 0): NULL
+/// ```
+///
+/// # `n == 0` never resolves `s`
+///
+/// `jcxz` is checked before the scan loop even starts, so a zero-length call
+/// answers `NULL` without this host reading `s` either -- a `memchr(p, c, 0)`
+/// with a `p` this host could not otherwise resolve is not an error, matching
+/// the assembly's own order of checks.
+///
+/// Registers as `memchr` -- `_MEMCHR`, one leading underscore.
+///
+/// # Errors
+///
+/// If `n` is nonzero and `s` does not resolve for `n` bytes.
+pub fn memchr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `void *memchr(const void *s, int val, size_t n)` -- Borland's; no
+    // Galacticomm header redeclares it.
+    let s = call.ptr();
+    let want = Into::<u32>::into(call.int()) as u8;
+    let n = Into::<u32>::into(call.int()) as usize;
+
+    if n == 0 {
+        return Ok(abi::Ret::Ptr(A::null_ptr()));
+    }
+
+    let bytes = s
+        .resolve(call.mem(), n)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    match bytes.iter().position(|&b| b == want) {
+        Some(i) => Ok(abi::Ret::Ptr(at::<A>(s, i)?)),
+        None => Ok(abi::Ret::Ptr(A::null_ptr())),
+    }
+}
+
+/// `int rmdir(const char *pathname)` -- remove an empty directory of the
+/// module's own.
+///
+/// `SOURCE/RTL/SOURCE/IO/COMMON16/RMDIR.CAS`: `mov ah, 03Ah; int 021h` -- DOS
+/// `AH=3Ah` "Remove Directory", which the source's own doc comment says fails
+/// if the directory is not empty, is the current directory, or is the root.
+/// `0` on success, `-1` on any failure (`errno` set to `EACCES` or `ENOENT`).
+///
+/// # Every filesystem failure is `-1`, matching [`crate::shims::ftf::mkdir`]'s
+/// own established rule for the identical DOS contract
+///
+/// `mkdir`'s own doc comment already settles this for its side of the same
+/// pair: DOS's `mkdir`/`rmdir` are both two-value contracts (`0` or `-1`),
+/// and every reason `std::fs::remove_dir` can fail (not empty, not there,
+/// permission denied) collapses into the one value a module built around
+/// that contract already expects -- not a host-level [`ShimError::Failed`].
+/// The one exception, again matching `mkdir`, is [`Host::dos_name`] refusing
+/// the path outright: that is not an answer DOS could ever have given.
+///
+/// Paths go through [`Host::dos_name`]/[`Host::find`], the same sandbox
+/// [`crate::shims::ftf::mkdir`] and every other file routine in this crate
+/// use.
+///
+/// Registers as `rmdir` -- `_RMDIR`, one leading underscore.
+///
+/// # Errors
+///
+/// If the path escapes the module's own directory ([`Host::dos_name`]'s
+/// rule), or if reading `pathname` out of module memory fails.
+pub fn rmdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `int rmdir(const char *pathname)` -- Borland's; no Galacticomm header
+    // redeclares it.
+    let path = call.ptr();
+    let named = String::from_utf8_lossy(
+        path.read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+    let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
+
+    let Some(at) = host.find(&name) else {
+        // Not there at all -- `ENOENT`, the same `-1` every other failure
+        // here answers. See this routine's own doc comment.
+        return Ok(minus_one::<A>());
+    };
+
+    match std::fs::remove_dir(&at) {
+        Ok(()) => Ok(abi::Ret::Int(A::Int::from(0u16))),
+        // Not empty, permission denied, or anything else DOS's own two-value
+        // contract was always going to collapse into `-1` regardless of
+        // which it was -- see this routine's own doc comment.
+        Err(_) => Ok(minus_one::<A>()),
+    }
+}
+
+/// `int setvbuf(FILE *stream, char *buf, int type, size_t size)` -- ask for
+/// a stream's buffering to change.
+///
+/// `SOURCE/RTL/SOURCE/IO/COMMON16/SETVBUF.C`'s own doc comment: `type` is one
+/// of `_IOFBF` (0, fully buffered), `_IOLBF` (1, line buffered) or `_IONBF`
+/// (2, unbuffered); "setvbuf returns 0 on success. It returns non-zero if an
+/// invalid value is given for type or size... setvbuf returns 0 on success,"
+/// and the source's own check is exactly `fp->token != (short)fp ||
+/// _IONBF < type || 0x7fff < size` -- an invalid `stream`, a `type` outside
+/// `0..=2`, or a `size` above `0x7fff` all answer `EOF` (`-1`).
+///
+/// # This host does no buffering to configure
+///
+/// Every stream in this crate already goes straight to its underlying `File`
+/// on every `fread`/`fwrite`/`fgetc`/`fputc` -- there is no
+/// [`crate::stream::Streams`]-level buffer `setvbuf` could hand a caller's
+/// block to, allocate one into, or switch off. What survives here is the
+/// part of the contract that is genuinely observable regardless: whether the
+/// call succeeds or is refused for a bad `stream`/`type`/`size`. This is not
+/// a smaller lie than answering `0` unconditionally would be -- it is the
+/// whole of what a module compiled against this host's I/O model could ever
+/// check, since nothing here ever reads slower or faster for having "called"
+/// `setvbuf` one way or another.
+///
+/// `buf` itself is read from the call (to consume the right number of
+/// arguments) and otherwise unused, the same as `open`'s and `creat`'s own
+/// ignored DOS permission argument.
+///
+/// # Errors
+///
+/// If `stream` names no open stream (this host's own stand-in for
+/// `fp->token != (short)fp`, a validity check this host has no `FILE.token`
+/// field to reproduce byte for byte); if reading either pointer argument
+/// fails.
+///
+/// Registers as `setvbuf` -- `_SETVBUF`, one leading underscore.
+pub fn setvbuf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `int setvbuf(FILE *stream, char *buf, int type, size_t size)` --
+    // Borland's; no Galacticomm header redeclares it.
+    const IOFBF: u32 = 0;
+    const IONBF: u32 = 2;
+
+    let cookie = call.ptr();
+    let _buf = call.ptr();
+    let kind = Into::<u32>::into(call.int());
+    let size = Into::<u32>::into(call.int());
+
+    host.streams
+        .name(cookie)
+        .map_err(|e| ShimError::Failed(format!("setvbuf: {e}")))?;
+
+    if kind < IOFBF || kind > IONBF || size > 0x7fff {
+        // `EOF` -- see this routine's own doc comment for the source's exact
+        // check.
+        return Ok(minus_one::<A>());
+    }
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// `char *getcwd(char *buf, int n)` -- the module's own current directory,
+/// drive letter included.
+///
+/// `SOURCE/RTL/SOURCE/IO/COMMON16/GETCWD.C`, in full for the shape (the
+/// three-byte drive prefix, then the working directory, then the length
+/// check against `n`):
+///
+///
+/// # This host's current directory is always [`Host::root`] itself
+///
+/// `crate::shims::tfscan`'s own module doc already establishes the reading
+/// this routine inherits: "'The current directory' is `Host::root`" -- and
+/// nothing in this crate implements a `chdir`, so there is no second
+/// directory a module could ever have moved into. `getcurdir(0, ...)` -- "the
+/// path relative to the root, for the current drive" -- therefore always
+/// answers empty here, and the whole path is always exactly three bytes,
+/// `"X:\"`, plus the terminator.
+///
+/// # The drive letter is not tracked anywhere and `C` is a documented guess
+///
+/// This host has no [`Host`] field recording which DOS drive letter a board
+/// was installed under (nothing else in this crate ever needs one --
+/// [`searchpath`]'s own doc comment reads `Host::root` as both the current
+/// directory and the whole `PATH`, never as a lettered drive). Every
+/// MajorBBS/Worldgroup install this repo's own archive documents put the
+/// board on `C:\`, and this is that convention, disclosed rather than
+/// silently asserted as measured: if a genuine board ever ran from another
+/// drive, this answers the wrong letter, and there is nothing this host
+/// currently tracks that could answer better.
+///
+/// # `buf == NULL` allocates, mirroring `getenv`'s established heap pattern
+///
+/// Same [`crate::heap::Heap::reserve`] call [`getenv`]/[`searchpath`] already
+/// use for an answer with no caller-supplied home.
+///
+/// # `n` too small for the answer is `NULL`, not a refusal
+///
+/// `GETCWD.C`'s own `errno = ERANGE; return NULL` -- a documented outcome a
+/// module tests for, the same category [`getenv`]'s own doc comment already
+/// argues NULL-for-absence belongs in rather than among this crate's stops.
+///
+/// # Errors
+///
+/// If `buf` is non-NULL and the write to it fails; if `buf` is NULL and the
+/// module's heap cannot give up a block of `n` bytes.
+///
+/// Registers as `getcwd` -- `_GETCWD`, one leading underscore.
+pub fn getcwd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `char *getcwd(char *buf, int n)` -- Borland's; no Galacticomm header
+    // redeclares it.
+    let buf = call.ptr();
+    let n = sign_extend::<A>(call.int().into());
+
+    // `"C:\"` plus the terminator -- see this routine's own doc comment for
+    // why the drive letter is `C` and why there is never anything past the
+    // backslash.
+    let mut text = b"C:\\".to_vec();
+    text.push(0);
+
+    if n < 0 || (text.len() as i64) > i64::from(n) {
+        // `ERANGE` -- a documented answer, not a refusal. See this routine's
+        // own doc comment.
+        return Ok(abi::Ret::Ptr(A::null_ptr()));
+    }
+
+    let is_null = A::ptr_to_bytes(buf).iter().all(|&b| b == 0);
+    let dest = if is_null {
+        host.heap
+            .reserve(call.mem(), text.len() as u16)
+            .map_err(|e| ShimError::Failed(format!("getcwd: {e}")))?
+    } else {
+        buf
+    };
+    dest.write(call.mem(), &text)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Ptr(dest))
+}
+
+/// `struct tm *localtime(const time_t *timer)` -- `*timer`, broken down to
+/// this host's own local time.
+///
+/// `INCLUDE/TIME.H:52-63`, the field order this writes, all plain `int`s (so
+/// `A::INT_WIDTH` bytes each, not a fixed two):
+///
+///
+/// # Built on [`crate::clock::Civil`], the same conversion `gettime`/`now`/
+/// `today`/`time` already share
+///
+/// `*timer` is a UTC `time_t` (Borland's own is always a 32-bit `long`,
+/// independent of this ABI's own `int` width -- read here as four raw bytes
+/// through the pointer rather than through [`Call::long`], which would read
+/// it from the wrong place: an *argument*, not memory `timer` points at).
+/// [`Civil::from_local_epoch`] wants a *local* epoch second, so this adds
+/// [`crate::clock::Clock::offset`] first -- exactly what
+/// [`crate::clock::Clock::civil`] does internally for "now"; this is that
+/// same arithmetic applied to a caller-supplied instant instead of the
+/// current one.
+///
+/// `tm_mon` is zero-based and `tm_year` is years since 1900 -- `Civil`'s own
+/// module doc names both of these as exactly the reasons it keeps its own,
+/// human field order instead, so the translation happens once, here, at the
+/// `struct tm` boundary rather than leaking into `Civil` itself.
+///
+/// # `tm_wday`/`tm_yday` are derived, not invented
+///
+/// Days since the epoch for local midnight on `*timer`'s own date comes back
+/// out of [`Civil::to_local_epoch`] -- the exact inverse of
+/// `from_local_epoch` -- rather than a second calendar routine: 1970-01-01
+/// was a Thursday, so `tm_wday` is `(days % 7 + 7 + 4) % 7` (`+7` to keep a
+/// negative `days.rem_euclid`-style remainder in range before the final
+/// modulus); `tm_yday` is the same days-since-epoch difference between
+/// `*timer`'s own midnight and that year's own January 1st midnight, both
+/// computed the same way. Two calls to already-tested code, not a second
+/// implementation of the calendar.
+///
+/// # `tm_isdst` is `-1`, "information is not available"
+///
+/// [`crate::clock::Clock`]'s own module doc: a clock's offset is filled in
+/// once (`tm_gmtoff` at [`crate::clock::Clock::system`] construction, or a
+/// pinned test's own explicit choice) and never adjusted for a daylight
+/// boundary crossed since. This host genuinely has no DST information to
+/// report, and ISO C's own documented meaning for a *negative* `tm_isdst` is
+/// exactly "the information is not available" -- distinct from `0`
+/// ("standard time is in effect"), which would be a specific, unverified
+/// claim this host cannot back up.
+///
+/// # Address stability: not attempted, matching every sibling in this file
+///
+/// A fresh [`crate::heap::Heap::reserve`] cell per call, the same compromise
+/// [`localeconvention`]/[`errno`]/[`searchpath`] already make and disclose
+/// for the identical "no pre-reserved `Host<A>` slot" reason.
+///
+/// Registers as `localtime` -- `_LOCALTIME`, one leading underscore.
+///
+/// # Errors
+///
+/// If `timer` does not resolve for four bytes; if the host's clock cannot
+/// say what its own offset is; if the resulting date is not one
+/// [`Civil::to_local_epoch`] can round-trip (both calls here use `Civil`
+/// fields this same routine just derived from a successful
+/// [`Civil::from_local_epoch`], so this is not expected to fail in practice);
+/// if the module's heap cannot give up a block for the answer.
+pub fn localtime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `struct tm *localtime(const time_t *timer)` -- Borland's; no
+    // Galacticomm header redeclares it.
+    let timer_ptr = call.ptr();
+    let raw = timer_ptr
+        .resolve(call.mem(), 4)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&raw[..4]);
+    // `time_t` is signed; DOS-era values never go negative in practice, but
+    // reading it that way costs nothing and is not wrong the way reading it
+    // unsigned would be for one that did.
+    let epoch = i32::from_le_bytes(bytes);
+
+    let offset = host.clock().offset();
+    let civil = Civil::from_local_epoch(i64::from(epoch) + i64::from(offset));
+
+    // Local midnight on `civil`'s own date, as an epoch second -- the shared
+    // basis for both `tm_wday` and `tm_yday` below. See this routine's own
+    // doc comment.
+    let midnight = Civil { hour: 0, minute: 0, second: 0, ..civil };
+    let midnight_epoch = midnight
+        .to_local_epoch()
+        .map_err(|e| ShimError::Failed(format!("localtime: {e}")))?;
+    let days_since_epoch = midnight_epoch.div_euclid(86_400);
+    // 1970-01-01 was a Thursday -- weekday index 4, Sunday == 0.
+    let wday = (days_since_epoch.rem_euclid(7) + 4).rem_euclid(7) as i32;
+
+    let january_first = Civil {
+        year: civil.year,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+    };
+    let january_first_epoch = january_first
+        .to_local_epoch()
+        .map_err(|e| ShimError::Failed(format!("localtime: {e}")))?;
+    let yday = ((midnight_epoch - january_first_epoch) / 86_400) as i32;
+
+    let width = A::INT_WIDTH;
+    let fields = [
+        civil.second as i32,
+        civil.minute as i32,
+        civil.hour as i32,
+        civil.day as i32,
+        civil.month as i32 - 1,
+        civil.year - 1900,
+        wday,
+        yday,
+        -1i32,
+    ];
+    let mut image = Vec::with_capacity(width * fields.len());
+    for v in fields {
+        image.extend_from_slice(&v.to_le_bytes()[..width]);
+    }
+
+    let at = host
+        .heap
+        .reserve(call.mem(), image.len() as u16)
+        .map_err(|e| ShimError::Failed(format!("localtime: {e}")))?;
+    at.write(call.mem(), &image)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Ptr(at))
+}
+
+/// `int creattemp(char *fname, int attrib)` -- create a file with a unique
+/// name under the directory `fname` already names, write that full name back
+/// into `fname`, and answer a raw handle onto it.
+///
+/// Galacticomm's own, not Borland's: `re/wg33src/INC/GCOMM.H:60` (`INT
+/// creattemp(CHAR *,INT);`), exported by the host itself at ordinal 46
+/// (`re/wg33src/LIB/WGSERVER.DEF:53`, `re/wg33src/SRC/server/wgserver/WGSERVER.DEF:53`:
+/// `_creattemp @46`) -- `WGSERVER.EXE`/`MAJORBBS.EXE` is the *host*
+/// (`docs/majorbbs-host-binary-found.md`), not a module, so there is no
+/// module SDK source to decompile it from, and none survives in either wg33
+/// tree.
+///
+/// # The in/out buffer contract is measured off three real call sites, not guessed
+///
+/// `re/wg33src/SRC/api/galmhs/GALMHS.C:516-521`:
+///
+///
+/// `outnam` holds a **directory**, with its own trailing separator already
+/// appended by the caller, when `creattemp` is called. Immediately after, the
+/// same variable is reopened by name (`fopen(outnam, ...)`) -- so
+/// `creattemp` **appended a generated filename onto the buffer it was given**
+/// and left the *complete* path there for the caller to reuse.
+/// `re/wg33src/SRC/api/galmhs/inpost/INPOST.C:174` and
+/// `re/wg33src/SRC/api/galmhs/outpost/OUTPOST.C:380` are the same shape again
+/// (`creattemp(dstfil,0)`/`creattemp(sfname,0)`, both prefixed from a `*dir`
+/// variable immediately before the call, both reopened by name afterward).
+///
+/// # The generated name itself has no oracle, and is disclosed rather than hidden
+///
+/// No copy of `creattemp`'s own body survives anywhere this repo has
+/// recovered -- the same gap [`lrand`]'s own doc comment names for a
+/// different routine, and answered the same way this crate's own scope rule
+/// prescribes for it ("a documented best-effort body, not a citation to a
+/// source that does not exist"): an 8.3-safe name, `TM` followed by four hex
+/// digits drawn from [`Host::random`] and a `.TMP` extension, retried against
+/// [`Host::find`] until one is not already there. The three measured call
+/// sites only ever check the *handle*, never the generated spelling, so
+/// nothing measured is at stake in this choice -- only the *contract*
+/// (directory in, full path out, a working handle) is drawn from evidence.
+///
+/// # Sandboxed and created the same way [`creat`] is
+///
+/// [`resolve_for_open`]/[`Host::dos_name`], [`mode_from_oflags`] at
+/// `O_WRONLY|O_CREAT|O_TRUNC` and [`crate::stream::Streams::open_raw`] --
+/// `creattemp`'s own effect ("make a new file, ready to write") is exactly
+/// `creat`'s, aimed at a name this routine picked rather than one the caller
+/// did. The DOS attribute argument (`attrib`) is read and ignored, the same
+/// as [`open`]'s and [`creat`]'s own.
+///
+/// # Errors
+///
+/// If the directory in `fname` escapes the module's own directory
+/// ([`Host::dos_name`]'s rule); if no unused name under that prefix can be
+/// found in a bounded number of tries; if the create itself fails; if
+/// writing the final name back into `fname` fails.
+///
+/// Registers as `_creattemp` -- one leading underscore
+/// (`WGSERVER.DEF:53`).
+pub fn creattemp<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `int creattemp(char *fname, int attrib)` -- Galacticomm's; declared in
+    // `GCOMM.H`, not Borland's runtime.
+    let fname_ptr = call.ptr();
+    let _attrib = call.int();
+
+    let prefix = String::from_utf8_lossy(
+        fname_ptr
+            .read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+
+    // See this routine's own doc comment for why this spelling and not
+    // another: no surviving source names one, so this is disclosed as an
+    // invented (but retried-until-free) name rather than a measured one.
+    const ATTEMPTS: u32 = 4096;
+    for _ in 0..ATTEMPTS {
+        let suffix = host.random.rand();
+        let candidate = format!("{prefix}TM{suffix:04X}.TMP");
+        let probe = Host::<Wg16>::dos_name(&candidate).map_err(ShimError::Failed)?;
+        if host.find(&probe).is_some() {
+            continue;
+        }
+
+        let Some((name, at)) = resolve_for_open(host, &candidate, true)? else {
+            // `resolve_for_open` never answers `None` when `creating` is
+            // `true` (see its own doc comment); kept rather than
+            // `unreachable!` so a future change to that contract fails here
+            // loudly instead of panicking.
+            continue;
+        };
+        let mode = mode_from_oflags(oflag::WRONLY | oflag::CREAT | oflag::TRUNC)
+            .map_err(|e| ShimError::Failed(format!("creattemp({prefix}): {e}")))?;
+        let fd = host
+            .streams
+            .open_raw(&name, &at, mode)
+            .map_err(|e| ShimError::Failed(format!("creattemp({prefix}): {e}")))?;
+
+        // Mutates the caller's own buffer in place -- the whole contract
+        // every measured call site depends on (`GALMHS.C:521` reopens
+        // `outnam` immediately after this call). See this routine's own doc
+        // comment.
+        let mut full = candidate.into_bytes();
+        full.push(0);
+        fname_ptr
+            .write(call.mem(), &full)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+        return Ok(abi::Ret::Int(A::int_from_u32(u32::from(fd))));
+    }
+
+    Err(ShimError::Failed(format!(
+        "creattemp({prefix}): could not find an unused temp name under this prefix in \
+         {ATTEMPTS} tries"
+    )))
 }
 
 #[cfg(test)]

@@ -163,6 +163,32 @@ const fn s(name: &'static str, size: u16) -> Global {
     }
 }
 
+/// `GALMSG` has no constructor here, and one symbol is the reason it stays
+/// that way.
+///
+/// `GALMSG!msgbyts` is the sole missing import of `CHRGAME.DLL` (six call
+/// sites), and it is **data**: `SRC/apps/galmsg/AAEFU.C:37` declares
+/// `UINT msgbyts; /* max msg text size (backward compat.) */`, exported as
+/// `_MSGBYTS @17` in `LIB/wg2/GALMSG.DEF:8`. A module reads it through its own
+/// fixup and never executes a `CALL`, so registering it in
+/// [`crate::shims::routines`] as an [`Entry::Routine`](crate::shims::Entry)
+/// would be a check that cannot fail: the import stops being reported as
+/// missing while the address the module actually reads is still unplaced. That
+/// trade -- a survey that goes quiet without the behaviour changing -- is
+/// worse than the gap.
+///
+/// Placing it as a [`Global`] would be the right *shape*, and it is still not
+/// done, because the value is `txtlen()` (`AAEFU.C:78`) out of GALME's own VDA
+/// text-sizing subsystem (`SRC/api/galme/GMEUTL.C:46`), which this host does
+/// not implement. `inimsg`'s `mxmssz` is a tempting stand-in and is a
+/// different subsystem's number -- GCOMM's shared `rawmsg` buffer, not GALME's
+/// `txtlen` -- so using it would be the plausible-looking answer this crate
+/// refuses to hand out.
+///
+/// So `CHRGAME.DLL` fails to load naming `msgbyts`, which is the honest state:
+/// a diagnosable refusal over an invented address. Adding a `GALMSG`
+/// constructor is a two-line change the day `txtlen` has a real answer.
+///
 /// A `GALME` global -- the Messaging Engine's.
 const fn m(name: &'static str, size: u16) -> Global {
     Global {

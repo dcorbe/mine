@@ -80,11 +80,11 @@ use super::ShimError;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
 
-/// The answer both routines give: yes.
+/// The answer every routine in this file (and [`rtstcrd`]) gives: yes.
 ///
-/// Named because `Ret::U16(1)` at two call sites is two magic numbers, and
-/// because the thing worth writing down is not the value but that it is the
-/// same value for both and never computed.
+/// Named because `Ret::U16(1)` at several call sites is several magic
+/// numbers, and because the thing worth writing down is not the value but
+/// that it is the same value for all of them and never computed.
 const YES: u16 = 1;
 
 /// `int otstcrd(int unum, long amt, int real)` -- can this user spare `amt`
@@ -143,6 +143,53 @@ pub fn odedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
         .terms()
         .chan(unum)
         .ok_or_else(|| ShimError::Failed(format!("odedcrd({unum}): there is no such channel")))?;
+    Ok(abi::Ret::Int(A::Int::from(YES)))
+}
+
+/// `int rtstcrd(long amt)` -- does the *current* user have `amt` **real**
+/// credits to spare? `ACCOUNT.C:582-586` in the wg1 archive
+/// (`archive/galacticomm/extract/wg1/GALDSRC/SRC/ACCOUNT.C`); the identical
+/// body is also in `re/wg33src/SRC/server/wgserver/ACCOUNT.C:572-577`:
+///
+///
+/// **[`crate::shims::credit::tstcrd`] with `real` set, and the same answer
+/// for the same reason** -- exactly the relationship
+/// [`crate::shims::credit::rdedcrd`] has to `dedcrd`, which is the precedent
+/// this follows (see that pair's own doc comments in `credit.rs`). `tstcrd`
+/// passes `real=0` to `ltstcrd`; `rtstcrd` passes `real=1`. That argument
+/// selects whether a class's debt limit and `CRDXMT` credit-exemption
+/// (`USRACC.H:124`, cited on this module's own doc comment) are allowed to
+/// make a shortfall pass anyway -- a distinction between two ledgers this
+/// host does not keep, the same reasoning [`otstcrd`]'s own doc comment gives
+/// for its `real` argument. With no balance, no class table and no debt limit
+/// behind either call, the distinction has nothing left to distinguish, so
+/// both answer yes.
+///
+/// Answering this differently from `tstcrd` would be the incoherent choice,
+/// not the careful one: a module testing through `tstcrd` would proceed and
+/// the identical module testing through `rtstcrd` would stop, over a balance
+/// neither of them ever measured.
+///
+/// # Why this is implemented here rather than in `credit.rs`
+///
+/// `rtstcrd` reads `usrnum` implicitly (`usaptr`, no `unum` argument) -- the
+/// shape [`crate::shims::credit::tstcrd`]/`dedcrd`/`rdedcrd` share, not the
+/// explicit-`unum` shape the rest of *this* file's routines take ([`otstcrd`],
+/// [`odedcrd`], [`crdusr`], [`addcrd`]). By the line this crate already splits
+/// `credit.rs` (current user, implicit `usrnum`) from `credits.rs` (named
+/// user, explicit `unum`), `rtstcrd` belongs beside `tstcrd` in `credit.rs`.
+/// It is filed here anyway, at the repository owner's explicit instruction,
+/// because of how this change was assigned rather than because this is where
+/// it reads best.
+///
+/// # Errors
+///
+/// If `usrnum` does not name a channel of this host -- in particular, if
+/// nobody is current at all; see [`crate::shims::credit::dedcrd`]'s own
+/// `# Errors` for what that means concretely.
+pub fn rtstcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let _amt = call.long();
+    host.current_channel_mem(call.mem())?;
     Ok(abi::Ret::Int(A::Int::from(YES)))
 }
 
@@ -320,6 +367,31 @@ mod tests {
         f
     }
 
+    /// One connected channel, made *current* -- what [`rtstcrd`] and
+    /// `crate::shims::credit::tstcrd` both need, since neither takes a
+    /// channel argument. Mirrors `credit.rs`'s own private `connect` test
+    /// helper (same fixture shape, duplicated here because that one is not
+    /// `pub`).
+    fn connect(f: &mut Fixture) -> crate::Chan {
+        let console = f.console();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                console,
+                &crate::Connection::ansi("rangerdan"),
+            )
+            .expect("channel 0");
+        console
+    }
+
+    /// A `long amt` argument as the two little-endian words a 16-bit cdecl
+    /// caller pushes, low half first -- matching `credit.rs`'s own
+    /// `long_words` test helper.
+    fn long_words(v: i64) -> [u16; 2] {
+        let v = v as u32;
+        [v as u16, (v >> 16) as u16]
+    }
+
     /// `addcrd` writes the console line the vendor writes (`ACCOUNT.C:703`),
     /// with `real` choosing the `PAID`/`FREE` wording. This host really does
     /// emit it -- `shocst` is implemented -- so it is the one observable
@@ -461,5 +533,54 @@ mod tests {
         assert!(f.invoke(odedcrd, &[past, 500, 0, 1, 1]).is_err());
         assert!(f.invoke(otstcrd, &[-1i16 as u16, 500, 0, 0]).is_err());
         assert!(f.invoke(odedcrd, &[-1i16 as u16, 500, 0, 1, 1]).is_err());
+    }
+
+    /// `rtstcrd` is `tstcrd` with `real` set, and answers the same way.
+    /// Asserted side by side with `crate::shims::credit::tstcrd` over the
+    /// identical argument, because the failure worth catching is the two
+    /// disagreeing -- a module testing through one would proceed and through
+    /// the other would stop, over a balance neither of them ever measured.
+    /// Mirrors `credit.rs`'s own `rdedcrd_answers_exactly_as_dedcrd_does`.
+    #[test]
+    fn rtstcrd_answers_exactly_as_tstcrd_does() {
+        let mut f = Fixture::new();
+        connect(&mut f);
+
+        for amt in [0, 500, -500] {
+            let args = long_words(amt);
+            assert_eq!(
+                f.invoke(rtstcrd, &args).expect("rtstcrd"),
+                f.invoke(crate::shims::credit::tstcrd, &args).expect("tstcrd"),
+                "rtstcrd and tstcrd must agree on {amt}"
+            );
+            assert_eq!(f.invoke(rtstcrd, &args).expect("rtstcrd"), Ret::U16(1));
+        }
+    }
+
+    /// With nobody current, `rtstcrd` refuses rather than answering yes --
+    /// the real `usaptr` would be pointing at whatever `usrnum=-1` names,
+    /// nothing. The same guard `tstcrd`/`dedcrd`/`rdedcrd` all carry.
+    #[test]
+    fn rtstcrd_refuses_when_nobody_is_the_current_user() {
+        let mut f = Fixture::new();
+        assert!(
+            f.invoke(rtstcrd, &long_words(500)).is_err(),
+            "usrnum is -1 before anyone connects"
+        );
+    }
+
+    /// A charge of zero and a refund answer the same way as an ordinary
+    /// charge -- there is no balance for any of them to be measured against.
+    #[test]
+    fn rtstcrd_takes_a_refund_and_a_zero_charge_the_same_way() {
+        let mut f = Fixture::new();
+        connect(&mut f);
+        for amt in [0, -500] {
+            assert_eq!(
+                f.invoke(rtstcrd, &long_words(amt)).expect("rtstcrd"),
+                Ret::U16(1),
+                "amt={amt}"
+            );
+        }
     }
 }

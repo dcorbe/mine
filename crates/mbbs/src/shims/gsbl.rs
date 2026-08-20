@@ -126,6 +126,35 @@ pub(crate) const OUT_OF_RANGE: u16 = -11i16 as u16;
 /// with either.
 pub(crate) const CMD_NOT_ACCEPTED: u16 = -1i16 as u16;
 
+/// `btuhwh`'s answer when a caller asks for real RTS/CTS hardware
+/// handshaking (guide `btuhwh`, page 101). The guide's own RETURNS section
+/// for this routine enumerates only `-10`/`-11`/`0` -- no dedicated failure
+/// code the way [`BAD_BAUD_RATE`]/[`BAD_SIZES`] have -- so this follows
+/// [`CMD_NOT_ACCEPTED`]'s own reasoning (BRKTHU.H documents "zero means OK"
+/// and nothing else, so any non-zero legitimately says "no"). `-2`, not
+/// `-1` or `-11`: a log line showing this should not be misread as "your
+/// dial command was refused" or "your channel number is out of range" --
+/// it is neither.
+pub(crate) const NO_HANDSHAKE_HARDWARE: u16 = -2i16 as u16;
+
+/// `btubrt`'s answer for every baud rate: guide page 35's own RETURNS entry
+/// for `btubrt`, "-3 means bad baud rate" -- not an invented code. There is
+/// no UART behind a socket at any rate, so every requested rate is equally
+/// unachievable and this is returned unconditionally; see [`btubrt`]'s own
+/// doc comment for why the vendor's existing code is reused rather than
+/// [`NO_HANDSHAKE_HARDWARE`] or a fresh one.
+pub(crate) const BAD_BAUD_RATE: u16 = -3i16 as u16;
+
+/// `btubsz`'s answer for a size that is not an integral power of two: guide
+/// page 41's own RETURNS entry, -5 for invalid buffer sizes.
+pub(crate) const BAD_SIZES: u16 = -5i16 as u16;
+
+/// `btux29`'s answer when the X.25 hardware refuses a transmission:
+/// `X25CLO`, `BRKTHU.H:39` ("btux29() return code for window-full error"),
+/// guide page 179 (btux29 answers 0x500 when the hardware declines). This host has no X.25 hardware at all, so the hardware
+/// refuses unconditionally -- see [`btux29`]'s own doc comment.
+pub(crate) const X25CLO: u16 = 0x0500;
+
 /// Run `body` against a channel, or answer `-11`.
 ///
 /// Every one of the fourteen begins this way, so it is written once. The
@@ -861,18 +890,32 @@ pub fn btuxmt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `btuxmt` -- is not in doubt, which is why this is implemented rather than
 /// left pinned: the module calls it seven times and the guide is explicit
 /// about everything but the one property this host cannot yet keep.
+///
+/// # Why this delegates to `btuxmt` rather than repeating its body
+///
+/// The two functions were, until this task, two byte-for-byte identical
+/// copies of the same five lines -- read `chan`, read the `datstg` pointer,
+/// bound-check the channel, read the ASCIIZ string, call
+/// [`crate::gsbl::Gsbl::transmit`]. That duplication was never a deliberate
+/// choice standing in for a real difference; it existed only because this
+/// host has not yet built the non-clearable block marker that *would* make
+/// the two diverge (see this doc comment's "Finding" section, above). Two
+/// copies of identical logic is exactly the shape that drifts silently: a
+/// future fix to word-wrapping, CRLF handling, or the CSI scanner applied to
+/// one and not the other would make `btuxmt` and `btuxmn` disagree about
+/// something neither routine's own doc comment claims they should ever
+/// disagree about. Delegating makes that impossible rather than merely
+/// unlikely.
+///
+/// **The day block boundaries land on [`crate::gsbl::Channel::output`]**,
+/// this delegation is exactly the line that has to change: `btuxmn` would
+/// need to mark the block it wrote as non-clearable *after* transmitting
+/// it, which `btuxmt` must never do to its own blocks. Until then, marking
+/// nothing is correct for both, so sharing the call is not papering over a
+/// difference -- there genuinely is none yet, and this is where that stops
+/// being true.
 pub fn btuxmn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let chan = Into::<u32>::into(call.int()) as i16;
-    let at = call.ptr();
-    let Some(chan) = host.gsbl().terms().chan(chan) else {
-        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
-    };
-    let text = at
-        .read_cstr(call.mem())
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-    host.gsbl_mut().transmit(chan, &text);
-    Ok(abi::Ret::Int(A::Int::from(0u16)))
+    btuxmt(call, host)
 }
 
 /// `int btuxct(int chan, int nbyt, const char *datstg)` -- transmit `nbyt`
@@ -1455,6 +1498,448 @@ pub fn btumks2<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     if let Some(chan) = host.gsbl().monitored {
         host.gsbl_mut().push_input(chan, &[c]);
     }
+    Ok(abi::Ret::Void)
+}
+
+// # Task 8: the twelve GALGSBL symbols the 2026-08-19 corpus survey found
+// (`python3 re/importgaps.py --abi <wg16|wg32> <module.dll>` over all 254
+// `archive/modules/dlls` binaries) -- everything left except `btux25`, which
+// is not a routine at all (see this block's own note below).
+//
+// Two real implementations, three unconditional structural refusals (real
+// hardware this host does not have and never will), one genuine no-op (a
+// UART fault condition a socket transport cannot produce), one structural
+// refusal for data this host has no state to honestly fill, and six
+// software features this host's own `Channel`/`Gsbl` (`crates/mbbs/src/
+// gsbl.rs`) do not yet carry the field they would need -- narrowed, where
+// the guide's own documented default already matches what this host does
+// unconditionally, to only refuse the values that would actually require
+// something new.
+//
+// `btux25` (`BRKTHU.H:93`: `extern int ... btux25;` -- "flag indicating
+// X.25 support in GSBL") is not in this list. It is a *datum*, the same
+// shape as `bturno`/`ictact`/`ticker` (`crates/mbbs/src/globals.rs`), not a
+// callable routine -- a module addresses it directly rather than calling
+// it, the same reason `bturno` lives in `globals.rs`'s `GLOBALS` table
+// rather than here. That file is out of this task's scope; see this task's
+// final report for the exact entry needed (`g("btux25", INT)` or
+// equivalent, value `0` -- this host has no X.25 support, honestly).
+
+/// `int btuhwh(int chan, int inpcut)` -- enable RTS/CTS hardware handshaking
+/// (guide `btuhwh`, page 101): an inpcut of zero restores the default: CTS ignored, RTS held active.
+///
+/// `inpcut == 0` answers `0`, genuinely, not a courtesy: "CTS ignored, RTS
+/// always active" is this host's only possible state -- there are no
+/// RTS/CTS signal lines behind a TCP socket to assert or sense, ever, so
+/// the default condition already holds and always will. A non-zero
+/// `inpcut` asks for the opposite state, which needs physical wires this
+/// host cannot manufacture by recording a field, so it refuses with
+/// [`NO_HANDSHAKE_HARDWARE`] -- see that constant's own doc comment for why
+/// a non-zero answer is legitimate here.
+pub fn btuhwh<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let inpcut = Into::<u32>::into(call.int());
+    Ok(match on_channel(host, chan, |_, _| ()) {
+        Some(()) => {
+            if inpcut == 0 {
+                abi::Ret::Int(A::Int::from(0u16))
+            } else {
+                host.note(format!(
+                    "btuhwh: channel {chan}: no RTS/CTS lines behind a \
+                     socket-based host; refusing to enable hardware \
+                     handshaking (inpcut={inpcut})"
+                ));
+                abi::Ret::Int(A::Int::from(NO_HANDSHAKE_HARDWARE))
+            }
+        }
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int btubrt(int chan, unsigned bdrate)` -- set a channel's UART baud rate
+/// (guide `btubrt`, page 34): it sets a serial channel's bit rate, touches only the UART, and is meant for Hayes and RS-232 channels alone.
+///
+/// **Always answers [`BAD_BAUD_RATE`].** There is no UART behind a TCP
+/// socket at any rate: unlike [`btuhwh`], where "handshaking off" is a
+/// real, always-true state this host already has, a baud rate is not a
+/// feature that can be "off" -- every requested value is equally
+/// unachievable, so there is no analogous zero-argument case to answer
+/// honestly with `0`. This reuses the vendor's own "bad baud rate" code
+/// rather than [`NO_HANDSHAKE_HARDWARE`] or a fresh one: from the caller's
+/// side, a UART that cannot be driven at the requested rate and a UART
+/// that does not exist are the same observable fact -- "the rate you asked
+/// for cannot be set" -- and BRKTHU.H already has a code for exactly that.
+pub fn btubrt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let bdrate = Into::<u32>::into(call.int());
+    Ok(match on_channel(host, chan, |_, _| ()) {
+        Some(()) => {
+            host.note(format!(
+                "btubrt: channel {chan}: no UART behind a socket-based \
+                 host; refusing {bdrate} baud with -3, the guide's own \
+                 \"bad baud rate\" code"
+            ));
+            abi::Ret::Int(A::Int::from(BAD_BAUD_RATE))
+        }
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int btux29(int chan, int nbyt, const char *data)` -- transmit an X.29
+/// string across an X.25 network to the remote user's PAD (guide `btux29`,
+/// page 179): btux29() takes the same arguments as btuxct() and answers 0x500 when the hardware declines, which the caller is expected to retry later.
+///
+/// **Always answers [`X25CLO`].** This host has no X.25 hardware behind its
+/// socket, at all, ever -- there is no window to fill and no card to report
+/// one, so the hardware refuses unconditionally. `X25CLO` is not an
+/// invented refusal; it is the vendor's own documented answer for exactly
+/// this condition, and the guide's own advice for a caller that receives it
+/// -- retry later -- costs this host nothing to honour honestly: a caller
+/// retrying forever gets `X25CLO` again, forever, which is the truth.
+///
+/// `nbyt`/`data` are read and validated the same way [`btuxct`]'s `nbyt` and
+/// pointer are -- [`usize_arg`], never narrowed, and `resolve`d before this
+/// answers, so a caller handing a bad pointer still learns that from an
+/// `Err` rather than being told the (unread) hardware refused it.
+pub fn btux29<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let nbyt = usize_arg::<A>(call.int());
+    let at = call.ptr();
+    let Some(()) = on_channel(host, chan, |_, _| ()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    at.resolve(call.mem(), nbyt)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    host.note(format!(
+        "btux29: channel {chan}: no X.25 hardware behind a socket; refusing \
+         the {nbyt}-byte X.29 string with X25CLO (0x0500), the vendor's own \
+         window-full code (BRKTHU.H:39) -- there is no window to fill and \
+         no card to report one, so the hardware refuses unconditionally"
+    ));
+    Ok(abi::Ret::Int(A::Int::from(X25CLO)))
+}
+
+/// `int btuhdr(int sapchn, int bufsiz, void *buffer)` -- capture the
+/// contents of internal X.25 or LAN data structures for a channel (guide
+/// `btuhdr`, page 93; `BRKTHU.H:186` names the parameters `sapchn`/`bufsiz`,
+/// the guide's own prose calls them `chan`/`nbytes`).
+///
+/// **Refuses.** Unlike [`btuhwh`]/[`btubrt`]/[`btux29`], which each have a
+/// vendor-documented in-band code meaning "no" that this host can answer
+/// honestly, `btuhdr` is a *query*: it copies real internal state --
+/// listen-ECB bytes for LAN channel groups, or an `x25hdr` cause/diagnostic
+/// pair for X.25 -- into the caller's buffer, and the guide gives no
+/// "nothing to report" answer the way `btusts`'s `0` does. This host
+/// implements neither X.25 (`btusdf`/`btux29`'s own hardware) nor IPX/SPX
+/// LAN channel groups, so there is no ECB, no `x25hdr`, no real state of
+/// either documented shape behind any channel here. Writing zeros -- or
+/// leaving the caller's buffer untouched -- would look exactly like a
+/// legitimate "not in use"/"no error" answer from hardware that does not
+/// exist, which is the plausible-looking fabrication this codebase's
+/// standard rules out (see this file's module doc comment and [`btuxmn`]'s
+/// own "finding, not a guess" for the shape of an honest gap statement
+/// instead). Refusing is the honest answer until this host grows real X.25
+/// or LAN channel-group state to report.
+pub fn btuhdr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let bufsiz = usize_arg::<A>(call.int());
+    let buffer = call.ptr();
+    let Some(()) = on_channel(host, chan, |_, _| ()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    Err(ShimError::Failed(format!(
+        "btuhdr(sapchn={chan}, bufsiz={bufsiz}, buffer={buffer}): this host \
+         implements neither X.25 (btusdf/btux29) nor IPX/SPX LAN channel \
+         groups -- there is no ECB and no x25hdr cause/diagnostic pair \
+         behind any channel here, for either of the guide's two documented \
+         buffer formats. Writing zeros, or leaving the caller's buffer \
+         untouched, would look like real 'not in use'/'no error' hardware \
+         state rather than the absence of any hardware at all -- refusing \
+         is the honest answer until this host has real X.25 or LAN \
+         channel-group state to report"
+    )))
+}
+
+/// `int btuerp(int chan, int onoff)` -- pass or block input bytes received
+/// with parity, framing or overrun errors (guide `btuerp`, page 88): with passthrough on (onoff = 1) such a character arrives with its high bit set; with it off (onoff = 0) the character is dropped.
+///
+/// A genuine, unconditional no-op -- the same shape [`btuclc`] uses, not
+/// [`Channel::xon`](crate::gsbl::Channel::xon)/[`Channel::xoff`](crate::gsbl::Channel::xoff)'s
+/// "recorded, not acted on": there is no field to add here because there is
+/// nothing for a field to gate. A parity, framing or overrun error is a
+/// UART condition; this host's transport is a byte stream off a TCP socket,
+/// which has no notion of any of the three -- no byte `Channel::take`
+/// (`crates/mbbs/src/gsbl.rs`) ever receives carries such a flag, on this
+/// host, ever, the same structural argument [`btuclc`]'s own doc comment
+/// makes for "no command can ever be in progress". `onoff` is read and
+/// discarded rather than stored, for the same reason `btuclc` clears a
+/// buffer it does not have: there is no future state a later host closing
+/// this gap would need to have remembered.
+pub fn btuerp<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let _onoff = Into::<u32>::into(call.int());
+    Ok(match on_channel(host, chan, |_, _| ()) {
+        Some(()) => abi::Ret::Int(A::Int::from(0u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int btubsz(int chan, int isiz, int osiz)` -- respecify input and output
+/// buffer sizes (guide `btubsz`, page 39): both sizes must be powers of two, and the call empties the input and output buffers as a side effect (CAUTIONS, page 40).
+///
+/// **Half implemented, honestly.** The power-of-two check and the
+/// buffer-clearing side effect are both real. `isiz`/`osiz` are read with
+/// [`usize_arg`] the same way [`btuxct`]'s `nbyt` is -- neither is ever
+/// stored, so nothing narrower is needed -- and a valid pair clears input
+/// and output the same way [`btucli`]/[`btuclo`] already do, `column`/
+/// `wrapped` included, for the reason [`btuclo`]'s own doc comment gives:
+/// without it, a wrap from output this call just discarded would leave the
+/// *next* line's first soft CR wrongly degraded to a SPACE.
+///
+/// **What is not checked:** the guide's other half of `-5`, "their sum
+/// exceeds the total data buffering capacity... as set by the original call
+/// to btusiz()". This host never implements `btusiz`/`btulsz`
+/// (`crate::shims::vda`'s own doc comment notes they are unserved) and its
+/// buffers are unbounded `VecDeque`s with no capacity to exceed -- there is
+/// no "original call" on record to check a sum against. A module asking for
+/// two absurdly large but individually power-of-two sizes will not see
+/// `-5` for that reason on this host, where real GSBL would refuse it.
+/// Stated here rather than silently passed, the same way [`btuxmn`]'s doc
+/// comment states its own gap.
+pub fn btubsz<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let isiz = usize_arg::<A>(call.int());
+    let osiz = usize_arg::<A>(call.int());
+    Ok(match on_channel(host, chan, |g, chan| {
+        if !isiz.is_power_of_two() || !osiz.is_power_of_two() {
+            return None;
+        }
+        let c = g.channel_mut(chan);
+        c.input.clear();
+        c.line.clear();
+        c.ready.clear();
+        c.output.clear();
+        c.column = 0;
+        c.wrapped = false;
+        Some(())
+    }) {
+        Some(Some(())) => abi::Ret::Int(A::Int::from(0u16)),
+        Some(None) => abi::Ret::Int(A::Int::from(BAD_SIZES)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int btuolk(int chan, int onoff)` -- pause or resume a channel's output
+/// (guide `btuolk`, page 134): it holds a channel's output until a later btuolk() releases it, which the guide suggests for throttling.
+///
+/// `onoff == 0` (resume/off) answers `0` honestly: nothing on this host can
+/// ever be output-paused -- there is no field recording it and nothing
+/// consults one -- so "not paused" already holds unconditionally, the same
+/// trivial-postcondition reasoning [`btuhwh`]'s `inpcut == 0` case uses.
+///
+/// `onoff != 0` (pause) refuses. Unlike `Channel::xon`/`Channel::xoff`,
+/// which are recorded but never consulted because real callers never send a
+/// value that would matter, `btuolk` is a module *explicitly* asking this
+/// host to stop draining a channel's output until told otherwise --
+/// recording that intent without a mechanism to read it back would be
+/// silent data loss to a caller that reasonably believes it worked, the
+/// same "active, continuing divergence" [`btuchi`]'s own doc comment
+/// refuses rather than risk. Making it real needs two things outside this
+/// file's scope, both in `crates/mbbs/src/gsbl.rs`: a `paused: bool` on
+/// `Channel`, and something in `Gsbl`'s output-draining path -- wherever
+/// bytes leave `Channel::output` for the transport -- to respect it.
+pub fn btuolk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let onoff = Into::<u32>::into(call.int());
+    let Some(()) = on_channel(host, chan, |_, _| ()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    if onoff == 0 {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+    Err(ShimError::Failed(format!(
+        "btuolk({chan}, {onoff}): this host has no paused flag on Channel \
+         and nothing in Gsbl's output-draining path would consult one -- \
+         recording the request and silently never honouring it would tell \
+         the caller a pause succeeded while output kept flowing. Needs a \
+         Channel::paused field and a check wherever output leaves for the \
+         transport, both in crates/mbbs/src/gsbl.rs, outside this task's \
+         file scope."
+    )))
+}
+
+/// `int btutrm(int chan, char crchar)` -- set the input line terminator
+/// character (guide `btutrm`, page 169): the character that ends editing of an input line, carriage return (13) by default.
+///
+/// `crchar == 0x0d` (13, the documented default) answers `0` honestly:
+/// `Channel::take`'s line-assembly match (`crates/mbbs/src/gsbl.rs`, the
+/// "8. Line terminator" step) already ends a line on `b'\r'` and nothing
+/// else -- asking for the default is asking for what this host already
+/// does.
+///
+/// Any other value refuses. `take`'s terminator match is a hardcoded
+/// `b'\r'` arm, not a field -- changing it for real needs a
+/// `Channel::term_char` (or similar), outside this task's file scope, in
+/// `crates/mbbs/src/gsbl.rs`.
+pub fn btutrm<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let crchar = Into::<u32>::into(call.int());
+    let Some(()) = on_channel(host, chan, |_, _| ()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    if crchar == u32::from(b'\r') {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+    Err(ShimError::Failed(format!(
+        "btutrm({chan}, {crchar:#x}): Channel::take's line terminator is a \
+         hardcoded b'\\r' match arm, not a field -- changing it for real \
+         needs a Channel::term_char in crates/mbbs/src/gsbl.rs, outside \
+         this task's file scope. Only the documented default (13) is \
+         honoured, because it is already this host's only behaviour."
+    )))
+}
+
+/// `int btulfd(int chan, char lfchar)` -- set the linefeed character
+/// automatically sent after every carriage return during ASCII output
+/// (guide `btulfd`, page 114): defaults to 10, linefeed; 0 disables it.
+///
+/// `lfchar == 10` answers `0` honestly: `emit_one` (`crates/mbbs/src/
+/// gsbl.rs`) already pushes a hardcoded `b'\n'` after every emitted CR --
+/// its own R1 comment names `btulfd` as the reason the default exists -- so
+/// asking for the default is asking for what this host already does,
+/// unlike [`btuhcr`]/[`btuscr`], whose fields `emit_one` already reads.
+///
+/// Any other value -- disabling it, or replacing it with a different byte --
+/// refuses: `emit_one`'s `out.push(b'\n')` is not parameterised by a field
+/// the way `hardcr`/`softcr` are, so honouring anything but the hardcoded
+/// default needs a `Channel::lfchar`, outside this task's file scope, in
+/// `crates/mbbs/src/gsbl.rs`.
+pub fn btulfd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let lfchar = Into::<u32>::into(call.int());
+    let Some(()) = on_channel(host, chan, |_, _| ()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    if lfchar == u32::from(b'\n') {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+    Err(ShimError::Failed(format!(
+        "btulfd({chan}, {lfchar:#x}): emit_one's post-CR linefeed is a \
+         hardcoded b'\\n' push, not a field -- changing or disabling it for \
+         real needs a Channel::lfchar in crates/mbbs/src/gsbl.rs, outside \
+         this task's file scope. Only the documented default (10) is \
+         honoured, because it is already this host's only behaviour."
+    )))
+}
+
+/// `int btubse(int chan, char bschar)` -- set how a backspace keystroke is
+/// echoed (guide `btubse`, page 37): 0 treats backspace as an ordinary character; 8 (the default) deletes the last character and echoes backspace, space, backspace; any other value NN deletes the last character and echoes NN.
+///
+/// `bschar == 0x08` (8, the documented default) answers `0` honestly:
+/// `Channel::take`'s backspace arm (`crates/mbbs/src/gsbl.rs`, the "7.
+/// Backspace" step) already pops the line and echoes `b"\x08 \x08"` -- the
+/// default's own literal echo sequence -- so asking for the default is
+/// asking for what this host already does.
+///
+/// Any other value refuses: `take`'s `0x08 =>` arm is hardcoded, not
+/// parameterised. Honouring `00` (treat backspace like any other printable
+/// character) or a custom `NN` echo byte needs a new `Channel` field,
+/// outside this task's file scope, in `crates/mbbs/src/gsbl.rs`.
+pub fn btubse<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let bschar = Into::<u32>::into(call.int());
+    let Some(()) = on_channel(host, chan, |_, _| ()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    if bschar == u32::from(0x08u8) {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+    Err(ShimError::Failed(format!(
+        "btubse({chan}, {bschar:#x}): Channel::take's backspace arm \
+         hardcodes the default echo (backspace-space-backspace), not a \
+         field -- honouring 00 (no special handling) or a custom echo byte \
+         for real needs a new Channel field in crates/mbbs/src/gsbl.rs, \
+         outside this task's file scope. Only the documented default (8) \
+         is honoured, because it is already this host's only behaviour."
+    )))
+}
+
+/// `int btutrs(int chan, int onoff)` -- generate status 6 (`OBFCLR`) when a
+/// user aborts output with the [`btutru`] character (guide `btutrs`, page
+/// 169): "bturst() defaults to 0" (don't generate).
+///
+/// `onoff == 0` answers `0` honestly, unconditionally: the abort mechanism
+/// `btutrs` would notify about does not exist on this host --
+/// `Channel::trunch`'s own doc comment already establishes that "the
+/// abort-on-receipt mechanism itself is not implemented", so status 6 can
+/// never fire whether or not `btutrs` runs. Asking to leave it off is
+/// asking for a state that already, and permanently, holds.
+///
+/// `onoff != 0` refuses: turning generation *on* implies a real abort event
+/// this host cannot detect (the same gap `trunch`'s doc comment names) to
+/// raise a status about. Recording the flag without the event that would
+/// ever consult it would tell a caller its request took effect when
+/// nothing downstream can ever act on it -- and making it real needs both a
+/// new `Channel` field and the output-abort detection `trunch`'s own doc
+/// comment already says this host lacks, both in `crates/mbbs/src/gsbl.rs`,
+/// outside this task's file scope.
+pub fn btutrs<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let onoff = Into::<u32>::into(call.int());
+    let Some(()) = on_channel(host, chan, |_, _| ()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    if onoff == 0 {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+    Err(ShimError::Failed(format!(
+        "btutrs({chan}, {onoff}): status 6 would notify about btutru's \
+         output-abort character, and Channel::trunch's own doc comment \
+         already establishes that mechanism is not implemented on this \
+         host -- there is no event that could ever raise the status this \
+         call is asking to enable. Needs both a new Channel field and the \
+         abort detection trunch's doc comment names, both in \
+         crates/mbbs/src/gsbl.rs, outside this task's file scope."
+    )))
+}
+
+/// `void btuxlt(char oldchr, char newchr)` -- remap one entry of the global
+/// input-character translation table (guide `btuxlt`, page 184): each incoming byte is looked up by value in the table, and an entry of 0 drops it.
+///
+/// **No channel argument** -- unlike every other routine in this file, the
+/// table this configures is global to the host, applied "to all channels in
+/// ASCII input mode... where you have not installed a custom character
+/// interceptor". There is accordingly no [`on_channel`] bound check to
+/// make, the same reason [`btumds2`]/[`btumks2`] skip it.
+///
+/// **Not wired in, and said so rather than silently ignored.** This host's
+/// translate table is `translate` (`crates/mbbs/src/gsbl.rs`), a hardcoded
+/// `match` -- backspace and CR pass through, `0x7f` becomes backspace, the
+/// high bit is stripped, every other printable byte passes, every other
+/// control character is dropped -- exactly the guide's own default table,
+/// but fixed at compile time rather than held in a mutable 256-entry array
+/// a module could remap one byte of. Making `btuxlt` real needs that array
+/// to live on `Gsbl` (global, matching the guide) and `Channel::take` to
+/// consult it instead of calling `translate` directly -- both in
+/// `crates/mbbs/src/gsbl.rs`, outside this task's file scope. `void` leaves
+/// this call nothing to refuse *through* -- the guide gives it no return
+/// value -- so this notes the remap it cannot perform and continues, the
+/// same shape [`chiout`]'s own doc comment uses for a `void` routine with
+/// no return code to carry a refusal.
+pub fn btuxlt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let Some(oldchr) = u8_arg::<A>(call.int()) else {
+        host.note("btuxlt: oldchr argument does not fit a byte".to_string());
+        return Ok(abi::Ret::Void);
+    };
+    let Some(newchr) = u8_arg::<A>(call.int()) else {
+        host.note("btuxlt: newchr argument does not fit a byte".to_string());
+        return Ok(abi::Ret::Void);
+    };
+    host.note(format!(
+        "btuxlt({oldchr:#04x}, {newchr:#04x}): the input translate table is \
+         a hardcoded match (crate::gsbl::translate), not a mutable array -- \
+         this remap is not applied"
+    ));
     Ok(abi::Ret::Void)
 }
 

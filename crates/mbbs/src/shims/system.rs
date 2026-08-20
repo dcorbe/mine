@@ -407,6 +407,67 @@ pub fn memcata<A: Abi>(_: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, 
     ))
 }
 
+/// `int int86(int intno, union REGS *inregs, union REGS *outregs)` --
+/// Borland's raw software-interrupt call: load the CPU registers from
+/// `*inregs`, fire `INT intno`, copy the result back into `*outregs`.
+///
+/// The vendor's own uses are in `MAJORBBS.C`'s `updclk`, reading and setting
+/// the CMOS/DOS clock, and only inside `#ifdef GCDOS` (`MAJORBBS.C:3846`
+/// opens the block; DOS-only, never compiled for `GCWINNT`/UNIX builds):
+///
+///
+/// Galacticomm's own library code (`re/wg33src/SRC/api/gcommlib`) uses it
+/// for still more interrupts this comment does not enumerate exhaustively:
+/// `INT 0x2F` (`UNDWIN.C:35`, `FIOAPI.C:1290`, the DOS multiplex interrupt)
+/// and `INT 0x10` (`VIDAPI.C:245,249`, BIOS video). `int86` is not a
+/// Galacticomm routine with a fixed contract the way `dedcrd`/`tstcrd` are --
+/// it is Borland's `dos.h` wrapper over *any* interrupt vector, selected at
+/// the call site by `intno`, which this shim does not get to see in advance
+/// any more than [`crate::shims::credit::intdos`] gets to see `AH`.
+///
+/// # This host has no interrupt path, and refuses for exactly [`intdos`]'s reason
+///
+/// [`crate::shims::credit::intdos`]'s doc comment already establishes the
+/// fact this shim depends on: `Machine` (`mbbs_machine::m16`) is an x86
+/// interpreter with no BIOS or DOS kernel underneath it, and this crate
+/// implements every file, timer, clock and console operation a module can
+/// reach through a Galacticomm-shaped host routine instead of a raw
+/// interrupt. `int86` is `intdos`'s superset, not a separate case: `intdos`
+/// only ever needed to answer for `INT 21h`, and even that was refused for
+/// lack of an `AH` to build a real dispatcher from. `int86` can be asked for
+/// *any* vector -- `0x10`, `0x1A`, `0x21`, `0x2F` all appear at genuine
+/// `int86` call sites above, and the sibling `int86x` (same idea, plus
+/// segment registers) adds `0x7B`, Btrieve's own vector (`DFAAPI.C:947`,
+/// `WGSRIDX.C:670`) -- which only grows the set of things a truthful answer
+/// would have to fake, not shrinks it.
+///
+/// `docs/2026-08-19-module-import-gap.md` measured `int86` as the *sole*
+/// blocking import for four module binaries under `archive/modules/dlls`
+/// (`MAJORBBS` library) -- this shim is enough to make all four **load**.
+/// It does not make whatever DOS/BIOS service they call through it *work*:
+/// answering that would mean choosing, `intno`-and-`AH` value by value,
+/// which of DOS's and the BIOS's services this host pretends to run, with
+/// no oracle in this repository for which ones those modules actually need
+/// (no call site in `re/exports` names an `int86`-derived arity or intno --
+/// none of the surveyed modules' decompiles are in this tree). Per this
+/// crate's standing rule (`crate::shims`'s "what to do when nothing does"),
+/// a host that cannot answer truthfully stops the module rather than
+/// fabricating a plausible `outregs`.
+///
+/// # Errors
+///
+/// Always. There is no `intno` this can answer for without lying.
+pub fn int86<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let intno = Into::<u32>::into(call.int()) as u8;
+    let _inregs = call.ptr();
+    let _outregs = call.ptr();
+    Err(ShimError::Failed(format!(
+        "int86: this host has no BIOS/DOS interrupt path -- INT {intno:#04x} is \
+         not emulated, and no measured call site names which service it would \
+         need (see this routine's own doc comment)"
+    )))
+}
+
 /// `VOID sstatr(INT attr)` -- set the display attribute.
 ///
 /// **No vendor body exists anywhere in `re/wg33src`** -- only call sites --
@@ -2936,6 +2997,32 @@ mod tests {
             message.contains("console") || message.contains("keypress"),
             "{message}"
         );
+    }
+
+    /// `int86` always refuses, and names the interrupt it was asked for.
+    ///
+    /// Asserting the message, not `is_err()`, for the same reason as
+    /// `memcata_refuses_and_names_what_it_needs`: the point is *which*
+    /// vector this could not answer for, not merely that it failed. Two
+    /// different `intno`s prove the value is actually read off the call
+    /// rather than a fixed string, the way `sstatr_sets_the_display_attribute`
+    /// proves its argument is read by varying it and checking both outcomes.
+    #[test]
+    fn int86_refuses_and_names_the_interrupt() {
+        let mut f = Fixture::new();
+        let regs = f.bytes(&[0u8; 16], false);
+        let mut args = vec![0x1A];
+        args.extend(Fixture::far(regs));
+        args.extend(Fixture::far(regs));
+        let err = f.invoke(int86, &args).expect_err("no BIOS/DOS path");
+        let message = err.to_string();
+        assert!(message.contains("0x1a"), "{message}");
+
+        let mut args = vec![0x21];
+        args.extend(Fixture::far(regs));
+        args.extend(Fixture::far(regs));
+        let err = f.invoke(int86, &args).expect_err("no BIOS/DOS path");
+        assert!(err.to_string().contains("0x21"), "{err}");
     }
 
     /// `frzseg` refuses, and says why a null would be worse.

@@ -231,6 +231,7 @@ pub fn rawmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(at))
 }
 
+
 /// `char *getasc(int msgnum)` -- [`rawmsg`]'s text with every line break
 /// doubled to `\r\n`.
 ///
@@ -507,6 +508,7 @@ pub fn inimsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     host.grow_msgbuf(maxsiz);
     Ok(abi::Ret::Void)
 }
+
 
 /// `MAXCHG` (`SETCNF.C:44`) -- how many `setcnf` changes fit before the
 /// vendor calls `catastro`.
@@ -1082,6 +1084,7 @@ mod tests {
         assert_eq!(f.host.msgbuf_size(), 8192);
     }
 
+
     /// `setcnf` records the pair it was given, in order.
     #[test]
     fn setcnf_records_the_name_and_value() {
@@ -1442,6 +1445,8 @@ mod tests {
         let mut f = Fixture::new();
         assert!(f.invoke(rawmsg, &[1]).is_err(), "no block current is a refusal");
     }
+
+
 
     /// A `.MSG` file with one option whose value has an embedded line break
     /// that survives `MsgFile::parse`'s `line_endings` as a bare `\n` -- the

@@ -1136,6 +1136,40 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // scope rule suspends. The Rose imports `getasc` at six sites.
         (MAJORBBS, "getasc", msg::getasc, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "rawmsg", msg::rawmsg, Cleans::Caller, Evidence::Unclassified),
+        // `getmsgblk` is `getmsg` under a second spelling, not a second
+        // routine: `GCOMM.H:195` is `#define getmsg getMsgBlk /* avoid Unix
+        // name space collision */`, and ordinal 326 is `_GETMSG` in the
+        // wg1.01/wg2/mbbs625 tables against `_GETMSGBLK` at the same ordinal
+        // in wg33's own wg2-era import library (`LIB/wg2/WGSERVER.DEF:327`).
+        // One export, renamed across SDK generations, which is why this is
+        // `mlt::getmsg` again rather than a body of its own -- the same "one
+        // body, two registered names" this table already does for
+        // `misc::hrtval` and `stream::fgetc`.
+        //
+        // The vendor's body is `xlttxv(rawmsg(msgnum), mxmssz)`
+        // (`MAJORBBS.C:5230-5235`); `mlt::getmsg`'s own doc comment argues why
+        // this host skips the `xlttxv` pass, and a module that wants the
+        // translation can still call `mudtext::xlttxv` on the result exactly
+        // as the vendor does.
+        (MAJORBBS, "getmsgblk", mlt::getmsg, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        // Borland's raw software-interrupt wrapper. A refusal that names the
+        // vector it was asked for -- see `system::int86`, and `credit::intdos`
+        // beside it, which refuses for the same reason: this host is an x86
+        // interpreter with no BIOS and no DOS kernel under it. It is the sole
+        // missing import of four TTI modules, so registering it makes those
+        // four *load*; it does not make whatever they ask DOS for work.
+        (MAJORBBS, "int86", system::int86, Cleans::Caller, Evidence::Standard),
+        // `tstcrd` with `real=1` -- `ACCOUNT.C:582-586` is
+        // `return(ltstcrd(usaptr,amt,1))` against `tstcrd`'s `...,0`. `real`
+        // selects whether a class debt limit or `CRDXMT` can let a shortfall
+        // pass, and this host has no balance, no class table and no debt
+        // limit for it to act on, so it answers as `tstcrd` does. Its own
+        // doc comment records that it belongs beside `tstcrd` in
+        // `shims::credit` by the line those two files split on -- it reads
+        // `usrnum` implicitly and takes no `unum`.
+        (MAJORBBS, "rtstcrd", credits::rtstcrd, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/ACCOUNT.C")),
         // FSD. `fsdfxt` deliberately does NOT refuse an out-of-range field:
         // it is the vendor's own guarded wrapper around the unguarded
         // `fsdnan`, and `buffer[0]='\0'` is its documented answer.
@@ -1951,6 +1985,23 @@ mod tests {
                 "{name} is imported from cw3220mt.DLL by a real module and must resolve there"
             );
         }
+    }
+
+    /// `getmsgblk` and `getmsg` are one export under two spellings
+    /// (`GCOMM.H:195`'s `#define`), so they must be one body. Asserted by
+    /// function address rather than by behaviour: two separate bodies that
+    /// happen to agree today would pass a behavioural check and drift later,
+    /// which is exactly how this crate accumulated the twenty dead twin shims
+    /// `da891421` deleted.
+    #[test]
+    fn getmsgblk_is_getmsg_under_its_other_spelling() {
+        let (Entry::Routine(blk, _), Entry::Routine(msg, _)) = (
+            entry::<Wg16>(MAJORBBS, "getmsgblk"),
+            entry::<Wg16>(MAJORBBS, "getmsg"),
+        ) else {
+            panic!("both spellings resolve");
+        };
+        assert!(std::ptr::fn_addr_eq(blk, msg), "one body under both names");
     }
 
     /// The pairing runs the other way too. These three are keyed `CW3220MT`,
