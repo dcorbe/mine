@@ -7613,6 +7613,33 @@ mod tests {
         );
     }
 
+    /// A caller that always wants the thread back still gets a second of the
+    /// module's time on every call. The interrupt is consulted after the tick
+    /// catch-up precisely so that a fast typist cannot stop the world.
+    #[test]
+    fn an_always_interrupting_caller_still_runs_the_tick_catch_up() {
+        let (mut f, module, rou) = polling_fixture();
+        let mut bytes = [0u8; 4];
+        bytes[0..2].copy_from_slice(&rou.offset.to_le_bytes());
+        bytes[2..4].copy_from_slice(&rou.selector.to_le_bytes());
+        f.host
+            .globals()
+            .write(&mut f.machine, "syscyc", &bytes)
+            .expect("syscyc is a placed global");
+        f.host.set_clock(Clock::stepped(1_135_952_405, 1_000));
+
+        // First call syncs `tcklst`; the second owes a second of time work.
+        let _ = f.host.cycle(&mut f.machine, &module, &mut || true).expect("first");
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || true).expect("second");
+
+        assert!(
+            cycles.dispatched >= 1,
+            "a cycle cut short on its first pass must still have run that \
+             pass's syscyc/prcrtk catch-up; dispatched was {}",
+            cycles.dispatched
+        );
+    }
+
     /// `ticker` (`globals.rs`'s own doc comment on the datum) advances once
     /// per elapsed real second -- the same round `syscyc`/`prcrtk` already
     /// fire in, driven by `cycle`'s own `tcklst` reconciliation -- and NOT
