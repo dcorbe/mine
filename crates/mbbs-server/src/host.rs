@@ -1064,6 +1064,25 @@ fn life<A: Abi>(
         if spent > worst_turn {
             worst_turn = spent;
         }
+        // DIAGNOSTIC 2026-08-20 -- `MBBS_TRACE_TURNS=<ms>` prints every turn
+        // that took longer than that. The running census cannot answer this
+        // question: `report_census` returns early on a zero-poll interval
+        // (`:536`), which is exactly the idle board whose heartbeat turns are
+        // the ones worth seeing.
+        if let Some(floor) = std::env::var("MBBS_TRACE_TURNS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            if spent >= Duration::from_millis(floor) {
+                eprintln!(
+                    "mbbs-server: turn[m{who}]: {spent:?}, {iters} passes, {disp} dispatches, ended {ended:?}",
+                    who = boot.machine.0,
+                    iters = cycles.iterations,
+                    disp = cycles.dispatched,
+                    ended = std::mem::discriminant(&cycles.ended),
+                );
+            }
+        }
         if let Some(meter) = &boot.clock_reads {
             meter.store(host.clock_reads(), Ordering::Relaxed);
         }
