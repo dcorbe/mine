@@ -232,7 +232,7 @@ impl Fixture {
     }
 
     /// Run `line` through `ext`'s `command` handler, on this fixture's own
-    /// host and channel.
+    /// host and channel, against `module`.
     ///
     /// `CommandCtx`'s fields stay `pub(crate)` to the `mbbs` crate -- a Lua
     /// (or any other) extension crate cannot build one itself, only call
@@ -240,19 +240,25 @@ impl Fixture {
     /// This is that hand-off, so a test in another crate can invoke a real
     /// handler without `mbbs` ever depending back on that crate.
     ///
-    /// Takes no `module` parameter yet. `CommandCtx` will likely grow one
-    /// once handlers can call module exports; adding it here is that
-    /// change's problem, not this one's.
+    /// Takes `module` now that [`crate::extension::CommandCtx::call_export`]
+    /// exists: a handler that wants to call a module export needs both the
+    /// machine and the module to resolve and run it against, and this is
+    /// the only place a `CommandCtx` gets built for a test. Every existing
+    /// caller gained one argument -- the "churn" the task that added
+    /// `call_export` called out and approved in advance.
     pub fn run_command(
         &mut self,
         ext: &mut dyn crate::extension::Extension<Wg16>,
         chan: crate::Chan,
         line: &str,
+        module: &mbbs_machine::m16::Module,
     ) -> crate::extension::Verdict {
         let mut ctx = crate::extension::CommandCtx {
             chan,
             line: line.to_owned(),
             host: &mut self.host,
+            machine: &mut self.machine,
+            module,
         };
         ext.command(&mut ctx)
     }
@@ -501,6 +507,126 @@ pub fn module_bytes_importing(module: &str, symbol: &str, addend: i16) -> Vec<u8
     out
 }
 
+/// [`minimal_module_bytes`], plus one named export, `name`, at ordinal 1,
+/// pointing at a second segment holding `code` verbatim.
+///
+/// For [`crate::extension::CommandCtx::call_export`]'s own tests: proving
+/// that a name resolves means calling something real, and the only way to
+/// get something [`crate::Host::run`] can actually execute is a genuine NE
+/// code segment -- the module's memory is mapped executable or not
+/// (`mbbs_machine::m16::ne`'s loader: `Segment::new(alloc, !is_data())`)
+/// according to exactly this flag, so planting `code` in the existing data
+/// segment would fault on the real `PROT_EXEC` mapping rather than produce
+/// a clean [`crate::Outcome`]. `minimal_module_bytes`'s own scratch-code
+/// trick (`machine.load_code`, used by `Fixture::call`) does not help here
+/// either: it writes outside any module's segments, so nothing in `module`
+/// would resolve to it by name.
+///
+/// The entry table gets one **fixed** bundle (`ne.rs`'s `parse_entry_table`
+/// -- an indicator byte that is a plain segment number, not `0` or `0xFF`)
+/// naming segment 2, offset 0, exported. The resident-name table gets the
+/// module's own name (ordinal 0, never resolvable -- see
+/// [`mbbs_machine::m16::ne`]'s `collect_names`) followed by `name` at
+/// ordinal 1, which is what makes `Module::entry_by_name(name)` answer
+/// this entry.
+pub fn module_bytes_exporting(name: &str, code: &[u8]) -> Vec<u8> {
+    const ALIGN: u16 = 4;
+    const SECTOR: usize = 1 << ALIGN;
+
+    fn pstring(name: &str, ordinal: u16) -> Vec<u8> {
+        let mut out = vec![name.len() as u8];
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&ordinal.to_le_bytes());
+        out
+    }
+
+    // No imports at all, so the table is only its own leading empty string.
+    let impnames = vec![0u8];
+
+    // The module's own name, then the one export, then a terminator.
+    let mut restab = pstring("TESTMOD", 0);
+    restab.extend_from_slice(&pstring(name, 1));
+    restab.push(0);
+
+    // A description, then a terminator.
+    let mut nrtab = pstring("a test module", 0);
+    nrtab.push(0);
+
+    // One fixed bundle: count 1, indicator = segment 2 (the code segment
+    // below), then that entry's own flags (bit 0 set: exported) and offset
+    // (0, the segment's first byte) -- three bytes, per `ne.rs`'s
+    // `parse_entry_table` non-moveable arm. A trailing zero count ends the
+    // table.
+    let entrytab = vec![1u8, 2, 0x01, 0, 0, 0u8];
+
+    let mut out = vec![0u8; 0x80];
+    out[0..2].copy_from_slice(b"MZ");
+    out[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    out[0x40..0x42].copy_from_slice(b"NE");
+
+    // Two segment rows -- data, then code -- filled in once their data is
+    // placed.
+    let segtab = 0x80;
+    out.resize(segtab + 16, 0);
+
+    let modtab = out.len(); // no imported modules, so nothing follows here
+    let imptab = out.len();
+    out.extend_from_slice(&impnames);
+    let restab_at = out.len();
+    out.extend_from_slice(&restab);
+    let entrytab_at = out.len();
+    out.extend_from_slice(&entrytab);
+    let nrtab_at = out.len();
+    out.extend_from_slice(&nrtab);
+
+    // Segment 1: the autodata segment, four zero bytes, same as
+    // `minimal_module_bytes` -- `call_export`'s own tests have no reason to
+    // touch DGROUP, only to have one, the way every real module does.
+    while !out.len().is_multiple_of(SECTOR) {
+        out.push(0);
+    }
+    let sector1 = (out.len() / SECTOR) as u16;
+    let data = [0u8; 4];
+    out.extend_from_slice(&data);
+
+    // Segment 2: the code segment, `code` verbatim.
+    while !out.len().is_multiple_of(SECTOR) {
+        out.push(0);
+    }
+    let sector2 = (out.len() / SECTOR) as u16;
+    out.extend_from_slice(code);
+
+    out[segtab..segtab + 2].copy_from_slice(&sector1.to_le_bytes());
+    out[segtab + 2..segtab + 4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    out[segtab + 4..segtab + 6].copy_from_slice(&0x0001u16.to_le_bytes()); // a data segment
+    out[segtab + 6..segtab + 8].copy_from_slice(&(data.len() as u16).to_le_bytes());
+
+    out[segtab + 8..segtab + 10].copy_from_slice(&sector2.to_le_bytes());
+    out[segtab + 10..segtab + 12].copy_from_slice(&(code.len() as u16).to_le_bytes());
+    out[segtab + 12..segtab + 14].copy_from_slice(&0x0000u16.to_le_bytes()); // a code segment
+    out[segtab + 14..segtab + 16].copy_from_slice(&(code.len() as u16).to_le_bytes());
+
+    let w = |out: &mut Vec<u8>, at: usize, v: u16| {
+        out[0x40 + at..0x40 + at + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    w(&mut out, 0x04, (entrytab_at - 0x40) as u16);
+    w(&mut out, 0x06, entrytab.len() as u16);
+    w(&mut out, 0x0c, 0x8001); // a single-data library
+    w(&mut out, 0x0e, 1); // autodata: segment 1
+    w(&mut out, 0x1c, 2); // segment count
+    w(&mut out, 0x1e, 0); // imported module count
+    w(&mut out, 0x20, nrtab.len() as u16);
+    w(&mut out, 0x22, (segtab - 0x40) as u16);
+    w(&mut out, 0x26, (restab_at - 0x40) as u16);
+    w(&mut out, 0x28, (modtab - 0x40) as u16);
+    w(&mut out, 0x2a, (imptab - 0x40) as u16);
+    w(&mut out, 0x32, ALIGN);
+    out[0x40 + 0x2c..0x40 + 0x30].copy_from_slice(&(nrtab_at as u32).to_le_bytes());
+    out[0x40 + 0x36] = 0x02;
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +636,16 @@ mod tests {
         let mut f = Fixture::new();
         let module = f.minimal_module();
         assert_eq!(module.segment_count(), 1);
+    }
+
+    #[test]
+    fn the_exporting_module_resolves_its_export_by_name() {
+        let mut f = Fixture::new();
+        let module = f
+            .host
+            .load(&mut f.machine, &module_bytes_exporting("SUMMONTEST", &[0xcb]))
+            .expect("loads");
+        assert_eq!(module.segment_count(), 2);
+        assert!(module.entry_by_name("SUMMONTEST").is_some());
     }
 }

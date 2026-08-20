@@ -16,7 +16,8 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 
-use mbbs::abi::Wg16;
+use mbbs::Outcome;
+use mbbs::abi::{Abi, Arg, Wg16};
 use mbbs::extension::{CommandCtx, Extension, Verdict};
 use mlua::{Function, Lua, Value};
 
@@ -128,6 +129,98 @@ fn to_verdict(value: Value) -> Verdict {
     }
 }
 
+/// `c:summon(name)` -- look `name` up via `_GET_ITEM_FROM_NAME` and, on a
+/// match, hand it to `_ADD_ITEM_TO_INVENTORY`.
+///
+/// The call shape (six words, three far pointers; a null return
+/// disambiguated by an OUT match count; `_ADD_ITEM_TO_INVENTORY`'s own
+/// `(usrnum, 0, 0, 0xfffe, item)` and its `char` return) is measured off the
+/// module's own `sysop summon` handler -- see
+/// `.superpowers/sdd/2026-08-20-lua-command-seam/task-6-findings.md`, which
+/// corrected the task's own plan in three places: the argument count, the
+/// meaning of a null return, and whether acquisition is level-gated (it is
+/// not -- only encumbrance is checked here, which is why this reads
+/// `_ADD_ITEM_TO_INVENTORY`'s return instead of discarding it the way the
+/// module's own handler does).
+///
+/// Returns `(true, nil)` on success, `(false, reason)` otherwise:
+/// `"no such item"`, `"ambiguous"` (the DLL has already prompted the player
+/// through its own output -- the caller must print nothing more), or `"too
+/// heavy or no free slot"` (`_ADD_ITEM_TO_INVENTORY` refused).
+///
+/// `name`'s bytes go into guest memory verbatim, the same "whatever Lua
+/// handed us" contract [`CommandCtx::print`] already has for output --
+/// CP437 in, CP437 out, no re-encoding at this seam.
+///
+/// [`CommandCtx::print`]: mbbs::extension::CommandCtx::print
+fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result<(bool, Option<&'static str>)> {
+    // `[name][NUL][count: u16, zero]` in one allocation: the search
+    // string `_GET_ITEM_FROM_NAME` reads, immediately followed by the real
+    // 2-byte scratch its OUT match-count parameter must point at -- the
+    // callee writes through that pointer unconditionally, so `0,0` is not
+    // an option (see the findings file's own correction on this point).
+    let mut buf = name.to_vec();
+    buf.push(0);
+    let count_at = buf.len();
+    buf.extend_from_slice(&0u16.to_le_bytes());
+
+    let base = ctx.borrow_mut().write_scratch(&buf).map_err(mlua::Error::external)?;
+    let count_ptr = Wg16::ptr_offset(base, count_at as u16);
+
+    let outcome = ctx
+        .borrow_mut()
+        .call_export(
+            "_GET_ITEM_FROM_NAME",
+            &[Arg::Ptr(base), Arg::Ptr(Wg16::null_ptr()), Arg::Ptr(count_ptr)],
+        )
+        .map_err(mlua::Error::external)?;
+    let (lo, hi) = match outcome {
+        Outcome::Returned { lo, hi } => (lo, hi),
+        Outcome::Stopped(poison) => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "_GET_ITEM_FROM_NAME stopped the machine: {poison:?}"
+            )));
+        }
+    };
+
+    // The far pointer DX:AX came back in -- offset (AX) then selector (DX),
+    // the same order `Abi::ptr_to_bytes` writes one in.
+    let mut ptr_bytes = (lo as u16).to_le_bytes().to_vec();
+    ptr_bytes.extend_from_slice(&(hi as u16).to_le_bytes());
+    let item = Wg16::ptr_from_bytes(&ptr_bytes);
+
+    if item == Wg16::null_ptr() {
+        let count_bytes = ctx.borrow().read_scratch(count_ptr, 2).map_err(mlua::Error::external)?;
+        let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]);
+        // Nonzero: several items matched and the DLL already told the
+        // player so through its own output. Zero: nothing matched at all.
+        return Ok((false, Some(if count != 0 { "ambiguous" } else { "no such item" })));
+    }
+
+    // `usrnum` is exactly this channel's number -- `point_curusr_mem`
+    // already pointed the global at it before this seam ever ran, so
+    // reading `ctx.chan()` back is the same value a fresh memory read
+    // would give, without the read.
+    let usrnum = ctx.borrow().chan().number() as u16;
+    let add_outcome = ctx
+        .borrow_mut()
+        .call_export(
+            "_ADD_ITEM_TO_INVENTORY",
+            &[Arg::Int(usrnum), Arg::Int(0), Arg::Int(0), Arg::Int(0xfffe), Arg::Ptr(item)],
+        )
+        .map_err(mlua::Error::external)?;
+    match add_outcome {
+        // A `char` return: only the low byte (AL) is meaningful, so mask
+        // rather than compare `lo` whole -- AH is whatever a `char`-typed
+        // Borland routine's caller-saved half happened to hold.
+        Outcome::Returned { lo, .. } if lo & 0xff != 0 => Ok((true, None)),
+        Outcome::Returned { .. } => Ok((false, Some("too heavy or no free slot"))),
+        Outcome::Stopped(poison) => Err(mlua::Error::RuntimeError(format!(
+            "_ADD_ITEM_TO_INVENTORY stopped the machine: {poison:?}"
+        ))),
+    }
+}
+
 impl Extension<Wg16> for LuaExtension {
     fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
         let line = ctx.line().to_string();
@@ -146,17 +239,29 @@ impl Extension<Wg16> for LuaExtension {
         let chan = i64::from(ctx.chan().number());
 
         let result = self.lua.scope(|scope| {
-            let cell = RefCell::new(&mut *ctx);
+            // `Rc`, not a bare `RefCell`, now that two closures below both
+            // need to reach it: `scope.create_function` wants a closure
+            // that *owns* what it captures (`mlua::Scope`'s own lifetime
+            // bound), which is why the closure that reads this even needed
+            // `move` in the first place -- and only one closure can move a
+            // bare value. Cloning the `Rc` gives each its own handle to the
+            // same cell -- still one `RefCell<&mut CommandCtx>`, still one
+            // thread, no `Mutex` needed.
+            let cell = Rc::new(RefCell::new(&mut *ctx));
             let t = self.lua.create_table()?;
             t.set("line", line.clone())?;
             t.set("args", args.clone())?;
             t.set("chan", chan)?;
-            t.set(
-                "print",
+            t.set("print", {
+                let cell = Rc::clone(&cell);
                 scope.create_function(move |_, (_this, s): (mlua::Table, mlua::String)| {
                     cell.borrow_mut().print(&s.as_bytes());
                     Ok(())
-                })?,
+                })?
+            })?;
+            t.set(
+                "summon",
+                scope.create_function(move |_, (_this, name): (mlua::Table, mlua::String)| summon(&cell, &name.as_bytes()))?,
             )?;
             handler.call::<Value>(t)
         });

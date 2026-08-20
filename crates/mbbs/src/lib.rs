@@ -3877,7 +3877,7 @@ impl<A: Abi> Host<A> {
             // comment on the `entry == None` fallback, further down), so
             // there is nothing for `Handled` to fake.
             if status == gsbl::Gsbl::CRSTG && self.extension.is_some() {
-                if let extension::Verdict::Handled = self.dispatch_command(machine, chan)? {
+                if let extension::Verdict::Handled = self.dispatch_command(machine, module, chan)? {
                     continue;
                 }
             }
@@ -3959,12 +3959,18 @@ impl<A: Abi> Host<A> {
     /// is not also borrowed. Taking it out and putting it back is what makes
     /// that legal, and it also means a handler cannot re-enter itself
     /// through the host.
-    fn dispatch_command(&mut self, machine: &mut A::Cpu, chan: Chan) -> io::Result<extension::Verdict> {
+    ///
+    /// Takes `module` now that [`extension::CommandCtx::call_export`] exists
+    /// to resolve a name against it -- `module` was already in scope at
+    /// this call's one call site (`Host::poll_with_chan` already threads it
+    /// through for `dopoll`/`self.run`), so this is purely a new borrow
+    /// handed down, not a new lookup.
+    fn dispatch_command(&mut self, machine: &mut A::Cpu, module: &A::Module, chan: Chan) -> io::Result<extension::Verdict> {
         let Some(mut ext) = self.extension.take() else {
             return Ok(extension::Verdict::Pass);
         };
         let line = self.input_line(A::mem(machine));
-        let mut ctx = extension::CommandCtx { chan, line, host: self };
+        let mut ctx = extension::CommandCtx { chan, line, host: self, machine, module };
         let verdict = ext.command(&mut ctx);
         self.extension = Some(ext);
         Ok(verdict)

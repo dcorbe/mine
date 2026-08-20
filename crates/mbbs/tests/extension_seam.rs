@@ -2,12 +2,14 @@
 //! is Lua-agnostic by design, so its dispatch contract is testable without an
 //! interpreter in the loop.
 
+use std::io;
 use std::sync::{Arc, Mutex};
 
 use mbbs::Chan;
+use mbbs::Outcome;
 use mbbs::abi::Wg16;
 use mbbs::extension::{CommandCtx, Extension, Verdict};
-use mbbs::testing::Fixture;
+use mbbs::testing::{Fixture, module_bytes_exporting};
 
 /// Records every line it is shown and always passes.
 #[derive(Default)]
@@ -177,4 +179,58 @@ fn a_handler_can_write_to_the_channel() {
         "handler output must reach the channel, got: {:?}",
         String::from_utf8_lossy(&out)
     );
+}
+
+/// Calls [`CommandCtx::call_export`] with a fixed name and no arguments when
+/// dispatched, and records the result -- shared with the test through an
+/// `Arc<Mutex<_>>` the same way [`Swallow`] shares its log, since
+/// `Fixture::run_command` takes the extension by `&mut` and this test needs
+/// to read the result back out afterward.
+struct Caller {
+    name: &'static str,
+    result: Arc<Mutex<Option<io::Result<Outcome<Wg16>>>>>,
+}
+
+impl Extension<Wg16> for Caller {
+    fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
+        let result = ctx.call_export(self.name, &[]);
+        *self.result.lock().expect("lock") = Some(result);
+        Verdict::Handled
+    }
+}
+
+#[test]
+fn call_export_resolves_a_known_export_and_runs_it() {
+    let mut f = Fixture::new();
+    // `0xcb` is `retf`: the smallest real NE code segment that returns
+    // cleanly to `Host::run`'s own caller -- see `module_bytes_exporting`'s
+    // own doc comment for why a hand-built export, not `minimal_module`, is
+    // what this test needs.
+    let module = f.host.load(&mut f.machine, &module_bytes_exporting("SUMMONTEST", &[0xcb])).expect("loads");
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = Caller { name: "SUMMONTEST", result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let outcome = result.lock().expect("lock").take().expect("command ran").expect("call_export ran");
+    assert_eq!(
+        outcome,
+        Outcome::Returned { lo: 0, hi: 0 },
+        "a resolved export that immediately retf's must come back Returned"
+    );
+}
+
+#[test]
+fn call_export_names_the_symbol_when_unresolvable() {
+    let mut f = Fixture::new();
+    let module = f.minimal_module();
+    let chan = f.console();
+    let result = Arc::new(Mutex::new(None));
+    let mut ext = Caller { name: "NOSUCHTHING", result: result.clone() };
+
+    f.run_command(&mut ext, chan, "anything", &module);
+
+    let err = result.lock().expect("lock").take().expect("command ran").expect_err("must refuse an unknown export");
+    assert!(err.to_string().contains("NOSUCHTHING"), "got: {err}");
 }
