@@ -1203,6 +1203,9 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "setvbuf", crt::setvbuf, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "getcwd", crt::getcwd, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "localtime", crt::localtime, Cleans::Caller, Evidence::Standard),
+        // Drives `credit::scan`, the loop `sscanf` already uses, over a line
+        // from the stream -- extracted rather than transcribed a second time.
+        (MAJORBBS, "fscanf", crt::fscanf, Cleans::Caller, Evidence::Standard),
         // Borland's `__read`: a direct MS-DOS read with no text-mode
         // translation, distinct from `read` the way `_write` is from `write`
         // (`READ.CAS`'s own comment). The descriptor branch refuses rather
@@ -1388,7 +1391,7 @@ const CRT_SHARED: &[&str] = &[
     "stricmp", "strlen", "strlwr", "strncat", "strncmp", "strncpy", "strnicmp", "strrchr",
     "strstr", "strtok", "strupr",
     // Conversion and formatting.
-    "atol", "itoa", "sprintf", "sscanf", "strtol", "ultoa", "vsprintf",
+    "atol", "fscanf", "itoa", "sprintf", "sscanf", "strtol", "ultoa", "vsprintf",
     // Character classification. `_ctype` keeps its one leading underscore for
     // the reason `_localeconvention` does: `c_name` strips exactly one, so a
     // module's `__ctype` arrives here already spelled this way.

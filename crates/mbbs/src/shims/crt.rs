@@ -2553,6 +2553,56 @@ pub fn creattemp<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
     )))
 }
 
+/// How much of a line `fscanf` will read in one call.
+///
+/// Borland's `fscanf` reads as many characters as its conversions consume,
+/// crossing newlines freely; this reads one line and scans that. The
+/// difference is invisible to a format that stays within a line, which is
+/// every measured call site, and it is a real limit for one that does not --
+/// stated here rather than left to be discovered.
+const FSCANF_LINE: usize = 1024;
+
+/// `int fscanf(FILE *f, const char *fmt, ...)` -- Borland's.
+///
+/// Drives [`super::credit::scan`], the same conversion loop `sscanf` uses,
+/// over a line read from the stream instead of over a caller's string. The two
+/// share everything after their first pointer, so this reads the `FILE` cookie
+/// and the format, gets a line, and hands the still-positioned `Call` to the
+/// loop, which reads each destination pointer as the format names it.
+///
+/// No second scanf implementation was written for this. That is the whole
+/// point of the split -- see [`super::credit::scan`]'s own doc comment.
+///
+/// EOF with nothing read answers `EOF` (`-1`), the same value `sscanf` answers
+/// when its input is exhausted before the first conversion.
+///
+/// # Errors
+///
+/// A `FILE *` that names no open stream, an unreadable format pointer, or
+/// whatever [`super::credit::scan`] refuses.
+pub fn fscanf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let cookie = call.ptr();
+    let fmt_ptr = call.ptr();
+    let fmt = fmt_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("fscanf: format: {e}")))?
+        .to_vec();
+
+    let line = host
+        .streams
+        .line_mem(call.mem(), cookie, FSCANF_LINE)
+        .map_err(|e| ShimError::Failed(format!("fscanf: {e}")))?;
+    let Some(line) = line else {
+        // End of file before anything was converted. `scan` would answer the
+        // same thing for an empty input, but going through it would first read
+        // destination pointers off the frame for conversions that can never
+        // happen.
+        return Ok(abi::Ret::Int(A::int_from_u32(u32::MAX)));
+    };
+
+    super::credit::scan(call, &fmt, &line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2591,6 +2641,63 @@ mod tests {
     }
 
     /// `fopen(name, mode)`, as the `FILE *` it must return.
+    /// `fscanf` converts off a real file, and answers the number assigned.
+    ///
+    /// The point of the test is not that scanf works -- `sscanf`'s own tests
+    /// cover the loop -- it is that `fscanf` is *wired to that same loop* and
+    /// positions the `Call` cursor so the loop finds the destination pointers.
+    /// A `fscanf` that read its own arguments wrongly would still answer a
+    /// plausible count while writing to the wrong addresses, which is why both
+    /// destinations are read back rather than just the return value.
+    #[test]
+    fn fscanf_converts_from_a_file_through_sscanfs_own_loop() {
+        let root = scratch("crt-fscanf");
+        std::fs::write(root.join("NUMS.TXT"), b"42 hello\n").expect("fixture");
+        let mut f = Fixture::rooted(root);
+        let stream = opened(&mut f, "NUMS.TXT", "r");
+        let fmt = f.text("%d %s");
+        let n = f.buffer(2);
+        let word = f.buffer(16);
+
+        let got = f
+            .invoke(
+                fscanf,
+                &[
+                    stream.offset,
+                    stream.selector,
+                    fmt.offset,
+                    fmt.selector,
+                    n.offset,
+                    n.selector,
+                    word.offset,
+                    word.selector,
+                ],
+            )
+            .expect("fscanf");
+        assert_eq!(got, Ret::U16(2), "two conversions assigned");
+        assert_eq!(f.read(word), "hello", "the %s destination");
+    }
+
+    /// End of file before any conversion is `EOF`, not zero -- and it must not
+    /// read destination pointers off the frame for conversions that can never
+    /// happen.
+    #[test]
+    fn fscanf_at_end_of_file_answers_eof() {
+        let root = scratch("crt-fscanf-eof");
+        std::fs::write(root.join("EMPTY.TXT"), b"").expect("fixture");
+        let mut f = Fixture::rooted(root);
+        let stream = opened(&mut f, "EMPTY.TXT", "r");
+        let fmt = f.text("%d");
+        let n = f.buffer(2);
+        let got = f
+            .invoke(
+                fscanf,
+                &[stream.offset, stream.selector, fmt.offset, fmt.selector, n.offset, n.selector],
+            )
+            .expect("fscanf at EOF is not an error");
+        assert_eq!(got, Ret::U16(u16::MAX), "EOF is -1, not 0");
+    }
+
     fn opened(f: &mut Fixture, name: &str, mode: &str) -> FarPtr {
         let path = f.text(name);
         let how = f.text(mode);

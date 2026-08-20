@@ -340,10 +340,35 @@ pub fn sscanf<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
+    scan(call, &fmt, &input)
+}
 
+/// `sscanf`'s conversion loop, over a format and an input the caller has
+/// already read.
+///
+/// Split out of [`sscanf`] so that [`crate::shims::crt::fscanf`] can drive the
+/// same loop over a line read from a `FILE` instead of a string. The two
+/// routines have the same argument shape after their first pointer -- the
+/// destination pointers are read from the `Call` cursor here, as the format
+/// string names them -- so one loop genuinely serves both.
+///
+/// Extracted rather than copied. A second transcription of scanf's conversion
+/// rules is the kind of duplication this crate has paid for before: see
+/// `shims::mod`'s `getmsgblk` registration for a third body deleted the same
+/// day, and `da891421` for the twenty before that.
+///
+/// # Errors
+///
+/// An unsupported conversion specifier, or a destination pointer that does not
+/// resolve.
+pub(crate) fn scan<A: Abi>(
+    call: &mut Call<A>,
+    fmt: &[u8],
+    input: &[u8],
+) -> Result<abi::Ret<A>, ShimError> {
     // Exhaustion before the first conversion is EOF (`-1`); exhaustion or a
-    // mismatch after at least one conversion just stops, per this function's
-    // own doc comment.
+    // mismatch after at least one conversion just stops, per `sscanf`'s own
+    // doc comment.
     let exhausted = |assigned: i32| -> abi::Ret<A> {
         if assigned == 0 {
             abi::Ret::Int(A::int_from_u32(u32::MAX))
