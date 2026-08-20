@@ -54,6 +54,7 @@ pub mod acs;
 pub mod btrcall;
 pub mod census;
 mod create;
+pub mod format;
 pub mod keys;
 pub mod mem;
 mod ops;
