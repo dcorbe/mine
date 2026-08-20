@@ -493,15 +493,14 @@ pub fn cntrbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// exists for: a module told its insert worked and then finding the character
 /// gone is the failure nothing else catches.
 pub fn invbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let recptr = call.ptr();
+    let length = ushort_arg::<A>(call.int());
     let Some(block) = positioned(call, host, "invbtv")? else {
         note_no_file(host, "invbtv");
         return Ok(abi::Ret::Void);
     };
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    Err(ShimError::Failed(format!(
-        "invbtv into {}, and nothing in this host writes to a Btrieve file",
-        file.name()
-    )))
+    insert_record(call, host, "invbtv", block, recptr, length, true)?;
+    Ok(abi::Ret::Void)
 }
 
 /// `void delbtv(void)` -- delete the record the file is positioned on.
@@ -603,45 +602,13 @@ pub fn dinsbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
                 .to_owned(),
         )
     })?;
-
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let length = file.maxlen();
-    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
-        true => file.data(),
-        false => recptr,
-    };
-    let bytes = recptr
-        .resolve(call.mem(), usize::from(length))
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-
-    if let Some((key, value)) = duplicate_key(host, block, &bytes, None)? {
-        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
-        note_duplicate_key(host, "dinsbtv", &name, key, &value);
-        return Ok(abi::Ret::Int(A::Int::from(0u16)));
-    }
-
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    let position = file.insert(&bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
-
-    // Btrieve's Insert establishes currency on the record it just created --
-    // `PLBTVSTF.C:626` passes a hardcoded key number of 0 to the underlying
-    // Btrieve call (unlike dupdbtv, which threads `bb->lastkn` through), so
-    // this positions in key 0's order specifically. Before this, `dinsbtv`
-    // never touched the cursor, so the file stayed wherever it happened to
-    // be positioned before the insert -- accidentally right when the new
-    // record sorted before the cursor, and wrong when it sorted after.
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-    let physical = records
-        .find_physical(position)
-        .expect("insert just wrote this position");
-    let cursor = match records.place_in(0, physical) {
-        Some(at) => Cursor::Ordered { key: 0, at },
-        None => Cursor::Physical { at: physical },
-    };
-    file.seek_to(cursor);
-
-    Ok(abi::Ret::Int(A::Int::from(1u16)))
+    // `bb->reclen`, which this host holds as `maxlen`. `dinsbtv` takes no
+    // length argument of its own -- `PLBTVSTF.C:598` reads it off the block.
+    let length = host.btrieve.block(block).map_err(ShimError::Failed)?.maxlen();
+    // `false`: `DFAAPI.C:637-638`'s case-5 branch is the whole point of the
+    // `d` in `dinsbtv`, so a duplicate answers 0 rather than refusing.
+    let inserted = insert_record(call, host, "dinsbtv", block, recptr, length, false)?;
+    Ok(abi::Ret::Int(A::Int::from(u16::from(inserted))))
 }
 
 /// `int dupdbtv(void *recptr)` -- update the record the file is positioned
@@ -1962,6 +1929,78 @@ pub(crate) fn load<A: Abi>(host: &mut Host<A>, block: A::Ptr) -> Result<(), Shim
     Ok(())
 }
 
+/// Insert one record into `block`, shared by every routine that inserts.
+///
+/// `refuse_on_duplicate` is the whole difference between the family's members:
+/// `dfaInsertDup`/`dinsbtv` have the vendor's own case-5 branch for a
+/// duplicate key and answer false, while `dfaInsertV`/`dfaInsert`/`invbtv`/
+/// `insbtv` have no such exception and must not silently discard the write.
+///
+/// # Why this lives here and not in `shims::dfa`
+///
+/// Because `btv*` and `dfa*` are the same exports renamed, not two APIs.
+/// Galacticomm's own porting tool says so outright -- `SRC/devutils/galport/
+/// GALPORT.C:66` is a literal `{"invbtv", "dfaInsertV"}` table covering the
+/// whole family -- and `re/ordinal-renames.tsv` shows the pairs sharing one
+/// ordinal. This body was written on the `dfa` side first and `invbtv`/`insbtv`
+/// sat next to it refusing outright, which is exactly how `dfaDelete` came to
+/// drop the cursor invalidation `delbtv` performs (`ce64fbbe`). One insert, one
+/// implementation, in the lower of the two modules so the dependency runs
+/// `dfa -> btv` the way it already does.
+///
+/// # Errors
+///
+/// An unresolvable record pointer, a duplicate key when `refuse_on_duplicate`,
+/// or an engine refusal from the write itself.
+pub(crate) fn insert_record<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    who: &str,
+    block: A::Ptr,
+    recptr: A::Ptr,
+    length: u16,
+    refuse_on_duplicate: bool,
+) -> Result<bool, ShimError> {
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
+        true => file.data(),
+        false => recptr,
+    };
+    let bytes = recptr
+        .resolve(call.mem(), usize::from(length))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    if let Some((key, value)) = duplicate_key(host, block, &bytes, None)? {
+        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
+        if refuse_on_duplicate {
+            return Err(ShimError::Failed(format!(
+                "{who} on {name} collided with an existing record on key {key} \
+                 ({value:02x?}), which does not permit duplicates -- unlike \
+                 dfaInsertDup's own case-5 branch (DFAAPI.C:637-638), {who}'s underlying \
+                 call has no exception for a duplicate, so this refuses instead of \
+                 answering false and silently discarding the write"
+            )));
+        }
+        note_duplicate_key(host, who, &name, key, &value);
+        return Ok(false);
+    }
+
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    let position = file.insert(&bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // Currency on the record just inserted, key 0's order -- see
+    // [`dinsbtv`]'s own doc comment for why key 0 specifically.
+    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+    let physical = records.find_physical(position).expect("insert just wrote this position");
+    let cursor = match records.place_in(0, physical) {
+        Some(at) => Cursor::Ordered { key: 0, at },
+        None => Cursor::Physical { at: physical },
+    };
+    file.seek_to(cursor);
+    Ok(true)
+}
+
 /// The current file, or `None` if there is none.
 ///
 /// **Not an error.** `PLBTVSTF.C` opens eleven of its routines with
@@ -2734,7 +2773,7 @@ pub(crate) fn update_variable<A: Abi>(
 /// would risk failing on a bad pointer *before* naming the real reason this
 /// call cannot succeed, which is a worse error for the same outcome.
 pub fn insbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let _recptr = call.ptr();
+    let recptr = call.ptr();
     let block = positioned(call, host, "insbtv")?.ok_or_else(|| {
         ShimError::Failed(
             "insbtv with no Btrieve file current -- PLBTVSTF.C:576 reads \
@@ -2744,12 +2783,12 @@ pub fn insbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
                 .to_owned(),
         )
     })?;
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    Err(ShimError::Failed(format!(
-        "insbtv (invbtv(recptr, bb->reclen), PLBTVSTF.C:576) into {}, and \
-         nothing in this host writes to a Btrieve file",
-        file.name()
-    )))
+    // `PLBTVSTF.C:576`: `insbtv(recptr)` IS `invbtv(recptr, bb->reclen)`. The
+    // length this host uses for that is `maxlen`, the same one `dinsbtv` reads
+    // for the identical reason.
+    let length = host.btrieve.block(block).map_err(ShimError::Failed)?.maxlen();
+    insert_record(call, host, "insbtv", block, recptr, length, true)?;
+    Ok(abi::Ret::Void)
 }
 
 // ---------------------------------------------------------------------------
@@ -4797,18 +4836,54 @@ mod tests {
         );
     }
 
+    /// `invbtv` inserts, and the record survives a reopen.
+    ///
+    /// This test replaces one that asserted the opposite -- that `invbtv`
+    /// refuses because "nothing in this host writes to a Btrieve file". That
+    /// stopped being true when the v6 write path landed (2026-08-16), and the
+    /// stale refusal is what stopped a real 16-bit MajorMUD booting: init
+    /// calls `invbtv` into `WGSGEN2.DAT`. Its `dfa` twin `dfaInsertV` had been
+    /// inserting successfully the whole time -- same export slot @357,
+    /// `GALPORT.C:66`'s own `{"invbtv", "dfaInsertV"}` -- which is the cost of
+    /// one routine having two bodies.
+    ///
+    /// Re-read through a fresh host, like `dinsbtv`'s own insert test: an
+    /// in-memory model that agrees with itself proves nothing.
     #[test]
-    fn invbtv_with_a_file_current_refuses_and_names_the_file() {
-        // The other half, and the more important one. Nothing in this host
-        // writes to a Btrieve file, so an insert into a real file must stop the
-        // module rather than appear to work -- a module told its insert
-        // succeeded and then finding the record gone is the failure mode this
-        // whole crate is shaped around.
-        let mut f = Fixture::new();
+    fn invbtv_inserts_a_record_and_it_survives_a_reopen() {
+        let dir = crate::testing::scratch_with("invbtv-insert", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
         open(&mut f, "SAMPLE.DAT", 64);
-        let e = f.invoke(invbtv, &[0, 0, 64]).expect_err("nothing here writes");
+        let recptr = f.bytes(&sample_record(97, "Vixen"), false);
+
+        let mut args = Fixture::far(recptr).to_vec();
+        args.push(64); // the length invbtv takes and insbtv reads off the block
+        f.invoke(invbtv, &args).expect("inserts");
+
+        let mut g = Fixture::rooted(dir);
+        let block = open(&mut g, "SAMPLE.DAT", 64);
+        let into = buffer(&g, block);
+        assert!(acquire(&mut g, Some(97), 0, 5), "the new record is on disk");
+        assert_eq!(
+            g.read(FarPtr { offset: into.offset + 2, selector: into.selector }),
+            "Vixen"
+        );
+    }
+
+    /// A duplicate key must stop the module rather than answer, because
+    /// `invbtv`'s underlying call has no case-5 branch -- unlike `dinsbtv`,
+    /// whose whole `d` is that exception.
+    #[test]
+    fn invbtv_refuses_a_record_colliding_on_a_key_without_duplicates() {
+        let dir = crate::testing::scratch_with("invbtv-dup", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(5, "Troll"), false);
+        let mut args = Fixture::far(recptr).to_vec();
+        args.push(64);
+        let e = f.invoke(invbtv, &args).expect_err("5 is already Troll");
         assert!(e.to_string().contains("invbtv"), "{e}");
-        assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
+        assert!(e.to_string().contains("collided"), "{e}");
     }
 
     #[test]

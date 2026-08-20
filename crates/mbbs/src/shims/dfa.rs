@@ -881,63 +881,6 @@ pub fn dfaStepLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi
     Ok(abi::Ret::Int(A::Int::from(1u16)))
 }
 
-/// The body [`dfaInsert`]/[`dfaInsertV`]/[`dfaInsertDup`] share -- opcode 2,
-/// always key 0 (`DFAAPI.C:613,634`: `btvu(2,recptr,dfa->key,0,length)` in
-/// both), which is [`btv::dinsbtv`]'s own body with `length` and the
-/// duplicate-key convention taken as parameters instead of fixed.
-///
-/// `refuse_on_duplicate` is `true` for [`dfaInsert`]/[`dfaInsertV`] (no
-/// `case 5` branch at either's underlying call -- `:613`/`:556`-shaped, see
-/// [`btv::upvbtv`]'s own doc comment for the identical shape) and `false`
-/// for [`dfaInsertDup`] (`:634-642`'s own `case 5: break;`).
-fn dfa_insert<A: Abi>(
-    call: &mut Call<A>,
-    host: &mut Host<A>,
-    who: &str,
-    block: A::Ptr,
-    recptr: A::Ptr,
-    length: u16,
-    refuse_on_duplicate: bool,
-) -> Result<bool, ShimError> {
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
-        true => file.data(),
-        false => recptr,
-    };
-    let bytes = recptr
-        .resolve(call.mem(), usize::from(length))
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-
-    if let Some((key, value)) = btv::duplicate_key(host, block, &bytes, None)? {
-        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
-        if refuse_on_duplicate {
-            return Err(ShimError::Failed(format!(
-                "{who} on {name} collided with an existing record on key {key} \
-                 ({value:02x?}), which does not permit duplicates -- unlike \
-                 dfaInsertDup's own case-5 branch (DFAAPI.C:637-638), {who}'s underlying \
-                 call has no exception for a duplicate, so this refuses instead of \
-                 answering false and silently discarding the write"
-            )));
-        }
-        btv::note_duplicate_key(host, who, &name, key, &value);
-        return Ok(false);
-    }
-
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    let position = file.insert(&bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
-
-    // Currency on the record just inserted, key 0's order -- see
-    // `btv::dinsbtv`'s own doc comment for why key 0 specifically.
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-    let physical = records.find_physical(position).expect("insert just wrote this position");
-    let cursor = match records.place_in(0, physical) {
-        Some(at) => Cursor::Ordered { key: 0, at },
-        None => Cursor::Physical { at: physical },
-    };
-    file.seek_to(cursor);
-    Ok(true)
-}
 
 /// `VOID dfaInsertV(VOID *recptr, USHORT length)` -- insert a new record at
 /// a module-supplied length.
@@ -950,7 +893,7 @@ pub fn dfaInsertV<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
     let recptr = call.ptr();
     let length = btv::ushort_arg::<A>(call.int());
     let block = dfa_required(host, "dfaInsertV")?;
-    dfa_insert(call, host, "dfaInsertV", block, recptr, length, true)?;
+    btv::insert_record(call, host, "dfaInsertV", block, recptr, length, true)?;
     Ok(abi::Ret::Void)
 }
 
@@ -964,7 +907,7 @@ pub fn dfaInsert<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
     let recptr = call.ptr();
     let block = dfa_required(host, "dfaInsert")?;
     let length = host.btrieve.block(block).map_err(ShimError::Failed)?.maxlen();
-    dfa_insert(call, host, "dfaInsert", block, recptr, length, true)?;
+    btv::insert_record(call, host, "dfaInsert", block, recptr, length, true)?;
     Ok(abi::Ret::Void)
 }
 
@@ -979,7 +922,7 @@ pub fn dfaInsertDup<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
     let recptr = call.ptr();
     let block = dfa_required(host, "dfaInsertDup")?;
     let length = host.btrieve.block(block).map_err(ShimError::Failed)?.maxlen();
-    let ok = dfa_insert(call, host, "dfaInsertDup", block, recptr, length, false)?;
+    let ok = btv::insert_record(call, host, "dfaInsertDup", block, recptr, length, false)?;
     Ok(abi::Ret::Int(A::Int::from(u16::from(ok))))
 }
 
