@@ -13,6 +13,8 @@
 //! that: a structure's fields must account for every byte of it, so a range
 //! nobody has described is a reported fault instead of a silent omission.
 
+pub mod generation;
+
 /// One described range of bytes.
 pub struct Field {
     /// What this range is, in the vendor's vocabulary where one exists.
