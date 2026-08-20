@@ -29,6 +29,29 @@
 //! and see `LuaExtension::load`'s duplicate-registration refusal for the
 //! related failure mode of two scripts silently shadowing each other.
 //!
+//! ## It also shadows the module's OWN commands, abbreviations included
+//!
+//! The seam runs before the module, so a registered name wins over a built-in
+//! of the same name -- silently, with nothing logged and nothing for the
+//! player to notice except that a command they have always used stopped
+//! working.
+//!
+//! This is not hypothetical. Milestone 1 shipped `exp`, which is the natural
+//! abbreviation for MajorMUD's own `experience` command (`cmd_experience`,
+//! ordinal 469) -- the one that SHOWS your total. A live board caught it on
+//! 2026-08-20 and the script was renamed to `setexp`.
+//!
+//! Before naming a command, check it against the module's own list, and check
+//! it is not a PREFIX of one either -- MajorMUD resolves abbreviations, so a
+//! short name captures every command it prefixes:
+//!
+//! ```text
+//! python3 re/ne_exports.py re/WCCMMUD.DLL --list | grep cmd_
+//! ```
+//!
+//! This crate deliberately does not enforce that itself: it is module-agnostic,
+//! and a hard-coded MajorMUD command list has no business in it.
+//!
 //! # Where a command's business logic goes
 //!
 //! `mbbs-lua`'s two coin/experience commands set two different precedents

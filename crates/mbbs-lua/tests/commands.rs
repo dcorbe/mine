@@ -237,7 +237,7 @@ fn cash_a_negative_amount_against_a_module_with_no_export_names_addon_adjust_use
 #[test]
 fn the_shipped_exp_script_loads_and_registers() {
     let ext = LuaExtension::load(&shipped_scripts()).expect("scripts/ must load");
-    assert!(ext.command_names().contains(&"exp".to_owned()), "got: {:?}", ext.command_names());
+    assert!(ext.command_names().contains(&"setexp".to_owned()), "got: {:?}", ext.command_names());
 }
 
 #[test]
@@ -247,11 +247,11 @@ fn exp_with_no_amount_prints_a_prompt_and_never_calls_into_the_module() {
     let module = fixture.minimal_module();
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "exp", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "setexp", &module);
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(String::from_utf8_lossy(&out), "exp <total>\r\n");
+    assert_eq!(String::from_utf8_lossy(&out), "setexp <total>\r\n");
     assert!(fixture.host.notes().is_empty(), "a usage message must not touch the module at all");
 }
 
@@ -262,7 +262,7 @@ fn exp_with_a_fractional_amount_reports_it_honestly_and_never_calls_into_the_mod
     let module = fixture.minimal_module();
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "exp 1.5", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "setexp 1.5", &module);
 
     assert_eq!(verdict, Verdict::Handled, "a bad amount is the player's mistake, not a reason to disable the command");
     let out = fixture.host.gsbl_mut().drain_output(chan);
@@ -280,7 +280,7 @@ fn exp_with_a_negative_amount_reports_it_honestly_and_never_calls_into_the_modul
     let module = fixture.minimal_module();
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "exp -50", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "setexp -50", &module);
 
     assert_eq!(verdict, Verdict::Handled, "a bad amount is the player's mistake, not a reason to disable the command");
     let out = fixture.host.gsbl_mut().drain_output(chan);
@@ -295,7 +295,7 @@ fn exp_with_a_negative_amount_reports_it_honestly_and_never_calls_into_the_modul
 /// `CommandCtx::set_experience` -- which calls `player_record()` first,
 /// before it ever writes a byte -- fails at exactly the "unresolvable
 /// `_GET_PLAYER`" path `call_export` refuses. As close as this fixture gets
-/// to exercising `exp.lua`'s real Rust glue without a real, code-bearing
+/// to exercising `setexp.lua`'s real Rust glue without a real, code-bearing
 /// module (see `task-6-report.md`'s "untestable" section for the general
 /// shape of this gap, and `task-8-report.md` for what this task's own
 /// `setting_experience_writes_both_copies` proves instead, against a real
@@ -307,12 +307,12 @@ fn exp_against_a_module_with_no_export_disables_the_handler_and_names_get_player
     let module = fixture.minimal_module();
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "exp 100", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "setexp 100", &module);
 
     assert_eq!(verdict, Verdict::Pass, "a broken handler must never swallow the line");
     let notes = fixture.host.notes();
     assert_eq!(notes.len(), 1, "got: {notes:?}");
-    assert!(notes[0].contains("exp"), "got: {notes:?}");
+    assert!(notes[0].contains("setexp"), "got: {notes:?}");
     assert!(notes[0].contains("_GET_PLAYER"), "got: {notes:?}");
 }
 
@@ -360,7 +360,7 @@ fn exp_with_no_character_loaded_reports_it_and_leaves_the_handler_enabled() {
     let chan = fixture.console();
 
     for attempt in 0..3 {
-        let verdict = fixture.run_command(&mut ext, chan, "exp 100", &module);
+        let verdict = fixture.run_command(&mut ext, chan, "setexp 100", &module);
         assert_eq!(verdict, Verdict::Handled, "attempt {attempt}: no character loaded is a player mistake, not a reason to disable exp");
         let out = fixture.host.gsbl_mut().drain_output(chan);
         assert_eq!(String::from_utf8_lossy(&out), "no character loaded on this channel.\r\n", "attempt {attempt}");
