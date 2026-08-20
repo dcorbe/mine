@@ -7350,12 +7350,20 @@ mod tests {
     /// `select()` onto it). Here tokio owns I/O and the vector carries only
     /// the module's gate.
     ///
-    /// `Fixture::new`'s clock is frozen, so no second elapses across these
-    /// calls and the per-second site cannot fire -- which is exactly what
-    /// makes the assertion below discriminate.
+    /// `Fixture::new` hands out a real, advancing [`Clock::system`] --
+    /// `Host::new` installs one, and nothing about a fixture changes that.
+    /// This test pins it, so no second can elapse across the four calls
+    /// below and the per-second site cannot fire -- which is exactly what
+    /// makes `dispatched == 0` discriminate Site A's absence. Without the
+    /// pin the test would still usually pass (four in-process calls finish
+    /// in microseconds), but "usually" is not a proof, and a scheduling
+    /// stall spanning a wall-clock second would make the per-second site
+    /// fire legitimately and fail the assertion for a reason that has
+    /// nothing to do with what this test exists to check.
     #[test]
     fn cycle_does_not_fire_syscyc_merely_because_the_scan_did_not_advance() {
         let (mut f, module, rou) = polling_fixture();
+        f.host.set_clock(Clock::pinned(1_135_952_405));
 
         // Install a vector, as a module's init routine does.
         let mut bytes = [0u8; 4];
