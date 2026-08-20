@@ -56,7 +56,16 @@ use mbbs_machine::library::CW3220MT;
 /// missing global. The names are printed in capitals so a grep separates them
 /// from the per-dispatch lines.
 pub(crate) fn traced() -> bool {
-    std::env::var_os("MBBS_TRACE_SHIMS").is_some()
+    // Read once, not per dispatch. The old comment on the trace site said
+    // "costs one `var_os` per dispatch when off", which was true and turned out
+    // to cost 2.7% of total host CPU under `perf` -- `getenv` was the second
+    // hottest symbol in the process -- because a 32-bit MajorMUD session makes
+    // nearly two million dispatches.
+    //
+    // Reading it once also means the switch is fixed for the run, which is what
+    // an operator already assumes: nothing re-reads the environment mid-session.
+    static TRACED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACED.get_or_init(|| std::env::var_os("MBBS_TRACE_SHIMS").is_some())
 }
 
 /// `KERNEL32.dll`'s own import-directory spelling -- measured byte-for-byte

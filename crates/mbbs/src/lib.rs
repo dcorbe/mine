@@ -439,6 +439,43 @@ impl PollCensus {
 /// pass under a second cannot have cost the module a timer.
 const STALL_FLOOR: Duration = Duration::from_secs(1);
 
+/// How long one [`Host::cycle`] call may spend before it hands control back,
+/// regardless of how many passes that took.
+///
+/// `max` -- `--passes`, 32 by default -- is a *count*, and the thing that
+/// actually matters is time: `mbbs-server`'s loop reads the socket in exactly
+/// one place, so a keystroke arriving just after `cycle` was entered waits for
+/// the whole call. `--passes`'s own doc records the tuning that produced 32,
+/// measured at 104-352ms per call on the 16-bit board.
+///
+/// A count cannot hold that promise across boards. On the 32-bit module the
+/// same 32 passes take 4-7 seconds: each pass drives the module's realtime
+/// engine through roughly 60,000 shim dispatches -- `MBBS_TRACE_SHIMS` counted
+/// 1,918,319 `ptrblok` calls in one session, 99.7% of its traffic -- so
+/// per-pass cost is two orders of magnitude larger than when 32 was chosen,
+/// and the host reports "one pass took 7.5s" while a player waits that long to
+/// see a keystroke echo.
+///
+/// So the loop stops on whichever bound comes first. A slower board does fewer
+/// passes rather than overrunning; a faster one still gets its 32. This is what
+/// makes the count a safety net instead of the only bound.
+///
+/// # Verified by measurement, not by a unit test
+///
+/// Stated because the gap matters: this is checked against the live 32-bit
+/// board -- the same scripted session goes from 11 stall notes, worst pass
+/// 7.4s, to none -- and `mbbs-server`'s
+/// `the_pass_bound_sits_below_the_poll_budget_so_a_burst_stays_interruptible`
+/// still holds, which this only strengthens.
+///
+/// There is no unit test. `Host::cycle`'s test fixtures reach a terminal state
+/// of their own -- `Ended::Idle` with nothing queued, or a stop on an
+/// unresolved thunk once input is pushed -- before either bound is reached, so
+/// every assertion I could get out of them would be measuring that stop rather
+/// than this budget. A test that cannot fail for the right reason is worse than
+/// the absence of one, so this is the absence, said out loud.
+const PASS_BUDGET: Duration = Duration::from_millis(250);
+
 /// Whether one pass of [`Host::cycle`] took long enough to be worth reporting,
 /// and what to say about it.
 ///
@@ -1469,6 +1506,34 @@ pub struct Host<A: Abi> {
     /// something that outlives `Host` (the supervisor in `mbbs-server`) keep
     /// the same inventory across every life this process has.
     survey: Option<survey::Shared>,
+
+    /// `shims::entry`'s answer for a thunk index, remembered.
+    ///
+    /// The dispatch loop below resolved every call from scratch: an
+    /// `import_owner` lookup, a `String` clone of the library name, a second
+    /// `String` built for the symbol (formatted, for an ordinal), then
+    /// `shims::entry`. That is fine at a few thousand calls and ruinous at the
+    /// real rate -- `MBBS_TRACE_SHIMS` over one 32-bit session counted
+    /// **1,918,319** calls to `ptrblok` alone, 99.7% of all its shim traffic,
+    /// because MajorMUD reaches every element of its big tables through it.
+    ///
+    /// Safe to remember because the answer cannot change: `shims::entry` is a
+    /// pure function of `(dll, symbol)` and this crate's static tables, the
+    /// dispatch path never consults `self.loaded` (only `Resolver` does, at
+    /// load time), and thunk indices are machine-wide unique since `50944874`
+    /// -- so one index means one import for the life of the machine.
+    ///
+    /// Only routine hits are cached. Every other `Entry` goes down the slow
+    /// path, which is where survey recording and the refusal diagnostics live
+    /// and which is not hot by construction: a `Datum` resolves at load time
+    /// and never traps, and an `Unimplemented` stops the module.
+    resolved: Vec<Option<(shims::Shim<A>, shims::Cleans)>>,
+
+    /// How long one [`Host::cycle`] call may run. See [`PASS_BUDGET`], which is
+    /// the default; a field so a test can shrink it instead of burning the real
+    /// budget in wall-clock, and so an operator can retune it without a
+    /// rebuild.
+    pass_budget: Duration,
 }
 
 /// What `poll` does with a status.
@@ -1786,6 +1851,8 @@ impl<A: Abi> Host<A> {
             trace: std::env::var_os("MBBS_TRACE").is_some(),
             inited: false,
             survey: None,
+            resolved: Vec::new(),
+            pass_budget: PASS_BUDGET,
         };
 
         // `clock()` counts from here. Set after construction because
@@ -2081,6 +2148,11 @@ impl<A: Abi> Host<A> {
     /// `inventory` is a shared handle rather than a value this method takes
     /// ownership of, because `Host` does not live long enough to be trusted
     /// with the only copy -- see this struct's own `survey` field.
+    /// Retune how long one [`Host::cycle`] call may run. See [`PASS_BUDGET`].
+    pub fn set_pass_budget(&mut self, budget: Duration) {
+        self.pass_budget = budget;
+    }
+
     pub fn enable_survey(&mut self, inventory: survey::Shared) {
         self.survey = Some(inventory);
     }
@@ -3139,6 +3211,51 @@ impl<A: Abi> Host<A> {
             // ever meaningful decoded against the module whose code was
             // actually running -- which, once execution has crossed into
             // `owner`, is no longer `module`.
+            // The remembered answer, when there is one. Skips two `String`
+            // allocations and the table lookups; see `Host::resolved`.
+            //
+            // Stood down while `MBBS_TRACE_SHIMS` is on, because the trace
+            // needs the library and symbol names that this path exists to
+            // avoid building.
+            // The remembered answer, when there is one. Skips the
+            // `import_owner` lookup, both `String` allocations and the table
+            // lookups; see `Host::resolved`.
+            //
+            // Stood down while either trace is on, because both print names
+            // this path exists precisely to avoid building.
+            if !self.trace
+                && !shims::traced()
+                && let Some(Some((shim, cleans))) = self.resolved.get(usize::from(index)).copied()
+            {
+                self.calls += 1;
+                let mut call = shims::call::<A>(machine);
+                match shim(&mut call, self) {
+                    Ok(ret) => {
+                        exit = A::resume(machine, ret, cleans)?;
+                        continue;
+                    }
+                    Err(e) => {
+                        // Terminal, so the names are worth rebuilding here to
+                        // report properly -- the fast path skips them for the
+                        // millions of calls that succeed, not for the one that
+                        // stops the module.
+                        let (from, symbol, owner) = match self.import_owner(module, index) {
+                            Some((owner, site)) => (
+                                site.module.clone(),
+                                self.symbol_name(&site.module, &site.symbol),
+                                owner,
+                            ),
+                            None => (String::new(), format!("thunk #{index}"), None),
+                        };
+                        let why = match A::caller(machine, owner.as_ref().unwrap_or(module)) {
+                            Some(at) => format!("{e}, called from {at}"),
+                            None => e.to_string(),
+                        };
+                        return self.stop(machine, A::refused(from, symbol, why));
+                    }
+                }
+            }
+
             let (from, symbol, ordinal, owner) = match self.import_owner(module, index) {
                 Some((owner, site)) => (
                     site.module.clone(),
@@ -3171,6 +3288,13 @@ impl<A: Abi> Host<A> {
                     if shims::traced() {
                         eprintln!("mbbs-trace: chan={chan:?} {from}!{symbol}");
                     }
+                    // Remember it, so the next of the million calls to this
+                    // thunk takes the fast path above.
+                    let at = usize::from(index);
+                    if self.resolved.len() <= at {
+                        self.resolved.resize(at + 1, None);
+                    }
+                    self.resolved[at] = Some((shim, cleans));
                     (shim, cleans)
                 }
                 other @ (Entry::Datum | Entry::Absolute(_) | Entry::Unimplemented) => {
@@ -3995,7 +4119,21 @@ impl<A: Abi> Host<A> {
         // the first pass is charged for its own work and not for the vector's.
         let mut pass_mark = std::time::Instant::now();
 
+        // Whichever bound comes first -- see `PASS_BUDGET`.
+        let cycle_start = std::time::Instant::now();
         while iterations < max {
+            if iterations > 0 && cycle_start.elapsed() >= self.pass_budget {
+                let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
+                return Ok(Cycles {
+                    iterations,
+                    dispatched,
+                    // The same answer reaching `max` gives: `Ended::Bound`
+                    // is what drives `Wait::Now`, so the driver comes
+                    // straight back rather than sleeping on a board that
+                    // still has work queued.
+                    ended: Ended::Bound { next_kick },
+                });
+            }
             iterations += 1;
 
 
@@ -7267,6 +7405,7 @@ mod tests {
         }
         assert_eq!(f.host.clock_reads(), 100, "counted even though it did not move");
     }
+
 
     /// `MAJORBBS.C:419-424` fires the `syscyc` vector whenever the channel
     /// scan does not advance. This host declined it for most of its life, and
