@@ -61,6 +61,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mbbs::abi::Abi;
 use mbbs::{Chan, Ended, Host, Outcome, Terms, Wait};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 use crate::msg::{In, Out};
@@ -371,6 +372,72 @@ fn wait_with_peek(wait: Wait, peeked: bool) -> Wait {
         Wait::Blocked | Wait::Until(_) if peeked => Wait::Now,
         other => other,
     }
+}
+
+/// What step 2 of `life`'s turn decided to do, before any of it is acted on.
+///
+/// Extracted out of `life` so the property this fix rests on -- draining
+/// `peeked`, `first` and `rx`'s backlog happens *before* a `Woke::Gone` wake
+/// gets any say in whether the turn ends -- can be tested without a real
+/// `Host`/`Machine`/`Module`, the way [`wait_with_peek`] already is.
+/// `drain_turn` never touches `apply` or `shut_down` itself; it hands the
+/// caller a plan, in order, and reports the decision rather than the side
+/// effects.
+struct Drain {
+    /// Every message to hand to `apply`, in the order `life`'s step 2 always
+    /// used: `peeked` first (it was received before anything `wake`
+    /// returned this turn), then `first`, then the rest of `rx`'s backlog.
+    /// Never contains `In::Shutdown` -- see `stopping`.
+    apply: Vec<In>,
+    /// Whether anything in `apply` was real input rather than a bare
+    /// `In::Alarm` -- step 3's `expected_kick` companion.
+    saw_input: bool,
+    /// The first `In::Shutdown` drained, pulled out of `apply`'s batch
+    /// because ending the loop is `life`'s job, not `apply`'s -- see
+    /// `apply`'s own doc for what happens if one reaches it directly.
+    stopping: Option<oneshot::Sender<()>>,
+    /// Whether this turn should end with `LifeEnd::Gone`, once `apply`'s
+    /// batch has actually been applied and, if `stopping` is `Some`,
+    /// `shut_down` has run instead of this.
+    ends_gone: bool,
+}
+
+/// Build this turn's [`Drain`] plan: fold `peeked`, `first` and `rx`'s
+/// backlog into one ordered batch, and only then let `woke_gone` decide
+/// whether the turn ends.
+///
+/// This is the whole fix for the bug `wait_with_peek`'s own doc warns
+/// about: `woke_gone` is not consulted until *after* the loop below has
+/// already decided `apply` and `stopping`. A message already taken out of
+/// `rx` -- `peeked`'s reason to exist -- is a message already received, and
+/// `Woke::Gone` says nobody can send *again*, not that this batch never
+/// happened. A drained `Shutdown` always wins over a `Gone` wake too: it
+/// still deserves the real `shut_down()` sweep `life` runs for `stopping`,
+/// not silent starvation because it happened to be the last message anyone
+/// ever sent.
+fn drain_turn(
+    peeked: Option<In>,
+    first: Option<In>,
+    rx: &std::sync::mpsc::Receiver<In>,
+    woke_gone: bool,
+) -> Drain {
+    let mut apply = Vec::new();
+    let mut saw_input = false;
+    let mut stopping = None;
+    for msg in peeked
+        .into_iter()
+        .chain(first)
+        .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+    {
+        if let In::Shutdown { done } = msg {
+            stopping = Some(done);
+            continue;
+        }
+        saw_input |= !matches!(msg, In::Alarm);
+        apply.push(msg);
+    }
+    let ends_gone = woke_gone && stopping.is_none();
+    Drain { apply, saw_input, stopping, ends_gone }
 }
 
 /// How often to report [`mbbs::PollCensus`], from `MBBS_POLL_CENSUS` -- a
@@ -849,23 +916,10 @@ fn life<A: Abi>(
         }
 
         // 1. Sleep according to what the previous cycle told us to do.
-        //
-        //    `Woke::Gone` is not an immediate return any more. `peeked` can
-        //    hold a message the interrupt closure already took out of `rx`
-        //    on a prior turn -- every sender being gone says nobody can send
-        //    *again*, it says nothing about a message already received.
-        //    Returning here unconditionally would be exactly the silent
-        //    drop `wait_with_peek`'s own doc warns about, just with no hang
-        //    left to notice it by. `gone` is acted on after step 2 has had
-        //    its chance to drain whatever `peeked` was holding.
-        let mut gone = false;
-        let first = match wake(armed, rx) {
-            Woke::Message(msg) => Some(msg),
-            Woke::Nothing => None,
-            Woke::Gone => {
-                gone = true;
-                None
-            }
+        let (first, woke_gone) = match wake(armed, rx) {
+            Woke::Message(msg) => (Some(msg), false),
+            Woke::Nothing => (None, false),
+            Woke::Gone => (None, true),
         };
 
         // 2. Drain every message available, not just the one that woke us --
@@ -875,32 +929,16 @@ fn life<A: Abi>(
         //    exactly like `apply`'s other callers -- `saw_input` is what
         //    tells step 3 apart from a bare bell.
         //
-        //    `peeked` goes first: it was received before anything `wake`
-        //    returns this turn, and draining it out of order would answer
-        //    messages younger than it before it is even applied. This runs
-        //    unconditionally, even when `wake` just reported `Gone` above --
-        //    see this loop's own comment.
-        let mut saw_input = false;
-        let mut stopping = None;
-        for msg in peeked
-            .take()
-            .into_iter()
-            .chain(first)
-            .chain(std::iter::from_fn(|| rx.try_recv().ok()))
-        {
-            // Taken here rather than in `apply`, because this is the one
-            // message that ends the loop rather than acting on it, and
-            // `apply` has no way to say so. The rest of the batch is still
-            // drained: a `Disconnect` queued behind the shutdown is a channel
-            // whose module still deserves its `huprou`.
-            if let In::Shutdown { done } = msg {
-                stopping = Some(done);
-                continue;
-            }
-            saw_input |= !matches!(msg, In::Alarm);
+        //    `drain_turn` is what makes this run unconditionally, even when
+        //    `wake` just reported `Gone` above: `peeked` was received before
+        //    anything `wake` returns this turn, and `woke_gone` does not get
+        //    a say until `drain_turn` has already decided what to apply --
+        //    see its own doc for why.
+        let batch = drain_turn(peeked.take(), first, rx, woke_gone);
+        for msg in batch.apply {
             apply(&mut host, &mut machine, &module, &mut pool, &mut conns, msg)?;
         }
-        if let Some(done) = stopping {
+        if let Some(done) = batch.stopping {
             shut_down(&mut host, &mut machine, &module, boot.machine, &mut conns, terms);
             // Sent after the sweep, not before: the whole point of the
             // channel is that the waiter learns when `finrou` has finished,
@@ -909,19 +947,18 @@ fn life<A: Abi>(
             let _ = done.send(());
             return Ok(LifeEnd::ShutDown);
         }
-        if gone {
-            // Whatever `peeked` was holding has just been applied above, in
-            // the same batch a live `Shutdown` would have been (and, had it
-            // been a `Shutdown`, `stopping` would already have returned
-            // above with a real `shut_down()` sweep, not this bare exit).
-            // There is nothing left to drain and nobody left to serve: every
-            // sender is gone, including the one `conn::spawn_machine`'s own
-            // alarm task keeps for the process's whole life -- see that
-            // function's doc for why that makes this path unreachable on a
-            // real board, and reachable only by a test that drives `run`
-            // with a channel of its own.
+        if batch.ends_gone {
+            // Everything `peeked` and `rx` were holding has just been
+            // applied above -- `drain_turn` guarantees that regardless of
+            // `woke_gone`. There is nothing left to drain and nobody left
+            // to serve: every sender is gone, including the one
+            // `conn::spawn_machine`'s own alarm task keeps for the
+            // process's whole life -- see that function's doc for why that
+            // makes this path unreachable on a real board, and reachable
+            // only by a test that drives `run` with a channel of its own.
             return Ok(LifeEnd::Gone);
         }
+        let saw_input = batch.saw_input;
 
         // 3. The pump as a derived clock (design doc §7): grant a fresh poll
         //    budget only on a turn that had a reason to expect new work --
@@ -1246,7 +1283,7 @@ mod tests {
 
     use crate::pool::{MachineId, Pool};
 
-    use super::{Woke, collapse, wait_with_peek, wake};
+    use super::{Woke, collapse, drain_turn, wait_with_peek, wake};
     use crate::msg::{In, Out};
     use mbbs::Wait;
 
@@ -1360,42 +1397,21 @@ mod tests {
         assert_eq!(wait_with_peek(Wait::Stop, true), Wait::Stop);
     }
 
-    /// The gap `wait_with_peek`'s own doc warns about, closed for real:
-    /// `peeked` is a message the interrupt closure already took out of `rx`,
-    /// so `wake` finding `rx` itself empty *and* disconnected (`Woke::Gone`)
-    /// on some later turn says nobody can send *again* -- it says nothing
-    /// about a message already received. `life` no longer returns on
-    /// `Woke::Gone` before step 2's drain runs; this reproduces that
-    /// ordering directly, since `life` itself cannot be driven without a
-    /// real `.DLL` (see this module's own doc): a fully disconnected `rx`
-    /// really does report `Gone`, and a message drained ahead of it --
-    /// exactly `peeked.take().into_iter().chain(first).chain(..)`'s order --
-    /// still reaches `apply` and lands in GSBL rather than vanishing with
-    /// the connection's last sender.
+    /// The whole fix, pinned directly against `drain_turn` (not a hand
+    /// copy of its shape): a message `peeked` is holding must end up in
+    /// `Drain::apply` even when `woke_gone` is `true`. `life` itself cannot
+    /// be driven without a real `.DLL` (see this module's own doc), which is
+    /// exactly why `drain_turn` was pulled out of it -- this calls the real
+    /// function `life` calls, not a reimplementation of it.
     #[test]
-    fn a_message_drained_ahead_of_a_gone_wake_still_reaches_apply() {
-        use mbbs::testing::Fixture;
-
+    fn drain_turn_applies_a_peeked_message_even_when_the_wake_was_gone() {
         let terms = Terms::new(1);
-        let mut fixture = Fixture::rooted_with_terms(
-            mbbs::testing::scratch("mbbs-server-host-peeked-survives-gone"),
-            terms,
-        );
-        let module = fixture.minimal_module();
-        let chan = fixture.console();
-
         let mut pool = Pool::new(MachineId(0), terms);
-        let routed = pool.key(chan);
-        let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
-        // Connected, unlike the two guard tests above -- the point here is
-        // that a peeked message reaches a *live* channel, not that it gets
-        // turned away from a dead one.
-        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
-        conns[routed.chan.index()] = Some(out_tx);
+        let routed = pool.take().expect("the only channel");
 
-        // Every sender dropped: exactly what `wake` sees once the interrupt
-        // closure has already taken the one message anyone was ever going
-        // to send.
+        // `rx` empty and disconnected -- exactly what `wake` sees once the
+        // interrupt closure has already taken the one message anyone was
+        // ever going to send.
         let (tx, rx) = std::sync::mpsc::channel::<In>();
         drop(tx);
         assert!(
@@ -1403,20 +1419,41 @@ mod tests {
             "the channel must report Gone, not spin"
         );
 
-        // `life`'s step 2, reproduced: `peeked` drains first, ahead of
-        // whatever else `rx` still holds (nothing, here -- the point is
-        // that `rx` being empty and Gone must not stop this message).
-        let peeked = Some(In::Input { chan: routed, bytes: b"hi\r".to_vec() });
-        for msg in peeked.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
-            super::apply(&mut fixture.host, &mut fixture.machine, &module, &mut pool, &mut conns, msg)
-                .expect("applies");
-        }
+        let peeked = Some(In::Input { chan: routed, bytes: b"hi".to_vec() });
+        let batch = drain_turn(peeked, None, &rx, true);
 
-        assert_eq!(
-            fixture.host.gsbl_mut().take_line(chan),
-            Some(b"hi".to_vec()),
-            "the peeked message must have reached GSBL, not been dropped \
-             with the connection's last sender"
+        assert_eq!(batch.apply.len(), 1, "the peeked message must survive draining");
+        let In::Input { chan, bytes } = &batch.apply[0] else {
+            panic!("expected the peeked In::Input to survive draining");
+        };
+        assert_eq!(*chan, routed);
+        assert_eq!(bytes, b"hi");
+        assert!(batch.stopping.is_none());
+        assert!(
+            batch.ends_gone,
+            "nothing else is queued, so Gone still ends the turn once the batch is applied"
+        );
+    }
+
+    /// A `Shutdown` drained in the very batch that also found `rx` gone
+    /// must still win: `ends_gone` is `false` whenever `stopping` is
+    /// `Some`, so `life` runs the real `shut_down()` sweep instead of a bare
+    /// `LifeEnd::Gone` exit that would drop `done` without ever touching
+    /// `finrou`.
+    #[test]
+    fn drain_turn_lets_a_drained_shutdown_win_over_a_gone_wake() {
+        let (tx, rx) = std::sync::mpsc::channel::<In>();
+        drop(tx);
+
+        let (done, _waiter) = oneshot::channel();
+        let peeked = Some(In::Shutdown { done });
+        let batch = drain_turn(peeked, None, &rx, true);
+
+        assert!(batch.apply.is_empty(), "Shutdown must not reach apply's batch");
+        assert!(batch.stopping.is_some(), "life must still see it to run shut_down");
+        assert!(
+            !batch.ends_gone,
+            "a drained Shutdown must win over Gone, not be absorbed by a bare exit"
         );
     }
 
