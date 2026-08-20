@@ -222,14 +222,18 @@ pub struct Boot<A: Abi> {
     /// Set per machine rather than per process because two machines on one
     /// server are two boards; nothing says they share a serial.
     pub bturno: Option<String>,
-    /// Poll dispatches granted per driver wake. See [`Host::refill_polls`].
-    pub polls_per_wake: usize,
+    /// Poll firings granted per elapsed second. Set once, at boot, via
+    /// [`mbbs::Host::set_polls_per_second`] -- the clock inside
+    /// [`mbbs::Host::cycle`] grants it every elapsed second from then on,
+    /// which is why this is no longer a per-wake re-arm: there is no
+    /// `refill_polls` to call any more.
+    pub polls_per_second: usize,
     // This struct used to carry `passes: usize` here too, `Host::cycle`'s
     // pass-count bound. Retired 2026-08-20 alongside `--passes`: a count is
     // a proxy for "has input arrived?", and a bad one -- see
     // `docs/superpowers/specs/2026-08-20-cycle-interrupt-and-syscyc-design.md`.
     // `cycle` now takes an interrupt predicate instead ([`life`]'s own
-    // `interrupted` closure, below); `polls_per_wake` above is the only
+    // `interrupted` closure, below); `polls_per_second` above is the only
     // tuning dial left.
     /// Where this thread reports its own [`Host::clock_reads`] after every
     /// `cycle` call, for a caller outside the thread to sample.
@@ -619,7 +623,7 @@ fn shut_down<A: Abi>(
 /// different one) to recover the board unattended, while still bounding a
 /// true crash loop to five module reloads a minute -- noise next to the
 /// ~500 poll dispatches a second this host already spends idling with two
-/// players in the Realm (see `DEFAULT_POLLS_PER_WAKE`'s doc in `main.rs`).
+/// players in the Realm (see `DEFAULT_POLLS_PER_SECOND`'s doc in `main.rs`).
 /// Five and sixty are both arbitrary within that bound; a future operator
 /// with a real crash-loop incident to look at should retune the constant,
 /// not the mechanism.
@@ -930,12 +934,31 @@ fn life<A: Abi>(
         boot.modules.len(),
         boot.terms.count()
     );
+    // Granted by the clock inside `Host::cycle` now, not by this loop. The
+    // pump's wake pattern is a property of socket traffic; the module's
+    // world rate must not be.
+    host.set_polls_per_second(boot.polls_per_second);
+    let census_every = census_interval();
+    // The poll grant's floor is a property of the MODULE's config, and this
+    // host does not read another program's config and pretend to understand
+    // it. What it can honestly do is report what the module asked for, so an
+    // operator can apply the rule in --polls-per-second's own doc. For
+    // MajorMUD the one that matters is option 24, MONSBUF. Gated on the same
+    // `MBBS_POLL_CENSUS` as the running census, not a flag of its own: an
+    // operator tuning the grant is exactly the operator already reading it.
+    if census_every.is_some() {
+        for (msgnum, value) in host.numeric_options() {
+            eprintln!(
+                "mbbs-server: numopt[m{who}]: option {msgnum} = {value}",
+                who = boot.machine.0
+            );
+        }
+    }
 
     let terms = boot.terms;
     let mut pool = Pool::new(boot.machine, terms);
     let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
     let mut wait = Wait::Now;
-    let census_every = census_interval();
     let mut census_due = Instant::now();
     // Driver-loop counters for the same report: how many turns this interval
     // took, and the longest single `cycle` call -- the ceiling on input

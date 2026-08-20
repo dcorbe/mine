@@ -620,7 +620,7 @@ fn boot_many(modules: Vec<PathBuf>, root_name: &str, terms: u16) -> Boot<Wg16> {
         modules,
         terms: mbbs::Terms::new(terms),
         bturno: None,
-        polls_per_wake: 8,
+        polls_per_second: 8,
         clock_reads: None,
         wake_age_ms: None,
         dispatched_total: None,

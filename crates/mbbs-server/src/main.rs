@@ -33,7 +33,7 @@ const WG32_LABEL: &str = "LunatiX";
 /// doc Part 3) -- everything a `Wg32` module asks the host to allocate at
 /// runtime, on top of its own loaded image.
 ///
-/// **Provisional, the same way `DEFAULT_POLLS_PER_WAKE` is provisional.** No
+/// **Provisional, the same way `DEFAULT_POLLS_PER_SECOND` is provisional.** No
 /// real 32-bit module has ever run against this host long enough to measure
 /// what it actually needs (`crates/mbbs/tests/wg32_round_trip.rs`'s own
 /// fixture gets by on `0x0002_0000`, but that is a synthetic one-import
@@ -48,42 +48,22 @@ const WG32_LABEL: &str = "LunatiX";
 /// not from this comment.
 const DEFAULT_WG32_ARENA_BYTES: usize = 0x0100_0000;
 
-/// Poll dispatches granted per driver wake -- `--polls-per-wake`'s default.
+/// Poll firings granted per elapsed second -- `--polls-per-second`'s default.
 ///
-/// **This number is the board's whole idle CPU cost, and very nearly its
-/// poll rate in hertz.** Measured with two players standing in the Realm:
-/// wakes are kick-driven at one a second, a polling channel spends the whole
-/// budget every wake, and the host thread's clock reads came back as
-/// `budget + 1` -- 33, 129 and 513 at budgets of 32, 128 and 512.
+/// **512 preserves today's behaviour and is not a derived number.** The old
+/// `--polls-per-wake` granted 512 per driver wake, and an armed board wakes
+/// about once a second off `_BACKGROUND_FAST`'s heartbeat, so 512/second is
+/// what the board was already getting. Keeping it makes this change a
+/// cadence fix rather than a retuning.
 ///
-/// It cannot be calibrated from inside the host. At the time this was
-/// measured, `Ended::Waiting` carried a `polls_cut` field that was `true` at
-/// every budget, because `dopoll` re-armed until the budget ran out and the
-/// chain had no way to say "done". `polls_cut` was removed 2026-08-20 -- once
-/// polling moved to a clock-driven grant, the field could only ever read
-/// `true`, which is not a meter -- but the underlying fact it was trying to
-/// report stands: the host still has no way to see whether the module is
-/// keeping up. Whether the number is big enough is a question about the
-/// module's own amortised work -- for MajorMUD, whether monsters act at the
-/// rate they should -- and answering it needs someone to play the game.
-///
-/// 512 is provisional, and chosen for the asymmetry rather than from a
-/// measurement of the game: MajorMUD's polling routine advances ONE monster
-/// per call, gated on every other call, so a budget of 32 buys about sixteen
-/// monster updates a second and a table of any size would starve. Overshoot
-/// is nearly free -- once a round drains, every further dispatch falls
-/// through one branch -- while undershoot makes the world visibly slow. 513
-/// clock reads a second is a rounding error of CPU; sixteen monster updates
-/// a second may not be a playable game.
-///
-/// **This is the operator's dial now; `--passes` is gone.** `--passes`
-/// bounded `Host::cycle`'s pass count -- a proxy for "has input arrived?",
-/// and a bad one: it fired when nothing was waiting and stayed silent when
-/// something was. It was retired 2026-08-20 in favour of an interrupt
-/// predicate the pump supplies by peeking its own mailbox, which is the
-/// signal itself. See
-/// `docs/superpowers/specs/2026-08-20-cycle-interrupt-and-syscyc-design.md`.
-const DEFAULT_POLLS_PER_WAKE: usize = 512;
+/// The floor that would make it *meaningful* is a property of the module's
+/// own config -- for MajorMUD, `MONSBUF` (option 24, 300 on the board this
+/// was measured against), the monster-table bound its firings walk one entry
+/// at a time. Below that the world runs at `grant / MONSBUF` of intended
+/// speed, silently. This host does not read another program's config and
+/// pretend to understand it; see the design doc's "the budget, and what the
+/// host may not pretend to know".
+const DEFAULT_POLLS_PER_SECOND: usize = 512;
 
 // Every rejection (an unknown flag, a missing required one, a number that
 // does not parse) is a clear message to stderr and a non-zero exit, never a
@@ -145,9 +125,9 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_TERMS, value_parser = parse_terms)]
     terms: u16,
 
-    /// Poll dispatches granted per driver wake
-    #[arg(long, default_value_t = DEFAULT_POLLS_PER_WAKE)]
-    polls_per_wake: usize,
+    /// Poll firings granted per elapsed second
+    #[arg(long, default_value_t = DEFAULT_POLLS_PER_SECOND)]
+    polls_per_second: usize,
 
     /// Connection keys handed to a new player [default: DEMO,NORMAL,USER]
     #[arg(long, value_delimiter = ',', value_parser = parse_key)]
@@ -576,7 +556,7 @@ async fn main() -> ExitCode {
             modules: wg16.modules,
             terms,
             bturno: cli.bturno.clone(),
-            polls_per_wake: cli.polls_per_wake,
+            polls_per_second: cli.polls_per_second,
             clock_reads: None,
             wake_age_ms: None,
             dispatched_total: None,
@@ -599,7 +579,7 @@ async fn main() -> ExitCode {
             modules: vec![wg32.module],
             terms,
             bturno: cli.bturno32.clone().or_else(|| cli.bturno.clone()),
-            polls_per_wake: cli.polls_per_wake,
+            polls_per_second: cli.polls_per_second,
             clock_reads: None,
             wake_age_ms: None,
             dispatched_total: None,
@@ -730,7 +710,7 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, DEFAULT_MODULE, DEFAULT_POLLS_PER_WAKE, MachineId,
+        Cli, DEFAULT_MODULE, DEFAULT_POLLS_PER_SECOND, MachineId,
         check_module32_count, listeners, plan,
     };
 
@@ -796,7 +776,7 @@ mod tests {
         assert_eq!(cli.listen, vec!["127.0.0.1:2323".to_string()]);
         assert!(cli.listen_raw.is_empty(), "no default period port -- opt in with --listen-raw");
         assert_eq!(cli.terms, 2);
-        assert_eq!(cli.polls_per_wake, DEFAULT_POLLS_PER_WAKE);
+        assert_eq!(cli.polls_per_second, DEFAULT_POLLS_PER_SECOND);
         assert!(cli.keys.is_empty(), "no --keys given, so main falls back to default_keys()");
     }
 

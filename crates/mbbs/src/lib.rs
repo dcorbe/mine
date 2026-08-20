@@ -378,7 +378,7 @@ pub enum Wait {
 
 /// What the poll budget is actually buying, counted per poll dispatch.
 ///
-/// `polls_per_wake` is the host guessing how much simulation to allow, and
+/// `polls_per_second` is the host guessing how much simulation to allow, and
 /// the module has no way to answer "I am done": [`Host::cycle`] grants
 /// [`Host::set_polls_per_second`] firings every elapsed second regardless of
 /// whether the module has anything left to do, and a poll routine with
@@ -394,7 +394,7 @@ pub enum Wait {
 /// is too small to be starving the module of anything.
 ///
 /// **Not a control input.** Nothing branches on this; it exists so an
-/// operator can size `--polls-per-wake` against measurement instead of
+/// operator can size `--polls-per-second` against measurement instead of
 /// against the 512 that has never been calibrated.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PollCensus {
@@ -1470,6 +1470,10 @@ pub struct Host<A: Abi> {
     /// Every lock a module has asked about, in order. See [`Host::keys_asked`].
     asked: Vec<Query>,
 
+    /// Every `(msgnum, value)` a module's `numopt` call has read, in order.
+    /// See [`Host::numeric_options`].
+    numeric_options: Vec<(u16, i32)>,
+
     /// The channel whose polling routine is running right now, or `None`.
     ///
     /// `inpolr`, `MAJORBBS.C:322`, with the original's `-1` as `None`. Rust-side
@@ -1850,6 +1854,7 @@ impl<A: Abi> Host<A> {
             heap,
             users,
             asked: Vec::new(),
+            numeric_options: Vec::new(),
             inpolr: None,
             tcklst: None,
             calls: 0,
@@ -2532,6 +2537,26 @@ impl<A: Abi> Host<A> {
             lock: lock.to_string(),
             answer,
         });
+    }
+
+    /// Every `(msgnum, value)` this module's `numopt` calls have read at
+    /// boot, in order.
+    ///
+    /// **Reporting, not tuning input.** The poll grant's correct floor is a
+    /// property of the *module's* own config -- for MajorMUD, `MONSBUF`,
+    /// option 24 -- but nothing makes option 24 mean the same thing in
+    /// another module, so this host does not read the numbers back and act
+    /// on them; it only remembers what was asked, the same way
+    /// [`Host::keys_asked`] remembers locks without interpreting them. An
+    /// operator reads this list and applies `--polls-per-second`'s own rule
+    /// by hand.
+    pub fn numeric_options(&self) -> &[(u16, i32)] {
+        &self.numeric_options
+    }
+
+    /// Record a `numopt` call. See [`Host::numeric_options`].
+    pub(crate) fn recorded_numeric_option(&mut self, msgnum: u16, value: i32) {
+        self.numeric_options.push((msgnum, value));
     }
 
     /// The terminal channels.

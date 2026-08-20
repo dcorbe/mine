@@ -295,6 +295,7 @@ pub fn numopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
             "{name} is {parsed}, outside the {floor}..={ceiling} this module accepts"
         )));
     }
+    host.recorded_numeric_option(number, parsed);
     Ok(abi::Ret::Int(A::Int::from(parsed as i16 as u16)))
 }
 
