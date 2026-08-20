@@ -1065,28 +1065,10 @@ pub fn dfaUpdateDup<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
 /// missing file is refused.
 pub fn dfaDelete<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let block = dfa_required(host, "dfaDelete")?;
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let position = file
-        .current()
-        .ok_or_else(|| {
-            ShimError::Failed(format!(
-                "dfaDelete on {}, which is not positioned on a record -- nothing has \
-                 positioned it yet",
-                file.name()
-            ))
-        })?
-        .position;
-
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    file.delete(position).map_err(|e| ShimError::Failed(e.to_string()))?;
-    // The same cursor invalidation `btv::delbtv` and `btrieve::btrcall`'s op-4
-    // dispatch both do, and for the reason `crates/btrieve/src/btrcall.rs:576`
-    // states outright: so a deleted record does not stay reachable as
-    // "current". This was the one of the three delete paths that omitted it,
-    // which left the block positioned on a record that no longer existed --
-    // and a second `dfaDelete` would then act on that stale position instead
-    // of refusing. `dfadelete_leaves_the_file_positioned_nowhere` pins it.
-    file.seek_to(Cursor::Nowhere);
+    // `btv::delete_record`, not a body of its own: `GALPORT.C` names
+    // `delbtv`/`dfaDelete` one routine, and the cursor invalidation this used
+    // to omit (`ce64fbbe`) is exactly what a second transcription loses.
+    btv::delete_record(host, "dfaDelete", block)?;
     Ok(abi::Ret::Void)
 }
 

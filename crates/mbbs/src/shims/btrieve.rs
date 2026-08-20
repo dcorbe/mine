@@ -541,23 +541,7 @@ pub fn delbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         note_no_file(host, "delbtv");
         return Ok(abi::Ret::Void);
     };
-
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let position = file
-        .current()
-        .ok_or_else(|| {
-            ShimError::Failed(format!(
-                "delbtv on {}, which is not positioned on a record -- opcode 4 \
-                 deletes the record the file is positioned on, and nothing has \
-                 positioned this one",
-                file.name()
-            ))
-        })?
-        .position;
-
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    file.delete(position).map_err(|e| ShimError::Failed(e.to_string()))?;
-    file.seek_to(Cursor::Nowhere);
+    delete_record(host, "delbtv", block)?;
     Ok(abi::Ret::Void)
 }
 
@@ -1926,6 +1910,55 @@ pub(crate) fn load<A: Abi>(host: &mut Host<A>, block: A::Ptr) -> Result<(), Shim
              cannot be checked against"
         ));
     }
+    Ok(())
+}
+
+/// Delete the record `block` is positioned on, shared by every routine that
+/// deletes.
+///
+/// # Why this is a core and not two bodies
+///
+/// `delbtv` and `dfaDelete` are one export renamed -- `GALPORT.C`'s own
+/// `{"delbtv", "dfaDelete"}` -- and they were two transcriptions of one
+/// decision: find the current position, delete it, then invalidate the cursor
+/// so a deleted record does not stay reachable as "current"
+/// (`crates/btrieve/src/btrcall.rs:576` states that reasoning for the raw
+/// opcode-4 path, which is the third transcription).
+///
+/// The third step is the one that got dropped. `dfaDelete` shipped without it
+/// (`ce64fbbe`), so a second `dfaDelete` acted on a freed position, and the
+/// only reason `delbtv` was right is that somebody wrote the same decision
+/// correctly twice. One core removes the opportunity.
+///
+/// `who` names the caller in the refusal, because "not positioned on a record"
+/// is a real upstream mistake and the module author needs to know which
+/// routine saw it.
+///
+/// # Errors
+///
+/// Nothing positioned, or an engine refusal from the delete itself.
+pub(crate) fn delete_record<A: Abi>(
+    host: &mut Host<A>,
+    who: &str,
+    block: A::Ptr,
+) -> Result<(), ShimError> {
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let position = file
+        .current()
+        .ok_or_else(|| {
+            ShimError::Failed(format!(
+                "{who} on {}, which is not positioned on a record -- opcode 4 \
+                 deletes the record the file is positioned on, and nothing has \
+                 positioned this one",
+                file.name()
+            ))
+        })?
+        .position;
+
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    file.delete(position).map_err(|e| ShimError::Failed(e.to_string()))?;
+    // Never separable from the delete above: see this function's own doc.
+    file.seek_to(Cursor::Nowhere);
     Ok(())
 }
 
@@ -5248,6 +5281,33 @@ mod tests {
     }
 
     // # `upvbtv`, `dupdbtv`'s variable-length sibling
+
+    /// A delete leaves the file positioned [`Cursor::Nowhere`], asserted here
+    /// as well as on the `dfaDelete` side.
+    ///
+    /// Both names share `delete_record` now, so one test would cover the
+    /// core -- but only this one covers *this wrapper actually calling it*.
+    /// Worth having for a second reason: when `delete_record` was extracted, a
+    /// mutation removing the invalidation was caught by
+    /// `dfadelete_leaves_the_file_positioned_nowhere` and by nothing on this
+    /// side. `delbtv` was the transcription that had it right from the start
+    /// and the property was never pinned here.
+    #[test]
+    fn delbtv_leaves_the_file_positioned_nowhere() {
+        let dir = crate::testing::scratch_with("delbtv-cursor", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(5), 0, 5), "positioned on Troll");
+        f.invoke(delbtv, &[]).expect("deletes");
+
+        let e = f
+            .invoke(delbtv, &[])
+            .expect_err("the cursor is Nowhere, so there is nothing to delete");
+        assert!(
+            e.to_string().contains("not positioned on a record"),
+            "a delete must not leave the deleted record current: {e}"
+        );
+    }
 
     /// The record the cursor names is gone from the file on disk, and the
     /// count drops with it. Re-read through a fresh `Fixture` on purpose --
