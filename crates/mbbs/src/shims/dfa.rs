@@ -594,64 +594,20 @@ pub fn dfaAcqNPLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
         return Ok(abi::Ret::Int(A::Int::from(0u16)));
     };
 
-    // `:432` -- `movmem(dfa->key,dfa->data,dfa->keylns[dfa->lastkn])`, read
-    // before the step below can overwrite either buffer.
-    let key = btv::key_number(call, host, block, -1)?;
-    let key_len = btv::key_length(host, block, key)?;
-    let key_buffer = host.btrieve.block(block).map_err(ShimError::Failed)?.key();
-    let old = key_buffer
-        .resolve(call.mem(), usize::from(key_len))
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-    let data_buf = btv::data_buffer(host, block)?;
-    data_buf
-        .write(call.mem(), &old)
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-
-    // `:433` -- `dfaAcqLock(recptr,NULL,-1,anpopt,loktyp)`.
-    let op = btv::Op::of(anpopt).ok_or_else(|| {
-        ShimError::Failed(format!("dfaAcqNPLock with option {anpopt}, which is not a get operation"))
-    })?;
-    let into = match recptr == Btrieve::<AbiMem<A>>::null() {
-        true => btv::data_buffer(host, block)?,
-        false => recptr,
-    };
-    let found = btv::locate(
-        call,
-        host,
-        btv::Request {
-            who: "dfaAcqNPLock",
-            block,
-            op,
-            keynum: -1,
-            value: Btrieve::<AbiMem<A>>::null(),
-            into: Some(into),
-            lock: loktyp,
-        },
+    // `btv::acquire_next_prev`, not a body of its own: `DFAAPI.C:432-436` and
+    // `PLBTVSTF.C:409-412` are the same four steps, and this file used to
+    // transcribe them a second time. See that core's doc comment for the one
+    // divergence the two copies had already grown.
+    let stepped = btv::acquire_next_prev(
+        call, host, "dfaAcqNPLock", block, recptr, chkcas != 0, anpopt, loktyp,
     )?;
-    if !found {
+    // `DFAAPI.C:433` records the length once the step succeeded, BEFORE the
+    // key comparison at `:434-436` decides the answer -- so a record found
+    // whose key moved still updates `dfa->lastlen`.
+    let Some(equal) = stepped else {
         return Ok(abi::Ret::Int(A::Int::from(0u16)));
-    }
-    note_len(host, block);
-
-    // `:434-436` -- compare the scratch copy against the key the step just
-    // refreshed, `strcmp` or `stricmp` per `chkcas`.
-    let data_buf = btv::data_buffer(host, block)?;
-    let now = data_buf
-        .resolve(call.mem(), usize::from(key_len))
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-    let key_buffer = host.btrieve.block(block).map_err(ShimError::Failed)?.key();
-    let landed = key_buffer
-        .resolve(call.mem(), usize::from(key_len))
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-
-    let equal = if chkcas != 0 {
-        btv::strcmp_eq(&now, &landed)
-    } else {
-        stricmp_eq(&now, &landed)
     };
+    note_len(host, block);
     Ok(abi::Ret::Int(A::Int::from(u16::from(equal))))
 }
 
@@ -667,85 +623,59 @@ pub fn dfaAcqNPLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
 /// for why it does not answer `0` when merely unpositioned either.
 pub fn dfaAbs<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let block = dfa_required(host, "dfaAbs")?;
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let record = file.current().ok_or_else(|| {
-        ShimError::Failed(format!("dfaAbs on {}, which is not positioned on a record", file.name()))
-    })?;
-    Ok(abi::Ret::Long(record.position))
+    Ok(abi::Ret::Long(btv::current_position(host, "dfaAbs", block)?))
 }
 
-/// The core [`dfaAcqAbsLock`] is, and -- via `DFAAPI.C:467`'s own
-/// `dfaAcqAbsLock(recptr,abspos,keynum,loktyp)` call -- [`dfaGetAbsLock`]
-/// re-derives rather than reproduces by re-entering the dispatch table
-/// (this crate's shims call each other's *logic*, never the table itself).
-/// Both public routines below read the same four arguments in the same
-/// order and hand them here.
+/// `dfaAcqAbsLock`/`dfaGetAbsLock`'s shared middle, which is now
+/// [`btv::absolute`] with this side's own two answers filled in.
 ///
-/// `DFAAPI.C:472-505`. `recptr`/`abspos`/`keynum`/`loktyp` map onto exactly
-/// what `btv::absolute`'s own `Position` bundles for `aabbtv`/`gabbtvl`,
-/// but this does not call `absolute` unchanged: `absolute` treats "no file
-/// current" as a quiet `false` via [`btv::positioned`], which is `aabbtv`'s
-/// and `gabbtvl`'s own *real* guard (`PLBTVSTF.C:452,476`). `dfaAcqAbsLock`
-/// has no such guard -- only `ASSERT(dfa != NULL)` (`:479`) before an
-/// unguarded `dfa->data`/`dfa->lastkn` -- so this refuses instead, through
-/// [`dfa_required`], and re-derives the rest of `absolute`'s core (find the
-/// physical position, seek, lock, answer the key, deliver the record)
-/// directly rather than forcing it through a helper whose no-file case does
-/// not fit.
+/// `GALPORT.C` names `aabbtvl`/`dfaAcqAbsLock` and `gabbtvl`/`dfaGetAbsLock`
+/// one routine each, and this used to be a second transcription of
+/// `btv::absolute` -- the same find-position, place-cursor, take-lock,
+/// answer-key, deliver sequence written out again. Only two things ever
+/// differed, and both are parameters now: where the file comes from
+/// (`dfa_required` here against `positioned` there) and what a negative key
+/// number means (`DFAAPI.C` ASSERTs `keynum >= 0`; `PLBTVSTF.C:483` stores it
+/// unchecked).
 ///
-/// `keynum < 0` is refused outright: `:466,484` `ASSERT(keynum >= 0)`,
-/// where `aabbtv`/`gabbtvl` have no such assertion and store a negative one
-/// unchecked (`PLBTVSTF.C:483`, `btv::absolute`'s own "`bb->lastkn=keynum`
-/// and nothing else" note) -- a real host would have stored `dfa->lastkn`
-/// the same way, but `DFAAPI.C`'s own `ASSERT` marks it as a case the
-/// vendor considered a bug rather than a documented limit, so this refuses
-/// rather than reproduces it.
+/// `note_len` stays here rather than moving into the core: `dfa->lastlen` is
+/// this side's bookkeeping and the `btv*` spellings have no such field.
 ///
-/// The status-22 truncation `:489-497` performs by hand
-/// (`dfa->data[dfa->reclen-1]='\0'; status=0;`) is exactly what
-/// [`btv::deliver`] already does for every routine that calls it -- see
-/// that function's own doc comment -- so no separate handling is needed
-/// here.
+/// # Errors
+///
+/// A negative key number, no `dfa` file current, or whatever
+/// [`btv::absolute`] refuses.
 fn dfa_acq_abs<A: Abi>(
     call: &mut Call<A>,
     host: &mut Host<A>,
-    who: &str,
+    who: &'static str,
     recptr: A::Ptr,
     abspos: u32,
     keynum: i16,
     loktyp: i16,
 ) -> Result<bool, ShimError> {
-    if keynum < 0 {
-        return Err(ShimError::Failed(format!(
-            "{who} with key number {keynum} -- DFAAPI.C ASSERTs keynum >= 0 here (unlike \
-             aabbtv/gabbtvl, which tolerate and store a negative one), so a negative key \
-             number is a module bug this host refuses rather than reproduces"
-        )));
-    }
-
     let block = dfa_required(host, who)?;
-    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
-        true => btv::data_buffer(host, block)?,
-        false => recptr,
-    };
-    btv::load(host, block)?;
-    let key = btv::key_number(call, host, block, keynum)?;
-
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-    let Some(physical) = records.find_physical(abspos) else {
-        return Ok(false);
-    };
-    let cursor = match records.place_in(key, physical) {
-        Some(at) => Cursor::Ordered { key, at },
-        None => Cursor::Physical { at: physical },
-    };
-    file.seek_to(cursor);
-    btv::take_lock(host, block, loktyp)?;
-    btv::answer_with_key(call, host, block, key)?;
-    btv::deliver(call, host, block, recptr)?;
-    note_len(host, block);
-    Ok(true)
+    let found = btv::absolute(
+        call,
+        host,
+        btv::Position {
+            who,
+            block,
+            negative_keynum: btv::NegativeKey::Refuse,
+            // `dfaGetAbsLock` reports its own failure (`DFAAPI.C:467-469`
+            // sends it to `dfaPosError("GET-ABSOLUTE")`), so the core must
+            // answer `false` and let the caller do it.
+            fatal: false,
+            lock: loktyp,
+            into: recptr,
+            position: abspos,
+            keynum,
+        },
+    )?;
+    if found {
+        note_len(host, block);
+    }
+    Ok(found)
 }
 
 /// `GBOOL dfaAcqAbsLock(VOID *recptr, LONG abspos, SHORT keynum, USHORT
@@ -2484,6 +2414,57 @@ mod tests {
 
         assert!(!acquire(&mut f, Some(99), 0, 5, 0), "a failed acquire");
         assert_eq!(f.invoke(dfaWasLocked, &[]).expect("answers"), Ret::U16(0));
+    }
+
+    /// `dfaAcqNPLock` steps and answers 0 when the key it lands on differs
+    /// from the one it saved.
+    ///
+    /// There was no `dfaAcqNPLock` test at all before this, which is how
+    /// extracting `btv::acquire_next_prev` nearly folded two conditions
+    /// together unnoticed.
+    ///
+    /// # What this does NOT pin, and why
+    ///
+    /// `DFAAPI.C:433` records `dfa->lastlen` when the step FINDS a record;
+    /// `:434-436` then compares the keys, and that comparison is only the
+    /// *answer*. So a record found whose key moved should still update
+    /// `lastlen`. The code follows that ordering on the vendor's authority and
+    /// **no test here discriminates it**: `note_len` stores
+    /// `min(maxlen, record.len())`, every record in `SAMPLE.DAT` is the same
+    /// fixed length, so `lastlen` reads identically whether the ordering is
+    /// right or wrong. A mutation moving `note_len` behind the comparison
+    /// passes the whole suite.
+    ///
+    /// Pinning it needs a variable-length fixture -- records of differing
+    /// length -- which this tree's `tests/data` does not have. Stated rather
+    /// than papered over with an assertion that looks like it covers the
+    /// ordering when it cannot.
+    #[test]
+    fn dfaacqnplock_steps_and_answers_zero_when_the_key_moved() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(5), 0, 5, 0), "positioned on Troll");
+        assert_ne!(f.invoke(dfaLastLen, &[]).expect("answers"), Ret::U16(0));
+
+        // A real `recptr`, not the module's null. With null, `:433`'s step
+        // delivers into `dfa->data` -- the very buffer `:432` just saved the
+        // old key into -- so the comparison at `:434-436` ends up comparing the
+        // new record against its own key and answers 1. That is the vendor's
+        // own behaviour and presumably why real call sites pass a buffer; it
+        // also means a null here would test nothing.
+        let into = f.buffer(64);
+        let mut args = Fixture::far(into).to_vec();
+        args.extend_from_slice(&[1, 6, 0]); // chkcas, acquire-next, no lock
+        let answer = f.invoke(dfaAcqNPLock, &args).expect("acquire-next");
+        assert_eq!(answer, Ret::U16(0), "a different record has a different key");
+
+        // The step delivered a record, so a length is on record. This says
+        // nothing about the ordering above -- see this test's own doc.
+        let reclen = f.host.btrieve().block(block).expect("open").geometry().reclen;
+        assert_eq!(
+            f.invoke(dfaLastLen, &[]).expect("answers"),
+            Ret::U16(64u16.min(reclen))
+        );
     }
 
     #[test]

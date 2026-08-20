@@ -1237,14 +1237,7 @@ pub fn absbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         note_no_file(host, "absbtv");
         return Ok(abi::Ret::Long(0));
     };
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let record = file.current().ok_or_else(|| {
-        ShimError::Failed(format!(
-            "absbtv on {}, which is not positioned on a record",
-            file.name()
-        ))
-    })?;
-    Ok(abi::Ret::Long(record.position))
+    Ok(abi::Ret::Long(current_position(host, "absbtv", block)?))
 }
 
 /// `int aabbtv(void *recptr, long abspos, int keynum)` -- acquire the record at
@@ -1277,11 +1270,20 @@ pub fn aabbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let into = call.ptr();
     let position = call.long();
     let keynum = i16_arg::<A>(call.int());
+    // `absolute` no longer looks the file up itself -- the `dfa*`
+    // spelling of this routine finds it a different way. Same guard as
+    // before, in the caller that owns it.
+    let Some(block) = positioned(call, host, "aabbtv")? else {
+        note_no_file(host, "aabbtv");
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    };
     Ok(abi::Ret::Int(A::Int::from(u16::from(absolute(
         call,
         host,
         Position {
             who: "aabbtv",
+            block,
+            negative_keynum: NegativeKey::Note,
             fatal: false,
             lock: UNLOCKED,
             into,
@@ -1333,11 +1335,20 @@ pub fn gabbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     let position = call.long();
     let keynum = i16_arg::<A>(call.int());
     let lock = i16_arg::<A>(call.int());
+    // `absolute` no longer looks the file up itself -- the `dfa*`
+    // spelling of this routine finds it a different way. Same guard as
+    // before, in the caller that owns it.
+    let Some(block) = positioned(call, host, "gabbtvl")? else {
+        note_no_file(host, "gabbtvl");
+        return Ok(abi::Ret::Void);
+    };
     absolute(
         call,
         host,
         Position {
             who: "gabbtvl",
+            block,
+            negative_keynum: NegativeKey::Note,
             fatal: true,
             lock,
             into,
@@ -1352,9 +1363,34 @@ pub fn gabbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// rather than passed as six more parameters -- clippy already has an opinion
 /// about `absolute` at seven, and the file already has a precedent for this
 /// shape in [`Request`], below.
+/// What a negative key number means to whoever asked -- see
+/// [`Position::negative_keynum`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NegativeKey {
+    /// Tolerate it and say so once: what `PLBTVSTF.C:483` did.
+    Note,
+    /// Refuse: what `DFAAPI.C`'s own ASSERT says.
+    Refuse,
+}
+
 pub(crate) struct Position<A: Abi> {
     /// The routine asking, for anything it has to refuse or note by name.
     pub(crate) who: &'static str,
+
+    /// The file, resolved by the caller. Passed in rather than looked up here
+    /// because the `btv*` and `dfa*` spellings of this routine find it two
+    /// different ways -- `positioned` off the `btv` current block,
+    /// `dfa_required` off the `dfa` one -- and that is the only thing that ever
+    /// differed between them. See [`absolute`].
+    pub(crate) block: A::Ptr,
+
+    /// What a negative key number means to this caller.
+    ///
+    /// The two spellings genuinely disagree and both cite a source, so this is
+    /// a real parameter and not a wrinkle to flatten: `PLBTVSTF.C:483` stores
+    /// `lastkn` unchecked, so `aabbtv`/`gabbtvl` tolerate and note; `DFAAPI.C`
+    /// ASSERTs `keynum >= 0`, so the `dfa*` spellings refuse.
+    pub(crate) negative_keynum: NegativeKey,
 
     /// Whether a position naming no record is a refusal ([`gabbtvl`]) or a
     /// quiet `false` ([`aabbtv`]). See [`absolute`]'s own doc comment.
@@ -1395,22 +1431,14 @@ pub(crate) struct Position<A: Abi> {
 pub(crate) fn absolute<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Position<A>) -> Result<bool, ShimError> {
     let Position {
         who,
+        block,
+        negative_keynum,
         fatal,
         lock,
         into,
         position,
         keynum,
     } = req;
-
-    // `:452` and `:476` both guard before `:479` defaults `recptr` to
-    // `bb->data`. Same ordering point as `obtbtvl`: with no file current the
-    // original returned before it looked at anything, including `lock`, so
-    // `take_lock` runs later -- only once a record has actually been found
-    // (below) -- not here.
-    let Some(block) = positioned(call, host, who)? else {
-        note_no_file(host, who);
-        return Ok(false);
-    };
 
     let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
@@ -1432,13 +1460,23 @@ pub(crate) fn absolute<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Posi
     // `gabbtvl`'s thirty-four pushes a negative key number -- and noted rather
     // than refused for the same reason the `keylns` case is.
     if keynum < 0 {
-        host.note_once(
-            "lastkn",
-            format!(
-                "{who} was given key number {keynum}, and PLBTVSTF.C:483 would \
-                 have stored it in bb->lastkn unchecked. Read lastkn instead"
+        match negative_keynum {
+            NegativeKey::Refuse => {
+                return Err(ShimError::Failed(format!(
+                    "{who} with key number {keynum} -- DFAAPI.C ASSERTs keynum >= 0 \
+                     here (unlike aabbtv/gabbtvl, which tolerate and store a \
+                     negative one), so a negative key number is a module bug this \
+                     host refuses rather than reproduces"
+                )));
+            }
+            NegativeKey::Note => host.note_once(
+                "lastkn",
+                format!(
+                    "{who} was given key number {keynum}, and PLBTVSTF.C:483 would \
+                     have stored it in bb->lastkn unchecked. Read lastkn instead"
+                ),
             ),
-        );
+        }
     }
     let key = key_number(call, host, block, keynum)?;
 
@@ -1447,7 +1485,7 @@ pub(crate) fn absolute<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Posi
     let Some(physical) = records.find_physical(position) else {
         if fatal {
             return Err(ShimError::Failed(format!(
-                "gabbtvl of {}, which has no record at file position {position}",
+                "{who} of {}, which has no record at file position {position}",
                 file.name()
             )));
         }
@@ -1905,6 +1943,27 @@ pub(crate) fn delete_record<A: Abi>(
     // Never separable from the delete above: see this function's own doc.
     file.seek_to(Cursor::Nowhere);
     Ok(())
+}
+
+/// The file position of the record `block` is positioned on.
+///
+/// Shared by `absbtv` and `dfaAbs`, which `GALPORT.C` names one routine. Both
+/// were the same two steps -- read `current()`, refuse if there is none -- and
+/// the only difference was where the file came from, so that is the parameter.
+///
+/// # Errors
+///
+/// Nothing positioned on a record.
+pub(crate) fn current_position<A: Abi>(
+    host: &Host<A>,
+    who: &str,
+    block: A::Ptr,
+) -> Result<u32, ShimError> {
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let record = file.current().ok_or_else(|| {
+        ShimError::Failed(format!("{who} on {}, which is not positioned on a record", file.name()))
+    })?;
+    Ok(record.position)
 }
 
 /// Insert one record into `block`, shared by every routine that inserts.
@@ -2426,11 +2485,20 @@ pub fn gabbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let into = call.ptr();
     let position = call.long();
     let keynum = i16_arg::<A>(call.int());
+    // `absolute` no longer looks the file up itself -- the `dfa*`
+    // spelling of this routine finds it a different way. Same guard as
+    // before, in the caller that owns it.
+    let Some(block) = positioned(call, host, "gabbtv")? else {
+        note_no_file(host, "gabbtv");
+        return Ok(abi::Ret::Void);
+    };
     absolute(
         call,
         host,
         Position {
             who: "gabbtv",
+            block,
+            negative_keynum: NegativeKey::Note,
             fatal: true,
             lock: UNLOCKED,
             into,
@@ -2934,7 +3002,17 @@ pub fn anpbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     let recptr = call.ptr();
     let chkcas = i16_arg::<A>(call.int());
     let anpopt = i16_arg::<A>(call.int());
-    anp(call, host, "anpbtvl", recptr, chkcas != 0, anpopt, 0)
+    let Some(block) = positioned(call, host, "anpbtvl")? else {
+        note_no_file(host, "anpbtvl");
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    };
+    // Both spellings answer 0 for "no record" and for "found but the key
+    // moved", which is why the core keeps them apart and this does not.
+    let equal = acquire_next_prev(
+        call, host, "anpbtvl", block, recptr, chkcas != 0, anpopt, 0,
+    )?
+    .unwrap_or(false);
+    Ok(abi::Ret::Int(A::Int::from(u16::from(equal))))
 }
 
 /// `int anpbtvlk(void *recptr, int chkcas, int anpopt, int loktyp)` -- step
@@ -2957,7 +3035,17 @@ pub fn anpbtvlk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::R
     let chkcas = i16_arg::<A>(call.int());
     let anpopt = i16_arg::<A>(call.int());
     let lock = i16_arg::<A>(call.int());
-    anp(call, host, "anpbtvlk", recptr, chkcas != 0, anpopt, lock)
+    let Some(block) = positioned(call, host, "anpbtvlk")? else {
+        note_no_file(host, "anpbtvlk");
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    };
+    // Both spellings answer 0 for "no record" and for "found but the key
+    // moved", which is why the core keeps them apart and this does not.
+    let equal = acquire_next_prev(
+        call, host, "anpbtvlk", block, recptr, chkcas != 0, anpopt, lock,
+    )?
+    .unwrap_or(false);
+    Ok(abi::Ret::Int(A::Int::from(u16::from(equal))))
 }
 
 /// The body [`anpbtvl`] and [`anpbtvlk`] share -- [`anpbtv`]'s own body
@@ -2967,19 +3055,41 @@ pub fn anpbtvlk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::R
 /// and why, including the ordering hazard when `recptr` is null -- every
 /// word of that reasoning applies here unchanged; only the two fixed
 /// constants became parameters.
-fn anp<A: Abi>(
+/// Acquire next/prev and report whether the key still matches, shared by every
+/// spelling of that routine.
+///
+/// `block` is the caller's because that is the only thing the two spellings
+/// ever disagreed about: `anpbtvl`/`anpbtvlk` find the file through
+/// `positioned`, `dfaAcqNPLock` through `dfa_positioned`. `GALPORT.C` names
+/// `anpbtvlk`/`dfaAcqNPLock` one routine, and `shims::dfa` used to carry a
+/// second transcription of everything below.
+///
+/// The two transcriptions had already grown apart in one place without
+/// breaking: this one lower-cased both buffers and called [`strcmp_eq`], the
+/// other called a `stricmp_eq` of its own that truncated at the NUL first.
+/// Those agree -- lowering a NUL leaves it a NUL, so it cannot move where the
+/// scan stops -- which is the state that precedes a divergence rather than one.
+///
+/// `Ok(None)` means the step found no record at all, and `Ok(Some(equal))`
+/// means it found one and this is whether the key still matches. The two are
+/// deliberately separate: both `btv*` spellings answer 0 either way, but
+/// `dfaAcqNPLock` records `dfa->lastlen` on *found* regardless of the
+/// comparison, and folding them together silently dropped that -- caught while
+/// extracting this, by re-reading the transcription being replaced.
+///
+/// # Errors
+///
+/// An option that is not a get operation, or an unresolvable buffer.
+pub(crate) fn acquire_next_prev<A: Abi>(
     call: &mut Call<A>,
     host: &mut Host<A>,
     who: &'static str,
+    block: A::Ptr,
     recptr: A::Ptr,
     chkcas: bool,
     anpopt: i16,
     lock: i16,
-) -> Result<abi::Ret<A>, ShimError> {
-    let Some(block) = positioned(call, host, who)? else {
-        note_no_file(host, who);
-        return Ok(abi::Ret::Int(A::Int::from(0u16)));
-    };
+) -> Result<Option<bool>, ShimError> {
 
     // `:409` -- `movmem(bb->key,bb->data,bb->keylns[bb->lastkn])`, read
     // before the step below can overwrite either buffer.
@@ -3017,7 +3127,7 @@ fn anp<A: Abi>(
         },
     )?;
     if !found {
-        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+        return Ok(None);
     }
 
     // `:411-412` -- compare the scratch copy against the key the step just
@@ -3037,12 +3147,11 @@ fn anp<A: Abi>(
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
 
-    let equal = if chkcas {
+    Ok(Some(if chkcas {
         strcmp_eq(&now, &landed)
     } else {
         strcmp_eq(&now.to_ascii_lowercase(), &landed.to_ascii_lowercase())
-    };
-    Ok(abi::Ret::Int(A::Int::from(u16::from(equal))))
+    }))
 }
 
 /// `int aabbtvl(void *recptr, long abspos, int keynum, int loktyp)` --
@@ -3067,11 +3176,20 @@ pub fn aabbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     let position = call.long();
     let keynum = i16_arg::<A>(call.int());
     let lock = i16_arg::<A>(call.int());
+    // `absolute` no longer looks the file up itself -- the `dfa*`
+    // spelling of this routine finds it a different way. Same guard as
+    // before, in the caller that owns it.
+    let Some(block) = positioned(call, host, "aabbtvl")? else {
+        note_no_file(host, "aabbtvl");
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    };
     Ok(abi::Ret::Int(A::Int::from(u16::from(absolute(
         call,
         host,
         Position {
             who: "aabbtvl",
+            block,
+            negative_keynum: NegativeKey::Note,
             fatal: false,
             lock,
             into,
