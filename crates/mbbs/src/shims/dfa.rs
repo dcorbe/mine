@@ -926,66 +926,6 @@ pub fn dfaInsertDup<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
     Ok(abi::Ret::Int(A::Int::from(u16::from(ok))))
 }
 
-/// The body [`dfaUpdateDup`] alone needs: [`btv::update_variable`]'s own
-/// write with the one convention it does not offer -- a duplicate-key
-/// collision answers a quiet `false` instead of refusing.
-///
-/// `DFAAPI.C:561-589`'s own `case 5: break;` (`:583-584`) is the one branch
-/// [`dfaUpdate`]/[`dfaUpdateV`]'s underlying call (`:543`) does not have --
-/// see [`dfaUpdateV`]'s own doc comment, which is why those two reuse
-/// [`btv::update_variable`] unchanged and this does not.
-fn dfa_update_dup<A: Abi>(
-    call: &mut Call<A>,
-    host: &mut Host<A>,
-    block: A::Ptr,
-    recptr: A::Ptr,
-    length: u16,
-) -> Result<bool, ShimError> {
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let position = file
-        .current()
-        .ok_or_else(|| {
-            ShimError::Failed(format!(
-                "dfaUpdateDup on {}, which is not positioned on a record -- opcode 3 \
-                 updates the record the file is positioned on, and nothing has \
-                 positioned this one",
-                file.name()
-            ))
-        })?
-        .position;
-    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
-        true => file.data(),
-        false => recptr,
-    };
-    let bytes = recptr
-        .resolve(call.mem(), usize::from(length))
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-
-    if let Some((key, value)) = btv::duplicate_key(host, block, &bytes, Some(position))? {
-        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
-        btv::note_duplicate_key(host, "dfaUpdateDup", &name, key, &value);
-        return Ok(false);
-    }
-
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
-
-    // Same currency re-derivation `btv::dupdbtv`/`update_variable` already
-    // give their own writes -- see either's doc comment for why an
-    // `Ordered` cursor is recomputed and a `Physical` one needs no
-    // correction.
-    if let Cursor::Ordered { key, .. } = file.cursor() {
-        let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-        let physical = records.find_physical(position).expect("update just wrote this position");
-        let cursor = match records.place_in(key, physical) {
-            Some(at) => Cursor::Ordered { key, at },
-            None => Cursor::Physical { at: physical },
-        };
-        file.seek_to(cursor);
-    }
-    Ok(true)
-}
 
 /// `VOID dfaUpdateV(VOID *recptr, USHORT length)` -- update the record the
 /// file is positioned on, at a module-supplied length.
@@ -1002,7 +942,7 @@ pub fn dfaUpdateV<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
     let recptr = call.ptr();
     let length = btv::ushort_arg::<A>(call.int());
     let block = dfa_required(host, "dfaUpdateV")?;
-    btv::update_variable(call, host, "dfaUpdateV", block, recptr, length)?;
+    btv::update_variable(call, host, "dfaUpdateV", block, recptr, length, false)?;
     Ok(abi::Ret::Void)
 }
 
@@ -1016,7 +956,7 @@ pub fn dfaUpdate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
     let recptr = call.ptr();
     let block = dfa_required(host, "dfaUpdate")?;
     let length = host.btrieve.block(block).map_err(ShimError::Failed)?.maxlen();
-    btv::update_variable(call, host, "dfaUpdate", block, recptr, length)?;
+    btv::update_variable(call, host, "dfaUpdate", block, recptr, length, false)?;
     Ok(abi::Ret::Void)
 }
 
@@ -1036,7 +976,10 @@ pub fn dfaUpdateDup<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
         return Ok(abi::Ret::Int(A::Int::from(0u16)));
     };
     let length = host.btrieve.block(block).map_err(ShimError::Failed)?.maxlen();
-    let ok = dfa_update_dup(call, host, block, recptr, length)?;
+    // `btv::update_variable`, not a helper of its own: `GALPORT.C` names
+    // `dupdbtv`/`dfaUpdateDup` one routine, and this file used to carry a
+    // second transcription of it.
+    let ok = btv::update_variable(call, host, "dfaUpdateDup", block, recptr, length, true)?;
     Ok(abi::Ret::Int(A::Int::from(u16::from(ok))))
 }
 

@@ -670,67 +670,12 @@ pub fn dupdbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
                 .to_owned(),
         )
     })?;
-
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let position = file
-        .current()
-        .ok_or_else(|| {
-            ShimError::Failed(format!(
-                "dupdbtv on {}, which is not positioned on a record -- \
-                 opcode 3 updates the record the file is positioned on, and \
-                 nothing has positioned this one",
-                file.name()
-            ))
-        })?
-        .position;
-    let length = file.maxlen();
-    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
-        true => file.data(),
-        false => recptr,
-    };
-    let bytes = recptr
-        .resolve(call.mem(), usize::from(length))
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-
-    if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
-        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
-        note_duplicate_key(host, "dupdbtv", &name, key, &value);
-        return Ok(abi::Ret::Int(A::Int::from(0u16)));
-    }
-
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
-
-    // Btrieve's opcode 3 maintains currency on the record it just rewrote.
-    // `Cursor::Ordered` is an ordinal into a key's *sorted* order, and
-    // `Block::update` (via `Records::update`) just re-sorted every key's
-    // order as part of the write -- so the ordinal the cursor held before
-    // the call is very likely to name a different record now (see this
-    // test module's `dupdbtv_maintains_currency_on_the_record_it_rewrote_...`
-    // for a measured example: index 4 of key order was Troll before an
-    // update moved Troll to index 6, and after the update it was Elf).
-    // `position` itself did not move -- an update rewrites in place -- so
-    // the cursor is re-derived from it rather than carried forward:
-    // `find_physical` gets back to physical order, and `place_in` re-derives
-    // the ordinal in whichever key the cursor was already following. A
-    // `Physical` cursor needs no correction, because physical order is
-    // insertion order and an update does not touch it -- but it is still
-    // fine to fall through to `Physical` below if the key the cursor was on
-    // is not one `place_in` recognises.
-    if let Cursor::Ordered { key, .. } = file.cursor() {
-        let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-        let physical = records
-            .find_physical(position)
-            .expect("update just wrote this position");
-        let cursor = match records.place_in(key, physical) {
-            Some(at) => Cursor::Ordered { key, at },
-            None => Cursor::Physical { at: physical },
-        };
-        file.seek_to(cursor);
-    }
-
-    Ok(abi::Ret::Int(A::Int::from(1u16)))
+    // `bb->reclen`, which this host holds as `maxlen`; `dupdbtv` takes no
+    // length argument of its own.
+    let length = host.btrieve.block(block).map_err(ShimError::Failed)?.maxlen();
+    // `true`: the case-5 branch is the `d` in `dupdbtv`. See `update_variable`.
+    let wrote = update_variable(call, host, "dupdbtv", block, recptr, length, true)?;
+    Ok(abi::Ret::Int(A::Int::from(u16::from(wrote))))
 }
 
 
@@ -2626,7 +2571,7 @@ pub fn updbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         )
     })?;
     let length = host.btrieve.block(block).map_err(ShimError::Failed)?.maxlen();
-    update_variable(call, host, "updbtv", block, recptr, length)?;
+    update_variable(call, host, "updbtv", block, recptr, length, false)?;
     Ok(abi::Ret::Void)
 }
 
@@ -2696,7 +2641,7 @@ pub fn upvbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         note_no_file(host, "upvbtv");
         return Ok(abi::Ret::Void);
     };
-    update_variable(call, host, "upvbtv", block, recptr, length)?;
+    update_variable(call, host, "upvbtv", block, recptr, length, false)?;
     Ok(abi::Ret::Void)
 }
 
@@ -2725,7 +2670,8 @@ pub(crate) fn update_variable<A: Abi>(
     block: A::Ptr,
     recptr: A::Ptr,
     length: u16,
-) -> Result<(), ShimError> {
+    tolerate_duplicate: bool,
+) -> Result<bool, ShimError> {
     let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => recptr,
@@ -2750,14 +2696,21 @@ pub(crate) fn update_variable<A: Abi>(
 
     if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
         let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
-        return Err(ShimError::Failed(format!(
-            "{who} on {name} collided with an existing record on key {key} \
-             ({value:02x?}), which does not permit duplicates -- unlike \
-             dupdbtv's case-5 branch (PLBTVSTF.C:564-565), upvbtv's own \
-             :544-546 sends every nonzero status to btverrptr(\"UPDATE\") with \
-             no exception for a duplicate, so this refuses instead of \
-             answering 0 and silently discarding the write"
-        )));
+        // `tolerate_duplicate` is the whole difference between this family's
+        // members, and it is the `d` in `dupdbtv`/`dfaUpdateDup`:
+        // `PLBTVSTF.C:564-565` is their case-5 branch, answering 0 rather than
+        // reporting. Everyone else -- `upvbtv`'s own `:544-546` -- sends every
+        // nonzero status to `btverrptr("UPDATE")` with no exception for a
+        // duplicate, so refusing is what they must do rather than answer 0 and
+        // silently discard the write.
+        if !tolerate_duplicate {
+            return Err(ShimError::Failed(format!(
+                "{who} on {name} collided with an existing record on key {key} \
+                 ({value:02x?}), which does not permit duplicates"
+            )));
+        }
+        note_duplicate_key(host, who, &name, key, &value);
+        return Ok(false);
     }
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
@@ -2777,7 +2730,7 @@ pub(crate) fn update_variable<A: Abi>(
         };
         file.seek_to(cursor);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// `void insbtv(void *recptr)` -- insert a new record, at the module's own
