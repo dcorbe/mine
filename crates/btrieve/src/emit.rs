@@ -590,6 +590,88 @@ fn write_v6_page(canvas: &mut Canvas, page: &V6Page, page_size: usize) -> Result
     Ok(())
 }
 
+/// Write every v6 index page's content -- entry count, the two boundary
+/// pointers, every entry, then trailing padding -- for every page whose
+/// model carries one (`V6Page::index`, Task 19: `Some` for a page some
+/// key's own walk attributed to its tree, root or descendant alike).
+///
+/// The same field-by-field write [`write_index_pages`] does for v5, at each
+/// page's own absolute physical offset -- the entry-array layout past the
+/// 6-byte header is identical in both families (harvest 4 SS4's own
+/// framing), so there is nothing v6-specific to this beyond where the page
+/// itself lives. In particular each pointer (`rightmost`/`leftmost`/entry
+/// `child`) is written exactly as `read::read_index_page` stored it --
+/// including its top-byte key tag -- never re-masked or re-derived.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_v6_index_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for page in &model.v6_pages {
+        let Some(idx) = &page.index else { continue };
+        let at = page.physical_page as usize * page_size;
+
+        let count = idx.entries.len() as u16;
+        canvas.put_u16(at + index::at::COUNT, count, v6_page_owner("index_count", page.physical_page))?;
+        canvas.put_long(
+            at + index::at::RIGHTMOST,
+            idx.rightmost,
+            v6_page_owner("index_rightmost", page.physical_page),
+        )?;
+        canvas.put_long(
+            at + index::at::LEFTMOST,
+            idx.leftmost,
+            v6_page_owner("index_leftmost", page.physical_page),
+        )?;
+
+        let mut offset = at + index::at::ENTRIES;
+        for entry in &idx.entries {
+            canvas.put(offset, &entry.key, v6_page_owner("index_key", page.physical_page))?;
+            offset += entry.key.len();
+            canvas.put_long(offset, entry.head, v6_page_owner("index_head", page.physical_page))?;
+            offset += 4;
+            if let Some(tail) = entry.tail {
+                canvas.put_long(offset, tail, v6_page_owner("index_tail", page.physical_page))?;
+                offset += 4;
+            }
+            if let Some(child) = entry.child {
+                canvas.put_long(offset, child, v6_page_owner("index_child", page.physical_page))?;
+                offset += 4;
+            }
+        }
+        canvas.put(offset, &idx.padding, v6_page_owner("index_padding", page.physical_page))?;
+    }
+    Ok(())
+}
+
+/// Write every v6 ACS page's content -- tag, name, table, then trailing
+/// padding -- for every page whose model carries one (`V6Page::acs`, Task
+/// 19: `Some` for a page tagged `TAG_ACS`). The same field-by-field write
+/// [`write_acs_blocks`] does for v5's single, fixed-page block -- the
+/// 265-byte block layout is identical in both families (harvest 4 SS6:
+/// "same layout in both families"), so only the page this writes to differs.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_v6_acs_blocks(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for page in &model.v6_pages {
+        let Some(block) = &page.acs else { continue };
+        let at = page.physical_page as usize * page_size;
+        canvas.put(at + acs::at::TAG, &[block.tag], v6_page_owner("acs_tag", page.physical_page))?;
+        canvas.put(at + acs::at::NAME, &block.name, v6_page_owner("acs_name", page.physical_page))?;
+        canvas.put(at + acs::at::TABLE, &block.table, v6_page_owner("acs_table", page.physical_page))?;
+        canvas.put(
+            at + acs::at::TABLE + acs::at::TABLE_LEN,
+            &block.padding,
+            v6_page_owner("acs_padding", page.physical_page),
+        )?;
+    }
+    Ok(())
+}
+
 /// Write one control record's fixed portion (`0x00..0x110`) into `canvas` at
 /// `base` -- absolute offset `0` for a v5 file (there is only one copy), or
 /// `0` / `page_size` for a v6 file's shadow pair, once per copy. Shared by
@@ -803,13 +885,18 @@ pub(crate) fn write_v6_fixed_portion(
 /// descriptors`/`v6_stale_page_tail` for the stale one, both `None`/empty
 /// when the model does not carry them); every "PP" allocation-table block's
 /// both shadow copies (`model.v6_allocation_blocks`, Task 17); and every
-/// ordinary v6 page the allocation table resolves (`model.v6_pages`, Task
-/// 18) -- a `TAG_DATA` page's header, per-slot marker and record content
-/// when the model describes one, or just its header otherwise. `read::file`
-/// only ever populates `v6_pages` for a file declaring no keys at all (that
-/// function's own doc comment), so a real v6 corpus file -- every one of
-/// which declares at least one key -- still leaves an index page's content
-/// unwritten and refuses before reaching this function at all. A v5 file's
+/// ordinary v6 page the allocation table resolves (`model.v6_pages`) -- a
+/// genuine data page's header, per-slot marker and record content
+/// (`V6Page::content`, Task 18); an index page's own entry array, for a
+/// page some key's own walk attributed to its tree, root or descendant
+/// alike (`V6Page::index`, Task 19 -- `write_v6_index_pages`); and a v6
+/// ACS block's tag, name, table and padding (`V6Page::acs`, Task 19 --
+/// `write_v6_acs_blocks`), found by scanning for `TAG_ACS` rather than at a
+/// fixed page the way v5's single block is. `read::file` refuses a v6 file
+/// whose allocation table claims a page this crate cannot classify this
+/// way -- a `TAG_TEMPLATE`/`TAG_VARIABLE` page no key's walk claims, or a
+/// `TAG_DATA` page on a variable-length file (Task 20's own scope) -- so
+/// this function never has to guess at one either. A v5 file's
 /// page 0 (the control record plus its key/segment definitions) is fully
 /// described and will round-trip on its own; every page's six-byte header
 /// round-trips too; a `Data`/`Free` page's slots and slack described
@@ -882,6 +969,8 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
         for page in &model.v6_pages {
             write_v6_page(&mut canvas, page, page_size)?;
         }
+        write_v6_index_pages(&mut canvas, model)?;
+        write_v6_acs_blocks(&mut canvas, model)?;
 
         return canvas.finish();
     };

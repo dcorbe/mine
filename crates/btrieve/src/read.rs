@@ -1320,6 +1320,352 @@ fn walk_index_trees(
     Ok(())
 }
 
+/// v6's own walk (Task 19, harvest 4 SS2/SS4/SS4a): the same
+/// pointers-before-tags discipline [`walk_one_key`]/[`enter_child`] apply to
+/// v5, adapted to v6's two real differences from v5 addressing --
+///
+/// 1. Every pointer this walk follows (a key descriptor's `ROOT`, already
+///    masked to `key_number`/`root_page` by [`key_descriptors`]; an index
+///    page's own `rightmost`/`leftmost`/entry `child`, stored **raw** here)
+///    is a **logical** id whose top byte carries the owning key's own tag
+///    (`0x80|keynum`) -- resolved to a physical page through `physical_map`,
+///    never dereferenced directly (harvest 4 SS2, re-measured directly
+///    against `wccupda2.dat`'s own 165-page tree for this task: root,
+///    interior and leaf pages of the same key's tree all carry the
+///    identical tag).
+/// 2. There is no `data_bit` to cross-check a child against -- v6's
+///    equivalent signal is that same tag: a genuine child of key `k`'s tree
+///    carries tag `0x80|k` at its own header, cross-checked the same way
+///    v5's `data_bit` is (a mismatch is refused, never silently accepted).
+///
+/// The absent-child sentinels are unchanged from v5's own
+/// (`is_index_leaf`'s literal `NOWHERE`-or-`0` on `leftmost`; the last
+/// entry's own placeholder `child`, never consulted for navigation) --
+/// masking only ever applies to a pointer already known to be a real
+/// candidate, exactly mirroring how `walk_one_key` only ever calls
+/// [`enter_child`] once a sentinel check has already ruled out "no child".
+fn v6_enter_child(
+    raw: u32,
+    key_index: usize,
+    key_tag: u8,
+    physical_map: &HashMap<u32, u32>,
+    owner: &mut HashMap<u32, usize>,
+    visited: &mut HashMap<u32, usize>,
+    bytes: &[u8],
+    page_size: usize,
+) -> Result<u32, NotBtrieve> {
+    let logical = raw & 0x00ff_ffff;
+    let tag = (raw >> 24) as u8;
+    if logical == 0 {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s B-tree names a child at raw \
+                 pointer {raw:#010x} -- logical page 0 is the control \
+                 record, never a real B-tree node"
+            ),
+        });
+    }
+    if tag != key_tag {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s B-tree names a child (raw \
+                 pointer {raw:#010x}) whose own top byte is {tag:#04x}, but \
+                 this key's own tag (its ROOT's top byte, harvest 4 SS2) is \
+                 {key_tag:#04x} -- a child cannot belong to a different \
+                 key's tree"
+            ),
+        });
+    }
+    if let Some(&existing_key) = visited.get(&logical) {
+        return if existing_key == key_index {
+            Err(NotBtrieve {
+                why: format!(
+                    "key_descriptor[{key_index}]'s B-tree revisits logical \
+                     page {logical} -- the tree does not terminate cleanly \
+                     (a cycle)"
+                ),
+            })
+        } else {
+            Err(NotBtrieve {
+                why: format!(
+                    "logical page {logical} is reached by both \
+                     key_descriptor[{existing_key}]'s and \
+                     key_descriptor[{key_index}]'s B-tree walk -- a page \
+                     cannot belong to two keys' trees"
+                ),
+            })
+        };
+    }
+    let Some(&physical) = physical_map.get(&logical) else {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s B-tree names child logical \
+                 page {logical}, which the allocation table never resolves \
+                 to a physical page"
+            ),
+        });
+    };
+    if let Some(&existing) = owner.get(&physical) {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s B-tree names logical page \
+                 {logical} (physical {physical}), which is already claimed \
+                 by key_descriptor[{existing}]'s own tree"
+            ),
+        });
+    }
+    let physical_at = physical as usize * page_size;
+    let actual_tag = get_u16(bytes, physical_at + page::v6::at::TAG);
+    let expected_tag = u16::from(key_tag) << 8;
+    if actual_tag != expected_tag {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s B-tree names logical page \
+                 {logical} (physical {physical}) as a child, but that \
+                 page's own header tag reads {actual_tag:#06x}, not \
+                 {expected_tag:#06x} -- the tag this key's own root carries \
+                 (harvest 4 SS2, SS5)"
+            ),
+        });
+    }
+    visited.insert(logical, key_index);
+    owner.insert(physical, key_index);
+    Ok(physical)
+}
+
+/// v6's own [`walk_one_key`]: identical control flow, differing only in how
+/// a candidate is resolved to a physical page ([`v6_enter_child`] instead of
+/// [`enter_child`]) and in how the root itself is validated (a logical-id
+/// lookup through `physical_map` plus a tag check, rather than a bounds
+/// check plus a `data_bit` check).
+///
+/// # Errors
+///
+/// See [`v6_enter_child`]; additionally if the root's own logical id does
+/// not resolve, is already claimed, or its physical page's own tag
+/// disagrees with `d.key_number`, or if the tree runs deeper than
+/// [`walk_one_key`]'s own generous bound.
+fn v6_walk_one_key(
+    bytes: &[u8],
+    page_size: usize,
+    physical_map: &HashMap<u32, u32>,
+    key_index: usize,
+    d: &KeyDescriptor,
+    owner: &mut HashMap<u32, usize>,
+    visited: &mut HashMap<u32, usize>,
+) -> Result<(), NotBtrieve> {
+    const MAX_DEPTH: usize = 64;
+
+    let root_logical = d.root_page;
+    let key_tag = d.key_number;
+    let Some(&root_physical) = physical_map.get(&root_logical) else {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s root names logical page \
+                 {root_logical}, which the allocation table never resolves \
+                 to a physical page -- not a real page to walk"
+            ),
+        });
+    };
+    if let Some(&existing) = owner.get(&root_physical) {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s root names logical page \
+                 {root_logical} (physical {root_physical}), already \
+                 claimed by key_descriptor[{existing}]'s own tree"
+            ),
+        });
+    }
+    let root_at = root_physical as usize * page_size;
+    let actual_tag = get_u16(bytes, root_at + page::v6::at::TAG);
+    let expected_tag = u16::from(key_tag) << 8;
+    if actual_tag != expected_tag {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s root is logical page \
+                 {root_logical} (physical {root_physical}), but that \
+                 page's own header tag reads {actual_tag:#06x}, not \
+                 {expected_tag:#06x} (0x80|keynum, harvest 4 SS2) -- a \
+                 key's root claims it, but the page itself disagrees"
+            ),
+        });
+    }
+    visited.insert(root_logical, key_index);
+    owner.insert(root_physical, key_index);
+
+    struct Frame {
+        physical: u32,
+        page: IndexPage,
+        at: usize,
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut next = Some(root_physical);
+
+    loop {
+        while let Some(physical) = next.take() {
+            if stack.len() >= MAX_DEPTH {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "key_descriptor[{key_index}]'s B-tree from root \
+                         logical page {root_logical} is more than \
+                         {MAX_DEPTH} levels deep -- not a real B-tree"
+                    ),
+                });
+            }
+            let at = physical as usize * page_size;
+            let page = read_index_page(
+                bytes,
+                at,
+                page_size,
+                d.key_length as usize,
+                d.entry_size as usize,
+                d.attributes,
+            )?;
+            let leftmost = page.leftmost;
+            stack.push(Frame { physical, page, at: 0 });
+            next = if is_index_leaf(leftmost) {
+                None
+            } else {
+                Some(v6_enter_child(
+                    leftmost, key_index, key_tag, physical_map, owner, visited, bytes, page_size,
+                )?)
+            };
+        }
+
+        let Some(frame) = stack.last_mut() else { return Ok(()) };
+        if frame.at == frame.page.entries.len() {
+            stack.pop();
+            continue;
+        }
+        let is_last = frame.at + 1 == frame.page.entries.len();
+        let entry_child = frame.page.entries[frame.at].child;
+        let leaf = is_index_leaf(frame.page.leftmost);
+        let rightmost = frame.page.rightmost;
+        let frame_physical = frame.physical;
+        let entry_index = frame.at;
+        frame.at += 1;
+        if !leaf {
+            let candidate = if is_last {
+                rightmost
+            } else {
+                entry_child.ok_or_else(|| NotBtrieve {
+                    why: format!(
+                        "key_descriptor[{key_index}]'s B-tree: physical \
+                         page {frame_physical}'s entry {entry_index} has no \
+                         stored child field at all, but it is not the \
+                         page's last entry -- only the last entry of a page \
+                         may omit it"
+                    ),
+                })?
+            };
+            next = Some(v6_enter_child(
+                candidate, key_index, key_tag, physical_map, owner, visited, bytes, page_size,
+            )?);
+        }
+    }
+}
+
+/// v6's own [`walk_index_trees`]: walk every key's own B-tree from its
+/// (logical) root, attributing each physical page reached -- root and every
+/// descendant -- to that key. `visited` (keyed by logical id) is seeded with
+/// every key's own root first, the same reason v5's own function seeds it:
+/// so a walk straying into its own root, or a different key's, is refused
+/// by the identical "already reached" predicate a genuine cycle or
+/// cross-key collision is.
+///
+/// # Errors
+///
+/// See [`v6_walk_one_key`].
+fn v6_walk_index_trees(
+    bytes: &[u8],
+    page_size: usize,
+    physical_map: &HashMap<u32, u32>,
+    key_descriptors: &[KeyDescriptor],
+    owner: &mut HashMap<u32, usize>,
+) -> Result<(), NotBtrieve> {
+    let mut visited: HashMap<u32, usize> = HashMap::new();
+    for (i, d) in key_descriptors.iter().enumerate() {
+        if d.root_page != 0 {
+            visited.insert(d.root_page, i);
+        }
+    }
+    for (i, d) in key_descriptors.iter().enumerate() {
+        if d.root_page == 0 {
+            continue;
+        }
+        v6_walk_one_key(bytes, page_size, physical_map, i, d, owner, &mut visited)?;
+    }
+    Ok(())
+}
+
+/// v6's per-key alternate-collating-sequence binding (harvest 4 SS1a, SS6d):
+/// three **discontiguous** bytes, not a `u16` at a single offset --
+/// `acs_page_high<<16 | acs_page_mid<<8 | acs_page_low`, decompile
+/// `W32MKDE_decompiled.c:15369-15371` (`Create` writes the identical order at
+/// `:18392-18394`). Set on **every** segment of an `ALT_COLLATING` key,
+/// continuations included (harvest 4 SS3's own `GALTELA.DAT` cross-check:
+/// "GALTELA's segmented key names page 1 from both segments") -- unlike
+/// `ROOT`/`RECORDS`/`KEY_LENGTH`, which are meaningful only on a key's first
+/// segment, so this crate checks every descriptor, not just the ones with a
+/// nonzero `root_page`.
+fn v6_acs_page_in_key(d: &KeyDescriptor) -> u32 {
+    (u32::from(d.acs_page_high) << 16) | (u32::from(d.acs_page_mid) << 8) | u32::from(d.acs_page_low)
+}
+
+/// Cross-check every `ALT_COLLATING` key's own [`v6_acs_page_in_key`]
+/// binding against what is actually on disk: the logical id it names must
+/// resolve through `physical_map`, and that physical page's own header tag
+/// must be `TAG_ACS` -- the same "pointers and content must agree"
+/// discipline this crate's own `data_bit` check enforces on v5. Extracted
+/// from [`file`]'s own v6 branch so this specific cross-check is directly
+/// testable (and directly mutation-testable) independent of whether the
+/// rest of the file round-trips -- `MULTIACS.DAT` itself is blocked past
+/// this point by its own `variable_mark` (Task 20's scope), so this is the
+/// only way to exercise the assembly formula against real bytes at all.
+///
+/// # Errors
+///
+/// If some `ALT_COLLATING` descriptor's binding names a logical id the
+/// allocation table never resolves, or resolves to a physical page whose
+/// own tag is not `TAG_ACS`.
+fn v6_validate_acs_bindings(
+    bytes: &[u8],
+    page_size: usize,
+    live_descriptors: &[KeyDescriptor],
+    physical_map: &HashMap<u32, u32>,
+) -> Result<(), NotBtrieve> {
+    for (i, d) in live_descriptors.iter().enumerate() {
+        if d.attributes & key_descriptor::ALT_COLLATING == 0 {
+            continue;
+        }
+        let logical = v6_acs_page_in_key(d);
+        let Some(&physical) = physical_map.get(&logical) else {
+            return Err(NotBtrieve {
+                why: format!(
+                    "key_descriptor[{i}] is ALT_COLLATING and names ACS \
+                     logical page {logical} (harvest 4 SS6d's three-byte \
+                     binding: acs_page_high<<16 | acs_page_mid<<8 | \
+                     acs_page_low), but the allocation table never resolves \
+                     that logical id to a physical page"
+                ),
+            });
+        };
+        let tag = get_u16(bytes, physical as usize * page_size + page::v6::at::TAG);
+        if tag != page::v6::TAG_ACS {
+            return Err(NotBtrieve {
+                why: format!(
+                    "key_descriptor[{i}] is ALT_COLLATING and names ACS \
+                     logical page {logical} (physical {physical}), but that \
+                     page's own header tag reads {tag:#06x}, not TAG_ACS \
+                     ({:#06x})",
+                    page::v6::TAG_ACS
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Resolve the v5 page graph: what every physical page from 1 to
 /// `total_pages - 1` *is*, derived from **two** independent sources -- the
 /// control record's own pointers, and each page's own header bit -- neither
@@ -1915,66 +2261,24 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         let (allocation_blocks, physical_map) =
             v6_allocation_table(bytes, page_size, total_pages)?;
 
-        // Task 18: an ordinary v6 page's header, per-slot marker and
-        // fixed-length-record content (harvest 5 SS1.2, SS2.2; harvest 3
-        // SS2) are described now -- but only for a file declaring no keys
-        // at all. With any key, a page tagged TAG_DATA (0x4400, harvest 3
-        // SS2) could equally be a genuine data page or an index-tree
-        // descendant no pointer names directly; telling the two apart needs
-        // the walk from a key's own root that Task 19 builds, and guessing
-        // here would repeat exactly the mistake `model::PageKind::Orphan`'s
-        // own doc records a v5 task once made (defaulting an unclassified
-        // page to a kind it merely resembled, and mislabelling 9,058 real
-        // pages that way). So this crate refuses any v6 file with `keys >
-        // 0` rather than guess -- past both the control record and the
-        // allocation table, further than before this task, but still a
-        // refusal for every real corpus file: no v6-family corpus file
-        // declares zero keys.
-        if !live_descriptors.is_empty() {
-            return Err(NotBtrieve {
-                why: format!(
-                    "identified as {:?} with {page_size}-byte pages; the \
-                     live control record is physical page {live_is_page} \
-                     (generation {}), KEYS={} realized as {} key/segment \
-                     definitions plus a validated definition-offset trailer \
-                     (page 0 is fully described), RECLEN={}, PHYSICAL={}, \
-                     RECORDS={}, PAGES={} (logical, not physical); the \
-                     allocation table has {} block(s) resolving {} logical \
-                     page(s) to physical pages out of {total_pages} \
-                     physical pages total; this crate can describe an \
-                     ordinary v6 data page's header, per-slot marker and \
-                     records now (Task 18), but only for a file declaring no \
-                     keys at all -- with KEYS={}, a TAG_DATA page could \
-                     equally be a genuine data page or an index-tree \
-                     descendant, and distinguishing the two needs a walk \
-                     from each key's own root this crate does not build \
-                     until Task 19, so it refuses rather than guess which \
-                     TAG_DATA pages are which",
-                    id.generation,
-                    live.generation,
-                    live.keys,
-                    live_descriptors.len(),
-                    live.reclen,
-                    live.physical,
-                    live.records,
-                    live.pages,
-                    allocation_blocks.len(),
-                    physical_map.len(),
-                    live.keys,
-                ),
-            });
-        }
+        // Task 19: every physical page the allocation table claims must be
+        // exactly one thing -- a genuine data page, some key's own B-tree
+        // node (root or descendant), or the ACS block -- and the only way
+        // to tell a `TAG_DATA`-tagged descendant apart from a genuine data
+        // page (or key 0's own tree from a generic `TAG_TEMPLATE` page,
+        // `format::page::v6::TAG_TEMPLATE`'s own doc comment) is to walk
+        // each key's own tree from its root first, exactly the
+        // pointers-before-tags discipline `format::page`'s v5 module doc
+        // already documents. `v6_walk_index_trees` attributes every page it
+        // reaches to its owning key; the "no residue, ever" rule this walk
+        // enforces is [`v6_enter_child`]'s own four refusal predicates,
+        // Task 11b's v5 review finding carried over unchanged.
+        let mut owner: HashMap<u32, usize> = HashMap::new();
+        v6_walk_index_trees(bytes, page_size, &physical_map, &live_descriptors, &mut owner)?;
 
-        // KEYS == 0: no index root can exist, so every physical page this
-        // file claims through the allocation table is unambiguously a
-        // TAG_DATA page or something this task does not decode
-        // (TAG_TEMPLATE/TAG_VARIABLE) -- never an index descendant, since
-        // there is no key to grow a B-tree under. Every claimed physical
-        // page is read; every physical page in the file must be either the
-        // control record's own shadow pair, an allocation-table page, or a
-        // page some entry resolves to -- an unclaimed leftover physical
-        // page is refused by name (trap: a page this crate cannot classify
-        // is a refusal, never a silently dropped range).
+        // Two different logical ids resolving to the same physical page is
+        // a genuine contradiction -- checked before classification, the same
+        // way Task 18 checked it before this task's own walk existed.
         let mut claimed: Vec<u32> = physical_map.values().copied().collect();
         claimed.sort_unstable();
         claimed.dedup();
@@ -1990,21 +2294,106 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
             });
         }
 
+        // Task 19: every ALT_COLLATING key's own three-byte binding must
+        // name a genuine TAG_ACS page -- cross-checked, never merely
+        // trusted.
+        v6_validate_acs_bindings(bytes, page_size, &live_descriptors, &physical_map)?;
+
+        // Every claimed physical page is read; every physical page in the
+        // file must be either the control record's own shadow pair, an
+        // allocation-table page, or a page some entry resolves to -- an
+        // unclaimed leftover physical page is refused by name (trap: a page
+        // this crate cannot classify is a refusal, never a silently dropped
+        // range). A page the walk attributed to a key is that key's index
+        // content; a page tagged TAG_ACS (and not attributed, since no
+        // key's tree and the ACS block are ever the same page) is the ACS
+        // block; a page tagged TAG_DATA and not attributed is a genuine
+        // data page, decoded the same way Task 18 already does, gated on
+        // this being a fixed-length-record file (a variable-length file's
+        // data pages are Task 20's own scope); anything else (a
+        // TAG_TEMPLATE/TAG_VARIABLE page no key claims, or a TAG_DATA page
+        // on a variable-length file) is refused rather than guessed.
         let mut v6_pages = Vec::with_capacity(claimed.len());
         for physical_page in &claimed {
             let page_start = *physical_page as usize * page_size;
             let tag = get_u16(bytes, page_start + page::v6::at::TAG);
             let logical = get_u16(bytes, page_start + page::v6::at::LOGICAL);
             let stamp = get_u16(bytes, page_start + page::v6::at::STAMP);
-            let content = if tag == page::v6::TAG_DATA
-                && live.variable_mark == 0
-                && live.physical != 0
-            {
-                Some(read_v6_data_page(bytes, page_start, page_size, live.physical as usize)?)
-            } else {
-                None
-            };
-            v6_pages.push(V6Page { physical_page: *physical_page, tag, logical, stamp, content });
+
+            if let Some(&key_index) = owner.get(physical_page) {
+                let d = &live_descriptors[key_index];
+                let index_page = read_index_page(
+                    bytes,
+                    page_start,
+                    page_size,
+                    d.key_length as usize,
+                    d.entry_size as usize,
+                    d.attributes,
+                )?;
+                v6_pages.push(V6Page {
+                    physical_page: *physical_page,
+                    tag,
+                    logical,
+                    stamp,
+                    content: None,
+                    index: Some(index_page),
+                    acs: None,
+                });
+                continue;
+            }
+
+            if tag == page::v6::TAG_ACS {
+                let block = read_acs_block(bytes, page_start, page_size)?;
+                v6_pages.push(V6Page {
+                    physical_page: *physical_page,
+                    tag,
+                    logical,
+                    stamp,
+                    content: None,
+                    index: None,
+                    acs: Some(block),
+                });
+                continue;
+            }
+
+            if tag == page::v6::TAG_DATA && live.variable_mark == 0 && live.physical != 0 {
+                let content = read_v6_data_page(bytes, page_start, page_size, live.physical as usize)?;
+                v6_pages.push(V6Page {
+                    physical_page: *physical_page,
+                    tag,
+                    logical,
+                    stamp,
+                    content: Some(content),
+                    index: None,
+                    acs: None,
+                });
+                continue;
+            }
+
+            return Err(NotBtrieve {
+                why: format!(
+                    "identified as {:?}: physical page {physical_page} \
+                     (logical {logical}, tag {tag:#06x}) is claimed by the \
+                     allocation table but attributed to no key's B-tree and \
+                     is not TAG_ACS; {}",
+                    id.generation,
+                    if tag == page::v6::TAG_DATA {
+                        format!(
+                            "it IS TAG_DATA, but this file's variable_mark \
+                             is {:#010x} and PHYSICAL is {} -- a \
+                             variable-length file's data pages are Task \
+                             20's own scope, so this crate refuses rather \
+                             than guess",
+                            live.variable_mark, live.physical
+                        )
+                    } else {
+                        "and its tag is TAG_TEMPLATE, TAG_VARIABLE, or \
+                         unrecognized -- none of which this crate decodes \
+                         yet"
+                            .to_string()
+                    }
+                ),
+            });
         }
 
         let mut accounted: HashSet<u32> = HashSet::new();
@@ -2498,6 +2887,132 @@ mod tests {
         assert_eq!(descriptors[2].root_page, 0, "a continuation's root is 0");
     }
 
+    /// Task 19's own failing-test-first, on `MULTIACS.DAT` -- the corpus's
+    /// only v6.10 file, three keys, two `ALT_COLLATING`, a third distinct
+    /// table (`LOWER`) beyond the previously-known `UPPER`/`GALCAPS`/
+    /// `ALLCAPS` pair, and the corpus's only `Float` (`0x02`) type code.
+    ///
+    /// **This file does not round-trip even after this task**: `MULTIACS.
+    /// DAT`'s own `variable_mark` is `0xffffffff` (a genuinely
+    /// variable-length file, not measured by harvest 4 -- that harvest's
+    /// own scope is keys/index pages/ACS, not the variable-length fragment
+    /// format harvest 5 owns), so its one remaining `TAG_DATA` page
+    /// (physical 9, logical 6) needs Task 20's own work before `file` can
+    /// describe it. What this task's own walk *does* resolve on this exact
+    /// file, proven directly here rather than only through `file`'s single
+    /// pass/fail verdict: the three key roots (physical 6/7/8, tags
+    /// `0x8000`/`0x8100`/`0x8200`, harvest 4 SS2's own worked example) and
+    /// both ACS blocks (physical 4 `ALLCAPS`, physical 5 `LOWER`, harvest 4
+    /// SS6c) -- and `file`'s own refusal names the *one* page actually left,
+    /// not the old blanket `keys > 0` gate.
+    #[test]
+    fn multiacs_dat_index_trees_and_both_acs_blocks_resolve_the_rest_needs_task_20() {
+        let path = "archive/tooling/wbtrv32/assets/MULTIACS.DAT";
+        let Ok(original) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let id = identify(&original).expect("a v6.10 file");
+        let page_size = id.page_size as usize;
+        let total_pages = original.len() / page_size;
+
+        let control = resolve_shadow(&original, page_size).expect("resolves");
+        let Control::Shadowed { live, live_is_page, .. } = &control else {
+            panic!("a v6 file has two control records")
+        };
+        assert_eq!(live.keys, 3);
+        let live_start = live_is_page * page_size;
+        let descriptors =
+            key_descriptors(&original[live_start..], page_size, live.keys).expect("well-formed");
+        let (_blocks, physical_map) =
+            v6_allocation_table(&original, page_size, total_pages).expect("resolves");
+
+        // The walk itself: every root and, since this snapshot's keys are
+        // all empty (0 entries), no descendants -- proof the walk runs on
+        // real bytes, not just the synthetic fixtures elsewhere in this
+        // file.
+        let mut owner: HashMap<u32, usize> = HashMap::new();
+        v6_walk_index_trees(&original, page_size, &physical_map, &descriptors, &mut owner)
+            .expect("three independent, empty-leaf roots, no contradiction");
+        let mut owned_physical: Vec<u32> = owner.keys().copied().collect();
+        owned_physical.sort_unstable();
+        assert_eq!(owned_physical, vec![6, 7, 8], "physical pages 6/7/8 are the 3 roots");
+        for (physical, tag) in [(6u32, 0x8000u16), (7, 0x8100), (8, 0x8200)] {
+            let actual = get_u16(&original, physical as usize * page_size + page::v6::at::TAG);
+            assert_eq!(actual, tag, "physical {physical}'s own header tag");
+        }
+
+        // The ACS binding cross-check: both ALT_COLLATING keys (0 and 2)
+        // name a logical page that resolves to a genuine TAG_ACS page.
+        v6_validate_acs_bindings(&original, page_size, &descriptors, &physical_map)
+            .expect("both ALT_COLLATING keys name a genuine TAG_ACS page");
+
+        // Both blocks, decoded directly: physical 4 is ALLCAPS (key 0's
+        // table, logical 1), physical 5 is LOWER (key 2's table, logical 2,
+        // harvest 4 SS6c).
+        assert_eq!(*physical_map.get(&1).expect("logical 1 resolves"), 4);
+        assert_eq!(*physical_map.get(&2).expect("logical 2 resolves"), 5);
+        let allcaps = read_acs_block(&original, 4 * page_size, page_size).expect("a real ACS block");
+        assert_eq!(&allcaps.name[..7], b"ALLCAPS");
+        assert_eq!(allcaps.table[b'a' as usize], b'A', "uppercase fold");
+        let lower = read_acs_block(&original, 5 * page_size, page_size).expect("a real ACS block");
+        assert_eq!(&lower.name[..5], b"LOWER");
+        assert_eq!(lower.table[b'A' as usize], b'a', "lowercase fold -- the corpus's third table");
+        assert_ne!(
+            allcaps.table, lower.table,
+            "two genuinely distinct tables, not the same table under two names"
+        );
+
+        // Key 1's second segment carries the corpus's only Float (0x02)
+        // type code (harvest 4 SS1c) -- stored, never interpreted.
+        assert_eq!(descriptors[2].extended, 0x02, "the corpus's only Float type code");
+
+        // `file` itself: past this task's own walk and ACS cross-check
+        // (both of which just succeeded above, on these same bytes), the
+        // one thing left is physical page 9 (logical 6), a genuine
+        // TAG_DATA page on a variable-length file -- Task 20's scope, named
+        // by this refusal rather than guessed at.
+        let e = file(&original).expect_err("the one remaining data page needs Task 20");
+        assert!(e.why.contains("physical page 9"), "{}", e.why);
+        assert!(e.why.contains("Task 20"), "{}", e.why);
+        assert!(
+            !e.why.contains("a TAG_DATA page could equally be a genuine data \
+                            page or an index-tree descendant"),
+            "the old keys>0 gate must be gone: {}",
+            e.why
+        );
+    }
+
+    /// Task 19's own spot check, on a corpus file that is NOT
+    /// `MULTIACS.DAT`: `WCCUSER2.VIR` (the MajorMUD user database, v6) has
+    /// 3 independent keys and no ACS, walked and round-tripped by the same
+    /// general machinery `MULTIACS.DAT`'s test exercises, not by anything
+    /// specific to that one file -- proof this task described the
+    /// structure rather than accidentally reproducing one file's bytes.
+    #[test]
+    fn wccuser2_vir_three_keys_no_acs_round_trips_completely() {
+        let path = "archive/modules/majormud-nt/wccnt7pw/out/WCCUSER2.VIR";
+        let Ok(original) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+
+        let model = file(&original).expect("WCCUSER2.VIR: keys>0 no longer refuses");
+        assert_eq!(model.key_descriptors.len(), 3, "3 independent keys, no segments");
+
+        // Three roots, one for each key, each carrying its own key_number
+        // tag at physical page 1/2/3 (WCCUSER2.VIR's own logical 1/2/3,
+        // harvest 4 SS2) -- a different file, same tag convention.
+        let indexed: Vec<&V6Page> = model.v6_pages.iter().filter(|p| p.index.is_some()).collect();
+        assert_eq!(indexed.len(), 3, "one root per key, no descendants (this file is tiny)");
+        let mut tags: Vec<u16> = indexed.iter().map(|p| p.tag).collect();
+        tags.sort_unstable();
+        assert_eq!(tags, vec![0x8000, 0x8100, 0x8200], "key 0/1/2's own tags");
+
+        let emitted = crate::emit::file(&model).expect("WCCUSER2.VIR: nothing left undescribed");
+        assert_eq!(emitted.bytes(), original.as_slice(), "byte for byte");
+    }
+
     /// `wccmp002.vir`'s live control record's fixed portion (`0x00..0x110`)
     /// round-trips through `V6ControlRecord` and
     /// `emit::write_v6_fixed_portion` byte for byte -- including `PAGES`
@@ -2831,74 +3346,56 @@ mod tests {
     /// -- the shift this task exists to make: not just refused, but refused
     /// for a later, more specific reason than before.
     #[test]
-    fn the_refusal_names_the_live_copy_it_resolved() {
+    fn the_refusal_now_names_an_abandoned_physical_page_past_the_walk() {
         let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
         let Ok(bytes) = std::fs::read(corpus_path(path)) else {
             eprintln!("no archive/ on this box, nothing verified");
             return;
         };
-        let e = file(&bytes).expect_err("v6 pages are not yet described");
-        assert!(e.why.contains("page 1"), "{}", e.why);
-        assert!(e.why.contains("285"), "{}", e.why);
+
+        // Before Task 19: refused at the `keys > 0` gate, naming KEYS,
+        // RECORDS, PAGES, the allocation table's own block/logical counts,
+        // and "Task 19" as the task that would resolve it (this test's own
+        // prior name, `the_refusal_names_the_live_copy_it_resolved`). Task
+        // 19's own walk resolves `wccmp002.vir`'s single key's B-tree (208
+        // pages, root logical 137) and its own claimed data pages
+        // completely -- but this specific corpus file also carries physical
+        // pages the allocation table's *live* copy no longer claims at all
+        // (a controller-run Python walk of this exact file found 9 such
+        // pages, the first at physical 13528 -- an earlier root/interior
+        // page this file's own history abandoned, still carrying a genuine
+        // `0x8000`-tagged header, but named by no live logical id). Deciding
+        // whether that is a genuinely abandoned page (the same shape v5's
+        // `PageKind::Orphan`, Task 13, accepts) or a fault this crate should
+        // refuse is out of this task's own scope (harvest 4 does not cover
+        // it) -- so this crate refuses by name rather than guess, which is
+        // what this test now asserts.
+        let e = file(&bytes).expect_err("an abandoned physical page is still unresolved");
         assert!(
             !e.why.contains("every byte of a v6 control record"),
             "the old blanket refusal text must be gone: {}",
             e.why
         );
-
-        // Task 15: the refusal moved further along than Ruling 7's own
-        // shadow-pair message -- it now names the live copy's own
-        // fixed-portion geometry and how many key/segment definitions its
-        // walk actually assembled, not just which physical page and
-        // generation is live.
-        assert!(e.why.contains("KEYS=1"), "names the key count: {}", e.why);
         assert!(
-            e.why.contains("1 key/segment definitions"),
-            "names the definition count the walk assembled: {}",
-            e.why
-        );
-        assert!(e.why.contains("RECORDS=26720"), "names the live record count: {}", e.why);
-        assert!(
-            e.why.contains("PAGES=13572"),
-            "names the LOGICAL page count (13,572), not the file's 13,607 \
-             physical pages: {}",
-            e.why
-        );
-        assert!(
-            !e.why.contains("PAGES=13607") && !e.why.contains("PAGES=13,607"),
-            "must not report the physical page count as PAGES: {}",
-            e.why
-        );
-
-        // Task 17: the refusal moved past the allocation table too -- it
-        // now names how many blocks this 14-block file has and how many of
-        // its 13,571 possible logical ids the live table actually
-        // resolves (13,568; the gap is unclaimed headroom, not a refusal),
-        // against the file's 13,607 physical pages -- a *different*,
-        // correctly-labeled use of the physical count than the PAGES
-        // conflation the assertion above guards against.
-        assert!(e.why.contains("14 block"), "names the block count: {}", e.why);
-        assert!(e.why.contains("13568 logical"), "names the resolved logical count: {}", e.why);
-        assert!(
-            e.why.contains("out of 13607 physical pages"),
-            "names the total physical page count, correctly labeled: {}",
-            e.why
-        );
-        // Task 18: the refusal moved past addressing again -- it now says
-        // this crate *can* describe an ordinary v6 data page (header,
-        // per-slot marker, records), just not for a file with any key,
-        // since a TAG_DATA page could be a genuine data page or an
-        // index-tree descendant this crate cannot yet tell apart without
-        // Task 19's walk. `wccmp002.vir` has KEYS=1, so it still refuses --
-        // for a content reason now, not an addressing one.
-        assert!(
-            e.why.contains("a TAG_DATA page could equally be a genuine data \
+            !e.why.contains("a TAG_DATA page could equally be a genuine data \
                             page or an index-tree descendant"),
-            "the refusal is now about which TAG_DATA pages are which, not \
-             addressing: {}",
+            "the pre-Task-19 keys>0 gate must be gone -- this file's own \
+             walk now runs: {}",
             e.why
         );
-        assert!(e.why.contains("Task 19"), "names the task that would resolve it: {}", e.why);
+        assert!(
+            e.why.contains("physical page 13528"),
+            "names the specific abandoned page, deterministically the \
+             first found by the ascending 0..total_pages residue scan: {}",
+            e.why
+        );
+        assert!(
+            e.why.contains("cannot classify it and refuses rather than \
+                            silently dropping its bytes"),
+            "the same no-residue wording the v5 side already uses for an \
+             unaccounted page: {}",
+            e.why
+        );
     }
 
     /// A tie is refused rather than resolved. No corpus file has ever tied,

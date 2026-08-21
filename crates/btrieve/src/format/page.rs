@@ -116,17 +116,42 @@ pub mod v6 {
     /// field boundaries.
     pub const LEN: usize = 6;
 
-    /// `0x4400`: a data or index page (harvest 3 SS2). This crate decodes
-    /// content for this tag only when a file declares no keys at all
-    /// (`model::V6Page`'s own doc comment) -- with any key, this tag alone
-    /// cannot tell a data page from an index descendant, and that walk is a
-    /// later task's (Task 19).
+    /// `0x4400` (`'D'` in the high byte): a genuine data page. Harvest 4 SS5
+    /// once looked like ambiguous with an index descendant ("a data or
+    /// index page") until Task 19's own corpus walk (`wccupda2.dat`,
+    /// `wccmp002.vir`) measured that every page belonging to a key's own
+    /// B-tree -- root **and every descendant, at every depth** -- instead
+    /// carries that key's own tag (`0x80|keynum`, high byte) at this same
+    /// offset, the identical tag the root pointer's own top byte and the
+    /// allocation-table entry's marker high byte carry (harvest 4 SS2, SS5).
+    /// `TAG_DATA` is therefore never ambiguous on its own: this crate still
+    /// classifies by walking each key's own root down through its child
+    /// pointers first (`read::v6_walk_index_trees`), the same
+    /// pointers-before-tags discipline `format::page`'s own v5 module doc
+    /// documents, and only reads a claimed page's content as `Data` once no
+    /// key's walk has attributed it to a tree -- so a corpus file that
+    /// happened to tag some future descendant `TAG_DATA` instead would still
+    /// be caught (not decoded as data) rather than silently mis-read.
     pub const TAG_DATA: u16 = 0x4400;
-    /// `0x8000`: a template/empty page -- not decoded by this crate.
+    /// `0x8000`: a template/empty page, when no key's own tag claims it --
+    /// not decoded by this crate. **Collides on purpose** with key 0's own
+    /// root/descendant tag (`0x80|0` == `0x80`, the same byte): a file with
+    /// a key numbered 0 tags every page of that key's tree `0x8000` too, so
+    /// this constant alone can never decide "template" versus "key 0's
+    /// tree" -- only `read::v6_walk_index_trees`'s own walk (which attributes
+    /// pages from each key's root, never from this tag) can, which is why
+    /// this crate never uses `TAG_TEMPLATE` as a positive classification,
+    /// only as the name for "unclaimed and untagged `TAG_DATA`/`TAG_ACS`" --
+    /// see that function's own doc comment.
     pub const TAG_TEMPLATE: u16 = 0x8000;
-    /// `0x5600` (`'V'` in the low byte): a variable-length file's
+    /// `0x5600` (`'V'` in the high byte): a variable-length file's
     /// fragment/overflow page -- not decoded by this crate (Task 20).
     pub const TAG_VARIABLE: u16 = 0x5600;
+    /// `0x4100` (`'A'` in the high byte): the alternate collating sequence
+    /// block, found by scanning claimed pages for this tag rather than at a
+    /// fixed page the way v5's single block is (harvest 4 SS6a) -- a v6 file
+    /// may carry more than one (`MULTIACS.DAT`'s two, harvest 4 SS6c).
+    pub const TAG_ACS: u16 = 0x4100;
 
     /// Every named field of the six-byte v6 header, cited.
     #[must_use]
