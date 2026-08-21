@@ -1850,6 +1850,156 @@ mod tests {
         assert!(e.why.contains("data_bit is clear"), "{}", e.why);
     }
 
+    /// `enter_child`'s four refusal predicates (Task 11b review finding):
+    /// a child pointer naming page 0, one running past the file, a cycle
+    /// within one key's own tree, and two different keys' walks reaching
+    /// the same page. Each fixture below drives exactly one of these --
+    /// synthetic, since no corpus file happens to be malformed this way --
+    /// built from minimal empty index pages (`count` 0 or 1, real
+    /// `key_length`/`entry_size` so the walk actually decodes them rather
+    /// than faulting on an unrelated mismatch first) so only the single
+    /// targeted predicate can fire.
+
+    /// A child pointer naming page 0 (the control record). The last
+    /// entry's own `child` field is always a placeholder (harvest 4 SS4),
+    /// so the walk never reads a descent target from it -- the page
+    /// header's own `rightmost` slot is what stands in for the last
+    /// entry's child, and this fixture sets *that* to 0: root (page 1) has
+    /// one entry and a real `leftmost` child (page 2, a genuine empty
+    /// leaf, descended into and exhausted first) so the walk is genuinely
+    /// interior, then `rightmost` -- followed only after the root's one
+    /// (and therefore last) entry -- is the literal value 0.
+    #[test]
+    fn a_child_pointer_naming_page_zero_is_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf[0x14..0x16].copy_from_slice(&1u16.to_le_bytes()); // keys = 1
+        let def0 = 0x110;
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1
+        buf[def0 + 0x0a..def0 + 0x0c].copy_from_slice(&2u16.to_le_bytes()); // key_length
+        buf[def0 + 0x0c..def0 + 0x0e].copy_from_slice(&10u16.to_le_bytes()); // entry_size
+        buf.resize(1536, 0); // page 0, page 1 (root), page 2 (leftmost leaf)
+
+        // Page 1: root, one entry, leftmost = 2 (real, interior), rightmost
+        // = 0 (the control record -- not a real child, and this entry is
+        // both the root's only and its last, so `rightmost` is what the
+        // walk follows after it).
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // page 1 number = 1
+        buf[512 + 6..512 + 8].copy_from_slice(&1u16.to_le_bytes()); // count = 1
+        buf[512 + 8..512 + 12].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]); // rightmost = 0
+        buf[512 + 12..512 + 16].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]); // leftmost = 2
+        // entry 0: key (2 bytes), head (4), child placeholder (4) -- values
+        // do not matter, this entry is never used to name a child (it is
+        // the last entry, so `rightmost` stands in for it).
+
+        // Page 2: a genuine empty leaf -- the walk descends into it via
+        // `leftmost` before it ever reaches the root's own entry/rightmost.
+        buf[1024..1028].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]); // page 2 number = 2
+        buf[1024 + 8..1024 + 12].copy_from_slice(&[0xff; 4]); // rightmost = NOWHERE
+        buf[1024 + 12..1024 + 16].copy_from_slice(&[0xff; 4]); // leftmost = NOWHERE
+
+        let e = file(&buf).expect_err("the root's rightmost names page 0");
+        assert!(e.why.contains("child page 0"), "{}", e.why);
+        assert!(e.why.contains("control record"), "{}", e.why);
+    }
+
+    /// A child pointer naming a page past the end of the file -- the
+    /// root's own `leftmost` names page 99 in a 2-page file.
+    #[test]
+    fn a_child_pointer_past_the_end_of_the_file_is_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf[0x14..0x16].copy_from_slice(&1u16.to_le_bytes()); // keys = 1
+        let def0 = 0x110;
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1
+        buf[def0 + 0x0a..def0 + 0x0c].copy_from_slice(&2u16.to_le_bytes()); // key_length
+        buf[def0 + 0x0c..def0 + 0x0e].copy_from_slice(&10u16.to_le_bytes()); // entry_size
+        buf.resize(1024, 0); // page 0 plus page 1 only -- 2 pages total
+
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // page 1 number = 1
+        buf[512 + 8..512 + 12].copy_from_slice(&[0xff; 4]); // rightmost = NOWHERE
+        buf[512 + 12..512 + 16].copy_from_slice(&[0x00, 0x00, 99, 0x00]); // leftmost = 99
+
+        let e = file(&buf).expect_err("leftmost names page 99 in a 2-page file");
+        assert!(e.why.contains("page 99"), "{}", e.why);
+        assert!(e.why.contains("has only 2 pages"), "{}", e.why);
+    }
+
+    /// A cycle within one key's own tree: root (1) -> page 2 -> page 3 ->
+    /// back to page 2 (not the root itself, so the refusal can only come
+    /// from the walk's own `visited` map, never from page 2 already being
+    /// pre-claimed as some *other* kind before the walk starts).
+    #[test]
+    fn a_cycle_within_one_keys_own_tree_is_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf[0x14..0x16].copy_from_slice(&1u16.to_le_bytes()); // keys = 1
+        let def0 = 0x110;
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1
+        buf[def0 + 0x0a..def0 + 0x0c].copy_from_slice(&2u16.to_le_bytes()); // key_length
+        buf[def0 + 0x0c..def0 + 0x0e].copy_from_slice(&10u16.to_le_bytes()); // entry_size
+        buf.resize(2048, 0); // page 0, pages 1-3
+
+        // Page 1 (root): leftmost = 2, no entries needed to force descent.
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        buf[512 + 8..512 + 12].copy_from_slice(&[0xff; 4]); // rightmost = NOWHERE
+        buf[512 + 12..512 + 16].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]); // leftmost = 2
+
+        // Page 2: leftmost = 3.
+        buf[1024..1028].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]);
+        buf[1024 + 8..1024 + 12].copy_from_slice(&[0xff; 4]);
+        buf[1024 + 12..1024 + 16].copy_from_slice(&[0x00, 0x00, 0x03, 0x00]); // leftmost = 3
+
+        // Page 3: leftmost = 2 -- back to page 2, already on this key's own
+        // walk.
+        buf[1536..1540].copy_from_slice(&[0x00, 0x00, 0x03, 0x00]);
+        buf[1536 + 8..1536 + 12].copy_from_slice(&[0xff; 4]);
+        buf[1536 + 12..1536 + 16].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]); // leftmost = 2
+
+        let e = file(&buf).expect_err("page 3's leftmost cycles back to page 2");
+        assert!(e.why.contains("revisits page 2"), "{}", e.why);
+        assert!(e.why.contains("cycle"), "{}", e.why);
+    }
+
+    /// Two different keys' walks reaching the same page: key 0's root
+    /// (page 1) and key 1's root (page 2) both name page 3 as their own
+    /// `leftmost`. Key 0's walk runs first (key descriptors are walked in
+    /// order) and reaches page 3 cleanly; key 1's walk then reaches the
+    /// same page and must refuse, naming both keys.
+    #[test]
+    fn two_different_keys_walks_reaching_the_same_page_is_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf[0x14..0x16].copy_from_slice(&2u16.to_le_bytes()); // keys = 2
+        let def0 = 0x110;
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // key 0 root = 1
+        buf[def0 + 0x0a..def0 + 0x0c].copy_from_slice(&2u16.to_le_bytes());
+        buf[def0 + 0x0c..def0 + 0x0e].copy_from_slice(&10u16.to_le_bytes());
+        let def1 = def0 + 0x1e;
+        buf[def1..def1 + 4].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]); // key 1 root = 2
+        buf[def1 + 0x0a..def1 + 0x0c].copy_from_slice(&2u16.to_le_bytes());
+        buf[def1 + 0x0c..def1 + 0x0e].copy_from_slice(&10u16.to_le_bytes());
+        buf.resize(2048, 0); // page 0, page 1 (key 0 root), page 2 (key 1 root), page 3 (shared)
+
+        // Page 1 (key 0's root): leftmost = 3.
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        buf[512 + 8..512 + 12].copy_from_slice(&[0xff; 4]);
+        buf[512 + 12..512 + 16].copy_from_slice(&[0x00, 0x00, 0x03, 0x00]); // leftmost = 3
+
+        // Page 2 (key 1's root): leftmost = 3 too.
+        buf[1024..1028].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]);
+        buf[1024 + 8..1024 + 12].copy_from_slice(&[0xff; 4]);
+        buf[1024 + 12..1024 + 16].copy_from_slice(&[0x00, 0x00, 0x03, 0x00]); // leftmost = 3
+
+        // Page 3: a genuine empty leaf -- key 0's walk reaches it and
+        // finishes cleanly before key 1's walk ever starts.
+        buf[1536..1540].copy_from_slice(&[0x00, 0x00, 0x03, 0x00]);
+        buf[1536 + 8..1536 + 12].copy_from_slice(&[0xff; 4]);
+        buf[1536 + 12..1536 + 16].copy_from_slice(&[0xff; 4]);
+
+        let e = file(&buf).expect_err("page 3 is reached by both keys' walks");
+        assert!(e.why.contains("page 3"), "{}", e.why);
+        assert!(e.why.contains("key_descriptor[0]"), "{}", e.why);
+        assert!(e.why.contains("key_descriptor[1]"), "{}", e.why);
+        assert!(e.why.contains("cannot belong to two keys"), "{}", e.why);
+    }
+
     /// A free chain entry naming a position past the end of the file is
     /// refused, naming the file's own length.
     #[test]
