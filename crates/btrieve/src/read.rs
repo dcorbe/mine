@@ -16,7 +16,7 @@ use crate::format::page;
 use crate::format::variable;
 use crate::model::{
     AcsBlock, Control, ControlRecord, DataPage, File, FragmentPage, FragmentSlot, IndexEntry,
-    IndexPage, KeyDescriptor, Page, PageKind, RecordSlot, V6ControlRecord,
+    IndexPage, KeyDescriptor, Page, PageKind, RecordSlot, V6ControlRecord, V6PageTail,
 };
 
 /// Read a plain little-endian `u16` at `at`.
@@ -276,6 +276,84 @@ fn key_descriptors(
         }
     }
     Ok(out)
+}
+
+/// Read and validate a v6 physical page's definition-offset trailer (Task
+/// 16), plus the padding on either side of it -- `descriptors` is that same
+/// page's own key/segment definition array, already walked by
+/// [`key_descriptors`].
+///
+/// `bytes` starts at the physical page itself (offset `0` is this page's own
+/// `LEAD`), the same convention [`v6_control_record`] and [`key_descriptors`]
+/// use.
+///
+/// # Errors
+///
+/// If `descriptors` run past `format::fcr::trailer::position(page_size)`
+/// (never observed -- max 4 definitions in the corpus, every measured
+/// trailer position leaves room for far more), or any trailer slot's value
+/// disagrees with `format::fcr::trailer::expected_entry` -- a disagreement
+/// this crate's own census found in 0 of 493 corpus files.
+fn v6_page_tail(
+    bytes: &[u8],
+    page_size: usize,
+    descriptors: &[KeyDescriptor],
+) -> Result<V6PageTail, NotBtrieve> {
+    let after_definitions = key_descriptor::base(descriptors.len());
+
+    let Some(trailer_pos) = fcr::trailer::position(page_size as u16) else {
+        // No trailer at this page size (512, or one this corpus has never
+        // used) -- everything past the definitions is a plain tail, the
+        // same shape page_zero_tail describes for v5, carried verbatim.
+        let gap = if page_size > after_definitions {
+            bytes[after_definitions..page_size].to_vec()
+        } else {
+            Vec::new()
+        };
+        return Ok(V6PageTail { gap, padding: Vec::new() });
+    };
+
+    if after_definitions > trailer_pos {
+        return Err(NotBtrieve {
+            why: format!(
+                "{} key/segment definitions run to byte {after_definitions:#x}, \
+                 past the definition-offset trailer's own fixed position \
+                 {trailer_pos:#x} for a {page_size}-byte page -- more \
+                 definitions than this file's trailer has room for, never \
+                 observed in the corpus (max 4)",
+                descriptors.len()
+            ),
+        });
+    }
+    let gap = bytes[after_definitions..trailer_pos].to_vec();
+
+    for (n, d) in descriptors.iter().enumerate() {
+        let at = trailer_pos + n * 2;
+        let actual = get_u16(bytes, at);
+        let expected = fcr::trailer::expected_entry(n, d.self_tag);
+        if actual != expected {
+            return Err(NotBtrieve {
+                why: format!(
+                    "definition-offset trailer slot {n} at byte {at:#x} reads \
+                     {actual:#06x}, but key_descriptor[{n}]'s SELF_TAG is \
+                     {:#04x} so this crate's own derivation (harvest 2 \
+                     'Definition-offset trailer, worked', corrected by this \
+                     task's census of 493 corpus files) expects \
+                     {expected:#06x}",
+                    d.self_tag
+                ),
+            });
+        }
+    }
+
+    let after_trailer = trailer_pos + descriptors.len() * 2;
+    let padding = if page_size > after_trailer {
+        bytes[after_trailer..page_size].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Ok(V6PageTail { gap, padding })
 }
 
 /// Read a fixed-length-record data page's content: every slot in order,
@@ -1480,12 +1558,15 @@ fn resolve_pages(
 /// contradictions it checks for. Page 0's tail past the last key/segment
 /// definition is never a refusal reason -- see `model::File::page_zero_tail`.
 ///
-/// A v6 file is always refused today, but not until after Ruling 7's shadow
-/// resolution runs: the live control-record copy (harvest 0 ruling 7,
-/// harvest 2 "FCR shadowing") is resolved first, and the refusal names which
-/// physical page turned out to be live and at what generation, because the
-/// allocation table, page addressing, and everything else v6 geometry needs
-/// past the control record are later work -- see [`resolve_shadow`].
+/// A v6 file is always refused today, but not until after page 0 in its
+/// entirety has been read and validated: the live control-record copy
+/// (harvest 0 ruling 7, harvest 2 "FCR shadowing") is resolved first, then
+/// its key/segment definitions (Task 15), then its definition-offset
+/// trailer (Task 16, [`v6_page_tail`]) -- and the refusal names all of it
+/// (which physical page is live, at what generation, KEYS realized as how
+/// many definitions), because the allocation table, page addressing, and
+/// everything else v6 geometry needs past page 0 are later work -- see
+/// [`resolve_shadow`].
 pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
     let id = identify(bytes)?;
     let page_size = id.page_size as usize;
@@ -1525,24 +1606,33 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         let live_page_start = live_is_page * page_size;
         let live_descriptors = key_descriptors(&bytes[live_page_start..], page_size, live.keys)?;
 
+        // Task 16: the live copy's own definition-offset trailer -- past
+        // the key/segment definitions above -- is read and validated too,
+        // moving the frontier past all of page 0, not just its fixed
+        // portion and key array. A malformed trailer (a slot disagreeing
+        // with what this crate's own census-derived formula expects) is
+        // refused by that function's own, more specific message.
+        let _live_page_tail =
+            v6_page_tail(&bytes[live_page_start..], page_size, &live_descriptors)?;
+
         // Ruling 7, part 3: identification stays on page 0 -- already true,
         // `identify` never moves. What must not come from page 0 is
-        // geometry, and that is everything past the shadow pair and its key
-        // descriptors: the allocation table, page addressing, and the rest
-        // of a v6 file's own pages are not yet described by this crate, so
-        // the refusal moves here -- further along than Task 15 found it,
-        // naming the live copy's own fixed-portion geometry and key count,
-        // not just which physical page and generation Ruling 7 resolved.
+        // geometry, and that is everything past the shadow pair, its key
+        // descriptors and (Task 16) its definition-offset trailer: the
+        // allocation table, page addressing, and the rest of a v6 file's
+        // own pages are not yet described by this crate, so the refusal
+        // moves here -- past the whole of page 0 now, not just its fixed
+        // portion and key count.
         return Err(NotBtrieve {
             why: format!(
                 "identified as {:?} with {page_size}-byte pages; the live \
                  control record is physical page {live_is_page} (generation \
-                 {}), KEYS={} realized as {} key/segment definitions, \
-                 RECLEN={}, PHYSICAL={}, RECORDS={}, PAGES={} (logical, not \
-                 physical), but this crate does not yet describe the \
-                 allocation table or page addressing, so it cannot resolve \
-                 v6 pages or records past the control record and its key \
-                 descriptors",
+                 {}), KEYS={} realized as {} key/segment definitions plus a \
+                 validated definition-offset trailer (page 0 is fully \
+                 described), RECLEN={}, PHYSICAL={}, RECORDS={}, PAGES={} \
+                 (logical, not physical), but this crate does not yet \
+                 describe the allocation table or page addressing, so it \
+                 cannot resolve v6 pages or records past page 0",
                 id.generation,
                 live.generation,
                 live.keys,
@@ -1829,6 +1919,88 @@ mod tests {
             emitted.bytes(),
             &bytes[live_start..live_start + fcr::v6::FIXED_LEN],
             "the live copy's fixed portion must reproduce byte for byte"
+        );
+    }
+
+    /// Task 16's own failing-test-first: a named corpus file per page size
+    /// this corpus's v6 family actually uses above 512 (1024, 1536, 2048,
+    /// 3584, 4096) round-trips its *whole* physical page 0 -- fixed
+    /// portion, key/segment definitions, and (Task 16) the
+    /// definition-offset trailer plus its surrounding padding -- byte for
+    /// byte. Before Task 16 this could not be attempted at all:
+    /// `v6_page_tail` and `emit::write_v6_page_tail` did not exist, and
+    /// nothing described the region past the key/segment definitions.
+    fn assert_whole_page_zero_round_trips(path: &str, expected_page_size: u16) {
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified: {path}");
+            return;
+        };
+        let id = identify(&bytes).expect("a v6 file");
+        assert_eq!(id.page_size, expected_page_size, "{path}");
+        let page_size = id.page_size as usize;
+
+        // Physical page 0 itself, live or stale -- both copies share the
+        // same parsing rules, and this test is about page 0's own
+        // description, not shadow resolution (Ruling 7 is exercised
+        // elsewhere).
+        let page0 = &bytes[0..page_size];
+        let control = v6_control_record(page0);
+        let descriptors =
+            key_descriptors(page0, page_size, control.keys).expect("a well-formed key array");
+        let tail = v6_page_tail(page0, page_size, &descriptors).expect("a well-formed trailer");
+
+        let mut canvas = crate::canvas::Canvas::new(page_size);
+        crate::emit::write_v6_fixed_portion(&mut canvas, id.generation, id.page_size, &control, 0)
+            .expect("the fixed portion is fully described");
+        crate::emit::write_v6_page_tail(&mut canvas, page_size, &descriptors, &tail)
+            .expect("the key/segment definitions and trailer are fully described");
+        let emitted = canvas.finish().expect("every byte of page 0 written exactly once");
+
+        assert_eq!(emitted.bytes(), page0, "{path}: whole page 0 must reproduce byte for byte");
+    }
+
+    #[test]
+    fn elwglobn_dat_page_size_1024_whole_page_zero_round_trips() {
+        assert_whole_page_zero_round_trips(
+            "archive/modules/elwynor/elwglob/Dist/ELWGLOBN.DAT",
+            1024,
+        );
+    }
+
+    #[test]
+    fn wccacms2_nu1_page_size_1536_whole_page_zero_round_trips() {
+        assert_whole_page_zero_round_trips(
+            "archive/modules/majormud-nt/wccnt7py/out/wccacms2.nu1",
+            1536,
+        );
+    }
+
+    #[test]
+    fn wcctext2_vir_page_size_2048_whole_page_zero_round_trips() {
+        assert_whole_page_zero_round_trips(
+            "archive/modules/majormud-nt/wccnt7py/out/gcvirdat/WCCTEXT2.VIR",
+            2048,
+        );
+    }
+
+    #[test]
+    fn elwglobu_dat_page_size_3584_whole_page_zero_round_trips() {
+        assert_whole_page_zero_round_trips(
+            "archive/modules/elwynor/elwglob/Dist/ELWGLOBU.DAT",
+            3584,
+        );
+    }
+
+    /// `WCCBANK2.VIR` has `KEYS=1` realized as 2 key/segment definitions
+    /// (harvest 2's own "PAGES, worked" file) -- its trailer exercises the
+    /// zero-padded continuation slot this task's own census found (one real
+    /// offset, one zero), not just the trivial single-definition case the
+    /// other four files above give.
+    #[test]
+    fn wccbank2_vir_page_size_4096_whole_page_zero_round_trips() {
+        assert_whole_page_zero_round_trips(
+            "archive/modules/majormud-nt/wccnt8pj/out/WCCBANK2.VIR",
+            4096,
         );
     }
 

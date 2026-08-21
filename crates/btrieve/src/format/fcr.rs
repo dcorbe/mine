@@ -64,12 +64,36 @@
 //! `NULL_VALUE`) transcribes to identical offsets and widths; `KEYS` (`0x14`)
 //! counts *keys*, not definitions, exactly as it does for v5 (harvest 2's
 //! `MULTIACS.DAT` worked example: 3 keys, 4 definitions, the second key's
-//! two segments chained by `ANOSEG`). Whatever remains after the last
-//! definition -- the definition-offset trailer (one `u16` per definition,
-//! its own absolute byte offset, at a page-size-dependent fixed position)
-//! plus trailing zero padding -- is `page_tail`, still `NOT YET HARVESTED`:
-//! harvest 2 measured its position and content but not its exact capacity
-//! (GAP 9), and decomposing it is the next task's job, not this one's.
+//! two segments chained by `ANOSEG`).
+//!
+//! # The definition-offset trailer (Task 16)
+//!
+//! Whatever remains after the last key/segment definition is [`trailer`]: a
+//! gap, then an array of one little-endian `u16` per on-disk definition, at
+//! a page-size-dependent fixed absolute position ([`trailer::position`]),
+//! then trailing padding out to `page_size`. Harvest 2's own worked
+//! transcription of this array against `MULTIACS.DAT` (`01 00 2e 01 4c 01
+//! 6a 01` -> `0x0110, 0x012e, 0x014c, 0x016a`, "every entry is a plain
+//! little-endian u16 equal to that definition's own absolute byte offset")
+//! does not match this file's actual bytes: a direct re-read of
+//! `MULTIACS.DAT` at its own trailer position (`0xf10`, page size 4096)
+//! reads `10 01 2e 01 6a 01 00 00` -- `0x0110, 0x012e, 0x016a, 0x0000`, not
+//! `0x0110, 0x012e, 0x014c, 0x016a`. The third slot (`def2`, `MULTIACS.DAT`'s
+//! `ANOSEG` continuation of `def1`, `SELF_TAG` `0x00`) reads its own offset
+//! `0x14c` in the harvest's transcription but `0x0000` in the file itself,
+//! and a fourth slot the harvest's prose never mentions reads `0x0000` too.
+//!
+//! This task's own census of all 493 corpus v6 files whose page size
+//! exceeds 512 (0 exceptions) confirms the file, not the harvest's prose:
+//! **the trailer holds one entry per *key*, not per definition** -- each
+//! independent segment's (`SELF_TAG != 0`) own absolute offset, packed in
+//! definition order, then zero for every `ANOSEG` continuation slot that
+//! follows. `key_descriptors.len()` slots exist (matching this crate's own
+//! "one entry per definition" capacity, per harvest 2 GAP 9's still-open
+//! question of whether more are reserved), but only `KEYS` of them are ever
+//! nonzero. See [`trailer`]'s own module doc for the corrected rule, and
+//! `read::v6_page_tail`/`emit::write_v6_page_tail` for where it is read,
+//! validated and re-derived rather than stored as a redundant `Vec<u16>`.
 
 use super::generation::Generation;
 use super::{Field, Layout};
@@ -378,6 +402,71 @@ pub mod key_descriptor {
                        also incidentally moved FCR offset 0x68",
             },
         ]
+    }
+}
+
+/// The definition-offset trailer: a v6-only structure sitting past the last
+/// key/segment definition, at a fixed absolute position that depends on
+/// `page_size` but not on how many definitions the file actually has.
+/// Harvest 2 "FCR size" + "Definition-offset trailer, worked"; corrected by
+/// Task 16's own direct census (see this module's own top-level doc for the
+/// harvest transcription this correction supersedes).
+///
+/// # What an entry actually holds
+///
+/// Each of `key_descriptors.len()` little-endian `u16` slots corresponds,
+/// in order, to one on-disk key/segment definition -- but the *value*
+/// stored is not that definition's own offset unconditionally. It is:
+/// - that definition's own absolute byte offset (`key_descriptor::base(n)`),
+///   when the definition is an independent segment (`SELF_TAG != 0` --
+///   `key_descriptor::at::SELF_TAG`, this crate's own harvest-2-sourced
+///   field);
+/// - `0x0000`, when the definition is an `ANOSEG` continuation of the
+///   previous one (`SELF_TAG == 0`).
+///
+/// Measured across all 493 corpus v6 files whose page size exceeds 512: 0
+/// exceptions. This is why the number of *nonzero* slots always equals
+/// `KEYS` (`fcr::v6::KEYS` / `fcr::at::KEYS`) even though the array itself
+/// has one slot per *definition* -- a segmented key's continuation slots
+/// are real, allocated, and zero.
+pub mod trailer {
+    /// The trailer's own fixed absolute byte offset, one entry per page
+    /// size this corpus's v6 family has ever been measured at above 512
+    /// bytes. Harvest 2 measured these five positions directly; there is no
+    /// clean formula in `page_size` (`page_size - offset` gives 48, 50,
+    /// 110, 110, 240 for the five page sizes below, in order -- not linear,
+    /// not `page_size / k` for a constant `k`), so this is a measured
+    /// table, not a derived rule. A page size not listed here has never
+    /// been measured and must not be guessed at.
+    const POSITIONS: &[(u16, usize)] =
+        &[(1024, 976), (1536, 1486), (2048, 1938), (3584, 3474), (4096, 3856)];
+
+    /// The trailer's absolute position for `page_size`, or `None` when
+    /// there is no trailer to place: either `page_size` is `512` (14 of 14
+    /// corpus v6 files at this page size have nothing past their key
+    /// descriptors but zero padding -- `page_size` already equals the FCR's
+    /// old assumed length, leaving no room past the fixed portion and
+    /// definitions for a distinct trailer) or `page_size` is some other
+    /// value this corpus's v6 family has never used, for which this crate
+    /// has no measurement to place a trailer from.
+    #[must_use]
+    pub fn position(page_size: u16) -> Option<usize> {
+        POSITIONS.iter().find(|(ps, _)| *ps == page_size).map(|(_, at)| *at)
+    }
+
+    /// The one formula both `read::v6_page_tail` (which refuses a file
+    /// whose bytes disagree) and `emit::write_v6_page_tail` (which
+    /// regenerates the array from scratch) share -- one canonical
+    /// definition of what a slot holds, not two copies that could drift
+    /// apart. See this module's own doc for the census this is measured
+    /// against.
+    #[must_use]
+    pub fn expected_entry(index: usize, self_tag: u8) -> u16 {
+        if self_tag != 0 {
+            super::key_descriptor::base(index) as u16
+        } else {
+            0
+        }
     }
 }
 
@@ -1177,48 +1266,122 @@ fn v6_fixed() -> Vec<Field> {
 /// file's array actually holds -- data-dependent, read from the file by
 /// walking `KEYS` ANOSEG-terminated runs (`read::file` does the walking; see
 /// `format::fcr::key_descriptor`'s module doc for why the count cannot be a
-/// formula). Ignored for a v6 file, whose key array this task does not
-/// describe.
+/// formula). Also the definition-offset trailer's own slot count for a v6
+/// file (Task 16) -- the same walk, the same count, one structure reusing
+/// the other's length rather than a second one of its own.
 #[must_use]
 pub fn layout(generation: Generation, page_size: usize, key_descriptors: usize) -> Layout {
     let mut fields = if generation.is_v6() { v6_fixed() } else { v5_fixed() };
 
-    // Both families now describe the same shape past their fixed portion
+    // Both families describe the same shape past their fixed portion
     // (`at::FIXED_LEN` / `v6::FIXED_LEN`, both `0x110`): one
     // `key_descriptor::fields(n)` group per on-disk definition -- the same
     // 30-byte, `ANOSEG`-chained structure for both, per harvest 2's own
-    // field table -- then whatever bytes remain, up to `page_size`, as one
-    // named tail field.
+    // field table.
     for n in 0..key_descriptors {
         fields.extend(key_descriptor::fields(n));
     }
     let after_definitions = key_descriptor::base(key_descriptors);
-    if page_size > after_definitions {
+
+    if generation.is_v6() {
+        // Task 16: past the definitions, v6 places the definition-offset
+        // trailer at a page-size-dependent fixed position -- see
+        // `trailer`'s own module doc for what an entry holds and why this
+        // crate's own earlier transcription of harvest 2's worked example
+        // was wrong. `trailer::position` returns `None` for a page size
+        // with no trailer at all (512, or one this corpus has never used),
+        // in which case whatever remains is a plain, undecomposed tail --
+        // the same shape this field used to cover unconditionally, just no
+        // longer citing "NOT YET HARVESTED" now that its content (zero on
+        // 14 of 14 512-byte-page v6 corpus files) is measured.
+        match trailer::position(page_size as u16) {
+            Some(trailer_pos) => {
+                if trailer_pos > after_definitions {
+                    fields.push(Field {
+                        name: "trailer_gap",
+                        index: None,
+                        at: after_definitions,
+                        len: trailer_pos - after_definitions,
+                        cite: "Task 16 census: zero in 493 of 493 corpus v6 \
+                               files whose page size exceeds 512 and \
+                               carries a measured trailer position; carried \
+                               verbatim rather than asserted, the same \
+                               caution page_zero_tail's own two exceptions \
+                               (wccitems.nu1 and its sibling) earned",
+                    });
+                }
+                for n in 0..key_descriptors {
+                    fields.push(Field {
+                        name: "definition_offset",
+                        index: Some(n),
+                        at: trailer_pos + n * 2,
+                        len: 2,
+                        cite: "harvest 2 'Definition-offset trailer, worked', \
+                               corrected by Task 16's own direct census of \
+                               all 493 corpus v6 files whose page size \
+                               exceeds 512 (0 exceptions): this definition's \
+                               own absolute offset when it is an \
+                               independent segment (key_descriptor's own \
+                               SELF_TAG != 0), 0x0000 when it is an ANOSEG \
+                               continuation -- one entry per KEY, not \
+                               unconditionally one real offset per \
+                               definition as this crate's own earlier \
+                               transcription of the harvest's worked \
+                               MULTIACS.DAT example assumed. See this \
+                               module's own top-level doc and \
+                               `trailer`'s.",
+                    });
+                }
+                let after_trailer = trailer_pos + key_descriptors * 2;
+                if page_size > after_trailer {
+                    fields.push(Field {
+                        name: "trailer_padding",
+                        index: None,
+                        at: after_trailer,
+                        len: page_size - after_trailer,
+                        cite: "Task 16 census: zero in 493 of 493 corpus v6 \
+                               files whose page size exceeds 512; harvest 2 \
+                               GAP 9's open question (whether the trailer \
+                               reserves more capacity than the file's own \
+                               definitions) is unresolved by this region \
+                               either way, since unused capacity and \
+                               ordinary end-of-page padding are both zero \
+                               and indistinguishable",
+                    });
+                }
+            }
+            None if page_size > after_definitions => {
+                fields.push(Field {
+                    name: "page_tail",
+                    index: None,
+                    at: after_definitions,
+                    len: page_size - after_definitions,
+                    cite: "Task 16 census: no corpus v6 file has ever used a \
+                           page size past 512 without a measured trailer \
+                           position, and every one of the 14 corpus v6 \
+                           files at page_size 512 itself reads zero here; \
+                           carried verbatim rather than asserted, not \
+                           NOT YET HARVESTED -- it is measured, just not a \
+                           trailer",
+                });
+            }
+            None => {}
+        }
+    } else if page_size > after_definitions {
         fields.push(Field {
-            name: if generation.is_v6() { "page_tail" } else { "page_zero_tail" },
+            name: "page_zero_tail",
             index: None,
             at: after_definitions,
             len: page_size - after_definitions,
-            cite: if generation.is_v6() {
-                "harvest 2 'Definition-offset trailer, worked' + GAP 9 -- this \
-                 region is a fixed-position array of little-endian u16s, one \
-                 per consumed definition, each holding that definition's own \
-                 absolute byte offset, followed by trailing zero padding; its \
-                 exact capacity (whether it reserves SEGMAX=24 entries always \
-                 or only as many as the file's key count needs) is not \
-                 determined by this harvest (GAP 9) -- decomposing it into \
-                 named fields is the next task's job, not this one's"
-            } else {
-                "harvest 1 tail_check.py (112/112 v5 corpus files: every \
-                 byte from the end of the last actual key/segment \
-                 definition to the end of the page is zero); re-measured \
-                 for Task 13 across all 145 currently-identified v5 \
-                 corpus files (143/145 confirmed; the 2 exceptions -- \
-                 wccitems.nu1 and its sibling -- hold genuine leftover \
-                 record prose here (Task 13), so this region is unused \
-                 space carried verbatim, not an invariant this crate \
-                 enforces -- see model::File::page_zero_tail)"
-            },
+            cite: "harvest 1 tail_check.py (112/112 v5 corpus files: every \
+                   byte from the end of the last actual key/segment \
+                   definition to the end of the page is zero); re-measured \
+                   for Task 13 across all 145 currently-identified v5 \
+                   corpus files (143/145 confirmed; the 2 exceptions -- \
+                   wccitems.nu1 and its sibling -- hold genuine leftover \
+                   record prose here (Task 13), so this region is unused \
+                   space carried verbatim, not an invariant this crate \
+                   enforces -- see model::File::page_zero_tail)",
         });
     }
 
@@ -1364,8 +1527,7 @@ mod tests {
 
     /// Task 15: the v6 fixed portion (`0x00..0x110`) must be fully described
     /// too -- no field in that range may carry a "NOT YET HARVESTED"
-    /// citation. `page_tail` (past `0x110`) is explicitly excepted: the
-    /// definition-offset trailer it covers is the next task's work.
+    /// citation.
     #[test]
     fn the_v6_fixed_portion_has_no_not_yet_harvested_fields() {
         for generation in [Generation::V600, Generation::V610, Generation::V620] {
@@ -1380,6 +1542,33 @@ mod tests {
                         field.at,
                         field.cite
                     );
+                }
+            }
+        }
+    }
+
+    /// Task 16: the placeholder `page_tail` field Task 1 introduced for
+    /// everything past the v6 fixed portion is gone. No field anywhere in a
+    /// v6 layout -- at any of the five page sizes this corpus's v6 family
+    /// actually uses above 512 -- may carry a "NOT YET HARVESTED" citation
+    /// any more; the definition-offset trailer and its surrounding padding
+    /// are named and cited like every other field.
+    #[test]
+    fn no_v6_field_at_any_corpus_page_size_carries_a_not_yet_harvested_citation() {
+        for generation in [Generation::V600, Generation::V610, Generation::V620] {
+            for page_size in [1024, 1536, 2048, 3584, 4096] {
+                for n in [0, 1, 2, 4] {
+                    let l = layout(generation, page_size, n);
+                    for field in &l.fields {
+                        assert!(
+                            !field.cite.contains("NOT YET HARVESTED"),
+                            "{generation:?} page_size {page_size} field {} \
+                             at {:#x} must be harvested: {}",
+                            field.name,
+                            field.at,
+                            field.cite
+                        );
+                    }
                 }
             }
         }
@@ -1412,9 +1601,56 @@ mod tests {
             l.tiling_fault(),
             None,
             "the v6 fixed portion plus MULTIACS.DAT's four key/segment \
-             definitions plus page_tail must tile a 4096-byte control record \
+             definitions plus the definition-offset trailer and its \
+             surrounding padding must tile a 4096-byte control record \
              exactly"
         );
+    }
+
+    /// Task 16's own failing-test-first, one named file per corpus page
+    /// size: the trailer sits at exactly the measured position, and the
+    /// whole layout still tiles regardless of how many key/segment
+    /// definitions the file has.
+    #[test]
+    fn the_trailer_sits_at_the_measured_position_for_every_corpus_page_size() {
+        let cases = [(1024usize, 976usize), (1536, 1486), (2048, 1938), (3584, 3474), (4096, 3856)];
+        for (page_size, expected_pos) in cases {
+            assert_eq!(
+                trailer::position(page_size as u16),
+                Some(expected_pos),
+                "page_size {page_size}"
+            );
+            for n in [0, 1, 2, 4] {
+                let l = layout(Generation::V600, page_size, n);
+                assert_eq!(
+                    l.tiling_fault(),
+                    None,
+                    "page_size {page_size}, {n} definitions must tile"
+                );
+                let first = l
+                    .fields
+                    .iter()
+                    .find(|f| f.name == "definition_offset" && f.index == Some(0));
+                if n > 0 {
+                    assert_eq!(
+                        first.expect("a definition_offset field for slot 0").at,
+                        expected_pos,
+                        "page_size {page_size}: the trailer's own first slot"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `page_size` 512 has no trailer at all -- every byte past the key
+    /// descriptors is `page_tail`, not a `definition_offset` array.
+    #[test]
+    fn page_size_512_has_no_trailer() {
+        assert_eq!(trailer::position(512), None);
+        let l = layout(Generation::V600, 512, 1);
+        assert!(l.fields.iter().any(|f| f.name == "page_tail"));
+        assert!(!l.fields.iter().any(|f| f.name == "definition_offset"));
+        assert_eq!(l.tiling_fault(), None);
     }
 
     /// A v6 layout with several key descriptors must tile for a range of

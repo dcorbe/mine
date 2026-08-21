@@ -46,7 +46,10 @@ use crate::format::generation::Generation;
 use crate::format::index;
 use crate::format::page;
 use crate::format::variable;
-use crate::model::{Control, ControlRecord, File, FragmentSlot, RecordSlot, V6ControlRecord};
+use crate::model::{
+    Control, ControlRecord, File, FragmentSlot, KeyDescriptor, RecordSlot, V6ControlRecord,
+    V6PageTail,
+};
 
 fn owner(field: &'static str) -> Owner {
     Owner { structure: "fcr", field, index: None }
@@ -337,16 +340,20 @@ fn write_orphan_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
     Ok(())
 }
 
-/// Write the key/segment definition array (`0x110` onward) and page 0's own
-/// tail (`model.page_zero_tail`) that follows it, out to `page_size`, into
-/// `canvas`. The tail is written verbatim -- it is not always zero, see
-/// `model::File::page_zero_tail`.
+/// Write every key/segment definition in `descriptors`, starting at
+/// `key_descriptor::base(0)` -- the 30-byte, `ANOSEG`-chained structure v5
+/// and v6 share (harvest 2's field table transcribes to identical offsets).
+/// Shared by v5's [`write_key_descriptors`] (which appends
+/// `model.page_zero_tail`) and v6's [`write_v6_page_tail`] (which appends
+/// the definition-offset trailer and its own surrounding padding, Task 16)
+/// -- one write site for one 30-byte structure, not two copies of the same
+/// eleven `canvas.put*` calls.
 ///
 /// # Errors
 ///
 /// See [`Canvas::put`].
-fn write_key_descriptors(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
-    for (n, d) in model.key_descriptors.iter().enumerate() {
+fn write_key_descriptor_array(canvas: &mut Canvas, descriptors: &[KeyDescriptor]) -> Result<(), Fault> {
+    for (n, d) in descriptors.iter().enumerate() {
         let start = key_descriptor::base(n);
         let root = (u32::from(d.key_number) << 24) | (d.root_page & 0x00ff_ffff);
         canvas.put_long(start + key_descriptor::at::ROOT, root, key_owner("root", n))?;
@@ -378,12 +385,65 @@ fn write_key_descriptors(canvas: &mut Canvas, model: &File) -> Result<(), Fault>
         canvas.put(start + key_descriptor::at::EXTENDED, &[d.extended], key_owner("extended", n))?;
         canvas.put(start + key_descriptor::at::NULL_VALUE, &[d.null_value], key_owner("null_value", n))?;
     }
+    Ok(())
+}
+
+/// Write the key/segment definition array (`0x110` onward) and page 0's own
+/// tail (`model.page_zero_tail`) that follows it, out to `page_size`, into
+/// `canvas`. The tail is written verbatim -- it is not always zero, see
+/// `model::File::page_zero_tail`.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_key_descriptors(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    write_key_descriptor_array(canvas, &model.key_descriptors)?;
 
     let after_definitions = key_descriptor::base(model.key_descriptors.len());
     let page_size = model.id.page_size as usize;
     if page_size > after_definitions {
         canvas.put(after_definitions, &model.page_zero_tail, owner("page_zero_tail"))?;
     }
+    Ok(())
+}
+
+/// Write a v6 physical page's key/segment definition array, then its
+/// definition-offset trailer and surrounding padding (Task 16) -- the
+/// write-side counterpart to `read::v6_page_tail`. `tail.gap` and
+/// `tail.padding` are written verbatim; the trailer's own `u16` slots are
+/// not stored in `tail` at all, since they are a pure function of
+/// `descriptors` -- see `model::V6PageTail`'s own doc comment for why, and
+/// `format::fcr::trailer::expected_entry` for the one formula both this and
+/// `read::v6_page_tail` share.
+///
+/// When `page_size` has no trailer at all (512), `tail.padding` is empty
+/// and `tail.gap` holds the whole remaining region instead -- see
+/// `read::v6_page_tail`.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+pub(crate) fn write_v6_page_tail(
+    canvas: &mut Canvas,
+    page_size: usize,
+    descriptors: &[KeyDescriptor],
+    tail: &V6PageTail,
+) -> Result<(), Fault> {
+    write_key_descriptor_array(canvas, descriptors)?;
+
+    let after_definitions = key_descriptor::base(descriptors.len());
+
+    let Some(trailer_pos) = fcr::trailer::position(page_size as u16) else {
+        return canvas.put(after_definitions, &tail.gap, owner("page_tail"));
+    };
+
+    canvas.put(after_definitions, &tail.gap, owner("trailer_gap"))?;
+    for (n, d) in descriptors.iter().enumerate() {
+        let value = fcr::trailer::expected_entry(n, d.self_tag);
+        canvas.put_u16(trailer_pos + n * 2, value, key_owner("definition_offset", n))?;
+    }
+    let after_trailer = trailer_pos + descriptors.len() * 2;
+    canvas.put(after_trailer, &tail.padding, owner("trailer_padding"))?;
     Ok(())
 }
 
