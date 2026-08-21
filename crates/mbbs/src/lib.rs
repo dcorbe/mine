@@ -1577,6 +1577,36 @@ enum PollTarget {
     Poll,
 }
 
+/// What servicing one status actually did.
+///
+/// `poll` carried this as an `Option<A::Ptr>` until 2026-08-20, and that is
+/// exactly one bit short: [`Host::fsd_dispatch`] answers "there is no far
+/// pointer to call" both when it has *just run the FSD itself* and when it
+/// has nothing wired up for the entry index it was handed, and
+/// [`Registration::AbsentBbs`] answers it for a third reason again. All
+/// three arrived at `poll` as `None`, so the one note it makes was printed
+/// for all three -- and on a live board the one it printed most was
+/// `"channel 6 has no entry 2 registered"`, at a channel sitting in an FSD
+/// screen that `fsd_cycle` was servicing correctly on every pass.
+///
+/// The variants are the three distinct facts, so the caller can say the
+/// true one.
+enum Serviced<P> {
+    /// The module's own entry point. Call it.
+    Call(P),
+    /// The host serviced this status itself and no module entry point was
+    /// involved. Nothing was dropped and there is nothing to report.
+    Host,
+    /// The channel's `state` names [`Registration::AbsentBbs`]: it is in no
+    /// module at all, so there was never an entry point to look up.
+    SessionOver,
+    /// Nothing is wired up at this entry index for whatever the channel's
+    /// `state` names -- a module that left the `struct module` slot null, or
+    /// the FSD's native slot at an index it has no handler for. The status
+    /// is dropped.
+    Unregistered,
+}
+
 /// The two things about an FSD session no module can see. See
 /// [`Host::fsd_sessions`].
 ///
@@ -4087,7 +4117,8 @@ impl<A: Abi> Host<A> {
             // input dispatch.
             let entry = self.state_entry(machine, chan, entry_index)?;
             let entry = match entry {
-                Ok(Dispatch::Module(entry)) => Ok(entry),
+                Ok(Dispatch::Module(Some(entry))) => Ok(Serviced::Call(entry)),
+                Ok(Dispatch::Module(None)) => Ok(Serviced::Unregistered),
                 Ok(Dispatch::Native(_native)) => {
                     self.fsd_dispatch(machine, module, chan, entry_index)
                 }
@@ -4100,7 +4131,7 @@ impl<A: Abi> Host<A> {
                     if !self.ended.contains(&chan) {
                         self.ended.push(chan);
                     }
-                    Ok(None)
+                    Ok(Serviced::SessionOver)
                 }
                 Err(e) => Err(e),
             };
@@ -4112,27 +4143,52 @@ impl<A: Abi> Host<A> {
                         .map(|outcome| Some((outcome, chan)));
                 }
             };
-            let Some(entry) = entry else {
-                // R24: `sttrou`'s `ax` answers "am I done with this
-                // channel?" -- zero means no, hand it back to the menuing
-                // system (`hdlcri`, `MAJORBBS.C:3358`; it is *not* "did you
-                // consume the input", as this comment used to say). The
-                // module never answered here, and a fabricated
-                // `Returned { lo: 0, hi: 0 }` would claim a call that never
-                // happened -- which now also means it would hang the channel
-                // up, so getting this wrong costs a session, not just a
-                // misleading value. On the CRSTG path `get_input` above
-                // has already taken the line, so a module with no `sttrou`
-                // silently drops every command; not implementing
-                // `module00`'s fallback is in scope, dropping the line
-                // without a word about it is not. `hdlcri`'s *other* half --
-                // acting on the value when there is one -- is implemented:
-                // see [`Host::go2mnu`], below.
-                self.note(format!(
-                    "poll: channel {chan} has no entry {entry_index} registered; \
-                     status {status} was serviced with no module call"
-                ));
-                continue;
+            let entry = match entry {
+                Serviced::Call(entry) => entry,
+                // The host serviced it -- today that is only the FSD, whose
+                // `fsd_cycle` has already run by the time this arm is
+                // reached. Nothing was dropped, so nothing is reported.
+                Serviced::Host => continue,
+                // The channel is in no module at all, so nothing could have
+                // serviced this status and it is dropped. Reported, because
+                // a dropped status is a real one -- but not as "the module
+                // registered no entry point", which is what this used to
+                // say about a channel that has no module.
+                Serviced::SessionOver => {
+                    self.note(format!(
+                        "poll: channel {chan} is in no module -- its state names the \
+                         absent BBS -- so status {status} was dropped"
+                    ));
+                    continue;
+                }
+                Serviced::Unregistered => {
+                    // R24: `sttrou`'s `ax` answers "am I done with this
+                    // channel?" -- zero means no, hand it back to the
+                    // menuing system (`hdlcri`, `MAJORBBS.C:3358`; it is
+                    // *not* "did you consume the input", as this comment
+                    // used to say). The module never answered here, and a
+                    // fabricated `Returned { lo: 0, hi: 0 }` would claim a
+                    // call that never happened -- which now also means it
+                    // would hang the channel up, so getting this wrong costs
+                    // a session, not just a misleading value. On the CRSTG
+                    // path `get_input` above has already taken the line, so
+                    // a module with no `sttrou` silently drops every command;
+                    // not implementing `module00`'s fallback is in scope,
+                    // dropping the line without a word about it is not.
+                    // `hdlcri`'s *other* half -- acting on the value when
+                    // there is one -- is implemented: see [`Host::go2mnu`],
+                    // below.
+                    // Not "the module registered no entry point": the FSD's
+                    // own native slot reaches this arm too, for any index but
+                    // 2, and it is not a module. What is true of both is that
+                    // whatever this channel's `state` names has nothing wired
+                    // up here.
+                    self.note(format!(
+                        "poll: nothing is registered at entry {entry_index} for \
+                         channel {chan}'s state, so status {status} was dropped"
+                    ));
+                    continue;
+                }
             };
             let outcome = self.run(machine, module, entry, &[], Some(chan))?;
 
@@ -4635,17 +4691,22 @@ impl<A: Abi> Host<A> {
         module: &A::Module,
         chan: Chan,
         n: usize,
-    ) -> Result<Option<A::Ptr>, ShimError> {
+    ) -> Result<Serviced<A::Ptr>, ShimError> {
         if n != 2 {
             self.note(format!(
                 "fsd_dispatch: channel {chan} entry {n} reached the FSD's native slot, \
                  which has no handler wired up yet"
             ));
-            return Ok(None);
+            return Ok(Serviced::Unregistered);
         }
 
         shims::fsd::fsd_cycle(machine, self, module, chan)?;
-        Ok(None)
+        // `Serviced::Host`, never `Unregistered`: the FSD has just run. It
+        // makes no far call of its own -- `fsd_cycle` reaches the module
+        // through `fldvfy`/`whndun` on its own terms -- but "no far pointer
+        // came back" is not "nothing happened", and `poll` used to report
+        // the second.
+        Ok(Serviced::Host)
     }
 
     /// `user[unum].usrcls` -- what kind of channel this is.
@@ -6434,6 +6495,13 @@ mod tests {
         let block = f.bytes(&bytes, false);
         f.invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
+        // **In** the module, not merely alongside it. Without this the
+        // channel's `state` is still zero, which names
+        // `Registration::AbsentBbs` and not the registration above -- this
+        // test asserted a note that a *handed-back session* was producing,
+        // and would have gone on passing if `sttrou` had been wired up.
+        let slot = u16::try_from(f.host.modules().len() - 1).expect("a slot");
+        set_state(&mut f, console, slot);
 
         f.host.gsbl_mut().push_input(console, b"look\r");
         let notes_before = f.host.notes().len();
@@ -6463,6 +6531,10 @@ mod tests {
         let block = f.bytes(&bytes, false);
         f.invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
+        // See the sibling test above: the channel has to be *in* the module
+        // for a missing entry point to be the fact under test.
+        let slot = u16::try_from(f.host.modules().len() - 1).expect("a slot");
+        set_state(&mut f, console, slot);
 
         f.host.gsbl_mut().push_input(console, b"look\r");
         f.host.poll(&mut f.machine, &module).expect("no fault");

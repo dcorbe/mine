@@ -3473,6 +3473,74 @@ mod tests {
         }
     }
 
+    /// A status the FSD **serviced** is not a status nobody could service.
+    ///
+    /// [`Host::fsd_dispatch`] answers `Ok(None)` for both of the things it
+    /// can do -- run [`fsd_cycle`] (entry 2, `stsrou`, which is how both
+    /// `fsdnfy`'s injected `CYCLE` and a painted screen's drained `OUTMT`
+    /// arrive) and decline every other entry index -- so [`Host::poll`]
+    /// could not tell "the host serviced this itself" from "the module
+    /// registered no entry point for it", and printed the second for both.
+    ///
+    /// Measured on a live board, not imagined. Entering MajorMUD's
+    /// full-screen character creation prints
+    ///
+    /// ```text
+    /// poll: channel 6 has no entry 2 registered; status 5 was serviced
+    /// with no module call
+    /// ```
+    ///
+    /// at the moment the screen it is denying paints correctly, with
+    /// `user[6].state` naming the FSD's own native slot. Both halves of
+    /// that note are false there: entry 2 *is* registered -- all nine of
+    /// MajorMUD's `struct module` slots hold real far pointers, measured
+    /// both through `init_gets_the_module_registered` and against the
+    /// DLL's own relocation table -- and the status was serviced *with* a
+    /// module call, by `fsd_cycle`.
+    #[test]
+    fn a_status_the_fsd_serviced_is_not_reported_as_a_missing_entry_point() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"NAME=Kaimon\0\0");
+        let chan = f.console();
+
+        let fldvfy = FarPtr { offset: 0x1000, selector: 0x2000 };
+        let whndun = FarPtr { offset: 0x3000, selector: 0x4000 };
+        assert!(matches!(
+            f.invoke(fsdego,
+                &[fldvfy.offset, fldvfy.selector, whndun.offset, whndun.selector],
+            ),
+            Ok(Ret::Void)
+        ));
+        assert_eq!(
+            f.host.users().state_mem(f.machine.mem(), chan).expect("read"),
+            f.host.fsd_state() as u16,
+            "the channel is in the FSD, which is the whole premise"
+        );
+
+        // Everything the setup had to say is already said; what this test
+        // is about is the note `poll` makes from here on.
+        let _ = f.host.drain_notes();
+
+        // `OUTMT`: the screen this session just painted has drained. `poll`
+        // routes 4, 5 and 240 alike to entry 2, the FSD's one wired-up
+        // entry point.
+        let module = f.minimal_module();
+        f.host.gsbl_mut().inject(chan, crate::gsbl::Gsbl::OUTMT);
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+        assert_eq!(outcome, None, "the FSD makes no far call of its own here");
+
+        // Nothing at all, rather than "no note matching some wording": the
+        // wording is the thing that was wrong, so a test written against it
+        // is a test that goes green the moment the wording changes. The
+        // contract is that a status the host serviced itself is not
+        // reported as a dropped one, and silence is what that looks like.
+        assert!(
+            f.host.notes().is_empty(),
+            "the FSD serviced this status; there is nothing to report: {:?}",
+            f.host.notes()
+        );
+    }
+
     #[test]
     fn fsdego_reads_flddat_flags_live_not_the_host_s_cached_form() {
         // `_EDIT_CHARACTER_STATS` sets FFFAVD on flddat[i].flags directly,

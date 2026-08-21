@@ -62,27 +62,28 @@ impl Extension<Wg16> for Swallow {
 /// shim, so channel 0's state names `Registration::AbsentBbs`
 /// (`task-2-findings.md` traces this in full). Every dispatch that reaches
 /// `Host::state_entry` for that state folds to `Dispatch::SessionOver`, which
-/// `poll_with_chan` turns into `entry = None` and then this exact note
-/// (`lib.rs`'s `let Some(entry) = entry else { .. }` fallback). A `Handled`
-/// verdict's `continue` skips `state_entry` entirely, so the note never
-/// fires for that call.
+/// `poll_with_chan` turns into `Serviced::SessionOver` and then this exact
+/// note. A `Handled` verdict's `continue` skips `state_entry` entirely, so
+/// the note never fires for that call.
 ///
 /// This is deliberately not "the module ran" -- unwitnessable with a
 /// code-less module -- it witnesses "dispatch resolution was reached", which
 /// is exactly the contract this task proves: a `Handled` line must never get
 /// that far, and a `Pass` line always must.
 ///
-/// Filtered by `chan` and by entry index 1 rather than a bare note-count
-/// diff: one `poll` call drains every status queued on the channel, and the
-/// identical fallback also fires for entry index 2 (`INBLK`/`OUTMT`/`CYCLE`)
-/// -- a length check alone cannot tell those apart from the `CRSTG` note
-/// this test cares about. Verified empirically that with the single
-/// `push_input` this fixture issues per poll, exactly one note of any kind
-/// is added, and it is always this one.
+/// Filtered by `chan` rather than by a bare note-count diff: one `poll`
+/// call drains every status queued on the channel, and the same note fires
+/// for whichever status is being serviced. Verified empirically that with
+/// the single `push_input` this fixture issues per poll, exactly one note
+/// of any kind is added, and it is always this one.
+///
+/// The note no longer names an entry index -- a channel whose `state` names
+/// the absent BBS never had an entry point to be missing, and saying it did
+/// was the 2026-08-20 defect this wording replaced.
 fn crstg_no_entry_noted(f: &Fixture, since: usize, chan: Chan) -> bool {
     f.host.notes()[since..]
         .iter()
-        .any(|n| n.contains(&format!("channel {chan} has no entry 1 registered")))
+        .any(|n| n.contains(&format!("channel {chan} is in no module")))
 }
 
 #[test]
