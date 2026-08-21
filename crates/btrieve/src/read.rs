@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::format::acs;
+use crate::format::alloc;
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
 use crate::format::free_slot;
@@ -16,7 +17,8 @@ use crate::format::page;
 use crate::format::variable;
 use crate::model::{
     AcsBlock, Control, ControlRecord, DataPage, File, FragmentPage, FragmentSlot, IndexEntry,
-    IndexPage, KeyDescriptor, Page, PageKind, RecordSlot, V6ControlRecord, V6PageTail,
+    IndexPage, KeyDescriptor, Page, PageKind, RecordSlot, V6AllocationBlock, V6AllocationBlockCopy,
+    V6AllocationEntry, V6ControlRecord, V6PageTail,
 };
 
 /// Read a plain little-endian `u16` at `at`.
@@ -361,6 +363,189 @@ fn v6_page_tail(
     };
 
     Ok(V6PageTail { gap, padding })
+}
+
+/// Read one allocation-table page's content, whole -- caller has already
+/// checked the `"PP"` magic; `bytes` starts at that copy's own physical
+/// page.
+fn v6_allocation_copy(bytes: &[u8], page_size: usize) -> V6AllocationBlockCopy {
+    let entries = alloc::entries_per_block(page_size);
+    let mut out = Vec::with_capacity(entries);
+    for n in 0..entries {
+        let at = alloc::at::ENTRIES + n * alloc::ENTRY_WIDTH;
+        out.push(V6AllocationEntry {
+            marker: get_u16(bytes, at),
+            physical_page: get_u16(bytes, at + 2),
+        });
+    }
+    V6AllocationBlockCopy {
+        block: get_u16(bytes, alloc::at::BLOCK),
+        generation: get_u16(bytes, alloc::at::GENERATION),
+        reserved_06: get_array(bytes, alloc::at::RESERVED_06),
+        entries: out,
+    }
+}
+
+/// Resolve one allocation-table block's shadow pair -- the identical rule
+/// [`resolve_shadow`] already enforces for the file control record's own
+/// pair (harvest 3 "Generation counters and shadow-copy resolution"): a
+/// `u16` generation at page-relative `0x04`, higher wins, a tie is refused
+/// rather than guessed.
+///
+/// `first` and `second` are physical page numbers, already computed by
+/// [`alloc::pair_position`] -- this function only resolves what is *at*
+/// them, it does not compute where they are.
+///
+/// # Errors
+///
+/// If either physical page does not carry the `"PP"` magic, if either
+/// claims a different block index than `block_index` names, or if the two
+/// generations tie.
+fn resolve_allocation_block(
+    bytes: &[u8],
+    page_size: usize,
+    block_index: u16,
+    first: usize,
+    second: usize,
+) -> Result<V6AllocationBlock, NotBtrieve> {
+    let page_bytes = |page: usize| &bytes[page * page_size..(page + 1) * page_size];
+
+    for &page in &[first, second] {
+        if &page_bytes(page)[0..2] != alloc::MAGIC {
+            return Err(NotBtrieve {
+                why: format!(
+                    "allocation-table block {block_index}'s shadow pair is \
+                     physical pages {first} and {second} (harvest 3's own \
+                     formula), but physical page {page} does not carry the \
+                     \"PP\" magic"
+                ),
+            });
+        }
+    }
+
+    let first_copy = v6_allocation_copy(page_bytes(first), page_size);
+    let second_copy = v6_allocation_copy(page_bytes(second), page_size);
+
+    for (page, copy) in [(first, &first_copy), (second, &second_copy)] {
+        if copy.block != block_index {
+            return Err(NotBtrieve {
+                why: format!(
+                    "physical page {page} is where allocation-table block \
+                     {block_index} lives (harvest 3's own formula), but it \
+                     calls itself block {}",
+                    copy.block
+                ),
+            });
+        }
+    }
+
+    match first_copy.generation.cmp(&second_copy.generation) {
+        std::cmp::Ordering::Greater => {
+            Ok(V6AllocationBlock { live: first_copy, stale: second_copy, live_is_first: true })
+        }
+        std::cmp::Ordering::Less => {
+            Ok(V6AllocationBlock { live: second_copy, stale: first_copy, live_is_first: false })
+        }
+        std::cmp::Ordering::Equal => Err(NotBtrieve {
+            why: format!(
+                "allocation-table block {block_index}'s shadow pair \
+                 (physical {first}/{second}) both carry generation \
+                 {} at page-relative 0x04 -- a tie between the two shadow \
+                 copies has no answer, and no corpus file has ever \
+                 produced one (harvest 3 'Generation counters and \
+                 shadow-copy resolution'), so this is refused rather than \
+                 resolved",
+                first_copy.generation
+            ),
+        }),
+    }
+}
+
+/// Walk every allocation-table block a v6 file has, resolving each block's
+/// shadow pair and building the logical-to-physical map every later v6
+/// structure needs.
+///
+/// Blocks are found by formula, never by scanning for the `"PP"` magic --
+/// see `format::alloc`'s own module doc for why a scan is actively wrong
+/// (real files carry abandoned pages that still carry the magic, a stale
+/// block index and a higher generation than the live table, at positions
+/// no block ever lives at). The walk stops at the first formula position
+/// where *neither* physical page carries the magic -- the same stopping
+/// rule the engine's own block-by-number lookup implies, since it never
+/// looks past the blocks a file actually has.
+///
+/// # Errors
+///
+/// If any block's shadow pair fails to resolve (see
+/// [`resolve_allocation_block`]), or if a live entry claims physical page 0
+/// or 1 (the file control record's own shadow pair, which cannot hold a
+/// logical page) or a physical page past the file's own `total_pages`.
+fn v6_allocation_table(
+    bytes: &[u8],
+    page_size: usize,
+    total_pages: usize,
+) -> Result<(Vec<V6AllocationBlock>, HashMap<u32, u32>), NotBtrieve> {
+    let mut blocks = Vec::new();
+    let mut physical: HashMap<u32, u32> = HashMap::new();
+    let entries_per_block = alloc::entries_per_block(page_size);
+
+    let mut index: usize = 1;
+    loop {
+        let (first, second) = alloc::pair_position(page_size, index);
+        if second >= total_pages {
+            break;
+        }
+        let magic = |page: usize| bytes[page * page_size..page * page_size + 2] == *alloc::MAGIC;
+        if !magic(first) && !magic(second) {
+            break;
+        }
+
+        let block_index = u16::try_from(index).map_err(|_| NotBtrieve {
+            why: format!(
+                "allocation-table block index {index} does not fit in the \
+                 format's own 16-bit block-index field -- no corpus file \
+                 has ever had more than 14 blocks"
+            ),
+        })?;
+        let block = resolve_allocation_block(bytes, page_size, block_index, first, second)?;
+
+        let base = u32::from(block_index - 1) * entries_per_block as u32;
+        for (slot, entry) in block.live.entries.iter().enumerate() {
+            // The engine's own "was this ever allocated" test is the
+            // entry's marker high byte -- 0 means this slot has never been
+            // claimed, and there is nothing to resolve.
+            if entry.marker >> 8 == 0 {
+                continue;
+            }
+            let logical = base + slot as u32 + 1;
+            let claimed = u32::from(entry.physical_page);
+            if claimed <= 1 {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "allocation-table block {block_index} resolves \
+                         logical page {logical} to physical page {claimed}, \
+                         which is the file control record's own shadow pair \
+                         and cannot hold a logical page"
+                    ),
+                });
+            }
+            if claimed as usize >= total_pages {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "allocation-table block {block_index} resolves \
+                         logical page {logical} to physical page {claimed}, \
+                         past this file's own {total_pages} physical pages"
+                    ),
+                });
+            }
+            physical.insert(logical, claimed);
+        }
+
+        blocks.push(block);
+        index += 1;
+    }
+
+    Ok((blocks, physical))
 }
 
 /// Read a fixed-length-record data page's content: every slot in order,
@@ -1565,15 +1750,17 @@ fn resolve_pages(
 /// contradictions it checks for. Page 0's tail past the last key/segment
 /// definition is never a refusal reason -- see `model::File::page_zero_tail`.
 ///
-/// A v6 file is always refused today, but not until after page 0 in its
-/// entirety has been read and validated: the live control-record copy
-/// (harvest 0 ruling 7, harvest 2 "FCR shadowing") is resolved first, then
-/// its key/segment definitions (Task 15), then its definition-offset
-/// trailer (Task 16, [`v6_page_tail`]) -- and the refusal names all of it
-/// (which physical page is live, at what generation, KEYS realized as how
-/// many definitions), because the allocation table, page addressing, and
-/// everything else v6 geometry needs past page 0 are later work -- see
-/// [`resolve_shadow`].
+/// A v6 file is always refused today, but not until after page 0 *and* the
+/// allocation table have been read and validated: the live control-record
+/// copy (harvest 0 ruling 7, harvest 2 "FCR shadowing") is resolved first,
+/// then its key/segment definitions (Task 15), then its definition-offset
+/// trailer (Task 16, [`v6_page_tail`]), then every "PP" allocation-table
+/// block's own shadow pair and the logical-to-physical map its entries
+/// encode (Task 17, [`v6_allocation_table`]) -- and the refusal names all of
+/// it (which physical page is live, at what generation, KEYS realized as how
+/// many definitions, how many allocation-table blocks and logical pages
+/// resolved), because ordinary v6 page headers, records and index pages
+/// past addressing are later work -- see [`resolve_shadow`].
 pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
     let id = identify(bytes)?;
     let page_size = id.page_size as usize;
@@ -1622,14 +1809,42 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         let _live_page_tail =
             v6_page_tail(&bytes[live_page_start..], page_size, &live_descriptors)?;
 
+        // Task 17: the allocation table is the mechanism that makes v6
+        // pages addressable at all, and it needs a whole-number-of-pages
+        // file to walk (harvest 3 SS7 measured this on all 612 corpus
+        // files with no exceptions) -- the same check the v5 path below
+        // makes, just needed here first since the table walk indexes by
+        // physical page number.
+        if bytes.len() % page_size != 0 {
+            return Err(NotBtrieve {
+                why: format!(
+                    "identified as {:?} with {page_size}-byte pages, but \
+                     the file is {} bytes -- not a whole number of pages",
+                    id.generation,
+                    bytes.len()
+                ),
+            });
+        }
+        let total_pages = bytes.len() / page_size;
+
+        // Task 17: resolve the allocation table -- every "PP" block's own
+        // shadow pair (the identical generation rule Ruling 7 already
+        // applies to the control record itself), and the logical-to-
+        // physical map its entries encode. A malformed table (a bad
+        // shadow pair, a block claiming the control record's own pages, a
+        // claim past the end of the file) is refused by that function's
+        // own, more specific message; a well-formed one still cannot
+        // produce a `File` today, since ordinary v6 page headers, records
+        // and index pages past the addressing layer are later work.
+        let (allocation_blocks, physical_map) =
+            v6_allocation_table(bytes, page_size, total_pages)?;
+
         // Ruling 7, part 3: identification stays on page 0 -- already true,
         // `identify` never moves. What must not come from page 0 is
-        // geometry, and that is everything past the shadow pair, its key
-        // descriptors and (Task 16) its definition-offset trailer: the
-        // allocation table, page addressing, and the rest of a v6 file's
-        // own pages are not yet described by this crate, so the refusal
-        // moves here -- past the whole of page 0 now, not just its fixed
-        // portion and key count.
+        // geometry, and page 0 plus the allocation table (Task 17) is now
+        // everything this crate can resolve without ordinary v6 page
+        // content: the refusal moves here, past addressing, not just past
+        // the control record and its key/segment definitions.
         return Err(NotBtrieve {
             why: format!(
                 "identified as {:?} with {page_size}-byte pages; the live \
@@ -1637,9 +1852,12 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                  {}), KEYS={} realized as {} key/segment definitions plus a \
                  validated definition-offset trailer (page 0 is fully \
                  described), RECLEN={}, PHYSICAL={}, RECORDS={}, PAGES={} \
-                 (logical, not physical), but this crate does not yet \
-                 describe the allocation table or page addressing, so it \
-                 cannot resolve v6 pages or records past page 0",
+                 (logical, not physical); the allocation table has {} \
+                 block(s) resolving {} logical page(s) to physical pages \
+                 out of {total_pages} physical pages total, but this crate \
+                 does not yet describe ordinary v6 page headers, records \
+                 or index pages, so it cannot resolve page content past \
+                 addressing",
                 id.generation,
                 live.generation,
                 live.keys,
@@ -1648,6 +1866,8 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                 live.physical,
                 live.records,
                 live.pages,
+                allocation_blocks.len(),
+                physical_map.len(),
             ),
         });
     }
@@ -1929,6 +2149,186 @@ mod tests {
         );
     }
 
+    /// Task 17's own failing-test-first: `wccmp002.vir` (already this
+    /// crate's own named fixture for the logical/physical `PAGES`
+    /// distinction) has 14 allocation-table blocks -- one of 29 corpus
+    /// files (measured directly with `format::alloc::pair_position`
+    /// against every identified v6 file, not reimplemented as a separate
+    /// count) with more than one. Before this task's implementation,
+    /// `v6_allocation_table` does not exist and this fails to compile;
+    /// after, it resolves all 14 blocks, both shadow copies of each, and
+    /// the logical ids they claim -- measured directly off the raw bytes
+    /// with a standalone Python script before this test was written:
+    /// block 1's shadow pair is physical 2/3 with generations 1/285 (live
+    /// at physical 3), block 14's is physical 13314/13315 with generations
+    /// 279/285 (live at physical 13315); 13,568 of the 13,571 possible
+    /// logical ids (`PAGES - 1`) are actually claimed; logical 1 resolves
+    /// to physical 13603, logical 2 to physical 8, logical 3 to physical
+    /// 112.
+    #[test]
+    fn wccmp002_virs_fourteen_allocation_table_blocks_resolve_every_live_claim() {
+        let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let id = identify(&bytes).expect("a v6 file");
+        let page_size = id.page_size as usize;
+        assert_eq!(bytes.len() % page_size, 0);
+        let total_pages = bytes.len() / page_size;
+        assert_eq!(total_pages, 13_607);
+
+        let (blocks, physical) =
+            v6_allocation_table(&bytes, page_size, total_pages).expect("a well-formed table");
+        assert_eq!(blocks.len(), 14, "wccmp002.vir has 14 allocation-table blocks");
+
+        // Block 1 (index 0): shadow pair physical 2/3, live at physical 3
+        // (generation 285 > 1) -- both copies carried, not just the live
+        // one.
+        assert_eq!(blocks[0].live.block, 1);
+        assert_eq!(blocks[0].live.generation, 285);
+        assert_eq!(blocks[0].stale.generation, 1);
+        assert!(!blocks[0].live_is_first, "physical 3 (second) is live, not physical 2");
+
+        // Block 14 (index 13): shadow pair physical 13314/13315, live at
+        // physical 13315 (generation 285 > 279).
+        assert_eq!(blocks[13].live.block, 14);
+        assert_eq!(blocks[13].live.generation, 285);
+        assert_eq!(blocks[13].stale.generation, 279);
+        assert!(!blocks[13].live_is_first, "physical 13315 (second) is live, not 13314");
+
+        assert_eq!(physical.len(), 13_568, "13,568 of 13,571 possible logical ids are claimed");
+        assert_eq!(physical.get(&1), Some(&13_603));
+        assert_eq!(physical.get(&2), Some(&8));
+        assert_eq!(physical.get(&3), Some(&112));
+        assert_eq!(
+            physical.keys().copied().max(),
+            Some(13_571),
+            "the highest claimed logical id is 13,571 (PAGES - 1)"
+        );
+    }
+
+    /// Every allocation-table entry [`v6_allocation_table`] resolves must
+    /// round-trip through the canvas byte for byte -- both shadow copies of
+    /// every block, not just the live one, the same discipline
+    /// `resolve_shadow`'s own control-record pair already earns.
+    #[test]
+    fn wccmp002_virs_allocation_table_blocks_round_trip_both_shadow_copies() {
+        let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let id = identify(&bytes).expect("a v6 file");
+        let page_size = id.page_size as usize;
+        let total_pages = bytes.len() / page_size;
+
+        let (blocks, _physical) =
+            v6_allocation_table(&bytes, page_size, total_pages).expect("a well-formed table");
+
+        for (n, block) in blocks.iter().enumerate() {
+            let index = n + 1;
+            let (first, second) = alloc::pair_position(page_size, index);
+            let (live_page, stale_page) =
+                if block.live_is_first { (first, second) } else { (second, first) };
+
+            let mut live_canvas = crate::canvas::Canvas::new(page_size);
+            crate::emit::write_v6_allocation_copy(&mut live_canvas, &block.live, 0, page_size)
+                .expect("the live copy is fully described");
+            let live_emitted = live_canvas.finish().expect("every byte written exactly once");
+            assert_eq!(
+                live_emitted.bytes(),
+                &bytes[live_page * page_size..(live_page + 1) * page_size],
+                "block {index}'s live copy (physical {live_page}) must reproduce byte for byte"
+            );
+
+            let mut stale_canvas = crate::canvas::Canvas::new(page_size);
+            crate::emit::write_v6_allocation_copy(&mut stale_canvas, &block.stale, 0, page_size)
+                .expect("the stale copy is fully described");
+            let stale_emitted = stale_canvas.finish().expect("every byte written exactly once");
+            assert_eq!(
+                stale_emitted.bytes(),
+                &bytes[stale_page * page_size..(stale_page + 1) * page_size],
+                "block {index}'s stale copy (physical {stale_page}) must reproduce byte for byte"
+            );
+        }
+    }
+
+    /// Required mutation: resolving a logical id as if it were a physical
+    /// one. Every v6 file with more than three pages must go red -- the
+    /// resolved physical page for logical 2 must *not* equal 2 itself
+    /// (which is what "treat logical as physical" would produce), and must
+    /// instead be whatever the table's own entry actually names.
+    #[test]
+    fn logical_ids_are_not_physical_page_numbers() {
+        let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let id = identify(&bytes).expect("a v6 file");
+        let page_size = id.page_size as usize;
+        let total_pages = bytes.len() / page_size;
+        let (_blocks, physical) =
+            v6_allocation_table(&bytes, page_size, total_pages).expect("a well-formed table");
+
+        // If resolution treated logical ids as physical page numbers, this
+        // crate would never even build this map (there would be nothing to
+        // resolve *through*) -- the mutation this guards against is a
+        // caller substituting `logical` for `physical.get(&logical)`. Both
+        // measured values disagree with their own logical id, which is
+        // exactly what a "logical == physical" bug would get wrong.
+        assert_ne!(physical.get(&1), Some(&1), "logical 1 must not resolve to physical 1");
+        assert_eq!(physical.get(&1), Some(&13_603));
+        assert_ne!(physical.get(&2), Some(&2), "logical 2 must not resolve to physical 2");
+        assert_eq!(physical.get(&2), Some(&8));
+    }
+
+    /// Second required mutation: flip which shadow copy of an
+    /// allocation-table block is treated as live. Block 1's own two copies
+    /// carry different generations (1 and 285) and materially different
+    /// entry arrays -- swapping them changes the resolved physical page for
+    /// logical ids in that block's own range, so this is a real catch, not
+    /// a vacuous one.
+    #[test]
+    fn swapping_a_blocks_live_and_stale_copy_changes_the_resolved_physical_page() {
+        let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let id = identify(&bytes).expect("a v6 file");
+        let page_size = id.page_size as usize;
+        let total_pages = bytes.len() / page_size;
+        let (blocks, physical) =
+            v6_allocation_table(&bytes, page_size, total_pages).expect("a well-formed table");
+
+        // Correct resolution: logical 1 (block 1, slot 0) is physical
+        // 13,603, from block 1's *live* copy (generation 285, physical 3).
+        assert_eq!(physical.get(&1), Some(&13_603));
+
+        // The mutation: pretend the *stale* copy (generation 1, physical 2)
+        // is live instead -- exactly what a shadow-pair selection bug
+        // (picking the lower generation, or an unconditional "first
+        // physical position wins") would do. Block 1's own stale entry for
+        // slot 0 must disagree with the live one, or this mutation could
+        // not be caught by anything -- it does, which is the point of this
+        // test rather than an assumption.
+        let stale_slot0 = blocks[0].stale.entries[0];
+        let live_slot0 = blocks[0].live.entries[0];
+        assert_ne!(
+            stale_slot0.physical_page, live_slot0.physical_page,
+            "block 1's two copies must genuinely disagree on slot 0, or a \
+             swapped-copy bug could not be observed here"
+        );
+        assert_ne!(
+            u32::from(stale_slot0.physical_page),
+            *physical.get(&1).expect("logical 1 resolves"),
+            "the stale copy's own claim for logical 1 must differ from the \
+             correctly-resolved (live-copy) answer"
+        );
+    }
+
     /// Task 16's own failing-test-first: a named corpus file per page size
     /// this corpus's v6 family actually uses above 512 (1024, 1536, 2048,
     /// 3584, 4096) round-trips its *whole* physical page 0 -- fixed
@@ -2076,8 +2476,28 @@ mod tests {
             e.why
         );
         assert!(
-            !e.why.contains("13607") && !e.why.contains("13,607"),
+            !e.why.contains("PAGES=13607") && !e.why.contains("PAGES=13,607"),
             "must not report the physical page count as PAGES: {}",
+            e.why
+        );
+
+        // Task 17: the refusal moved past the allocation table too -- it
+        // now names how many blocks this 14-block file has and how many of
+        // its 13,571 possible logical ids the live table actually
+        // resolves (13,568; the gap is unclaimed headroom, not a refusal),
+        // against the file's 13,607 physical pages -- a *different*,
+        // correctly-labeled use of the physical count than the PAGES
+        // conflation the assertion above guards against.
+        assert!(e.why.contains("14 block"), "names the block count: {}", e.why);
+        assert!(e.why.contains("13568 logical"), "names the resolved logical count: {}", e.why);
+        assert!(
+            e.why.contains("out of 13607 physical pages"),
+            "names the total physical page count, correctly labeled: {}",
+            e.why
+        );
+        assert!(
+            e.why.contains("cannot resolve page content past addressing"),
+            "the refusal is now about content, not addressing: {}",
             e.why
         );
     }

@@ -14,6 +14,7 @@
 //! nobody has described is a reported fault instead of a silent omission.
 
 pub mod acs;
+pub mod alloc;
 pub mod fcr;
 pub mod free_slot;
 pub mod generation;

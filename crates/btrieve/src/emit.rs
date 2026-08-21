@@ -39,6 +39,7 @@
 
 use crate::canvas::{Canvas, Emitted, Fault, Owner};
 use crate::format::acs;
+use crate::format::alloc;
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
 use crate::format::free_slot;
@@ -47,8 +48,8 @@ use crate::format::index;
 use crate::format::page;
 use crate::format::variable;
 use crate::model::{
-    Control, ControlRecord, File, FragmentSlot, KeyDescriptor, RecordSlot, V6ControlRecord,
-    V6PageTail,
+    Control, ControlRecord, File, FragmentSlot, KeyDescriptor, RecordSlot, V6AllocationBlockCopy,
+    V6ControlRecord, V6PageTail,
 };
 
 fn owner(field: &'static str) -> Owner {
@@ -444,6 +445,52 @@ pub(crate) fn write_v6_page_tail(
     }
     let after_trailer = trailer_pos + descriptors.len() * 2;
     canvas.put(after_trailer, &tail.padding, owner("trailer_padding"))?;
+    Ok(())
+}
+
+fn alloc_owner(field: &'static str) -> Owner {
+    Owner { structure: "v6_allocation_block", field, index: None }
+}
+
+fn alloc_entry_owner(index: usize) -> Owner {
+    Owner { structure: "v6_allocation_block", field: "entry", index: Some(index) }
+}
+
+/// Write one allocation-table page's whole content -- one shadow copy, at
+/// `base` (an absolute byte offset into `canvas`) -- the write-side
+/// counterpart to `read::v6_allocation_copy`. Every entry is written
+/// verbatim, allocated or not: an unallocated slot's marker (high byte
+/// zero) and whatever physical page number happens to sit in its low half
+/// are stored facts, not values this crate recomputes.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+pub(crate) fn write_v6_allocation_copy(
+    canvas: &mut Canvas,
+    copy: &V6AllocationBlockCopy,
+    base: usize,
+    page_size: usize,
+) -> Result<(), Fault> {
+    debug_assert_eq!(
+        copy.entries.len(),
+        alloc::entries_per_block(page_size),
+        "a copy read at one page_size must not be written back at another"
+    );
+    canvas.put(base + alloc::at::MAGIC, alloc::MAGIC, alloc_owner("magic"))?;
+    canvas.put_u16(base + alloc::at::BLOCK, copy.block, alloc_owner("block"))?;
+    canvas.put_u16(base + alloc::at::GENERATION, copy.generation, alloc_owner("generation"))?;
+    canvas.put(base + alloc::at::RESERVED_06, &copy.reserved_06, alloc_owner("reserved_06"))?;
+    for (n, entry) in copy.entries.iter().enumerate() {
+        let at = base + alloc::at::ENTRIES + n * alloc::ENTRY_WIDTH;
+        canvas.put_u16(at, entry.marker, alloc_entry_owner(n))?;
+        canvas.put_u16(at + 2, entry.physical_page, alloc_entry_owner(n))?;
+    }
+    // No trailing padding write: every corpus page size leaves the entry
+    // array tiling the page exactly (`format::alloc`'s own doc comment), so
+    // there is no byte left to describe here. If `page_size` ever disagreed,
+    // `Canvas::finish` would fault on the unwritten range on its own --
+    // exactly the outcome wanted, not a fabricated zero fill.
     Ok(())
 }
 
