@@ -2228,30 +2228,53 @@ mod tests {
 
         // Physical pages 2/3: allocation-table block 1's own shadow pair.
         // Page 3 is live (generation 20 > page 2's 10). One entry (logical
-        // 1, slot 0) claims physical page 4 as TAG_DATA.
+        // 1, slot 0) claims physical page 4 as TAG_DATA (0x4400).
+        //
+        // Offsets here are literal, not `alloc::at::*`/`page::v6::*` -- this
+        // fixture is meant to be an independent ground truth a mutation to
+        // those constants cannot also move. (`alloc::at::*` happen to be
+        // unaffected by this task's own required mutation, but keeping
+        // every offset in this builder literal means no future mutation to
+        // *any* of this crate's own offset constants can silently make the
+        // fixture and the code being tested agree with each other while
+        // both are wrong.)
         for (page, generation) in [(2usize, 10u16), (3usize, 20u16)] {
             let base = page * PAGE_SIZE;
-            b[base..base + 2].copy_from_slice(alloc::MAGIC);
-            b[base + alloc::at::BLOCK..base + alloc::at::BLOCK + 2].copy_from_slice(&1u16.to_le_bytes());
-            b[base + alloc::at::GENERATION..base + alloc::at::GENERATION + 2]
-                .copy_from_slice(&generation.to_le_bytes());
-            let entry0 = base + alloc::at::ENTRIES;
-            b[entry0..entry0 + 2].copy_from_slice(&page::v6::TAG_DATA.to_le_bytes());
-            b[entry0 + 2..entry0 + 4].copy_from_slice(&4u16.to_le_bytes());
+            b[base..base + 2].copy_from_slice(b"PP"); // alloc magic
+            b[base + 0x02..base + 0x04].copy_from_slice(&1u16.to_le_bytes()); // block
+            b[base + 0x04..base + 0x06].copy_from_slice(&generation.to_le_bytes());
+            let entry0 = base + 0x08; // entries start
+            b[entry0..entry0 + 2].copy_from_slice(&0x4400u16.to_le_bytes()); // TAG_DATA
+            b[entry0 + 2..entry0 + 4].copy_from_slice(&4u16.to_le_bytes()); // -> physical page 4
         }
 
         // Physical page 4: the one data page. Header: TAG_DATA, logical id
-        // 1 (self-reported, decorative), stamp 5.
+        // 1 (self-reported, decorative), stamp 5. Literal offsets 0/2/4,
+        // matching harvest 3 SS2's own field table -- not `page::v6::at::*`,
+        // for the same independence reason as above.
         let base = 4 * PAGE_SIZE;
-        b[base + page::v6::at::TAG..base + page::v6::at::TAG + 2]
-            .copy_from_slice(&page::v6::TAG_DATA.to_le_bytes());
-        b[base + page::v6::at::LOGICAL..base + page::v6::at::LOGICAL + 2]
-            .copy_from_slice(&1u16.to_le_bytes());
-        b[base + page::v6::at::STAMP..base + page::v6::at::STAMP + 2]
-            .copy_from_slice(&5u16.to_le_bytes());
+        b[base..base + 2].copy_from_slice(&0x4400u16.to_le_bytes()); // tag
+        b[base + 2..base + 4].copy_from_slice(&1u16.to_le_bytes()); // logical
+        b[base + 4..base + 6].copy_from_slice(&5u16.to_le_bytes()); // stamp
+
+        // Every slot offset below is `base + 6 + i * PHYSICAL` -- the
+        // literal "six-byte header, then slots" shape this task's brief
+        // states, spelled out as a number rather than as
+        // `page::v6::LEN`. This is the fix a Task 18 review asked for: an
+        // earlier version of this fixture computed slot offsets from
+        // `page::v6::LEN` directly, which meant the required mutation (that
+        // constant, 6 -> 8) moved the fixture's own "known good" marker
+        // position in lockstep with the code under test, so a marker-value
+        // assertion could never have gone red on its own -- only the
+        // slack-length arithmetic below (which was already literal) caught
+        // it. With literal offsets here, the fixture is a fixed,
+        // independent ground truth: only the code under test moves when
+        // `page::v6::LEN` is mutated, and a direct assertion on this
+        // fixture's own literal byte positions (below, in the test itself)
+        // now genuinely exercises where the crate believes the header ends.
 
         // Slot 0: live, marker 1, body "Sysop" padded with zeros.
-        let slot0 = base + page::v6::LEN;
+        let slot0 = base + 6;
         b[slot0..slot0 + 2].copy_from_slice(&1u16.to_le_bytes());
         b[slot0 + 2..slot0 + 2 + 5].copy_from_slice(b"Sysop");
 
@@ -2269,7 +2292,7 @@ mod tests {
         // NOWHERE.
         let mut next = 0xffff_ffffu32; // slot 7 (the last one built) reads NOWHERE
         for i in (2..8).rev() {
-            let slot = base + page::v6::LEN + i * PHYSICAL;
+            let slot = base + 6 + i * PHYSICAL;
             b[slot..slot + 2].copy_from_slice(&0u16.to_le_bytes()); // marker = 0 (free)
             b[slot + 2..slot + 6].copy_from_slice(&free_slot::encode_link(next));
             // fill (slot + 6..slot + PHYSICAL) stays zero.
@@ -2306,8 +2329,42 @@ mod tests {
 
         let content = page.content.as_ref().expect("a TAG_DATA page on a zero-key file is Data");
         assert_eq!(content.slots.len(), 8, "(512 - 6) / 60 == 8");
+
+        // `PAGE4_START` and the `+ 6`/`+ 8` below are LITERAL numbers, not
+        // `page::v6::LEN` -- this fixture's own construction
+        // (`v6_no_key_data_page_file`) is likewise built from literal
+        // offsets rather than from that constant, specifically so a
+        // mutation to it cannot move the fixture's "known good" byte
+        // layout in lockstep with the code under test. Without that
+        // independence, a review of this task found that a marker-value
+        // assertion here could only ever have caught the required mutation
+        // (`page::v6::LEN` 6 -> 8) indirectly, through a downstream
+        // slack-length arithmetic coincidence -- see this task's report for
+        // the transcript of that failure mode before this fixture was
+        // fixed. With the fixture now independent, this asserts on the raw
+        // two bytes immediately preceding the record body, directly: that
+        // the parsed marker and body are exactly what a fixed, literal
+        // read of the original file's own bytes says they must be, with no
+        // reference to any offset constant this crate's own code uses.
+        const PAGE4_START: usize = 4 * 512;
         match &content.slots[0] {
             V6RecordSlot::Live { marker, body } => {
+                assert_eq!(
+                    marker.to_le_bytes(),
+                    original[PAGE4_START + 6..PAGE4_START + 8],
+                    "the parsed marker must equal the file's own two bytes \
+                     at literal offset 6 -- immediately after the six-byte \
+                     header, not wherever the header-width constant \
+                     currently claims"
+                );
+                assert_eq!(
+                    &body[..5],
+                    &original[PAGE4_START + 8..PAGE4_START + 13],
+                    "the parsed body must equal the file's own bytes \
+                     starting at literal offset 8 -- the header plus the \
+                     2-byte marker, not shifted by whatever the header \
+                     width currently claims"
+                );
                 assert_eq!(*marker, 1);
                 assert!(body.starts_with(b"Sysop"));
             }
