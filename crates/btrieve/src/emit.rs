@@ -11,18 +11,21 @@
 //! Bytes are produced through a [`Canvas`], never a `vec![0; len]` written
 //! into directly: a byte the model does not describe is a reported fault,
 //! not a silent zero. [`crate::model::File`] describes a v5 file's control
-//! record fixed portion (`0x00..0x110`) and its key/segment definition
-//! array, so [`file`] now writes the whole of page 0 for a v5 file -- but
-//! records and index pages (page 1 onward) are still later tasks, so
+//! record fixed portion (`0x00..0x110`), its key/segment definition array,
+//! and now every physical page's six-byte header (`format::page`) plus what
+//! the page graph says it is -- but a page's *content* past that header
+//! (records, index entries, the ACS table) is still a later task, so
 //! [`file`] still faults on every real (multi-page) corpus file, just
-//! further along than it used to: page 0 round-trips, and the fault names
-//! the pages this crate has no description for yet. That is why the
-//! round-trip pin stays at zero.
+//! further along than it used to: page 0 round-trips completely, every
+//! other page's header round-trips too, and the fault names the first byte
+//! range past a header that this crate has no description for yet. That is
+//! why the round-trip pin stays at zero.
 
 use crate::canvas::{Canvas, Emitted, Fault, Owner};
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
 use crate::format::generation::Generation;
+use crate::format::page;
 use crate::model::File;
 
 fn owner(field: &'static str) -> Owner {
@@ -31,6 +34,31 @@ fn owner(field: &'static str) -> Owner {
 
 fn key_owner(field: &'static str, index: usize) -> Owner {
     Owner { structure: "fcr", field, index: Some(index) }
+}
+
+fn page_owner(field: &'static str, page_number: usize) -> Owner {
+    Owner { structure: "page", field, index: Some(page_number) }
+}
+
+/// Write every physical page's six-byte header (`format::page`) into
+/// `canvas`. Each page's content past the header -- records, index entries,
+/// the ACS table -- is a later task's job, so this leaves the rest of every
+/// page unwritten and `Canvas::finish` reports it.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_page_headers(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for (i, p) in model.pages.iter().enumerate() {
+        let page_number = i + 1;
+        let at = page_number * page_size;
+        let data_bit = if p.data_bit { page::DATA_BIT } else { 0 };
+        let counter = data_bit | (p.stamp & !page::DATA_BIT);
+        canvas.put_long(at + page::at::NUMBER, p.number, page_owner("number", page_number))?;
+        canvas.put_u16(at + page::at::COUNTER, counter, page_owner("counter", page_number))?;
+    }
+    Ok(())
 }
 
 /// Write the key/segment definition array (`0x110` onward) and the zero
@@ -187,13 +215,16 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
     }
     write_fixed_portion(&mut canvas, model)?;
     write_key_descriptors(&mut canvas, model)?;
+    write_page_headers(&mut canvas, model)?;
     canvas.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::fixtures::{usracc_fixed_portion, usracc_first_page, two_key_fixed_portion};
+    use crate::model::fixtures::{
+        two_key_fixed_portion, usracc_dat, usracc_first_page, usracc_fixed_portion,
+    };
     use crate::read;
 
     /// The fixed portion round-trips byte for byte: read it, emit it back
@@ -235,22 +266,47 @@ mod tests {
 
     /// `file` faults rather than succeeding on a real (multi-page) corpus
     /// file: page 0 (fixed portion, key/segment definitions, zero padding)
-    /// is now fully described and writes without a fault, but records and
-    /// index pages -- page 1 onward -- are not, so the fault must name the
-    /// range starting exactly at `page_size`, not at `0x110`.
+    /// is now fully described and writes without a fault, and so is every
+    /// page's own six-byte header -- but a page's content past that header
+    /// is not, so the fault must name the range starting exactly at
+    /// `page_size + 6` (right after page 1's header), not at `0x110` and
+    /// not at `page_size`.
     #[test]
-    fn file_faults_on_bytes_past_page_zero_for_a_multi_page_file() {
+    fn file_faults_on_bytes_past_page_one_header_for_a_multi_page_file() {
         // USRACC.DAT itself: page_size 512, 3 pages, 1536 bytes total.
-        let mut original = usracc_first_page();
-        original.resize(1536, 0);
+        let original = usracc_dat();
         let model = read::file(&original).expect("reads");
         assert_eq!(model.len, 1536);
 
-        let fault = file(&model).expect_err("pages 1 and 2 are not yet described");
+        let fault = file(&model).expect_err("page 1 and 2's content is not yet described");
         let said = fault.to_string();
         assert!(
-            said.contains("512") && said.contains("1536"),
-            "names the range starting at page_size (512) up to the file's own length (1536): {said}"
+            said.contains("518") && said.contains("1024"),
+            "names the range starting right after page 1's header (518) up \
+             to page 2's own header (1024): {said}"
         );
+    }
+
+    /// Page 1's own six-byte header round-trips byte for byte, checked in
+    /// isolation the same way `the_v5_fixed_portion_round_trips` checks page
+    /// 0's fixed portion alone: a two-page model (page 0 plus page 1, no
+    /// page 2) writes exactly `page_size + 6` bytes with nothing left over,
+    /// because page 1's content is the only thing past its header and this
+    /// model is deliberately shaped to have none.
+    #[test]
+    fn a_pages_own_header_round_trips_in_isolation() {
+        let mut original = usracc_first_page();
+        original.resize(1024, 0); // page 0 plus page 1, page 1 otherwise empty
+        original[512..518].copy_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x03, 0x00]);
+        let model = read::file(&original).expect("reads");
+        assert_eq!(model.pages.len(), 1, "page 1 only");
+
+        let mut canvas = Canvas::new(512 + page::LEN);
+        write_fixed_portion(&mut canvas, &model).expect("page 0's fixed portion");
+        write_key_descriptors(&mut canvas, &model).expect("page 0's key descriptor and padding");
+        write_page_headers(&mut canvas, &model).expect("page 1's header");
+        let emitted = canvas.finish().expect("512 + 6 bytes, all written");
+
+        assert_eq!(emitted.bytes(), &original[..512 + page::LEN]);
     }
 }

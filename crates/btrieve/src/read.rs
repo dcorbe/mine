@@ -4,10 +4,13 @@
 //! whose bytes are not yet fully described is refused with the reason, and the
 //! round-trip pin does not count it.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
 use crate::format::generation::{identify, NotBtrieve};
-use crate::model::{ControlRecord, File, KeyDescriptor};
+use crate::format::page;
+use crate::model::{ControlRecord, File, KeyDescriptor, Page, PageKind};
 
 /// Read a plain little-endian `u16` at `at`.
 fn get_u16(bytes: &[u8], at: usize) -> u16 {
@@ -159,6 +162,181 @@ fn key_descriptors(
     Ok(out)
 }
 
+/// How `page_number` is already spoken for, for a conflict message.
+fn describe_claim(kind: PageKind) -> String {
+    match kind {
+        PageKind::Index => "an index root".to_string(),
+        PageKind::Acs => "the ACS block".to_string(),
+        PageKind::Free => "on the free chain".to_string(),
+        PageKind::Data => "a data page".to_string(),
+    }
+}
+
+/// Resolve the v5 page graph: what every physical page from 1 to
+/// `total_pages - 1` *is*, derived from the control record's own pointers --
+/// there is no page-type tag in this family (harvest 3 SS2), so a page's kind
+/// cannot be read off the page itself.
+///
+/// A page named by a key descriptor's `root_page` is an index page. A page
+/// is the ACS block when some key descriptor sets `ALT_COLLATING`: harvest 4
+/// SS6a measured this as always physical page 1 on every v5 corpus file that
+/// declares a sequence, with no exceptions, so that is the rule this
+/// function trusts. FCR `0x10a` is read only as corroboration -- harvest 4
+/// SS6a's own caution is that it is unreliable on v5 (`CLASSADS.DAT` and
+/// `EMAIL.DAT` both read zero there while genuinely holding a block on page
+/// 1), so a zero `0x10a` alongside a declared sequence is accepted rather
+/// than refused, while a **nonzero** `0x10a` that disagrees with what the
+/// key descriptors say is a genuine contradiction and is refused, naming
+/// both. A page reachable by walking the record-slot free chain from FCR
+/// `0x10` (a byte position, not a page number -- harvest 3 SS4) is free;
+/// v5 has no page-level free list, so this only records "at least one freed
+/// record slot lives here," never displacing an Index or Acs claim.
+/// Whatever remains is data.
+///
+/// # Errors
+///
+/// If two keys claim the same root page, an index root and the ACS page
+/// coincide, FCR `0x10a` names an ACS page that contradicts what the key
+/// descriptors themselves declare (in either direction), or the free chain
+/// does not terminate cleanly -- a position repeats, a link runs past the
+/// end of the file, or a link names a position inside the control record
+/// itself, or reaches a page an index root or the ACS block already claims.
+fn resolve_pages(
+    bytes: &[u8],
+    page_size: usize,
+    total_pages: usize,
+    control: &ControlRecord,
+    key_descriptors: &[KeyDescriptor],
+) -> Result<Vec<Page>, NotBtrieve> {
+    let mut claim: HashMap<u32, PageKind> = HashMap::new();
+
+    // Index: every key descriptor's own root page (0 means "no root" --
+    // either a continuation definition or an as-yet-empty key).
+    for (i, d) in key_descriptors.iter().enumerate() {
+        if d.root_page == 0 {
+            continue;
+        }
+        if let Some(existing) = claim.get(&d.root_page).copied() {
+            return Err(NotBtrieve {
+                why: format!(
+                    "key_descriptor[{i}]'s root names page {}, which is \
+                     already {} -- two keys cannot share one root page",
+                    d.root_page,
+                    describe_claim(existing)
+                ),
+            });
+        }
+        claim.insert(d.root_page, PageKind::Index);
+    }
+
+    // ACS: gated on content (harvest 4 SS6a), not on FCR 0x10a alone.
+    const V5_ACS_PAGE: u32 = 1;
+    let acs_declared =
+        key_descriptors.iter().any(|d| d.attributes & key_descriptor::ALT_COLLATING != 0);
+    if acs_declared {
+        if let Some(existing) = claim.get(&V5_ACS_PAGE).copied() {
+            return Err(NotBtrieve {
+                why: format!(
+                    "a key descriptor declares an alternate collating \
+                     sequence, which harvest 4 SS6a places at physical page \
+                     {V5_ACS_PAGE} on every v5 corpus file measured, but \
+                     page {V5_ACS_PAGE} is already {} -- the ACS block and \
+                     an index root cannot be the same page",
+                    describe_claim(existing)
+                ),
+            });
+        }
+        claim.insert(V5_ACS_PAGE, PageKind::Acs);
+        if control.acs_page_pointer != 0 && control.acs_page_pointer != V5_ACS_PAGE {
+            return Err(NotBtrieve {
+                why: format!(
+                    "FCR 0x10a names page {} as the ACS block, but a key \
+                     descriptor's ALT_COLLATING bit places it at physical \
+                     page {V5_ACS_PAGE} instead (harvest 4 SS6a) -- the two \
+                     disagree",
+                    control.acs_page_pointer
+                ),
+            });
+        }
+    } else if control.acs_page_pointer != 0 {
+        return Err(NotBtrieve {
+            why: format!(
+                "FCR 0x10a names page {} as the ACS block, but no key \
+                 descriptor declares ALT_COLLATING -- harvest 4 SS6a's \
+                 content-based rule finds nothing to corroborate it",
+                control.acs_page_pointer
+            ),
+        });
+    }
+
+    // Free: walk the record-slot free chain from FCR 0x10.
+    const NOWHERE: u32 = 0xffff_ffff;
+    let mut cur = control.free;
+    let mut visited: HashSet<u32> = HashSet::new();
+    while cur != NOWHERE {
+        if !visited.insert(cur) {
+            return Err(NotBtrieve {
+                why: format!(
+                    "the free chain from FCR 0x10 revisits position \
+                     {cur:#x} -- it does not terminate cleanly"
+                ),
+            });
+        }
+        let at = cur as usize;
+        if at < page_size {
+            return Err(NotBtrieve {
+                why: format!(
+                    "the free chain from FCR 0x10 names position {cur:#x}, \
+                     inside the control record itself -- not a record \
+                     position on any real page"
+                ),
+            });
+        }
+        if at + 4 > bytes.len() {
+            return Err(NotBtrieve {
+                why: format!(
+                    "the free chain from FCR 0x10 names position {cur:#x}, \
+                     past the end of the {}-byte file", bytes.len()
+                ),
+            });
+        }
+        let page_number = (at / page_size) as u32;
+        if let Some(existing) = claim.get(&page_number).copied() {
+            if matches!(existing, PageKind::Index | PageKind::Acs) {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "the free chain from FCR 0x10 reaches page \
+                         {page_number}, which is already {} -- a B-tree or \
+                         ACS page cannot also hold a freed record slot",
+                        describe_claim(existing)
+                    ),
+                });
+            }
+        } else {
+            claim.insert(page_number, PageKind::Free);
+        }
+        cur = get_long(bytes, at);
+    }
+
+    // Whatever remains, 1..total_pages, is data -- not a default guess, but
+    // the necessarily-true residual once every other claim above has been
+    // checked for a contradiction.
+    let mut pages = Vec::with_capacity(total_pages.saturating_sub(1));
+    for page_number in 1..total_pages {
+        let at = page_number * page_size;
+        let number = get_long(bytes, at + page::at::NUMBER);
+        let counter = get_u16(bytes, at + page::at::COUNTER);
+        let kind = claim.get(&(page_number as u32)).copied().unwrap_or(PageKind::Data);
+        pages.push(Page {
+            number,
+            data_bit: counter & page::DATA_BIT != 0,
+            stamp: counter & !page::DATA_BIT,
+            kind,
+        });
+    }
+    Ok(pages)
+}
+
 /// Read a whole Btrieve file into a model.
 ///
 /// # Errors
@@ -166,8 +344,11 @@ fn key_descriptors(
 /// If [`identify`] refuses the control record, the file is shorter than its
 /// own declared page size, the file is a v6 file (not yet described by this
 /// crate), the key/segment definition array is malformed (runs past the
-/// page, or an `ANOSEG` chain never terminates), or the zero padding past
-/// the last definition, up to `page_size`, is not actually zero.
+/// page, or an `ANOSEG` chain never terminates), the zero padding past the
+/// last definition, up to `page_size`, is not actually zero, the file is not
+/// a whole number of pages, or [`resolve_pages`] cannot classify every page
+/// -- see that function's own documentation for the specific
+/// contradictions it checks for.
 pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
     let id = identify(bytes)?;
 
@@ -221,10 +402,28 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         }
     }
 
+    // The file must be a whole number of pages -- harvest 3 SS7 measured
+    // this on all 612 corpus files this crate has identified, with no
+    // exceptions, so a file that disagrees is refused rather than silently
+    // truncated to whatever whole pages fit.
+    if bytes.len() % page_size != 0 {
+        return Err(NotBtrieve {
+            why: format!(
+                "identified as {:?} with {page_size}-byte pages, but the \
+                 file is {} bytes -- not a whole number of pages",
+                id.generation,
+                bytes.len()
+            ),
+        });
+    }
+    let total_pages = bytes.len() / page_size;
+    let pages = resolve_pages(bytes, page_size, total_pages, &control, &key_descriptors)?;
+
     Ok(File {
         id,
         control,
         key_descriptors,
+        pages,
         len: bytes.len() as u64,
     })
 }
@@ -233,7 +432,9 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
 mod tests {
     use super::*;
     use crate::format::generation::Generation;
-    use crate::model::fixtures::{usracc_fixed_portion, usracc_first_page, two_key_fixed_portion};
+    use crate::model::fixtures::{
+        two_key_fixed_portion, usracc_dat, usracc_first_page, usracc_fixed_portion,
+    };
 
     /// The exact values the controller measured independently off
     /// `archive/galacticomm/hosts/majorbbs/USRACC.DAT`'s raw bytes before
@@ -371,5 +572,152 @@ mod tests {
         assert!(e.why.contains("key_descriptor[8]"), "names the overrunning definition: {}", e.why);
         assert!(e.why.contains("key_descriptor[0]"), "names the key it continues: {}", e.why);
         assert!(e.why.contains("512-byte control record"), "{}", e.why);
+    }
+
+    /// `USRACC.DAT`'s three page headers, the exact case this task was
+    /// dispatched to make pass: page 0's own header bytes are the control
+    /// record's always-zero `lead` (already checked by
+    /// `usracc_dat_fixed_portion_reads_its_measured_values` above -- nothing
+    /// new to assert there), page 1 is the index page its one key's root
+    /// names, and page 2 is everything else -- a data page.
+    #[test]
+    fn usracc_dats_three_page_headers_are_measured_correctly() {
+        let buf = usracc_dat();
+        let file = file(&buf).expect("a valid three-page v5 file");
+        assert_eq!(file.pages.len(), 2, "physical pages 1 and 2");
+
+        let page1 = &file.pages[0];
+        assert_eq!(page1.number, 1, "page 1's own header number");
+        assert_eq!(page1.stamp, 3, "page 1's stamp");
+        assert!(!page1.data_bit, "page 1 holds a B-tree node, not records");
+        assert_eq!(page1.kind, PageKind::Index, "named by key_descriptor[0]'s root");
+
+        let page2 = &file.pages[1];
+        assert_eq!(page2.number, 2, "page 2's own header number");
+        assert_eq!(page2.stamp, 6, "page 2's stamp");
+        assert!(page2.data_bit, "page 2 holds USRACC.DAT's two records");
+        assert_eq!(page2.kind, PageKind::Data, "claimed by no root, ACS, or free chain");
+    }
+
+    /// A real corpus file with deletions on record: `TTIHORBT.DAT`, 12
+    /// 512-byte pages, `records` 0 (every record ever inserted has since
+    /// been deleted). Its two keys' roots claim pages 1 and 2; the free
+    /// chain from FCR 0x10 (measured directly off this file when this task
+    /// was dispatched) visits every one of the remaining 9 pages, 3 through
+    /// 11. This is the real file the brief's mutation step asks for -- no
+    /// synthetic fixture was needed because this one already exists in the
+    /// corpus.
+    #[test]
+    fn a_real_files_emptied_data_pages_classify_as_free() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root
+            .join("modules/isv-file-libraries/ISVTTI - Tessier Technologies/temp/TTIHORBT.DAT");
+        let Ok(buf) = std::fs::read(&path) else {
+            eprintln!("read: TTIHORBT.DAT not present, nothing verified");
+            return;
+        };
+        let file = file(&buf).expect("TTIHORBT.DAT is a valid v5 file");
+        assert_eq!(file.control.records, 0, "every record has been deleted");
+        assert_eq!(file.pages.len(), 11, "12 physical pages, less page 0");
+        assert_eq!(file.pages[0].kind, PageKind::Index, "page 1, key 0's root");
+        assert_eq!(file.pages[1].kind, PageKind::Index, "page 2, key 1's root");
+        for (i, page) in file.pages.iter().enumerate().skip(2) {
+            assert_eq!(
+                page.kind,
+                PageKind::Free,
+                "page {} should be free -- every record has been deleted",
+                i + 1
+            );
+        }
+    }
+
+    /// Two keys cannot share one root page -- if they did, this crate would
+    /// have to guess which key's B-tree actually lives there. No corpus file
+    /// does this (0 of 145 v5 files measured for this task), so the fixture
+    /// is synthetic.
+    #[test]
+    fn two_keys_claiming_the_same_root_page_are_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf.resize(1024, 0); // 2 pages, so page 1 is a real page
+        buf[0x14..0x16].copy_from_slice(&2u16.to_le_bytes()); // keys = 2
+        let def0 = 0x110;
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1
+        let def1 = def0 + 0x1e;
+        buf[def1..def1 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1 too
+        let e = file(&buf).expect_err("both keys claim page 1");
+        assert!(e.why.contains("key_descriptor[1]"), "{}", e.why);
+        assert!(e.why.contains("page 1"), "{}", e.why);
+    }
+
+    /// A key cannot be both an index root and the ACS block at the same
+    /// page -- if a key's root names page 1 and some key also declares
+    /// `ALT_COLLATING` (which harvest 4 SS6a fixes at page 1), the file
+    /// contradicts itself. Unmeasured in the corpus (0 of 145 v5 files); a
+    /// synthetic fixture is the only way to exercise it.
+    #[test]
+    fn an_index_root_and_the_acs_block_on_the_same_page_are_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf.resize(1024, 0);
+        buf[0x14..0x16].copy_from_slice(&1u16.to_le_bytes()); // keys = 1
+        let def0 = 0x110;
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1
+        buf[def0 + 0x08..def0 + 0x0a].copy_from_slice(&0x20u16.to_le_bytes()); // ALT_COLLATING
+        let e = file(&buf).expect_err("page 1 cannot be both an index root and the ACS block");
+        assert!(e.why.contains("ACS"), "{}", e.why);
+        assert!(e.why.contains("page 1"), "{}", e.why);
+    }
+
+    /// FCR `0x10a` naming an ACS page while no key declares `ALT_COLLATING`
+    /// is the mirror of harvest 4 SS6a's known false negative (a declared
+    /// sequence the pointer misses) -- a false *positive* the pointer alone
+    /// cannot be trusted to invent. Unmeasured in the corpus; synthetic.
+    #[test]
+    fn an_acs_pointer_with_no_declaring_key_is_refused() {
+        let mut buf = usracc_first_page(); // keys = 1, attributes = 0 (no ALT_COLLATING)
+        buf[0x10a..0x10e].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // acs_page_pointer = 1
+        let e = file(&buf).expect_err("no key corroborates the pointer");
+        assert!(e.why.contains("0x10a"), "{}", e.why);
+        assert!(e.why.contains("ALT_COLLATING"), "{}", e.why);
+    }
+
+    /// A free chain that revisits a position it has already visited does not
+    /// terminate cleanly and is refused rather than looped forever.
+    #[test]
+    fn a_free_chain_that_cycles_is_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf.resize(1536, 0); // 3 pages
+        buf[0x10..0x14].copy_from_slice(&[0x00, 0x00, 0x06, 0x02]); // free = 518 (0x206)
+        buf[0x206..0x20a].copy_from_slice(&[0x00, 0x00, 0x06, 0x02]); // next = 518 too
+        let e = file(&buf).expect_err("the chain points back at itself");
+        assert!(e.why.contains("revisits"), "{}", e.why);
+    }
+
+    /// A free chain entry naming a position past the end of the file is
+    /// refused, naming the file's own length.
+    #[test]
+    fn a_free_chain_past_the_end_of_the_file_is_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf.resize(1536, 0); // 3 pages, 1536 bytes
+        buf[0x10..0x14].copy_from_slice(&[0x00, 0x00, 0xfe, 0x05]); // free = 1534 (0x5fe)
+        let e = file(&buf).expect_err("1534 + 4 runs past 1536 bytes");
+        assert!(e.why.contains("past the end"), "{}", e.why);
+    }
+
+    /// A free chain entry naming a page an index root already claims is
+    /// refused -- a B-tree page cannot also hold a freed record slot.
+    #[test]
+    fn a_free_chain_reaching_an_index_page_is_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf.resize(1536, 0); // 3 pages
+        buf[0x14..0x16].copy_from_slice(&1u16.to_le_bytes()); // keys = 1
+        let def0 = 0x110;
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1
+        buf[0x10..0x14].copy_from_slice(&[0x00, 0x00, 0x06, 0x02]); // free = 518 (page 1, offset 6)
+        let e = file(&buf).expect_err("the free chain reaches page 1, an index root");
+        assert!(e.why.contains("page 1"), "{}", e.why);
+        assert!(e.why.contains("index root"), "{}", e.why);
     }
 }

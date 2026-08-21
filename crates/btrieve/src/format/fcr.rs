@@ -105,6 +105,14 @@ pub mod key_descriptor {
     /// the next definition. `BTVSTF.H:59`'s `ANOSEG 0x10`.
     pub const ANOSEG: u16 = 1 << 4;
 
+    /// Bit 5 of `ATTRIBUTES`: this key is indexed through an alternate
+    /// collating sequence rather than raw byte order. `keys.rs:98`
+    /// (`flag::ALT_COLLATING`). `read::resolve_pages` gates the v5 ACS
+    /// page's *presence* on this bit rather than on FCR `0x10a` alone --
+    /// harvest 4 SS6a measured `0x10a` unreliable on 2 of 13 v5 files that
+    /// declare a sequence.
+    pub const ALT_COLLATING: u16 = 1 << 5;
+
     /// Byte offsets of one key/segment definition's fields, relative to the
     /// definition's own start.
     pub mod at {

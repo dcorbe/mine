@@ -15,6 +15,7 @@
 
 pub mod fcr;
 pub mod generation;
+pub mod page;
 
 /// One described range of bytes.
 pub struct Field {
