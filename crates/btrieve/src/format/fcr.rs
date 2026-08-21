@@ -32,11 +32,19 @@
 //! `0x00..0x110` exactly -- harvest 2's field table has 42 offset-addressed
 //! rows there, and this crate splits its one two-value row (`0x22`,
 //! "constant `0xffff` then `0x0100`") into `sentinel_22`/`sentinel_24`,
-//! since a [`Field`] carries one value, not two. `PAGE_SIZE` and `VERSION`
-//! are read through [`super::generation::Identified`], not duplicated in
-//! `model::V6ControlRecord` -- the same exclusion v5's `at` module makes for
-//! `lead`/`page_gen`/`page_size` in `model::ControlRecord`. Eighteen of the
-//! remaining forty are fully understood and
+//! since a [`Field`] carries one value, not two. `PAGE_SIZE` is read through
+//! [`super::generation::Identified`], not duplicated in `model::
+//! V6ControlRecord` -- the same exclusion v5's `at` module makes for
+//! `lead`/`page_gen`/`page_size` in `model::ControlRecord`. `VERSION` was
+//! excluded the same way until Task 20: `Identified.generation` is read off
+//! physical page 0 alone, and every v6 file measured through Task 19 had
+//! both shadow copies agreeing on it, so treating it as file-global rather
+//! than per-copy cost nothing observable. `MULTIACS.DAT` -- upgraded from
+//! V600 to V610, its stale copy still reading `0x600` -- disproved that
+//! assumption, so `version` is now a genuine field of `model::
+//! V6ControlRecord`, decoded and written independently per copy (see that
+//! field's own doc comment). Eighteen of the remaining forty are fully
+//! understood and
 //! cited to a decompile line or a clean corpus-measured formula; nineteen are
 //! constant and fully reproducible but of unresolved semantic meaning
 //! (named `reserved`/`sentinel`, each carrying the corpus count that pins its
@@ -825,11 +833,15 @@ fn v5_fixed() -> Vec<Field> {
 /// through `0x110` -- harvest 2's field table, transcribed directly (one
 /// name per row) so `v6_fixed`, `read::v6_control_record` and
 /// `emit::write_v6_fixed_portion` share this one set of offsets rather than
-/// three copies of the same magic numbers. `PAGE_SIZE` and `VERSION` are
-/// listed for [`v6_fixed`]'s own tiling, but the runtime side of this crate
-/// reads them through [`super::generation::Identified`], not through
-/// `model::V6ControlRecord` -- the same exclusion v5's `at` module makes for
-/// `lead`/`version`/`page_size`.
+/// three copies of the same magic numbers. `PAGE_SIZE` is listed for
+/// [`v6_fixed`]'s own tiling, but read through [`super::generation::
+/// Identified`] rather than `model::V6ControlRecord` -- the same exclusion
+/// v5's `at` module makes for `lead`/`page_size`. `VERSION`, unlike
+/// `PAGE_SIZE`, **is** also read into `model::V6ControlRecord` as of Task 20
+/// (`model::V6ControlRecord::version`'s own doc comment: `MULTIACS.DAT`'s
+/// two shadow copies genuinely disagree on it), so both `read::
+/// v6_control_record` and `emit::write_v6_fixed_portion` use this `VERSION`
+/// offset directly, per copy, rather than treating it as file-global.
 pub mod v6 {
     pub const GENERATION: usize = 0x04;
     pub const RESERVED_06: usize = 0x06;

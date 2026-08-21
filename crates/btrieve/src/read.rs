@@ -120,6 +120,7 @@ fn v6_control_record(bytes: &[u8]) -> V6ControlRecord {
         variable_mark: get_u32(bytes, fcr::v6::VARIABLE_MARK),
         acs_name: get_array(bytes, fcr::v6::ACS_NAME),
         reserved_44: get_array(bytes, fcr::v6::RESERVED_44),
+        version: get_u16(bytes, fcr::v6::VERSION),
         usage_4c: get_u16(bytes, fcr::v6::USAGE_4C),
         index_alloc_4e: get_u16(bytes, fcr::v6::INDEX_ALLOC_4E),
         mirror_50: get_u16(bytes, fcr::v6::MIRROR_50),
@@ -868,13 +869,24 @@ fn looks_like_fragment_page(bytes: &[u8], page_start: usize, page_size: usize) -
 /// bytes remain between the last live fragment's tiling and the entry array
 /// itself.
 ///
-/// Only called once `looks_like_fragment_page` has already confirmed the
-/// page's shape, so the two checks it performs are re-derived here rather
-/// than re-verified -- but every fragment's own tiling is still checked as
-/// it is walked: harvest 5 SS3.3's "length is derived, never stored" means a
-/// fragment's declared start must agree with where the fragments before it
-/// actually end, and a file that disagrees is refused rather than read past
-/// its own bounds.
+/// Shared between v5 (called from `resolve_pages` once `looks_like_
+/// fragment_page` has already confirmed the shape -- the two checks it
+/// performs are re-derived here rather than re-verified) and v6 (called
+/// straight off the page's own `TAG_VARIABLE` tag, Task 20 -- no structural
+/// heuristic needed, `format::variable`'s own module doc). `is_v6` is the
+/// one place the two families genuinely differ: whether a live fragment's
+/// leading 4-byte pointer is decided by the entry's own continuation bit
+/// (v5) or is simply always present (v6, harvest 5 SS3.4 -- "every fragment
+/// carries the 4-byte pointer, continued or not"; mirrors the existing
+/// engine's own `variable::fragment`, which takes an identical `Version`
+/// parameter for exactly this reason). Every fragment's own tiling is still
+/// checked as it is walked, on both families: harvest 5 SS3.3's "length is
+/// derived, never stored" means a fragment's declared start must agree with
+/// where the fragments before it actually end, and a file that disagrees is
+/// refused rather than read past its own bounds.
+///
+/// **No v6 file in this project's corpus reaches the `is_v6: true` branch**
+/// -- see `crate::model::FragmentPage`'s own doc comment.
 ///
 /// # Errors
 ///
@@ -887,6 +899,7 @@ fn read_fragment_page(
     bytes: &[u8],
     page_start: usize,
     page_size: usize,
+    is_v6: bool,
 ) -> Result<FragmentPage, NotBtrieve> {
     let free_chain = get_long(bytes, page_start + variable::at::FREE_CHAIN);
     let fragment_count = usize::from(get_u16(bytes, page_start + variable::at::FRAGMENT_COUNT));
@@ -915,7 +928,11 @@ fn read_fragment_page(
             continue;
         }
         let start = usize::from(entry & variable::OFFSET_MASK);
-        let continued = entry & variable::CONTINUED_BIT != 0;
+        // v5: the entry's own continuation bit decides. v6: the pointer is
+        // always present regardless of that bit (harvest 5 SS3.4), so this
+        // never reads it at all on that branch -- see `read_fragment_page`'s
+        // own doc comment.
+        let continued = is_v6 || entry & variable::CONTINUED_BIT != 0;
         if start != cursor {
             return Err(NotBtrieve {
                 why: format!(
@@ -1619,9 +1636,12 @@ fn v6_acs_page_in_key(d: &KeyDescriptor) -> u32 {
 /// discipline this crate's own `data_bit` check enforces on v5. Extracted
 /// from [`file`]'s own v6 branch so this specific cross-check is directly
 /// testable (and directly mutation-testable) independent of whether the
-/// rest of the file round-trips -- `MULTIACS.DAT` itself is blocked past
-/// this point by its own `variable_mark` (Task 20's scope), so this is the
-/// only way to exercise the assembly formula against real bytes at all.
+/// rest of the file round-trips -- before Task 20, `MULTIACS.DAT` itself
+/// was blocked past this point by its own `variable_mark`, so this function
+/// was the only way to exercise the assembly formula against real bytes at
+/// all; `MULTIACS.DAT` now round-trips completely (`multiacs_dat_
+/// round_trips_completely`, below), but this direct test stays, since it
+/// isolates the cross-check from everything else `file` also does.
 ///
 /// # Errors
 ///
@@ -2119,7 +2139,7 @@ fn resolve_pages(
         // this page is `PageKind::Variable` -- established above by content
         // evidence, not by residue.
         let fragment_content = if kind == PageKind::Variable {
-            Some(read_fragment_page(bytes, at, page_size)?)
+            Some(read_fragment_page(bytes, at, page_size, false)?)
         } else {
             None
         };
@@ -2171,15 +2191,19 @@ fn resolve_pages(
 /// root ([`v6_walk_index_trees`]), every `ALT_COLLATING` key's own ACS
 /// binding is cross-checked ([`v6_validate_acs_bindings`]), and every
 /// physical page the allocation table claims is classified as index
-/// content, the ACS block, or a genuine data page. What still refuses: a
-/// page attributed to no key's tree and tagged neither `TAG_ACS` nor
-/// (on a fixed-length-record file) `TAG_DATA` -- a `TAG_TEMPLATE`/
-/// `TAG_VARIABLE` page, or a `TAG_DATA` page on a variable-length file
-/// (`variable_mark != 0`, Task 20's own scope) -- and a physical page the
-/// allocation table never claims at all (an abandoned page from an earlier
-/// rebalance this crate does not yet have an `Orphan`-style rule for). Every
-/// such refusal names the specific page and predicate, the same "no
-/// residue, ever" discipline the v5 path already enforces.
+/// content, the ACS block, a genuine data page (`TAG_DATA`, whether or not
+/// the file holds variable-length records -- Task 20 removed the
+/// `variable_mark` gate this crate used to impose here, since a data page's
+/// slot layout does not depend on it), or a fragment/overflow page
+/// (`TAG_VARIABLE`, Task 20, [`read_fragment_page`] -- never witnessed on a
+/// real v6 file in this project's corpus, see `model::FragmentPage`'s own
+/// doc comment). What still refuses: a page attributed to no key's tree,
+/// tagged neither `TAG_ACS`/`TAG_DATA`/`TAG_VARIABLE` -- a `TAG_TEMPLATE`
+/// page, or any tag this crate does not recognize -- and a physical page
+/// the allocation table never claims at all (an abandoned page from an
+/// earlier rebalance this crate does not yet have an `Orphan`-style rule
+/// for). Every such refusal names the specific page and predicate, the
+/// same "no residue, ever" discipline the v5 path already enforces.
 pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
     let id = identify(bytes)?;
     let page_size = id.page_size as usize;
@@ -2317,11 +2341,13 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         // content; a page tagged TAG_ACS (and not attributed, since no
         // key's tree and the ACS block are ever the same page) is the ACS
         // block; a page tagged TAG_DATA and not attributed is a genuine
-        // data page, decoded the same way Task 18 already does, gated on
-        // this being a fixed-length-record file (a variable-length file's
-        // data pages are Task 20's own scope); anything else (a
-        // TAG_TEMPLATE/TAG_VARIABLE page no key claims, or a TAG_DATA page
-        // on a variable-length file) is refused rather than guessed.
+        // data page, decoded the same way Task 18 already does, whether or
+        // not the file holds variable-length records (Task 20 removed the
+        // fixed-length-only gate this used to have); a page tagged
+        // TAG_VARIABLE and not attributed is a fragment/overflow page (Task
+        // 20, never witnessed on a real v6 file in this corpus); anything
+        // else (a TAG_TEMPLATE page no key claims, or a tag this crate does
+        // not recognize) is refused rather than guessed.
         let mut v6_pages = Vec::with_capacity(claimed.len());
         for physical_page in &claimed {
             let page_start = *physical_page as usize * page_size;
@@ -2347,6 +2373,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     content: None,
                     index: Some(index_page),
                     acs: None,
+                    fragment: None,
                 });
                 continue;
             }
@@ -2361,11 +2388,21 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     content: None,
                     index: None,
                     acs: Some(block),
+                    fragment: None,
                 });
                 continue;
             }
 
-            if tag == page::v6::TAG_DATA && live.variable_mark == 0 && live.physical != 0 {
+            // Task 20: a genuine data page, whether or not the file holds
+            // variable-length records. `read_v6_data_page` needs no
+            // `variable_mark` gate of its own -- harvest 5 SS1.1's slot
+            // layout does not change shape when a live record's tail holds
+            // a fragment pointer instead of ordinary data (the identical
+            // reasoning `model::Page::content`'s own v5 doc comment already
+            // states), so the gate this crate used to impose here was never
+            // load-bearing for the shape, only a placeholder for work not
+            // yet done.
+            if tag == page::v6::TAG_DATA && live.physical != 0 {
                 let content = read_v6_data_page(bytes, page_start, page_size, live.physical as usize)?;
                 v6_pages.push(V6Page {
                     physical_page: *physical_page,
@@ -2375,6 +2412,28 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     content: Some(content),
                     index: None,
                     acs: None,
+                    fragment: None,
+                });
+                continue;
+            }
+
+            // Task 20: a variable-length file's fragment/overflow page,
+            // found by its own tag rather than a heuristic (v6 tags this
+            // shape explicitly, unlike v5 -- `format::variable`'s own
+            // module doc). Never witnessed on a real v6 file in this
+            // project's corpus; see `model::FragmentPage`'s own doc
+            // comment for what grounds this branch instead.
+            if tag == page::v6::TAG_VARIABLE {
+                let fragment = read_fragment_page(bytes, page_start, page_size, true)?;
+                v6_pages.push(V6Page {
+                    physical_page: *physical_page,
+                    tag,
+                    logical,
+                    stamp,
+                    content: None,
+                    index: None,
+                    acs: None,
+                    fragment: Some(fragment),
                 });
                 continue;
             }
@@ -2384,23 +2443,10 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     "identified as {:?}: physical page {physical_page} \
                      (logical {logical}, tag {tag:#06x}) is claimed by the \
                      allocation table but attributed to no key's B-tree and \
-                     is not TAG_ACS; {}",
-                    id.generation,
-                    if tag == page::v6::TAG_DATA {
-                        format!(
-                            "it IS TAG_DATA, but this file's variable_mark \
-                             is {:#010x} and PHYSICAL is {} -- a \
-                             variable-length file's data pages are Task \
-                             20's own scope, so this crate refuses rather \
-                             than guess",
-                            live.variable_mark, live.physical
-                        )
-                    } else {
-                        "and its tag is TAG_TEMPLATE, TAG_VARIABLE, or \
-                         unrecognized -- none of which this crate decodes \
-                         yet"
-                            .to_string()
-                    }
+                     is not TAG_ACS, TAG_DATA, or TAG_VARIABLE -- its tag is \
+                     TAG_TEMPLATE or unrecognized, neither of which this \
+                     crate decodes",
+                    id.generation
                 ),
             });
         }
@@ -2788,6 +2834,196 @@ mod tests {
         assert_eq!(emitted.bytes(), original.as_slice());
     }
 
+    /// A synthetic, zero-key v6 file carrying one `TAG_VARIABLE` fragment
+    /// page (Task 20). **Wholly synthetic, hand-built -- no corpus file
+    /// contains anything like it.** Harvest 3 SS4.3 measured zero of this
+    /// project's 507 v6 corpus files with a genuine `'V'`-tagged page at
+    /// all; this fixture exists so `read_fragment_page`'s `is_v6` branch and
+    /// `write_v6_fragment_pages` have *some* test coverage, grounded in the
+    /// decompile and in the oracle-measured shape harvest 5 SS3.3/SS3.4
+    /// describes (mirrored here the same way `v6_no_key_data_page_file`
+    /// mirrors a real data page's shape), not in anything this crate's own
+    /// round trip has ever witnessed.
+    ///
+    /// Five physical pages, 512 bytes each: 0/1 the control record's own
+    /// shadow pair (page 1 live), `variable_mark` `0xffffffff` on both --
+    /// 2/3 allocation-table block 1's own shadow pair, one entry (logical
+    /// 1) claiming physical page 4 as `TAG_VARIABLE` (`0x5600`); 4 the one
+    /// fragment page, two fragments:
+    ///
+    /// - fragment 0, offset `0x0c`: leads with the `END_PAGE`/`END_FRAGMENT`
+    ///   sentinel (`ff ff ff ff` -- harvest 5 SS3.2), then body `"TEST"`.
+    /// - fragment 1, offset `0x14`: leads with `Pointer { page: 3, fragment:
+    ///   7 }.encode()` (`00 03 00 07`, harvest 5 SS3.2's scrambled order),
+    ///   then body `"HELLO!"`.
+    ///
+    /// Neither entry's own continuation bit (`0x8000`) is set -- matching
+    /// measured reality (`variable.rs:340-353`), even though v6 reads both
+    /// fragments as carrying a leading pointer regardless of that bit.
+    ///
+    /// Offsets here are literal, not `variable::at::*`/`page::v6::LEN` --
+    /// the same independence `v6_no_key_data_page_file`'s own doc comment
+    /// explains: a mutation to those constants must move the code under
+    /// test, never this fixture's own "known good" bytes in lockstep with
+    /// it.
+    fn v6_no_key_variable_fragment_page_file() -> Vec<u8> {
+        const PAGE_SIZE: usize = 512;
+        let mut b = vec![0u8; 5 * PAGE_SIZE];
+
+        for (page, generation) in [(0usize, 1u16), (1usize, 2u16)] {
+            let base = page * PAGE_SIZE;
+            b[base..base + 4].copy_from_slice(&[b'F', b'C', 0, 0]);
+            b[base + 0x4a..base + 0x4c].copy_from_slice(&0x600u16.to_le_bytes());
+            b[base + 0x04..base + 0x06].copy_from_slice(&generation.to_le_bytes());
+            b[base + 0x08..base + 0x0a].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+            b[base + 0x10..base + 0x14].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // FREE
+            b[base + 0x14..base + 0x16].copy_from_slice(&0u16.to_le_bytes()); // KEYS = 0
+            b[base + 0x16..base + 0x18].copy_from_slice(&10u16.to_le_bytes()); // RECLEN
+            b[base + 0x18..base + 0x1a].copy_from_slice(&14u16.to_le_bytes()); // PHYSICAL
+            b[base + 0x26..base + 0x28].copy_from_slice(&0u16.to_le_bytes()); // PAGES high
+            b[base + 0x28..base + 0x2a].copy_from_slice(&1u16.to_le_bytes()); // PAGES low = 1
+            // VARIABLE_MARK (0x38): 0xffffffff, a variable-length file
+            b[base + 0x38..base + 0x3c].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+            // VARIABLE_HEAD (0xa0): NO_VARIABLE_HEAD -- this fixture does
+            // not model the write-side free-space chain, only one page's
+            // own content.
+            b[base + 0xa0..base + 0xa4].copy_from_slice(&0xff00_ffffu32.to_le_bytes());
+        }
+
+        for (page, generation) in [(2usize, 10u16), (3usize, 20u16)] {
+            let base = page * PAGE_SIZE;
+            b[base..base + 2].copy_from_slice(b"PP");
+            b[base + 0x02..base + 0x04].copy_from_slice(&1u16.to_le_bytes());
+            b[base + 0x04..base + 0x06].copy_from_slice(&generation.to_le_bytes());
+            let entry0 = base + 0x08;
+            b[entry0..entry0 + 2].copy_from_slice(&0x5600u16.to_le_bytes()); // TAG_VARIABLE
+            b[entry0 + 2..entry0 + 4].copy_from_slice(&4u16.to_le_bytes()); // -> physical page 4
+        }
+
+        // Physical page 4: the one fragment page. Header: TAG_VARIABLE,
+        // logical id 1, stamp 5 -- literal offsets 0/2/4, the same
+        // independence reason as `v6_no_key_data_page_file`.
+        let base = 4 * PAGE_SIZE;
+        b[base..base + 2].copy_from_slice(&0x5600u16.to_le_bytes()); // tag
+        b[base + 2..base + 4].copy_from_slice(&1u16.to_le_bytes()); // logical
+        b[base + 4..base + 6].copy_from_slice(&5u16.to_le_bytes()); // stamp
+        b[base + 6..base + 10].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // FREE_CHAIN = Off
+        b[base + 0x0a..base + 0x0c].copy_from_slice(&2u16.to_le_bytes()); // FRAGMENT_COUNT = 2
+
+        // Fragment 0: 0x0c..0x14 -- leading pointer is the END sentinel,
+        // then a 4-byte body.
+        b[base + 0x0c..base + 0x10].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        b[base + 0x10..base + 0x14].copy_from_slice(b"TEST");
+
+        // Fragment 1: 0x14..0x1e -- leading pointer is Pointer{page: 3,
+        // fragment: 7}.encode() (harvest 5 SS3.2's scrambled order), then a
+        // 6-byte body.
+        b[base + 0x14..base + 0x18].copy_from_slice(&[0x00, 0x03, 0x00, 0x07]);
+        b[base + 0x18..base + 0x1e].copy_from_slice(b"HELLO!");
+
+        // Entry array, growing down from the page's end: entry[0] (0x1fe)
+        // names fragment 0's own start (0x0c); entry[1] (0x1fc) names
+        // fragment 1's start, which also ends fragment 0; entry[2] (0x1fa,
+        // the boundary member) names where free space starts (0x1e), which
+        // also ends fragment 1. None sets the continuation bit (0x8000) --
+        // measured reality, `variable.rs:340-353`.
+        b[base + 0x1fe..base + 0x200].copy_from_slice(&0x000cu16.to_le_bytes());
+        b[base + 0x1fc..base + 0x1fe].copy_from_slice(&0x0014u16.to_le_bytes());
+        b[base + 0x1fa..base + 0x1fc].copy_from_slice(&0x001eu16.to_le_bytes());
+        // Bytes 0x1e..0x1fa stay zero: trailing free space, never assumed
+        // by anything this test checks -- `FragmentPage::trailing` stores
+        // it verbatim regardless of its value.
+
+        b
+    }
+
+    /// Task 20, end to end: a v6 file with no keys and a single
+    /// `TAG_VARIABLE` page round-trips completely, and the decoded model
+    /// agrees byte-for-byte with the fixture's own literal offsets -- not
+    /// with `variable::at::*`, which this test's own mutation-style
+    /// assertions below deliberately avoid depending on. See
+    /// `v6_no_key_variable_fragment_page_file`'s own doc comment for why
+    /// this is wholly synthetic and what grounds it instead of a corpus
+    /// witness.
+    #[test]
+    fn a_v6_variable_length_file_with_one_fragment_page_round_trips_completely() {
+        use crate::format::variable::Pointer;
+        use crate::model::FragmentSlot;
+
+        let original = v6_no_key_variable_fragment_page_file();
+        let model = file(&original).expect("a synthetic v6 fragment page describes completely");
+
+        assert_eq!(model.v6_pages.len(), 1, "one claimed logical page, physical 4");
+        let page = &model.v6_pages[0];
+        assert_eq!(page.physical_page, 4);
+        assert_eq!(page.tag, crate::format::page::v6::TAG_VARIABLE);
+        assert!(page.content.is_none(), "a TAG_VARIABLE page is not TAG_DATA content");
+        assert!(page.index.is_none());
+        assert!(page.acs.is_none());
+
+        let fp = page.fragment.as_ref().expect("TAG_VARIABLE -> V6Page::fragment");
+        assert_eq!(fp.free_chain, 0xffff_ffff, "FREE_CHAIN's Off state");
+        assert_eq!(fp.fragments.len(), 2);
+        assert_eq!(fp.free_space_entry, 0x001e);
+
+        match &fp.fragments[0] {
+            FragmentSlot::Live { next, body } => {
+                assert_eq!(
+                    *next,
+                    Some(Pointer::decode([0xff, 0xff, 0xff, 0xff])),
+                    "v6 always decodes the leading pointer, whatever the entry's own bit says"
+                );
+                assert_eq!(body, b"TEST");
+            }
+            other => panic!("fragment 0 must be live: {other:?}"),
+        }
+        match &fp.fragments[1] {
+            FragmentSlot::Live { next, body } => {
+                assert_eq!(*next, Some(Pointer { page: 3, fragment: 7 }));
+                assert_eq!(body, b"HELLO!");
+            }
+            other => panic!("fragment 1 must be live: {other:?}"),
+        }
+
+        let emitted = crate::emit::file(&model)
+            .expect("a zero-key v6 file with one described fragment page leaves nothing unwritten");
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// This task's own mutation target (mirroring the v5 fragment page's
+    /// own `format::variable` test): v6 never sets the entry's own
+    /// continuation bit on emit, even though `next` is always `Some` --
+    /// setting it from `next.is_some()` the way v5's write path does would
+    /// disagree with every real v6 fragment this project has ever measured
+    /// (`variable.rs:340-353`, 165/165 clear). This asserts the emitted
+    /// bytes directly, at the fixture's own literal entry offsets, rather
+    /// than only via the whole-file round trip above -- so a reviewer
+    /// mutating `write_one_fragment_page`'s `!is_v6` guard away sees this
+    /// fail specifically, not just "the round trip broke somewhere."
+    #[test]
+    fn v6_fragment_entries_never_carry_the_continuation_bit_on_emit() {
+        let original = v6_no_key_variable_fragment_page_file();
+        let model = file(&original).expect("describes completely");
+        let emitted = crate::emit::file(&model).expect("nothing left unwritten");
+        let bytes = emitted.bytes();
+
+        const PAGE4_START: usize = 4 * 512;
+        for (entry_at, expected) in [
+            (PAGE4_START + 0x1fe, 0x000cu16),
+            (PAGE4_START + 0x1fc, 0x0014u16),
+            (PAGE4_START + 0x1fa, 0x001eu16),
+        ] {
+            let got = u16::from_le_bytes([bytes[entry_at], bytes[entry_at + 1]]);
+            assert_eq!(
+                got & 0x8000,
+                0,
+                "entry at {entry_at:#x} must not carry the continuation bit \
+                 on a v6 fragment page: got {got:#06x}"
+            );
+            assert_eq!(got, expected, "and the offset itself must be unchanged: {got:#06x}");
+        }
+    }
+
     /// Physical page 0 of this file describes an empty three-page database.
     /// The file is 55,734,272 bytes. Nothing about page 0 is malformed --
     /// it is simply not the current copy, which is why reading it has never
@@ -2904,21 +3140,25 @@ mod tests {
     /// table (`LOWER`) beyond the previously-known `UPPER`/`GALCAPS`/
     /// `ALLCAPS` pair, and the corpus's only `Float` (`0x02`) type code.
     ///
-    /// **This file does not round-trip even after this task**: `MULTIACS.
-    /// DAT`'s own `variable_mark` is `0xffffffff` (a genuinely
+    /// **This file round-trips completely as of Task 20.** Before it,
+    /// `MULTIACS.DAT`'s own `variable_mark` (`0xffffffff`, a genuinely
     /// variable-length file, not measured by harvest 4 -- that harvest's
     /// own scope is keys/index pages/ACS, not the variable-length fragment
-    /// format harvest 5 owns), so its one remaining `TAG_DATA` page
-    /// (physical 9, logical 6) needs Task 20's own work before `file` can
-    /// describe it. What this task's own walk *does* resolve on this exact
-    /// file, proven directly here rather than only through `file`'s single
-    /// pass/fail verdict: the three key roots (physical 6/7/8, tags
-    /// `0x8000`/`0x8100`/`0x8200`, harvest 4 SS2's own worked example) and
-    /// both ACS blocks (physical 4 `ALLCAPS`, physical 5 `LOWER`, harvest 4
-    /// SS6c) -- and `file`'s own refusal names the *one* page actually left,
-    /// not the old blanket `keys > 0` gate.
+    /// format harvest 5 owns) blocked its one remaining `TAG_DATA` page
+    /// (physical 9, logical 6) from being read at all. That page turns out
+    /// to need nothing Task 20 actually built to describe it: `RECORDS` is
+    /// 0 (harvest 5 SS4.3's own census), so physical page 9 is wholly free
+    /// slots, pre-threaded onto `FREE_V6` (harvest 5 SS2.2) -- the same
+    /// shape a fixed-length-record file's data page already had, not a
+    /// genuine fragment/variable-tail structure this file has no evidence
+    /// for at all (see `model::FragmentPage`'s own doc comment). What this
+    /// task's own walk *does* resolve on this exact file, proven directly
+    /// here rather than only through `file`'s single pass/fail verdict: the
+    /// three key roots (physical 6/7/8, tags `0x8000`/`0x8100`/`0x8200`,
+    /// harvest 4 SS2's own worked example) and both ACS blocks (physical 4
+    /// `ALLCAPS`, physical 5 `LOWER`, harvest 4 SS6c).
     #[test]
-    fn multiacs_dat_index_trees_and_both_acs_blocks_resolve_the_rest_needs_task_20() {
+    fn multiacs_dat_round_trips_completely() {
         let path = "archive/tooling/wbtrv32/assets/MULTIACS.DAT";
         let Ok(original) = std::fs::read(corpus_path(path)) else {
             eprintln!("no archive/ on this box, nothing verified");
@@ -2981,18 +3221,53 @@ mod tests {
 
         // `file` itself: past this task's own walk and ACS cross-check
         // (both of which just succeeded above, on these same bytes), the
-        // one thing left is physical page 9 (logical 6), a genuine
-        // TAG_DATA page on a variable-length file -- Task 20's scope, named
-        // by this refusal rather than guessed at.
-        let e = file(&original).expect_err("the one remaining data page needs Task 20");
-        assert!(e.why.contains("physical page 9"), "{}", e.why);
-        assert!(e.why.contains("Task 20"), "{}", e.why);
+        // one thing left before Task 20 was physical page 9 (logical 6), a
+        // genuine TAG_DATA page on a variable-length file. `records == 0`
+        // means it holds nothing but pre-threaded free slots (harvest 5
+        // SS2.2) -- verified here directly against `FREE_V6` itself, not
+        // just a slot count, so this test would fail if the model's
+        // decoded links disagreed with the file's own free-list head.
+        assert_eq!(live.records, 0, "physical page 9 (logical 6) holds no live records");
+        let model = file(&original).expect("MULTIACS.DAT round-trips as of Task 20");
+
+        let page9 = model
+            .v6_pages
+            .iter()
+            .find(|p| p.physical_page == 9)
+            .expect("physical page 9 (logical 6) is claimed by the allocation table");
+        assert_eq!(page9.tag, page::v6::TAG_DATA);
+        assert_eq!(page9.logical, 6);
+        let content = page9.content.as_ref().expect("TAG_DATA, not attributed to any key's tree");
+        assert_eq!(content.slots.len(), 28, "(4096 - 6) / 142 == 28");
         assert!(
-            !e.why.contains("a TAG_DATA page could equally be a genuine data \
-                            page or an index-tree descendant"),
-            "the old keys>0 gate must be gone: {}",
-            e.why
+            content.slots.iter().all(|s| matches!(s, crate::model::V6RecordSlot::Free { .. })),
+            "records == 0: every one of this page's slots is free"
         );
+
+        // Walk `FREE_V6` itself and confirm it visits every one of this
+        // page's 28 slots exactly once before ending at NOWHERE -- this
+        // exercises the model's own decoded `next` links against the real
+        // file's free-list head, not merely their count. A v6 record
+        // position is `logical * page_size + 6 + slot * physical`
+        // (harvest 5 SS4.3's own worked measurement: `0x9c` reads
+        // `0x6006` == `6 * 4096 + 6 + 0 * 142`, logical page 6 slot 0).
+        let position_of = |slot: u32| 6u32 * page_size as u32 + 6 + slot * live.physical as u32;
+        let mut visited = HashSet::new();
+        let mut at = live.free_v6;
+        while at != 0xffff_ffff {
+            let slot = (0..28u32)
+                .find(|&s| position_of(s) == at)
+                .unwrap_or_else(|| panic!("free-list position {at:#x} names no slot on this page"));
+            assert!(visited.insert(slot), "the free list must not revisit a slot ({at:#x})");
+            let crate::model::V6RecordSlot::Free { next, .. } = &content.slots[slot as usize] else {
+                panic!("free-list position {at:#x} names a live slot")
+            };
+            at = *next;
+        }
+        assert_eq!(visited.len(), 28, "the free list threads every one of this page's 28 slots");
+
+        let emitted = crate::emit::file(&model).expect("every byte of MULTIACS.DAT is now described");
+        assert_eq!(emitted.bytes(), original.as_slice(), "MULTIACS.DAT round-trips byte for byte");
     }
 
     /// Task 19's own spot check, on a corpus file that is NOT
@@ -3053,7 +3328,7 @@ mod tests {
         assert_eq!(live.pages, 13_572, "PAGES is logical, not the 13,607 physical pages above");
 
         let mut canvas = crate::canvas::Canvas::new(fcr::v6::FIXED_LEN);
-        crate::emit::write_v6_fixed_portion(&mut canvas, id.generation, id.page_size, live, 0)
+        crate::emit::write_v6_fixed_portion(&mut canvas, id.page_size, live, 0)
             .expect("the fixed portion is fully described");
         let emitted = canvas.finish().expect("every byte written exactly once");
 
@@ -3273,7 +3548,7 @@ mod tests {
         let tail = v6_page_tail(page0, page_size, &descriptors).expect("a well-formed trailer");
 
         let mut canvas = crate::canvas::Canvas::new(page_size);
-        crate::emit::write_v6_fixed_portion(&mut canvas, id.generation, id.page_size, &control, 0)
+        crate::emit::write_v6_fixed_portion(&mut canvas, id.page_size, &control, 0)
             .expect("the fixed portion is fully described");
         crate::emit::write_v6_page_tail(&mut canvas, page_size, &descriptors, &tail, 0)
             .expect("the key/segment definitions and trailer are fully described");

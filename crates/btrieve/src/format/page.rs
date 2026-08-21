@@ -145,7 +145,13 @@ pub mod v6 {
     /// see that function's own doc comment.
     pub const TAG_TEMPLATE: u16 = 0x8000;
     /// `0x5600` (`'V'` in the high byte): a variable-length file's
-    /// fragment/overflow page -- not decoded by this crate (Task 20).
+    /// fragment/overflow page -- decoded by this crate (Task 20,
+    /// `read::read_v6_fragment_page`/`emit::write_v6_fragment_pages`) the
+    /// same way as v5's untagged fragment pages, since v6 tags this shape
+    /// explicitly rather than requiring the structural heuristic v5 needs
+    /// (`format::variable`'s own module doc). **Never seen on a real v6
+    /// file in this project's corpus** -- see `crate::model::FragmentPage`'s
+    /// own doc comment for what that means for this code's confidence.
     pub const TAG_VARIABLE: u16 = 0x5600;
     /// `0x4100` (`'A'` in the high byte): the alternate collating sequence
     /// block, found by scanning claimed pages for this tag rather than at a

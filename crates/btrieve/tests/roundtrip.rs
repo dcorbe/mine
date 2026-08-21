@@ -178,6 +178,81 @@ fn the_harness_reports_whether_it_verified_anything() {
     }
 }
 
+/// Task 20's own honest tripwire.
+///
+/// The v6 free list is established by the round trip (harvest 5 SS2.2's
+/// per-slot shape is exercised by every one of the 337+ v6 corpus files that
+/// pass). The v6 **variable-length/fragment path is not** -- harvest 5
+/// SS4.3 measured zero of this corpus's 507 v6-family files combining
+/// populated records with variable-length data, and a hole-walk over every
+/// one found no genuine `TAG_VARIABLE` page either. So `read::
+/// read_fragment_page`'s `is_v6` branch and `V6Page::fragment` are written
+/// from `W32MKDE_decompiled.c` and from the oracle fixtures this project's
+/// own `variable.rs` module cites (`variable.rs:340-353,493-501`), not from
+/// anything this test could drive across the corpus and watch pass.
+///
+/// This asserts the two claims that grounded that choice stay true, driven
+/// through the *shipped* `read::file` -- not a reimplementation of its own
+/// rule (Trap 3 from earlier tasks in this plan): no v6 file combines
+/// `variable_mark != 0` with `records > 0`, and no `V6Page` this crate has
+/// ever decoded carries `fragment: Some(_)`. If this test ever fails, that
+/// means a real v6 file finally showing the variable-length/fragment path
+/// has turned up -- go re-open harvest 5 SS3/SS4 and re-check this crate's
+/// only-fixture-tested assumptions against it (the entry continuation bit
+/// always clear, on emit and on read; the page-level free list still
+/// unestablished) before trusting the round trip's pass/fail verdict for
+/// that file, or for this path in general.
+#[test]
+fn no_corpus_file_witnesses_the_v6_variable_path() {
+    let files = corpus::walk();
+    if files.is_empty() {
+        eprintln!(
+            "roundtrip: no archive/ on this box, nothing verified -- this is \
+             expected in a fresh checkout and proves nothing either way"
+        );
+        return;
+    }
+
+    let mut populated_variable_v6: Vec<String> = Vec::new();
+    let mut fragment_pages_found: Vec<String> = Vec::new();
+    for entry in &files {
+        let Ok(original) = std::fs::read(&entry.path) else { continue };
+        let Ok(model) = read::file(&original) else { continue };
+        let btrieve::model::Control::Shadowed { live, .. } = &model.control else { continue };
+        if live.variable_mark != 0 && live.records > 0 {
+            populated_variable_v6.push(entry.path.display().to_string());
+        }
+        for page in &model.v6_pages {
+            if page.fragment.is_some() {
+                fragment_pages_found.push(format!(
+                    "{} physical page {}",
+                    entry.path.display(),
+                    page.physical_page
+                ));
+            }
+        }
+    }
+
+    assert!(
+        populated_variable_v6.is_empty(),
+        "a v6 file combining variable-length records with actual data now \
+         exists in the corpus -- Task 20's own report said this evidence did \
+         not exist. Go re-derive the fragment/free-list rules against it \
+         (harvest 5 SS2.2/SS3) before trusting anything this crate currently \
+         assumes about the v6 variable-length path. Files: {populated_variable_v6:?}"
+    );
+    assert!(
+        fragment_pages_found.is_empty(),
+        "a genuine TAG_VARIABLE ('V') page now exists in a corpus file -- \
+         this crate's v6 fragment-page code (`read::read_fragment_page`'s \
+         `is_v6` branch, `write_v6_fragment_pages`) has never been run \
+         against real data before now. Re-check the always-clear \
+         continuation bit and the pointer scramble against it (harvest 5 \
+         SS3.2/SS3.4) before trusting the round trip's verdict on this file. \
+         Pages: {fragment_pages_found:?}"
+    );
+}
+
 /// A diagnostic nobody has seen produce output is a diagnostic that does not
 /// work -- the round trip cannot currently reach the mismatched class (every
 /// corpus file is refused before it gets that far), so this test builds one

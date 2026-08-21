@@ -31,6 +31,21 @@
 //! `usrflgs` bit 0 (`fcr::usrflgs::VARIABLE`) is set -- on a non-variable
 //! file every unclaimed data-bit-clear page stays `IndexChild`, unchanged
 //! from before this task.
+//!
+//! # v6 needs none of the heuristic above (Task 20)
+//!
+//! v6 tags this exact shape explicitly (`format::page::v6::TAG_VARIABLE`,
+//! `0x5600`) at the same `format::page`-header offset every other v6 page
+//! uses, so `read::file`'s v6 branch places one by its tag alone --
+//! `looks_like_fragment_page` is v5-only and never called for v6. Past the
+//! header, harvest 3 SS4 measured this module's own fields (`at`,
+//! `MAX_FRAGMENTS`, `UNUSED_ENTRY`, `OFFSET_MASK`, `POINTER_LEN`,
+//! `Pointer`, `entry_at`, `fields`) identical in both families, so
+//! `read::read_fragment_page`/`emit`'s writer reuse them unchanged; only
+//! [`CONTINUED_BIT`] is v5-only, per its own doc comment. **No v6 file in
+//! this project's corpus carries a `TAG_VARIABLE` page at all** -- see
+//! `crate::model::FragmentPage`'s own doc comment for what grounds the v6
+//! side of this module instead.
 
 use super::Field;
 
@@ -61,15 +76,21 @@ pub const MAX_FRAGMENTS: u16 = 256;
 pub const UNUSED_ENTRY: u16 = 0xffff;
 
 /// Bit 15 of a live entry: whether the fragment leads with a 4-byte
-/// continuation pointer. **v5 only** -- harvest 5 SS3.4's version gate
-/// (`W32MKDE_decompiled.c:19045`): below version `0x600` this bit decides.
-/// `read::read_fragment_page` (which uses this constant) is only ever
-/// called from `read::resolve_pages`, the v5-only page graph -- `read::
-/// file`'s v6 branch never reaches it, since a variable-length v6 file's
-/// `TAG_VARIABLE` pages are refused outright (Task 20's own scope, not a
-/// gap in describing the v6 control record, which Task 15 already fully
-/// covers), so the v6 branch (every fragment carries the pointer
-/// unconditionally) is not implemented here.
+/// continuation pointer -- **consulted for v5 only**. Harvest 5 SS3.4's
+/// version gate (`W32MKDE_decompiled.c:19045`): below version `0x600` this
+/// bit decides; at or above it, every fragment carries the pointer whatever
+/// the bit says (`read::read_fragment_page`'s `is_v6` parameter is exactly
+/// this gate, mirroring the existing engine's own `variable::fragment`,
+/// which takes a `Version` for the identical reason -- `variable.rs:415-417`).
+/// `read::read_fragment_page` never even reads this bit on its v6 path.
+///
+/// On emit, this crate never *sets* it for a v6 entry either, matching
+/// measured reality rather than deriving it from `next.is_some()` the way
+/// the v5 write path does: every real v6 fragment this project has ever
+/// produced leaves it clear (`variable.rs:340-353`, 165/165 entries across
+/// four oracle-written fixtures) even though the pointer is unconditionally
+/// present. **No v6 file in this project's corpus has ever exercised this
+/// bit at all** -- see `crate::model::FragmentPage`'s own doc comment.
 pub const CONTINUED_BIT: u16 = 0x8000;
 
 /// The low 15 bits of an entry: the fragment's start offset within the page.

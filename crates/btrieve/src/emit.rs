@@ -48,8 +48,8 @@ use crate::format::index;
 use crate::format::page;
 use crate::format::variable;
 use crate::model::{
-    Control, ControlRecord, File, FragmentSlot, KeyDescriptor, RecordSlot, V6AllocationBlockCopy,
-    V6ControlRecord, V6Page, V6PageTail,
+    Control, ControlRecord, File, FragmentPage, FragmentSlot, KeyDescriptor, RecordSlot,
+    V6AllocationBlockCopy, V6ControlRecord, V6Page, V6PageTail,
 };
 
 fn owner(field: &'static str) -> Owner {
@@ -226,10 +226,13 @@ fn write_acs_blocks(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
     Ok(())
 }
 
-/// Write every fragment page's content -- the free-chain link, fragment
+/// Write one fragment page's content -- the free-chain link, fragment
 /// count, every fragment slot, the entry array's boundary member, and
-/// trailing free space -- for every page whose model carries one
-/// (`Page::fragments`, `Some` only for a `PageKind::Variable` page).
+/// trailing free space -- shared between v5's [`write_fragment_pages`] and
+/// v6's [`write_v6_fragment_pages`] (Task 20): the shape is identical in
+/// both families (harvest 3 SS4), and only how a live fragment's
+/// continuation bit is written differs, gated by `is_v6` the same way
+/// `read::read_fragment_page` gates how it is read.
 ///
 /// Every field is written from the model's own stored value: a fragment's
 /// placement is never re-read from a stored offset (there isn't one -- see
@@ -237,8 +240,103 @@ fn write_acs_blocks(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 /// same way `read::read_fragment_page` derived it in the first place, which
 /// is reproducing an already-fully-known tiling, not guessing a new one.
 /// `next: Some(pointer)`'s four bytes are written through
-/// `variable::Pointer::encode` -- harvest 5 SS3.2's scrambled byte order --
-/// which is exactly what this task's mutation test targets.
+/// `variable::Pointer::encode` -- harvest 5 SS3.2's scrambled byte order.
+///
+/// # The continuation bit, v5 versus v6
+///
+/// v5 sets `variable::CONTINUED_BIT` exactly when `next.is_some()` -- the
+/// bit is real, load-bearing on-disk data there. v6's `next` is always
+/// `Some` (`read_fragment_page`'s own doc comment), but this crate never
+/// sets the bit for it regardless: every real v6 fragment this project has
+/// ever produced leaves it clear (`variable.rs:340-353`, 165/165 entries
+/// across four oracle-written fixtures), so writing it from `next.is_some()`
+/// here would set a bit measured reality never sets. **No v6 file in this
+/// project's corpus has ever exercised this choice** -- see
+/// `model::FragmentPage`'s own doc comment.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_one_fragment_page(
+    canvas: &mut Canvas,
+    page_number: usize,
+    page_size: usize,
+    fp: &FragmentPage,
+    is_v6: bool,
+) -> Result<(), Fault> {
+    let at = page_number * page_size;
+
+    canvas.put_long(
+        at + variable::at::FREE_CHAIN,
+        fp.free_chain,
+        page_owner("variable_free_chain", page_number),
+    )?;
+    // `fragments.len()` came from a fragment_count this crate already
+    // validated fits `1..=256` when the page was read, so this cast
+    // cannot silently truncate.
+    let fragment_count = fp.fragments.len() as u16;
+    canvas.put_u16(
+        at + variable::at::FRAGMENT_COUNT,
+        fragment_count,
+        page_owner("variable_fragment_count", page_number),
+    )?;
+
+    let mut cursor = at + variable::at::FRAGMENTS;
+    for (n, slot) in fp.fragments.iter().enumerate() {
+        // `read_fragment_page` already computed this same offset
+        // successfully for this exact (page_size, n) pair when this
+        // model was built -- a page too small to hold it would have
+        // been refused before a `FragmentPage` ever existed to emit.
+        let entry_rel = variable::entry_at(page_size, n)
+            .expect("read already validated every entry position fits");
+        match slot {
+            FragmentSlot::Freed => {
+                canvas.put_u16(
+                    at + entry_rel,
+                    variable::UNUSED_ENTRY,
+                    page_owner("variable_entry", page_number),
+                )?;
+            }
+            FragmentSlot::Live { next, body } => {
+                let start = cursor - at;
+                let mut raw = start as u16;
+                if next.is_some() && !is_v6 {
+                    raw |= variable::CONTINUED_BIT;
+                }
+                canvas.put_u16(
+                    at + entry_rel,
+                    raw,
+                    page_owner("variable_entry", page_number),
+                )?;
+                if let Some(pointer) = next {
+                    canvas.put(
+                        cursor,
+                        &pointer.encode(),
+                        page_owner("variable_continuation", page_number),
+                    )?;
+                    cursor += variable::POINTER_LEN;
+                }
+                canvas.put(cursor, body, page_owner("variable_fragment", page_number))?;
+                cursor += body.len();
+            }
+        }
+    }
+
+    let boundary_rel = variable::entry_at(page_size, fp.fragments.len())
+        .expect("read already validated the boundary entry position fits");
+    canvas.put_u16(
+        at + boundary_rel,
+        fp.free_space_entry,
+        page_owner("variable_free_space_entry", page_number),
+    )?;
+
+    canvas.put(cursor, &fp.trailing, page_owner("variable_trailing", page_number))?;
+    Ok(())
+}
+
+/// Write every v5 fragment page's content, for every page whose model
+/// carries one (`Page::fragments`, `Some` only for a `PageKind::Variable`
+/// page). See [`write_one_fragment_page`] for the shared mechanics.
 ///
 /// # Errors
 ///
@@ -247,74 +345,28 @@ fn write_fragment_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> 
     let page_size = model.id.page_size as usize;
     for (i, p) in model.pages.iter().enumerate() {
         let Some(fp) = &p.fragments else { continue };
-        let page_number = i + 1;
-        let at = page_number * page_size;
+        write_one_fragment_page(canvas, i + 1, page_size, fp, false)?;
+    }
+    Ok(())
+}
 
-        canvas.put_long(
-            at + variable::at::FREE_CHAIN,
-            fp.free_chain,
-            page_owner("variable_free_chain", page_number),
-        )?;
-        // `fragments.len()` came from a fragment_count this crate already
-        // validated fits `1..=256` when the page was read, so this cast
-        // cannot silently truncate.
-        let fragment_count = fp.fragments.len() as u16;
-        canvas.put_u16(
-            at + variable::at::FRAGMENT_COUNT,
-            fragment_count,
-            page_owner("variable_fragment_count", page_number),
-        )?;
-
-        let mut cursor = at + variable::at::FRAGMENTS;
-        for (n, slot) in fp.fragments.iter().enumerate() {
-            // `read_fragment_page` already computed this same offset
-            // successfully for this exact (page_size, n) pair when this
-            // model was built -- a page too small to hold it would have
-            // been refused before a `FragmentPage` ever existed to emit.
-            let entry_rel = variable::entry_at(page_size, n)
-                .expect("read already validated every entry position fits");
-            match slot {
-                FragmentSlot::Freed => {
-                    canvas.put_u16(
-                        at + entry_rel,
-                        variable::UNUSED_ENTRY,
-                        page_owner("variable_entry", page_number),
-                    )?;
-                }
-                FragmentSlot::Live { next, body } => {
-                    let start = cursor - at;
-                    let mut raw = start as u16;
-                    if next.is_some() {
-                        raw |= variable::CONTINUED_BIT;
-                    }
-                    canvas.put_u16(
-                        at + entry_rel,
-                        raw,
-                        page_owner("variable_entry", page_number),
-                    )?;
-                    if let Some(pointer) = next {
-                        canvas.put(
-                            cursor,
-                            &pointer.encode(),
-                            page_owner("variable_continuation", page_number),
-                        )?;
-                        cursor += variable::POINTER_LEN;
-                    }
-                    canvas.put(cursor, body, page_owner("variable_fragment", page_number))?;
-                    cursor += body.len();
-                }
-            }
-        }
-
-        let boundary_rel = variable::entry_at(page_size, fp.fragments.len())
-            .expect("read already validated the boundary entry position fits");
-        canvas.put_u16(
-            at + boundary_rel,
-            fp.free_space_entry,
-            page_owner("variable_free_space_entry", page_number),
-        )?;
-
-        canvas.put(cursor, &fp.trailing, page_owner("variable_trailing", page_number))?;
+/// Write every v6 fragment/overflow page's content (Task 20), for every
+/// page whose model carries one (`V6Page::fragment`, `Some` only for a page
+/// tagged `TAG_VARIABLE`). See [`write_one_fragment_page`] for the shared
+/// mechanics and what distinguishes the v6 write from v5's.
+///
+/// **No v6 file in this project's corpus has a `TAG_VARIABLE` page** -- see
+/// `model::FragmentPage`'s own doc comment for what grounds this function
+/// instead.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_v6_fragment_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for p in &model.v6_pages {
+        let Some(fp) = &p.fragment else { continue };
+        write_one_fragment_page(canvas, p.physical_page as usize, page_size, fp, true)?;
     }
     Ok(())
 }
@@ -532,13 +584,15 @@ fn v6_page_owner(field: &'static str, physical_page: u32) -> Owner {
 ///
 /// `content` is `None` for a page this function does not write content
 /// for -- an index page (`V6Page::index`, written by
-/// `write_v6_index_pages` instead) or an ACS block (`V6Page::acs`, written
-/// by `write_v6_acs_blocks`), both called separately by [`file`] right
-/// after this one. Only a page where **all three** of `content`/`index`/
-/// `acs` are `None` -- which `read::file` never actually produces, since it
-/// refuses rather than build a `V6Page` it cannot fully classify (`V6Page`'s
-/// own doc comment) -- would leave its body unwritten here, `Canvas::finish`
-/// reporting it the same way an undescribed v5 page's content once did.
+/// `write_v6_index_pages` instead), an ACS block (`V6Page::acs`, written by
+/// `write_v6_acs_blocks`), or a fragment/overflow page (`V6Page::fragment`,
+/// Task 20, written by `write_v6_fragment_pages`), all three called
+/// separately by [`file`] right after this one. Only a page where **all
+/// four** of `content`/`index`/`acs`/`fragment` are `None` -- which
+/// `read::file` never actually produces, since it refuses rather than build
+/// a `V6Page` it cannot fully classify (`V6Page`'s own doc comment) --
+/// would leave its body unwritten here, `Canvas::finish` reporting it the
+/// same way an undescribed v5 page's content once did.
 ///
 /// # Errors
 ///
@@ -805,28 +859,26 @@ fn write_fixed_portion(
 /// `model::V6ControlRecord`'s own doc comment), not the same function with
 /// different constants.
 ///
-/// `generation` and `page_size` are not read off `control` -- like v5's
-/// `lead`/`version`/`page_size`, they are `Identified`'s job, carried by the
-/// caller rather than duplicated into `V6ControlRecord`.
+/// `page_size` is not read off `control` -- like v5's `lead`/`page_size`, it
+/// is `Identified`'s job, carried by the caller rather than duplicated into
+/// `V6ControlRecord`. **`version` no longer is** (Task 20): it used to be
+/// derived from the caller's own `Identified.generation` the same way, on
+/// the assumption that both shadow copies always report the same version --
+/// `MULTIACS.DAT`'s stale copy disproved that (`model::V6ControlRecord::
+/// version`'s own doc comment), so this function now writes each copy's own
+/// stored `version` verbatim instead of re-deriving one from a single
+/// file-wide generation.
 ///
 /// # Errors
 ///
 /// See [`Canvas::put`].
 pub(crate) fn write_v6_fixed_portion(
     canvas: &mut Canvas,
-    generation: Generation,
     page_size: u16,
     control: &V6ControlRecord,
     base: usize,
 ) -> Result<(), Fault> {
-    let version: [u8; 2] = match generation {
-        Generation::V600 => 0x600u16.to_le_bytes(),
-        Generation::V610 => 0x610u16.to_le_bytes(),
-        Generation::V620 => 0x620u16.to_le_bytes(),
-        Generation::V5R3 | Generation::V5R4 | Generation::V5R5 => unreachable!(
-            "write_v6_fixed_portion is only ever called for a v6 generation"
-        ),
-    };
+    let version = control.version.to_le_bytes();
     canvas.put(base + fcr::at::LEAD, &[b'F', b'C', 0, 0], owner("lead"))?;
     canvas.put_u16(base + fcr::v6::GENERATION, control.generation, owner("generation"))?;
     canvas.put(base + fcr::v6::RESERVED_06, &control.reserved_06, owner("reserved_06"))?;
@@ -897,11 +949,16 @@ pub(crate) fn write_v6_fixed_portion(
 /// alike (`V6Page::index`, Task 19 -- `write_v6_index_pages`); and a v6
 /// ACS block's tag, name, table and padding (`V6Page::acs`, Task 19 --
 /// `write_v6_acs_blocks`), found by scanning for `TAG_ACS` rather than at a
-/// fixed page the way v5's single block is. `read::file` refuses a v6 file
-/// whose allocation table claims a page this crate cannot classify this
-/// way -- a `TAG_TEMPLATE`/`TAG_VARIABLE` page no key's walk claims, or a
-/// `TAG_DATA` page on a variable-length file (Task 20's own scope) -- so
-/// this function never has to guess at one either. A v5 file's
+/// fixed page the way v5's single block is; and a fragment/overflow page's
+/// free-chain link, every fragment, and trailing free space (`V6Page::
+/// fragment`, Task 20 -- `write_v6_fragment_pages`), found by its own
+/// `TAG_VARIABLE` tag, whether or not the file also holds ordinary
+/// `TAG_DATA` pages (Task 20 also removed the `variable_mark` gate that used
+/// to keep a variable-length file's `TAG_DATA` pages unread). `read::file`
+/// refuses a v6 file whose allocation table claims a page this crate cannot
+/// classify this way -- a `TAG_TEMPLATE` page, or a tag it does not
+/// recognize, that no key's walk claims -- so this function never has to
+/// guess at one either. A v5 file's
 /// page 0 (the control record plus its key/segment definitions) is fully
 /// described and will round-trip on its own; every page's six-byte header
 /// round-trips too; a `Data`/`Free` page's slots and slack described
@@ -930,20 +987,8 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
         };
         let page_size = model.id.page_size as usize;
         let stale_is_page = 1 - live_is_page;
-        write_v6_fixed_portion(
-            &mut canvas,
-            model.id.generation,
-            model.id.page_size,
-            live,
-            live_is_page * page_size,
-        )?;
-        write_v6_fixed_portion(
-            &mut canvas,
-            model.id.generation,
-            model.id.page_size,
-            stale,
-            stale_is_page * page_size,
-        )?;
+        write_v6_fixed_portion(&mut canvas, model.id.page_size, live, live_is_page * page_size)?;
+        write_v6_fixed_portion(&mut canvas, model.id.page_size, stale, stale_is_page * page_size)?;
 
         if let Some(tail) = &model.v6_page_tail {
             write_v6_page_tail(
@@ -976,6 +1021,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
         }
         write_v6_index_pages(&mut canvas, model)?;
         write_v6_acs_blocks(&mut canvas, model)?;
+        write_v6_fragment_pages(&mut canvas, model)?;
 
         return canvas.finish();
     };
@@ -1026,6 +1072,7 @@ mod tests {
             variable_mark: 0,
             acs_name: [0; 8],
             reserved_44: [0; 6],
+            version: 0x600,
             usage_4c: 1,
             index_alloc_4e: 16,
             mirror_50: 1,
@@ -1114,7 +1161,7 @@ mod tests {
         let bytes = emitted.bytes();
 
         let mut want_page0 = Canvas::new(page_size);
-        write_v6_fixed_portion(&mut want_page0, Generation::V600, page_size as u16, &stale, 0)
+        write_v6_fixed_portion(&mut want_page0, page_size as u16, &stale, 0)
             .expect("stale, alone");
         let want_page0 = want_page0.finish().expect("fully described");
         assert_eq!(
@@ -1124,7 +1171,7 @@ mod tests {
         );
 
         let mut want_page1 = Canvas::new(page_size);
-        write_v6_fixed_portion(&mut want_page1, Generation::V600, page_size as u16, &live, 0)
+        write_v6_fixed_portion(&mut want_page1, page_size as u16, &live, 0)
             .expect("live, alone");
         let want_page1 = want_page1.finish().expect("fully described");
         assert_eq!(
