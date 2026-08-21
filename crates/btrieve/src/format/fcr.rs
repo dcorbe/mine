@@ -18,13 +18,15 @@
 //! not `KEYS` (`0x14`) -- a segmented key consumes one definition per
 //! segment, so the count comes from walking the file (`read::file`), not
 //! from a formula. Whatever page bytes remain after the last definition, up
-//! to `page_size`, are `zero_padding`: harvest 1's `tail_check.py` measured
-//! this zero on 112 of 112 v5 corpus files, re-measured for this task on all
+//! to `page_size`, are `page_zero_tail`: harvest 1's `tail_check.py` measured
+//! this zero on 112 of 112 v5 corpus files, re-measured for Task 13 on all
 //! 145 currently-identified v5 corpus files (143 of 145 confirmed; the 2
-//! exceptions -- `wccitems.nu1` and its sibling -- are refused by `read`'s
-//! assertion, not accommodated). v6's fixed portion is untouched by this
-//! task and still has three undescribed ranges (`undescribed_4`,
-//! `undescribed_a`, `undescribed_b`); a later task owns it.
+//! exceptions -- `wccitems.nu1` and its sibling -- carry genuine leftover
+//! record prose here, not corruption, so `read` carries the region verbatim
+//! rather than asserting it zero -- see `model::File::page_zero_tail`). v6's
+//! fixed portion is untouched by this task and still has three undescribed
+//! ranges (`undescribed_4`, `undescribed_a`, `undescribed_b`); a later task
+//! owns it.
 
 use super::generation::{Generation, FCR_MIN};
 use super::{Field, Layout};
@@ -733,17 +735,19 @@ pub fn layout(generation: Generation, page_size: usize, key_descriptors: usize) 
         let after_definitions = key_descriptor::base(key_descriptors);
         if page_size > after_definitions {
             fields.push(Field {
-                name: "zero_padding",
+                name: "page_zero_tail",
                 index: None,
                 at: after_definitions,
                 len: page_size - after_definitions,
                 cite: "harvest 1 tail_check.py (112/112 v5 corpus files: every \
                        byte from the end of the last actual key/segment \
                        definition to the end of the page is zero); re-measured \
-                       for this task across all 145 currently-identified v5 \
+                       for Task 13 across all 145 currently-identified v5 \
                        corpus files (143/145 confirmed; the 2 exceptions -- \
-                       wccitems.nu1 and its sibling -- are refused by read's \
-                       assertion, not accommodated)",
+                       wccitems.nu1 and its sibling -- hold genuine leftover \
+                       record prose here (Task 13), so this region is unused \
+                       space carried verbatim, not an invariant this crate \
+                       enforces -- see model::File::page_zero_tail)",
             });
         }
     }
@@ -869,7 +873,7 @@ mod tests {
 
     /// The fixed portion (`0x00..0x110`) must be fully described for v5 --
     /// no field in that range may carry a "NOT YET HARVESTED" citation. Past
-    /// `0x110`, key/segment definitions and (conditionally) `zero_padding`
+    /// `0x110`, key/segment definitions and (conditionally) `page_zero_tail`
     /// are now harvested too, but this test only concerns the fixed portion.
     #[test]
     fn the_v5_fixed_portion_has_no_not_yet_harvested_fields() {
@@ -902,14 +906,14 @@ mod tests {
 
     /// USRACC.DAT's real shape: 1 key, 1 definition. The layout with exactly
     /// that one definition must tile completely -- fixed portion, one
-    /// definition's worth of fields, then zero_padding out to 512.
+    /// definition's worth of fields, then page_zero_tail out to 512.
     #[test]
     fn a_layout_with_one_key_descriptor_tiles_completely() {
         let l = layout(Generation::V5R3, 512, 1);
         assert_eq!(
             l.tiling_fault(),
             None,
-            "the fixed portion plus one key descriptor plus zero_padding must \
+            "the fixed portion plus one key descriptor plus page_zero_tail must \
              tile a 512-byte control record exactly"
         );
     }

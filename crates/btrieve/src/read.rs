@@ -1236,11 +1236,11 @@ fn resolve_pages(
 /// If [`identify`] refuses the control record, the file is shorter than its
 /// own declared page size, the file is a v6 file (not yet described by this
 /// crate), the key/segment definition array is malformed (runs past the
-/// page, or an `ANOSEG` chain never terminates), the zero padding past the
-/// last definition, up to `page_size`, is not actually zero, the file is not
-/// a whole number of pages, or [`resolve_pages`] cannot classify every page
-/// -- see that function's own documentation for the specific
-/// contradictions it checks for.
+/// page, or an `ANOSEG` chain never terminates), the file is not a whole
+/// number of pages, or [`resolve_pages`] cannot classify every page -- see
+/// that function's own documentation for the specific contradictions it
+/// checks for. Page 0's tail past the last key/segment definition is never a
+/// refusal reason -- see `model::File::page_zero_tail`.
 pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
     let id = identify(bytes)?;
 
@@ -1270,29 +1270,19 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
     let key_descriptors = key_descriptors(bytes, page_size, control.keys)?;
 
     // Whatever bytes remain after the last actual key/segment definition, up
-    // to page_size, must be zero -- harvest 1's tail_check.py measured this
-    // on 112 of 112 v5 corpus files, re-measured for this task on 143 of the
-    // 145 v5 corpus files currently identified. The 2 exceptions
-    // (wccitems.nu1 and its sibling) are refused here, by name, rather than
-    // accepted as harmless padding -- a later task investigates them.
+    // to page_size, are carried verbatim rather than asserted zero -- see
+    // `model::File::page_zero_tail`'s own documentation. Harvest 1's
+    // tail_check.py measured this zero on 112 of 112 v5 corpus files,
+    // re-measured for Task 13 on 143 of the 145 v5 corpus files currently
+    // identified; the 2 exceptions (wccitems.nu1 and its sibling) hold
+    // genuine leftover record prose here, not corruption, so this crate
+    // stores what the file actually says instead of refusing it.
     let after_definitions = key_descriptor::base(key_descriptors.len());
-    if page_size > after_definitions {
-        let tail = &bytes[after_definitions..page_size];
-        if let Some(offset) = tail.iter().position(|&b| b != 0) {
-            return Err(NotBtrieve {
-                why: format!(
-                    "identified as {:?}, but byte {:#x} of the zero padding \
-                     past the {} key/segment definition(s) (ending at {:#x}) \
-                     is {:#04x}, not zero",
-                    id.generation,
-                    after_definitions + offset,
-                    key_descriptors.len(),
-                    after_definitions,
-                    tail[offset]
-                ),
-            });
-        }
-    }
+    let page_zero_tail = if page_size > after_definitions {
+        bytes[after_definitions..page_size].to_vec()
+    } else {
+        Vec::new()
+    };
 
     // The file must be a whole number of pages -- harvest 3 SS7 measured
     // this on all 612 corpus files this crate has identified, with no
@@ -1315,6 +1305,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         id,
         control,
         key_descriptors,
+        page_zero_tail,
         pages,
         len: bytes.len() as u64,
     })
@@ -1372,18 +1363,27 @@ mod tests {
         assert!(e.why.contains("512"), "{}", e.why);
     }
 
-    /// A page-size-1024 file with a nonzero byte in the zero-padding region
-    /// (past the historical 512-byte control record) is refused, naming the
-    /// specific offset and byte -- not just "this file is corrupt".
+    /// Task 13, Group A: a page-size-1024 file with a nonzero byte in page
+    /// 0's tail (past the historical 512-byte control record) is accepted --
+    /// not refused -- and the tail is captured verbatim in
+    /// `File::page_zero_tail`. This replaces the old
+    /// `nonzero_zero_padding_is_refused_and_names_the_offset`: the assertion
+    /// it exercised named a property (page 0's tail is always zero) that two
+    /// real corpus files (`wccitems.nu1` and its sibling) disprove, so this
+    /// crate now carries the tail rather than refusing a file for disagreeing
+    /// with a rule the format never actually enforced.
     #[test]
-    fn nonzero_zero_padding_is_refused_and_names_the_offset() {
+    fn nonzero_page_zero_tail_is_carried_verbatim_not_refused() {
         let mut buf = usracc_fixed_portion();
         buf[0x08..0x0a].copy_from_slice(&1024u16.to_le_bytes());
         buf.resize(1024, 0);
         buf[600] = 0xaa;
-        let e = file(&buf).expect_err("nonzero zero padding");
-        assert!(e.why.contains("0x258"), "names the offset: {}", e.why);
-        assert!(e.why.contains("0xaa"), "names the byte: {}", e.why);
+        let model = file(&buf).expect("a nonzero page-0 tail is not a refusal");
+        let after_definitions = key_descriptor::base(model.key_descriptors.len());
+        assert_eq!(after_definitions, 0x12e, "one key descriptor, tail starts right after it");
+        let mut expected = vec![0u8; 1024 - after_definitions];
+        expected[600 - after_definitions] = 0xaa;
+        assert_eq!(model.page_zero_tail, expected, "the nonzero byte is carried, at its own offset");
     }
 
     /// USRACC.DAT's own single key/segment definition (measured directly off
@@ -2410,6 +2410,54 @@ mod tests {
              scrambled one this crate uses -- if it agreed, this bit pattern could \
              not distinguish the two and the mutation below would be vacuous"
         );
+    }
+
+    /// Task 13, Group A: `wccitems.nu1` is one of this crate's two witnesses
+    /// that page 0's tail is not always zero. Controller-measured: 1,536-byte
+    /// pages, one key descriptor (`after_definitions` `0x12e`), and 239
+    /// non-zero bytes starting at page offset `0x400` (tail-relative `722`)
+    /// running to the very last byte of the page -- readable MajorMUD prose
+    /// ("er teeth like spears, and the ... intelligence"), leftover record
+    /// text, not structure. Before this task, `read::file` refused this file
+    /// outright; now it reads, `page_zero_tail` holds exactly these bytes,
+    /// and the whole file round-trips byte for byte.
+    #[test]
+    fn wccitems_nu1s_nonzero_page_zero_tail_is_carried_verbatim_and_round_trips() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join("modules/majormud-nt/wccnt7py/out/wccitems.nu1");
+        let Ok(original) = std::fs::read(&path) else {
+            eprintln!("read: wccitems.nu1 not present, nothing verified");
+            return;
+        };
+
+        let model = file(&original).expect("a nonzero page-0 tail is no longer a refusal");
+        assert_eq!(model.id.page_size, 1536);
+        assert_eq!(model.key_descriptors.len(), 1, "one key/segment definition");
+
+        let after_definitions = key_descriptor::base(1);
+        assert_eq!(after_definitions, 0x12e);
+        assert_eq!(model.page_zero_tail.len(), 1536 - after_definitions);
+
+        let nonzero: Vec<usize> = model
+            .page_zero_tail
+            .iter()
+            .enumerate()
+            .filter(|&(_, &b)| b != 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(nonzero.len(), 239, "the controller's own measured count");
+        assert_eq!(*nonzero.first().unwrap(), 722, "first non-zero byte, tail-relative");
+        assert_eq!(*nonzero.last().unwrap(), model.page_zero_tail.len() - 1, "runs to the page's last byte");
+        assert!(
+            model.page_zero_tail[722..].starts_with(b"er teeth like spears"),
+            "the tail is genuine leftover prose, not noise"
+        );
+
+        let emitted = crate::emit::file(&model).expect("wccitems.nu1: nothing undescribed");
+        assert_eq!(emitted.bytes(), original.as_slice(), "the whole file round-trips, tail included");
     }
 }
 

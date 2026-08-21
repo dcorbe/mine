@@ -314,8 +314,10 @@ fn write_fragment_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> 
     Ok(())
 }
 
-/// Write the key/segment definition array (`0x110` onward) and the zero
-/// padding that follows it, out to `page_size`, into `canvas`.
+/// Write the key/segment definition array (`0x110` onward) and page 0's own
+/// tail (`model.page_zero_tail`) that follows it, out to `page_size`, into
+/// `canvas`. The tail is written verbatim -- it is not always zero, see
+/// `model::File::page_zero_tail`.
 ///
 /// # Errors
 ///
@@ -357,8 +359,7 @@ fn write_key_descriptors(canvas: &mut Canvas, model: &File) -> Result<(), Fault>
     let after_definitions = key_descriptor::base(model.key_descriptors.len());
     let page_size = model.id.page_size as usize;
     if page_size > after_definitions {
-        let zeros = vec![0u8; page_size - after_definitions];
-        canvas.put(after_definitions, &zeros, owner("zero_padding"))?;
+        canvas.put(after_definitions, &model.page_zero_tail, owner("page_zero_tail"))?;
     }
     Ok(())
 }
@@ -525,7 +526,7 @@ mod tests {
         let mut original = usracc_first_page();
         original[0x110..0x114].copy_from_slice(&[0, 0, 0, 0]); // root = 0: no B-tree yet
         let model = read::file(&original).expect("reads");
-        let emitted = file(&model).expect("page 0 is fully described -- fixed portion plus one key descriptor plus zero_padding");
+        let emitted = file(&model).expect("page 0 is fully described -- fixed portion plus one key descriptor plus page_zero_tail");
         assert_eq!(emitted.bytes(), original.as_slice());
     }
 
@@ -541,7 +542,7 @@ mod tests {
         original[0x110..0x114].copy_from_slice(&[0, 0, 0, 0]); // key 0's root = 0
         original[0x12e..0x132].copy_from_slice(&[0, 0, 0, 0]); // key 1's root = 0
         let model = read::file(&original).expect("reads");
-        let emitted = file(&model).expect("two key descriptors plus zero_padding tile page 0");
+        let emitted = file(&model).expect("two key descriptors plus page_zero_tail tile page 0");
         assert_eq!(emitted.bytes(), original.as_slice());
     }
 
@@ -676,7 +677,7 @@ mod tests {
 
     /// Step 1/4 of this task, and the whole point of it: `USRACC.DAT`
     /// round-trips completely for the first time. Page 0 (fixed portion,
-    /// key descriptor, zero padding), page 1's header plus its index
+    /// key descriptor, page_zero_tail), page 1's header plus its index
     /// content (2 entries), and page 2's header plus its 2 data slots and
     /// slack are now *all* described -- nothing left for the canvas to
     /// fault on.
