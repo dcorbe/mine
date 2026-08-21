@@ -18,6 +18,7 @@ pub mod fcr;
 pub mod generation;
 pub mod index;
 pub mod page;
+pub mod variable;
 
 /// One described range of bytes.
 pub struct Field {

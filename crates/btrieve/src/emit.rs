@@ -37,7 +37,8 @@ use crate::format::fcr::key_descriptor;
 use crate::format::generation::Generation;
 use crate::format::index;
 use crate::format::page;
-use crate::model::File;
+use crate::format::variable;
+use crate::model::{File, FragmentSlot};
 
 fn owner(field: &'static str) -> Owner {
     Owner { structure: "fcr", field, index: None }
@@ -193,6 +194,99 @@ fn write_acs_blocks(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
     Ok(())
 }
 
+/// Write every fragment page's content -- the free-chain link, fragment
+/// count, every fragment slot, the entry array's boundary member, and
+/// trailing free space -- for every page whose model carries one
+/// (`Page::fragments`, `Some` only for a `PageKind::Variable` page).
+///
+/// Every field is written from the model's own stored value: a fragment's
+/// placement is never re-read from a stored offset (there isn't one -- see
+/// `model::FragmentPage`'s own doc) but replayed by advancing a cursor the
+/// same way `read::read_fragment_page` derived it in the first place, which
+/// is reproducing an already-fully-known tiling, not guessing a new one.
+/// `next: Some(pointer)`'s four bytes are written through
+/// `variable::Pointer::encode` -- harvest 5 SS3.2's scrambled byte order --
+/// which is exactly what this task's mutation test targets.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_fragment_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for (i, p) in model.pages.iter().enumerate() {
+        let Some(fp) = &p.fragments else { continue };
+        let page_number = i + 1;
+        let at = page_number * page_size;
+
+        canvas.put_long(
+            at + variable::at::FREE_CHAIN,
+            fp.free_chain,
+            page_owner("variable_free_chain", page_number),
+        )?;
+        // `fragments.len()` came from a fragment_count this crate already
+        // validated fits `1..=256` when the page was read, so this cast
+        // cannot silently truncate.
+        let fragment_count = fp.fragments.len() as u16;
+        canvas.put_u16(
+            at + variable::at::FRAGMENT_COUNT,
+            fragment_count,
+            page_owner("variable_fragment_count", page_number),
+        )?;
+
+        let mut cursor = at + variable::at::FRAGMENTS;
+        for (n, slot) in fp.fragments.iter().enumerate() {
+            // `read_fragment_page` already computed this same offset
+            // successfully for this exact (page_size, n) pair when this
+            // model was built -- a page too small to hold it would have
+            // been refused before a `FragmentPage` ever existed to emit.
+            let entry_rel = variable::entry_at(page_size, n)
+                .expect("read already validated every entry position fits");
+            match slot {
+                FragmentSlot::Freed => {
+                    canvas.put_u16(
+                        at + entry_rel,
+                        variable::UNUSED_ENTRY,
+                        page_owner("variable_entry", page_number),
+                    )?;
+                }
+                FragmentSlot::Live { next, body } => {
+                    let start = cursor - at;
+                    let mut raw = start as u16;
+                    if next.is_some() {
+                        raw |= variable::CONTINUED_BIT;
+                    }
+                    canvas.put_u16(
+                        at + entry_rel,
+                        raw,
+                        page_owner("variable_entry", page_number),
+                    )?;
+                    if let Some(pointer) = next {
+                        canvas.put(
+                            cursor,
+                            &pointer.encode(),
+                            page_owner("variable_continuation", page_number),
+                        )?;
+                        cursor += variable::POINTER_LEN;
+                    }
+                    canvas.put(cursor, body, page_owner("variable_fragment", page_number))?;
+                    cursor += body.len();
+                }
+            }
+        }
+
+        let boundary_rel = variable::entry_at(page_size, fp.fragments.len())
+            .expect("read already validated the boundary entry position fits");
+        canvas.put_u16(
+            at + boundary_rel,
+            fp.free_space_entry,
+            page_owner("variable_free_space_entry", page_number),
+        )?;
+
+        canvas.put(cursor, &fp.trailing, page_owner("variable_trailing", page_number))?;
+    }
+    Ok(())
+}
+
 /// Write the key/segment definition array (`0x110` onward) and the zero
 /// padding that follows it, out to `page_size`, into `canvas`.
 ///
@@ -338,15 +432,20 @@ fn write_fixed_portion(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 /// control record is entirely undescribed. A v5 file's page 0 (the control
 /// record plus its key/segment definitions) is fully described and will
 /// round-trip on its own; every page's six-byte header round-trips too; a
-/// `Data`/`Free` page of a non-variable-length file has its slots and slack
-/// described; an `Index` page (a key's own root) has its entry array
-/// described too; and now a v5 file's ACS block (`Page::acs`) has its tag,
-/// name, table and trailing padding described as well. An `IndexChild`
-/// page's content and a variable-length file's fragment-page content are
-/// not, so a real corpus file that has one of those still leaves the
-/// canvas with unwritten bytes and `Canvas::finish` reports them -- but a
-/// file small enough that every key's whole tree fits on its own root page
-/// (no `IndexChild` pages at all) now round-trips completely.
+/// `Data`/`Free` page's slots and slack described (variable-length or not --
+/// harvest 5 SS1.1's slot layout does not change shape); an `Index` page (a
+/// key's own root) has its entry array described too; a v5 file's ACS block
+/// (`Page::acs`) has its tag, name, table and trailing padding described;
+/// and now a variable-length file's fragment/overflow page (`Page::fragments`,
+/// harvest 5 SS3.3) has every fragment, the entry array's boundary member,
+/// and trailing free space described as well. An `IndexChild` page's content
+/// is not, so a real corpus file that has one still leaves the canvas with
+/// unwritten bytes and `Canvas::finish` reports them -- true of every real
+/// variable-length v5 corpus file this task found (see this task's report),
+/// which is why this module's own tests exercise fragment pages against a
+/// synthetic file wrapping a real `VARIABLE.DAT` page rather than the whole
+/// corpus file. A file small enough that every key's whole tree fits on its
+/// own root page (no `IndexChild` pages at all) now round-trips completely.
 pub fn file(model: &File) -> Result<Emitted, Fault> {
     let mut canvas = Canvas::new(model.len as usize);
     if model.id.generation.is_v6() {
@@ -358,6 +457,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
     write_page_content(&mut canvas, model)?;
     write_index_pages(&mut canvas, model)?;
     write_acs_blocks(&mut canvas, model)?;
+    write_fragment_pages(&mut canvas, model)?;
     canvas.finish()
 }
 
@@ -366,7 +466,7 @@ mod tests {
     use super::*;
     use crate::model::fixtures::{
         full_index_page_with_an_omitted_last_child, two_key_fixed_portion, usracc_dat,
-        usracc_first_page, usracc_fixed_portion,
+        usracc_first_page, usracc_fixed_portion, variable_length_file_with_a_real_fragment_page,
     };
     use crate::read;
 
@@ -646,5 +746,72 @@ mod tests {
         let emitted = file(&model)
             .expect("CLASSADS.DAT's ACS block, index root, and data page are all described");
         assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// This task, step 4/5 end to end: a synthetic v5 file wrapping a real
+    /// `VARIABLE.DAT` page (physical page 15, harvest 5 SS3.5's own named
+    /// best evidence for a multi-hop chain -- fragment 0 continues onto
+    /// another page) round-trips completely. Every real corpus file this
+    /// task found that carries fragment pages also carries at least one
+    /// unresolved `IndexChild` page (see this task's report), so this
+    /// synthetic fixture -- zero keys, nothing else on the page -- is what
+    /// actually proves the fragment-page writer byte for byte, independent
+    /// of that unrelated gap.
+    #[test]
+    fn a_real_fragment_page_from_variable_dat_round_trips_byte_for_byte() {
+        let original = variable_length_file_with_a_real_fragment_page();
+        let model = read::file(&original).expect("reads");
+        let emitted = file(&model).expect(
+            "zero keys leaves nothing undescribed but this one fragment page, \
+             fully described by this task",
+        );
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// This task's required mutation (brief step 6): emitting the fragment
+    /// pointer through an **unscrambled** `[low][mid][high][fragment]`
+    /// encoding instead of harvest 5 SS3.2's `[high][low][mid][fragment]`
+    /// must produce different bytes for this fixture's own continuing
+    /// fragment -- a real multi-hop chain from `VARIABLE.DAT`, the file
+    /// harvest 5 SS3.5 measures at 72% multi-hop. Performed here by
+    /// reproducing `write_fragment_pages`' own placement logic with the
+    /// alternate byte order substituted for `Pointer::encode`, rather than
+    /// editing the production function in place -- the manual mutation this
+    /// task's report describes was run directly against
+    /// `format::variable::Pointer::encode`, confirmed to turn this exact
+    /// test (and `read`'s own decode-side mutation test) red, then reverted;
+    /// this permanent test pins the same defect so a future change cannot
+    /// silently reintroduce it.
+    #[test]
+    fn emitting_the_pointer_unscrambled_would_mismatch_the_real_chain() {
+        let original = variable_length_file_with_a_real_fragment_page();
+        let model = read::file(&original).expect("reads");
+        let page = &model.pages[0];
+        let fp = page.fragments.as_ref().expect("a fragment page");
+        let crate::model::FragmentSlot::Live { next: Some(pointer), .. } = &fp.fragments[0] else {
+            panic!("fragment 0 continues onto another page");
+        };
+
+        // The scrambled encoding this crate actually uses (and what the
+        // real file's own bytes are, at fragment 0's leading four bytes,
+        // page offset 0x0c).
+        let scrambled = pointer.encode();
+        let real_bytes = &original[512 + 0x0c..512 + 0x10];
+        assert_eq!(&scrambled, real_bytes, "the scrambled encoding matches the real file");
+
+        // The unscrambled reading harvest 5 SS3.2 names as the wrong one:
+        // [low][mid][high][fragment] instead of [high][low][mid][fragment].
+        let unscrambled = [
+            pointer.page as u8,
+            (pointer.page >> 8) as u8,
+            (pointer.page >> 16) as u8,
+            pointer.fragment,
+        ];
+        assert_ne!(
+            &unscrambled, real_bytes,
+            "an emitter that dropped the scramble would write different bytes here \
+             than the real file has -- this is the mutation this task's Step 6 requires, \
+             and it is not vacuous: it changes real, on-disk bytes"
+        );
     }
 }

@@ -12,8 +12,10 @@ use crate::format::fcr::key_descriptor;
 use crate::format::generation::{identify, NotBtrieve};
 use crate::format::index;
 use crate::format::page;
+use crate::format::variable;
 use crate::model::{
-    AcsBlock, ControlRecord, DataPage, File, IndexEntry, IndexPage, KeyDescriptor, Page, PageKind,
+    AcsBlock, ControlRecord, DataPage, File, FragmentPage, FragmentSlot, IndexEntry, IndexPage,
+    KeyDescriptor, Page, PageKind,
 };
 
 /// Read a plain little-endian `u16` at `at`.
@@ -346,6 +348,190 @@ fn read_acs_block(bytes: &[u8], page_start: usize, page_size: usize) -> Result<A
     Ok(AcsBlock { tag, name, table, padding })
 }
 
+/// Whether `page_start`'s own bytes match harvest 5 SS3.3's fragment-page
+/// shape: fragment count (`0x0a`) in `1..=256`, and the first live
+/// (non-`0xffff`) entry of the array names offset exactly `0x0c` -- the same
+/// two checks `W32MKDE_decompiled.c:19029-19060` performs before treating a
+/// page as this shape at all. Used only as evidence for classifying an
+/// unclaimed, data-bit-clear page of a variable-length file; see
+/// `PageKind::Variable`'s own doc for the corpus measurement backing this as
+/// a real discriminator rather than a guess.
+fn looks_like_fragment_page(bytes: &[u8], page_start: usize, page_size: usize) -> bool {
+    if page_start + variable::at::FRAGMENTS > bytes.len() {
+        return false;
+    }
+    let fragment_count = get_u16(bytes, page_start + variable::at::FRAGMENT_COUNT);
+    if fragment_count == 0 || fragment_count > variable::MAX_FRAGMENTS {
+        return false;
+    }
+    for i in 0..=usize::from(fragment_count) {
+        let Some(rel) = variable::entry_at(page_size, i) else { return false };
+        if page_start + rel + 2 > bytes.len() {
+            return false;
+        }
+        let entry = get_u16(bytes, page_start + rel);
+        if entry != variable::UNUSED_ENTRY {
+            return usize::from(entry & variable::OFFSET_MASK) == variable::at::FRAGMENTS;
+        }
+    }
+    false
+}
+
+/// Read a variable-length file's fragment/overflow page (harvest 5 SS3.3):
+/// the write-side free-chain link, every fragment slot the page's own header
+/// says it holds, the entry array's one extra boundary member, and whatever
+/// bytes remain between the last live fragment's tiling and the entry array
+/// itself.
+///
+/// Only called once `looks_like_fragment_page` has already confirmed the
+/// page's shape, so the two checks it performs are re-derived here rather
+/// than re-verified -- but every fragment's own tiling is still checked as
+/// it is walked: harvest 5 SS3.3's "length is derived, never stored" means a
+/// fragment's declared start must agree with where the fragments before it
+/// actually end, and a file that disagrees is refused rather than read past
+/// its own bounds.
+///
+/// # Errors
+///
+/// If a fragment's start offset disagrees with where the previous live
+/// fragment's tiling says free space begins, a fragment has no live entry
+/// after it to end it, a continued fragment is too short to hold its
+/// 4-byte pointer, or the boundary entry's own offset disagrees with the
+/// tiling of the fragments before it.
+fn read_fragment_page(
+    bytes: &[u8],
+    page_start: usize,
+    page_size: usize,
+) -> Result<FragmentPage, NotBtrieve> {
+    let free_chain = get_long(bytes, page_start + variable::at::FREE_CHAIN);
+    let fragment_count = usize::from(get_u16(bytes, page_start + variable::at::FRAGMENT_COUNT));
+
+    // Every fragment_count + 1 raw entries, verbatim, read once up front --
+    // harvest 5 SS3.3: the array is one longer than the fragment count, the
+    // extra (index `fragment_count`) member marking only where free space
+    // starts.
+    let mut raw_entries = Vec::with_capacity(fragment_count + 1);
+    for i in 0..=fragment_count {
+        let rel = variable::entry_at(page_size, i).ok_or_else(|| NotBtrieve {
+            why: format!(
+                "page {page_start:#x}: entry {i} of {fragment_count} fragments \
+                 would start before byte 0 of a {page_size}-byte page"
+            ),
+        })?;
+        raw_entries.push(get_u16(bytes, page_start + rel));
+    }
+
+    let mut fragments = Vec::with_capacity(fragment_count);
+    let mut cursor = variable::at::FRAGMENTS;
+    for i in 0..fragment_count {
+        let entry = raw_entries[i];
+        if entry == variable::UNUSED_ENTRY {
+            fragments.push(FragmentSlot::Freed);
+            continue;
+        }
+        let start = usize::from(entry & variable::OFFSET_MASK);
+        let continued = entry & variable::CONTINUED_BIT != 0;
+        if start != cursor {
+            return Err(NotBtrieve {
+                why: format!(
+                    "page {page_start:#x}: fragment {i} names start offset \
+                     {start}, but the fragments before it tile up to {cursor} \
+                     -- harvest 5 SS3.3's fragments must tile with no gaps"
+                ),
+            });
+        }
+
+        let end = raw_entries[i + 1..=fragment_count]
+            .iter()
+            .find(|&&next| next != variable::UNUSED_ENTRY)
+            .map(|&next| usize::from(next & variable::OFFSET_MASK));
+        let Some(end) = end else {
+            return Err(NotBtrieve {
+                why: format!(
+                    "page {page_start:#x}: fragment {i} of {fragment_count} has \
+                     no live entry after it to end it"
+                ),
+            });
+        };
+        let Some(length) = end.checked_sub(start) else {
+            return Err(NotBtrieve {
+                why: format!(
+                    "page {page_start:#x}: fragment {i} starts at {start}, past \
+                     where the entry after it says free space begins ({end})"
+                ),
+            });
+        };
+        if page_start + end > page_start + page_size {
+            return Err(NotBtrieve {
+                why: format!(
+                    "page {page_start:#x}: fragment {i} ends at {end}, past the \
+                     {page_size}-byte page"
+                ),
+            });
+        }
+        let abs_start = page_start + start;
+
+        let slot = if continued {
+            if length < variable::POINTER_LEN {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "page {page_start:#x}: fragment {i} says it continues \
+                         and is {length} bytes, too short for a \
+                         {}-byte pointer",
+                        variable::POINTER_LEN
+                    ),
+                });
+            }
+            let ptr_bytes: [u8; variable::POINTER_LEN] =
+                get_array(bytes, abs_start);
+            let next = variable::Pointer::decode(ptr_bytes);
+            let body = bytes[abs_start + variable::POINTER_LEN..abs_start + length].to_vec();
+            FragmentSlot::Live { next: Some(next), body }
+        } else {
+            let body = bytes[abs_start..abs_start + length].to_vec();
+            FragmentSlot::Live { next: None, body }
+        };
+        fragments.push(slot);
+        cursor = end;
+    }
+
+    // The boundary entry (index `fragment_count`): no fragment of its own,
+    // but its offset must agree with where the live fragments before it
+    // say free space actually starts.
+    let free_space_entry = raw_entries[fragment_count];
+    if free_space_entry != variable::UNUSED_ENTRY {
+        let free_space_start = usize::from(free_space_entry & variable::OFFSET_MASK);
+        if free_space_start != cursor {
+            return Err(NotBtrieve {
+                why: format!(
+                    "page {page_start:#x}: the entry array's boundary member \
+                     names free space starting at {free_space_start}, but the \
+                     live fragments before it tile up to {cursor}"
+                ),
+            });
+        }
+    }
+    let entry_array_start = variable::entry_at(page_size, fragment_count).ok_or_else(|| {
+        NotBtrieve {
+            why: format!(
+                "page {page_start:#x}: the entry array's own boundary member \
+                 would start before byte 0 of a {page_size}-byte page"
+            ),
+        }
+    })?;
+    if cursor > entry_array_start {
+        return Err(NotBtrieve {
+            why: format!(
+                "page {page_start:#x}: the live fragments tile up to {cursor}, \
+                 past where the entry array itself begins ({entry_array_start})"
+            ),
+        });
+    }
+    let trailing = bytes[page_start + cursor..page_start + entry_array_start].to_vec();
+
+    Ok(FragmentPage { free_chain, fragments, free_space_entry, trailing })
+}
+
 /// How `page_number` is already spoken for, for a conflict message.
 fn describe_claim(kind: PageKind) -> String {
     match kind {
@@ -354,6 +540,7 @@ fn describe_claim(kind: PageKind) -> String {
         PageKind::Free => "on the free chain".to_string(),
         PageKind::IndexChild => "an index page (not a root)".to_string(),
         PageKind::Data => "a data page".to_string(),
+        PageKind::Variable => "a variable-length fragment page".to_string(),
     }
 }
 
@@ -555,6 +742,14 @@ fn resolve_pages(
         let data_bit = counter & page::DATA_BIT != 0;
         let stamp = counter & !page::DATA_BIT;
 
+        // Harvest 5 SS3.1's whole-file flag: only a variable-length file's
+        // unclaimed, data-bit-clear pages are ever candidates for
+        // `PageKind::Variable` -- see that variant's own doc for why
+        // gating on this (rather than trying the shape on every file) costs
+        // nothing and avoids even a theoretical false positive on the 143
+        // non-variable v5 corpus files this crate already reads correctly.
+        let variable = control.usrflgs & fcr::usrflgs::VARIABLE != 0;
+
         let kind = match claim.get(&(page_number as u32)).copied() {
             Some(PageKind::Index) if data_bit => {
                 return Err(NotBtrieve {
@@ -593,14 +788,19 @@ fn resolve_pages(
                 unreachable!("claim only ever stores Index, Acs, or Free -- got {other:?}")
             }
             None if data_bit => PageKind::Data,
+            None if variable && looks_like_fragment_page(bytes, at, page_size) => {
+                PageKind::Variable
+            }
             None => {
                 // Not named by any root, not the ACS block, not on the free
-                // chain, and its own header says "not records" -- a B-tree
-                // node no key's root claims, i.e. a child of some tree.
-                // Which tree is Task 9's business, once index entries are
-                // parsed and child pointers can actually be walked; this
-                // task only has to say honestly that the page is an index
-                // page, not that it knows whose.
+                // chain, its own header says "not records", and (on a
+                // variable-length file) its own bytes do not match this
+                // format's fragment-page shape either -- a B-tree node no
+                // key's root claims, i.e. a child of some tree. Which tree
+                // is Task 9's business, once index entries are parsed and
+                // child pointers can actually be walked; this task only has
+                // to say honestly that the page is an index page, not that
+                // it knows whose.
                 PageKind::IndexChild
             }
         };
@@ -608,16 +808,15 @@ fn resolve_pages(
         // A fixed-length-record data page's content -- slots plus trailing
         // slack -- is described whenever the page actually holds records
         // (`data_bit` set: `Data` or `Free`, never `Index`/`IndexChild`/
-        // `Acs`) and this task's scope actually covers it: `physical`
-        // nonzero (a sound slot width to divide by) and the file is not
-        // variable-length (harvest 5 SS3.1's `usrflgs` bit 0 -- a
-        // variable-length file's data-bit-set pages are `'V'`-tagged
-        // fragment pages, a different structure entirely, a later task's
-        // job). `USRACC.DAT` itself is not variable and every corpus file
-        // this task measured agrees: content is `None` only for a page kind
-        // this task does not yet describe, never as a residual guess.
-        let variable = control.usrflgs & fcr::usrflgs::VARIABLE != 0;
-        let content = if data_bit && !variable && control.physical != 0 {
+        // `Acs`/`Variable` -- the last three are never `data_bit` set, see
+        // `PageKind::Variable`'s own doc) and `physical` is a sound slot
+        // width to divide by. A variable-length file's `Data`/`Free` pages
+        // get this the same as any other file's: harvest 5 SS1.1's slot
+        // layout does not change shape when a record's tail holds a
+        // fragment pointer instead of zero padding, and `DataPage::slots`
+        // already stores each slot whole and verbatim, so nothing here
+        // needs to know a pointer is inside one.
+        let content = if data_bit && control.physical != 0 {
             Some(read_data_page(bytes, at, page_size, control.physical as usize))
         } else {
             None
@@ -655,6 +854,15 @@ fn resolve_pages(
         let acs_content =
             if kind == PageKind::Acs { Some(read_acs_block(bytes, at, page_size)?) } else { None };
 
+        // A fragment page's content (harvest 5 SS3.3), described whenever
+        // this page is `PageKind::Variable` -- established above by content
+        // evidence, not by residue.
+        let fragment_content = if kind == PageKind::Variable {
+            Some(read_fragment_page(bytes, at, page_size)?)
+        } else {
+            None
+        };
+
         pages.push(Page {
             number,
             data_bit,
@@ -663,6 +871,7 @@ fn resolve_pages(
             content,
             index: index_content,
             acs: acs_content,
+            fragments: fragment_content,
         });
     }
     Ok(pages)
@@ -765,8 +974,9 @@ mod tests {
     use crate::format::generation::Generation;
     use crate::model::fixtures::{
         full_index_page_with_an_omitted_last_child, two_key_fixed_portion, usracc_dat,
-        usracc_first_page, usracc_fixed_portion,
+        usracc_first_page, usracc_fixed_portion, variable_length_file_with_a_real_fragment_page,
     };
+    use crate::model::FragmentSlot;
 
     /// The exact values the controller measured independently off
     /// `archive/galacticomm/hosts/majorbbs/USRACC.DAT`'s raw bytes before
@@ -1091,13 +1301,28 @@ mod tests {
     }
 
     /// A real corpus file with B-tree nodes no key root names: `FW_QSQDB.DA_`
-    /// (13 1024-byte pages, three keys rooted at pages 1, 2, 8). Measured
-    /// directly off the file when this task's review was addressed: pages
-    /// 4, 6, and 10 hold records (`data_bit` set) and are `Data`; pages 3,
-    /// 5, 7, 9, 11, and 12 are B-tree nodes no root names (`data_bit`
-    /// clear) and are `IndexChild`. This is the exact case the review's
-    /// Critical finding caught -- the earlier `unwrap_or(PageKind::Data)`
-    /// residual mislabelled all six of the latter as `Data`.
+    /// (13 1024-byte pages, three keys rooted at pages 1, 2, 8; also a
+    /// variable-length file, `usrflgs` bit 0 set, `reclen` 101 `physical`
+    /// 113). Measured directly off the file when this task's review was
+    /// addressed: pages 4, 6, and 10 hold records (`data_bit` set) and are
+    /// `Data`; pages 3, 7, 11, and 12 are B-tree nodes no root names
+    /// (`data_bit` clear, and their own bytes do not match the
+    /// fragment-page shape) and are `IndexChild`.
+    ///
+    /// **Pages 5 and 9 are `Variable`, not `IndexChild`** -- a correction
+    /// this task's own dispatch made: the task that first wrote this test
+    /// (before fragment pages were described at all) classified every
+    /// unclaimed, data-bit-clear page here as `IndexChild` residually, with
+    /// no positive evidence either way. Direct measurement for this task
+    /// shows both pages match the fragment-page shape (fragment count in
+    /// range, first live entry at exactly `0x0c`) *and* are genuinely
+    /// reachable: every record slot on pages 4, 6, and 10 decodes a
+    /// fragment pointer landing on page 5 or page 9 (`variable_scan.py`,
+    /// this task's own corpus walk) -- the same "which fragment is this"
+    /// bit-3 `Pointer::decode` this task's mutation test exercises. Pages
+    /// 3, 7, 11, and 12 remain genuine `IndexChild`: their own fragment
+    /// count reads `0xffff`, out of the `1..=256` range the engine itself
+    /// requires.
     #[test]
     fn a_real_files_unrooted_btree_nodes_classify_as_index_children() {
         let Some(root) = crate::corpus::root() else {
@@ -1121,7 +1346,14 @@ mod tests {
         for &data_page in &[4, 6, 10] {
             assert_eq!(kind_of(data_page), PageKind::Data, "page {data_page} holds records");
         }
-        for &child_page in &[3, 5, 7, 9, 11, 12] {
+        for &fragment_page in &[5, 9] {
+            assert_eq!(
+                kind_of(fragment_page),
+                PageKind::Variable,
+                "page {fragment_page} is a fragment page real record pointers reach"
+            );
+        }
+        for &child_page in &[3, 7, 11, 12] {
             assert_eq!(
                 kind_of(child_page),
                 PageKind::IndexChild,
@@ -1343,5 +1575,82 @@ mod tests {
         assert_eq!(block.tag, 0xac);
         assert_eq!(&block.name, b"UPPER   ");
         assert_eq!(block.table[b'a' as usize], b'A', "the same uppercase fold");
+    }
+
+    /// This task's own anchor case: a real fragment page from
+    /// `archive/tooling/wbtrv32/assets/VARIABLE.DAT` -- physical page 15,
+    /// the harvest's own named best evidence for a multi-hop chain -- reads
+    /// as `PageKind::Variable` with 8 fragments, the first of which
+    /// continues onto page 13, fragment 8 (harvest 5 SS3.2/SS3.4).
+    #[test]
+    fn a_real_fragment_page_from_variable_dat_classifies_and_decodes() {
+        let buf = variable_length_file_with_a_real_fragment_page();
+        let model = file(&buf).expect("a valid v5 file with usrflgs bit 0 set");
+        assert_eq!(model.pages.len(), 1, "page 1 only");
+        let page = &model.pages[0];
+        assert_eq!(
+            page.kind,
+            PageKind::Variable,
+            "unclaimed, data_bit clear, and its own bytes match the fragment-page shape"
+        );
+        assert!(!page.data_bit, "harvest 5 SS3.3: a fragment page's data_bit reads clear");
+
+        let fp = page.fragments.as_ref().expect("Variable pages carry fragment content");
+        assert_eq!(fp.free_chain, 0xffff_ffff, "off the write-side free-space chain");
+        assert_eq!(fp.fragments.len(), 8, "this page's own fragment_count");
+
+        match &fp.fragments[0] {
+            FragmentSlot::Live { next, body } => {
+                assert_eq!(
+                    *next,
+                    Some(crate::format::variable::Pointer { page: 13, fragment: 8 }),
+                    "fragment 0's own leading 4 bytes, 00 0d 00 08, decoded"
+                );
+                assert_eq!(body.len(), 33, "37-byte span less the 4-byte pointer");
+                assert_eq!(body[0], 0x00, "this asset's own 0x00.. filler pattern");
+            }
+            other => panic!("fragment 0 is a live, continuing fragment: {other:?}"),
+        }
+        for (n, slot) in fp.fragments.iter().enumerate().skip(1) {
+            match slot {
+                FragmentSlot::Live { next, .. } => {
+                    assert_eq!(*next, None, "fragment {n} ends its chain here");
+                }
+                other => panic!("fragment {n} is live, not freed: {other:?}"),
+            }
+        }
+        assert!(fp.trailing.is_empty(), "the last fragment tiles right up to the entry array");
+    }
+
+    /// This task's required mutation, at the model layer rather than the
+    /// full corpus round trip (every real variable-length v5 file this task
+    /// found also has an unresolved `IndexChild` page elsewhere -- see this
+    /// task's report -- so the corpus round trip cannot isolate this
+    /// specific defect the way this fixture can): decoding the pointer with
+    /// an unscrambled `[low][mid][high][fragment]` reading, rather than
+    /// harvest 5 SS3.2's `[high][low][mid][fragment]`, must produce a
+    /// *different* page number from fragment 0's real leading bytes.
+    #[test]
+    fn decoding_the_pointer_unscrambled_would_read_a_different_page() {
+        let buf = variable_length_file_with_a_real_fragment_page();
+        let model = file(&buf).expect("a valid v5 file with usrflgs bit 0 set");
+        let fp = model.pages[0].fragments.as_ref().expect("Variable pages carry fragment content");
+        let FragmentSlot::Live { next: Some(scrambled), .. } = &fp.fragments[0] else {
+            panic!("fragment 0 continues");
+        };
+        assert_eq!(*scrambled, crate::format::variable::Pointer { page: 13, fragment: 8 });
+
+        // The exact reading the harvest names as the one this crate does
+        // not use: [low][mid][high][fragment] instead of
+        // [high][low][mid][fragment].
+        let bytes = [0x00u8, 0x0d, 0x00, 0x08];
+        let unscrambled_page =
+            u32::from(bytes[2]) << 16 | u32::from(bytes[0]) | u32::from(bytes[1]) << 8;
+        assert_ne!(
+            unscrambled_page, scrambled.page,
+            "an unscrambled reading of these exact bytes must disagree with the \
+             scrambled one this crate uses -- if it agreed, this bit pattern could \
+             not distinguish the two and the mutation below would be vacuous"
+        );
     }
 }
