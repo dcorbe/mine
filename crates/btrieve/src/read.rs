@@ -2239,6 +2239,33 @@ mod tests {
         assert!(e.why.contains("index root"), "{}", e.why);
     }
 
+    /// Task 12 review finding: `read_data_page`'s guard against a free
+    /// chain naming a slot too short to hold its own 4-byte forwarding
+    /// link had no fixture driving it. Reachable by construction -- nothing
+    /// upstream of `read_data_page` bounds `physical` below 4, so a
+    /// synthetic zero-key file with `physical = 2` and the free chain
+    /// pointing at its one data page reaches this arm directly. Without the
+    /// guard, `fill: bytes[start + 4..start + physical]` would build a
+    /// range whose start exceeds its end (`522..520`) and panic outright --
+    /// this refusal is what stands between a malformed free chain and a
+    /// crash, not decoration.
+    #[test]
+    fn a_free_slot_shorter_than_its_own_forwarding_link_is_refused() {
+        let mut buf = usracc_fixed_portion(); // keys = 1, root = 0 -- claims nothing
+        buf.resize(1024, 0); // page 0 plus page 1
+        buf[0x16..0x18].copy_from_slice(&2u16.to_le_bytes()); // reclen = 2
+        buf[0x18..0x1a].copy_from_slice(&2u16.to_le_bytes()); // physical = 2
+        buf[0x10..0x14].copy_from_slice(&[0x00, 0x00, 0x06, 0x02]); // free = 518 (page 1, offset 6)
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // page 1 number = 1
+        buf[516..518].copy_from_slice(&0x8003u16.to_le_bytes()); // data_bit set, stamp 3
+        buf[518..522].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]); // this slot's own link: terminates the chain
+        let e = file(&buf).expect_err("a 2-byte physical record cannot hold a 4-byte link");
+        assert!(e.why.contains("too short to hold"), "{}", e.why);
+        assert!(e.why.contains("2-byte physical record"), "{}", e.why);
+        assert!(e.why.contains("slot 0"), "{}", e.why);
+        assert!(e.why.contains("0x206"), "{}", e.why);
+    }
+
     /// A real corpus file whose control record's own `0x10a` pointer agrees
     /// with the page graph: `WLDSLOTS.DAT` (V5R4, one key declaring
     /// `ALT_COLLATING`, table name `GALCAPS `). Its ACS block decodes at
