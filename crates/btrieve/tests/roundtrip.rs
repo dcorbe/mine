@@ -39,16 +39,27 @@ fn the_round_trip_count_only_grows() {
         return;
     }
 
+    // Four distinct failure classes, each reported under its own heading.
+    // Collapsing an emit fault into a byte mismatch would print "first
+    // difference at byte 0x0" for every corpus file and bury the real
+    // diagnostic -- an emit fault is a new failure class the harness did not
+    // previously have an arm for.
     let mut passing = 0usize;
     let mut unreadable = 0usize;
-    let mut first_faults: Vec<String> = Vec::new();
+    let mut refused = 0usize;
+    let mut mismatched = 0usize;
+    let mut faulted = 0usize;
+    let mut unreadable_faults: Vec<String> = Vec::new();
+    let mut refused_faults: Vec<String> = Vec::new();
+    let mut mismatched_faults: Vec<String> = Vec::new();
+    let mut faulted_faults: Vec<String> = Vec::new();
     for entry in &files {
         let original = match std::fs::read(&entry.path) {
             Ok(original) => original,
             Err(e) => {
                 unreadable += 1;
-                if first_faults.len() < 10 {
-                    first_faults.push(format!(
+                if unreadable_faults.len() < 10 {
+                    unreadable_faults.push(format!(
                         "  {} ({:?}): could not read the file at all: {}",
                         entry.path.display(),
                         entry.id.generation,
@@ -59,52 +70,74 @@ fn the_round_trip_count_only_grows() {
             }
         };
         match read::file(&original) {
-            Ok(model) => {
-                let produced = emit::file(&model);
-                if produced == original {
-                    passing += 1;
-                } else if first_faults.len() < 10 {
-                    let at = produced
-                        .iter()
-                        .zip(original.iter())
-                        .position(|(a, b)| a != b)
-                        .unwrap_or_else(|| produced.len().min(original.len()));
-                    first_faults.push(format!(
-                        "  {} ({:?}): first difference at byte {at:#x} \
-                         (produced {} bytes, original {})",
+            Ok(model) => match emit::file(&model) {
+                Ok(emitted) => {
+                    let produced = emitted.bytes();
+                    if produced == original.as_slice() {
+                        passing += 1;
+                    } else {
+                        mismatched += 1;
+                        if mismatched_faults.len() < 10 {
+                            let at = produced
+                                .iter()
+                                .zip(original.iter())
+                                .position(|(a, b)| a != b)
+                                .unwrap_or_else(|| produced.len().min(original.len()));
+                            mismatched_faults.push(format!(
+                                "  {} ({:?}): first difference at byte {at:#x} \
+                                 (produced {} bytes, original {})",
+                                entry.path.display(),
+                                entry.id.generation,
+                                produced.len(),
+                                original.len()
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    faulted += 1;
+                    if faulted_faults.len() < 10 {
+                        faulted_faults.push(format!(
+                            "  {} ({:?}): emit faulted: {}",
+                            entry.path.display(),
+                            entry.id.generation,
+                            e
+                        ));
+                    }
+                }
+            },
+            Err(e) => {
+                refused += 1;
+                if refused_faults.len() < 10 {
+                    refused_faults.push(format!(
+                        "  {} ({:?}): read refused: {}",
                         entry.path.display(),
                         entry.id.generation,
-                        produced.len(),
-                        original.len()
+                        e.why
                     ));
                 }
             }
-            Err(e) if first_faults.len() < 10 => {
-                first_faults.push(format!(
-                    "  {} ({:?}): read refused: {}",
-                    entry.path.display(),
-                    entry.id.generation,
-                    e.why
-                ));
-            }
-            Err(_) => {}
         }
     }
 
-    if unreadable == 0 {
-        println!("round trip: {passing} of {} corpus files", files.len());
-    } else {
-        println!(
-            "round trip: {passing} of {} corpus files ({unreadable} unreadable)",
-            files.len()
-        );
-    }
+    println!(
+        "round trip: {passing} of {} corpus files ({unreadable} unreadable, \
+         {refused} refused, {mismatched} mismatched, {faulted} faulted)",
+        files.len()
+    );
     let pin = pin();
     assert!(
         passing >= pin,
         "round trip regressed: {passing} files now, pin says {pin}.\n\
-         The pin may only grow. First faults:\n{}",
-        first_faults.join("\n")
+         The pin may only grow.\n\
+         Unreadable ({unreadable}):\n{}\n\
+         Refused ({refused}):\n{}\n\
+         Mismatched ({mismatched}):\n{}\n\
+         Faulted ({faulted}):\n{}",
+        unreadable_faults.join("\n"),
+        refused_faults.join("\n"),
+        mismatched_faults.join("\n"),
+        faulted_faults.join("\n"),
     );
     assert!(
         passing <= files.len(),

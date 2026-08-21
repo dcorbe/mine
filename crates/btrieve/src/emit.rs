@@ -7,15 +7,25 @@
 //! achieved by copying the input -- the only way to reproduce a file is to
 //! have described it. Any function added here that accepts the source bytes
 //! defeats the crate's entire correctness argument.
+//!
+//! Bytes are produced through a [`Canvas`], never a `vec![0; len]` written
+//! into directly: a byte the model does not describe is a reported fault,
+//! not a silent zero. Today [`crate::model::File`] describes nothing beyond
+//! the length, so [`file`] always faults -- that is honest, matching
+//! [`crate::read::file`] refusing every input, and is why the round-trip pin
+//! stays at zero.
 
+use crate::canvas::{Canvas, Emitted, Fault};
 use crate::model::File;
 
 /// Produce the bytes of the file this model describes.
-#[must_use]
-pub fn file(model: &File) -> Vec<u8> {
-    // Deliberately not `vec![0; len]`: emitting zeroes would be a plausible
-    // wrong answer that could accidentally match a sparse file. An empty
-    // answer never accidentally matches anything.
-    let _ = model;
-    Vec::new()
+///
+/// # Errors
+///
+/// If the model does not yet describe every byte of the file -- today, that
+/// is every file, since [`crate::model::File`] carries nothing beyond
+/// generation, page size and length.
+pub fn file(model: &File) -> Result<Emitted, Fault> {
+    let canvas = Canvas::new(model.len as usize);
+    canvas.finish()
 }
