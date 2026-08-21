@@ -49,7 +49,7 @@ use crate::format::page;
 use crate::format::variable;
 use crate::model::{
     Control, ControlRecord, File, FragmentSlot, KeyDescriptor, RecordSlot, V6AllocationBlockCopy,
-    V6ControlRecord, V6PageTail,
+    V6ControlRecord, V6Page, V6PageTail,
 };
 
 fn owner(field: &'static str) -> Owner {
@@ -342,8 +342,14 @@ fn write_orphan_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 }
 
 /// Write every key/segment definition in `descriptors`, starting at
-/// `key_descriptor::base(0)` -- the 30-byte, `ANOSEG`-chained structure v5
-/// and v6 share (harvest 2's field table transcribes to identical offsets).
+/// `base + key_descriptor::base(0)` -- the 30-byte, `ANOSEG`-chained
+/// structure v5 and v6 share (harvest 2's field table transcribes to
+/// identical offsets). `base` is `0` for v5 (page 0 is the only copy, at
+/// absolute offset 0) or a v6 physical page's own absolute byte offset
+/// (`physical_page * page_size`) -- v6 needs this because the identical
+/// 30-byte structure repeats at whichever physical page holds the live or
+/// the stale copy (Task 18), not only at offset 0.
+///
 /// Shared by v5's [`write_key_descriptors`] (which appends
 /// `model.page_zero_tail`) and v6's [`write_v6_page_tail`] (which appends
 /// the definition-offset trailer and its own surrounding padding, Task 16)
@@ -353,9 +359,13 @@ fn write_orphan_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 /// # Errors
 ///
 /// See [`Canvas::put`].
-fn write_key_descriptor_array(canvas: &mut Canvas, descriptors: &[KeyDescriptor]) -> Result<(), Fault> {
+fn write_key_descriptor_array(
+    canvas: &mut Canvas,
+    descriptors: &[KeyDescriptor],
+    base: usize,
+) -> Result<(), Fault> {
     for (n, d) in descriptors.iter().enumerate() {
-        let start = key_descriptor::base(n);
+        let start = base + key_descriptor::base(n);
         let root = (u32::from(d.key_number) << 24) | (d.root_page & 0x00ff_ffff);
         canvas.put_long(start + key_descriptor::at::ROOT, root, key_owner("root", n))?;
         canvas.put_long(start + key_descriptor::at::RECORDS, d.records, key_owner("records", n))?;
@@ -398,7 +408,7 @@ fn write_key_descriptor_array(canvas: &mut Canvas, descriptors: &[KeyDescriptor]
 ///
 /// See [`Canvas::put`].
 fn write_key_descriptors(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
-    write_key_descriptor_array(canvas, &model.key_descriptors)?;
+    write_key_descriptor_array(canvas, &model.key_descriptors, 0)?;
 
     let after_definitions = key_descriptor::base(model.key_descriptors.len());
     let page_size = model.id.page_size as usize;
@@ -417,6 +427,12 @@ fn write_key_descriptors(canvas: &mut Canvas, model: &File) -> Result<(), Fault>
 /// `format::fcr::trailer::expected_entries` for the one formula both this and
 /// `read::v6_page_tail` share.
 ///
+/// `base` is this physical page's own absolute byte offset (`0` for a
+/// caller writing a lone page-sized canvas, `physical_page * page_size`
+/// when writing straight into a whole file's canvas -- Task 18 needs the
+/// latter, since the live and stale copies sit at different physical
+/// pages).
+///
 /// When `page_size` has no trailer at all (512), `tail.padding` is empty
 /// and `tail.gap` holds the whole remaining region instead -- see
 /// `read::v6_page_tail`.
@@ -429,10 +445,11 @@ pub(crate) fn write_v6_page_tail(
     page_size: usize,
     descriptors: &[KeyDescriptor],
     tail: &V6PageTail,
+    base: usize,
 ) -> Result<(), Fault> {
-    write_key_descriptor_array(canvas, descriptors)?;
+    write_key_descriptor_array(canvas, descriptors, base)?;
 
-    let after_definitions = key_descriptor::base(descriptors.len());
+    let after_definitions = base + key_descriptor::base(descriptors.len());
 
     let Some(trailer_pos) = fcr::trailer::position(page_size as u16) else {
         return canvas.put(after_definitions, &tail.gap, owner("page_tail"));
@@ -441,9 +458,9 @@ pub(crate) fn write_v6_page_tail(
     canvas.put(after_definitions, &tail.gap, owner("trailer_gap"))?;
     let self_tags: Vec<u8> = descriptors.iter().map(|d| d.self_tag).collect();
     for (n, value) in fcr::trailer::expected_entries(&self_tags).into_iter().enumerate() {
-        canvas.put_u16(trailer_pos + n * 2, value, key_owner("definition_offset", n))?;
+        canvas.put_u16(base + trailer_pos + n * 2, value, key_owner("definition_offset", n))?;
     }
-    let after_trailer = trailer_pos + descriptors.len() * 2;
+    let after_trailer = base + trailer_pos + descriptors.len() * 2;
     canvas.put(after_trailer, &tail.padding, owner("trailer_padding"))?;
     Ok(())
 }
@@ -491,6 +508,85 @@ pub(crate) fn write_v6_allocation_copy(
     // there is no byte left to describe here. If `page_size` ever disagreed,
     // `Canvas::finish` would fault on the unwritten range on its own --
     // exactly the outcome wanted, not a fabricated zero fill.
+    Ok(())
+}
+
+fn v6_page_owner(field: &'static str, physical_page: u32) -> Owner {
+    Owner { structure: "v6_page", field, index: Some(physical_page as usize) }
+}
+
+/// Write one ordinary v6 page (Task 18): its six-byte header
+/// (`format::page::v6`) plus, when the model describes one
+/// (`V6Page::content`), its fixed-length-record content -- every slot's own
+/// marker, live or free, then the trailing slack. The write-side
+/// counterpart to `read::read_v6_data_page`.
+///
+/// A live slot's marker is written from the model's own stored value, never
+/// re-derived (harvest 5 SS1.2: what a specific nonzero marker means beyond
+/// "live" is not established, so nothing here invents one). A free slot's
+/// marker is the literal `0` -- not stored in [`crate::model::V6RecordSlot::Free`]
+/// at all, since `0` is what "free" means, never a fact that could
+/// disagree -- followed by its forwarding link
+/// (`format::free_slot::encode_link`) and the model's own stored fill,
+/// never re-zeroed.
+///
+/// `content` is `None` for any page this crate does not yet decode
+/// (`V6Page`'s own doc comment): only the header is written for those, and
+/// the rest of that physical page stays unwritten, `Canvas::finish`
+/// reporting it the same way an undescribed v5 page's content once did.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_v6_page(canvas: &mut Canvas, page: &V6Page, page_size: usize) -> Result<(), Fault> {
+    let at = page.physical_page as usize * page_size;
+    canvas.put_u16(at + page::v6::at::TAG, page.tag, v6_page_owner("tag", page.physical_page))?;
+    canvas.put_u16(
+        at + page::v6::at::LOGICAL,
+        page.logical,
+        v6_page_owner("logical", page.physical_page),
+    )?;
+    canvas.put_u16(at + page::v6::at::STAMP, page.stamp, v6_page_owner("stamp", page.physical_page))?;
+
+    let Some(content) = &page.content else { return Ok(()) };
+    let mut offset = at + page::v6::LEN;
+    for slot in &content.slots {
+        match slot {
+            crate::model::V6RecordSlot::Live { marker, body } => {
+                canvas.put_u16(
+                    offset + free_slot::v6::at::MARKER,
+                    *marker,
+                    v6_page_owner("marker", page.physical_page),
+                )?;
+                canvas.put(
+                    offset + free_slot::v6::at::MARKER_LEN,
+                    body,
+                    v6_page_owner("record", page.physical_page),
+                )?;
+                offset += free_slot::v6::at::MARKER_LEN + body.len();
+            }
+            crate::model::V6RecordSlot::Free { next, fill } => {
+                canvas.put_u16(
+                    offset + free_slot::v6::at::MARKER,
+                    0,
+                    v6_page_owner("marker", page.physical_page),
+                )?;
+                let link_at = offset + free_slot::v6::at::LINK;
+                canvas.put(
+                    link_at,
+                    &free_slot::encode_link(*next),
+                    v6_page_owner("free_link", page.physical_page),
+                )?;
+                canvas.put(
+                    link_at + free_slot::at::LINK_LEN,
+                    fill,
+                    v6_page_owner("free_fill", page.physical_page),
+                )?;
+                offset = link_at + free_slot::at::LINK_LEN + fill.len();
+            }
+        }
+    }
+    canvas.put(offset, &content.slack, v6_page_owner("slack", page.physical_page))?;
     Ok(())
 }
 
@@ -698,22 +794,30 @@ pub(crate) fn write_v6_fixed_portion(
 ///
 /// # Errors
 ///
-/// If the model does not yet describe every byte of the file. A v6 file
-/// today only ever reaches this function with `Control::Shadowed` through
-/// this crate's own tests -- `read::file` refuses every real v6 file before
-/// building one, since the allocation table, page addressing, and the rest
-/// of v6's own pages are later work -- but when it is given one, both
-/// control-record shadow copies are written in full, each through the
-/// canvas, at physical pages 0 and 1 (harvest 0 ruling 7, part 2); nothing
-/// past the shadow pair is written for v6 yet. A v5 file's page 0 (the
-/// control record plus its key/segment definitions) is fully described and
-/// will round-trip on its own; every page's six-byte header round-trips
-/// too; a `Data`/`Free` page's slots and slack described (variable-length
-/// or not -- harvest 5 SS1.1's slot layout does not change shape); every
-/// index page -- a key's own root **and** every genuine descendant that
-/// key's own walk attributed it to (Task 11b) -- has its entry array
-/// described; a v5 file's ACS block (`Page::acs`) has its tag, name, table
-/// and trailing padding described; and a variable-length file's
+/// If the model does not yet describe every byte of the file. For
+/// `Control::Shadowed` (v6): both control-record shadow copies are written
+/// in full, each at its own physical page (harvest 0 ruling 7, part 2, never
+/// the live copy plus a flag or the live copy written twice); each copy's
+/// own key/segment definitions and definition-offset trailer (`model.
+/// key_descriptors`/`v6_page_tail` for the live copy, `v6_stale_key_
+/// descriptors`/`v6_stale_page_tail` for the stale one, both `None`/empty
+/// when the model does not carry them); every "PP" allocation-table block's
+/// both shadow copies (`model.v6_allocation_blocks`, Task 17); and every
+/// ordinary v6 page the allocation table resolves (`model.v6_pages`, Task
+/// 18) -- a `TAG_DATA` page's header, per-slot marker and record content
+/// when the model describes one, or just its header otherwise. `read::file`
+/// only ever populates `v6_pages` for a file declaring no keys at all (that
+/// function's own doc comment), so a real v6 corpus file -- every one of
+/// which declares at least one key -- still leaves an index page's content
+/// unwritten and refuses before reaching this function at all. A v5 file's
+/// page 0 (the control record plus its key/segment definitions) is fully
+/// described and will round-trip on its own; every page's six-byte header
+/// round-trips too; a `Data`/`Free` page's slots and slack described
+/// (variable-length or not -- harvest 5 SS1.1's slot layout does not change
+/// shape); every index page -- a key's own root **and** every genuine
+/// descendant that key's own walk attributed it to (Task 11b) -- has its
+/// entry array described; a v5 file's ACS block (`Page::acs`) has its tag,
+/// name, table and trailing padding described; and a variable-length file's
 /// fragment/overflow page (`Page::fragments`, harvest 5 SS3.3) has every
 /// fragment, the entry array's boundary member, and trailing free space
 /// described as well. An orphan page (`Page::orphan`, Task 13 -- a page no
@@ -728,8 +832,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
         // physical page. Not the live copy plus a flag and not the live
         // copy written twice -- that would silently lose the stale copy's
         // exact bytes, exactly the failure mode ruling 7 exists to
-        // forbid. Nothing past the shadow pair is described yet, so this
-        // is everything emit can do for v6 today.
+        // forbid.
         let Control::Shadowed { live, stale, live_is_page } = &model.control else {
             unreachable!("the Single arm above already matched")
         };
@@ -749,6 +852,37 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
             stale,
             stale_is_page * page_size,
         )?;
+
+        if let Some(tail) = &model.v6_page_tail {
+            write_v6_page_tail(
+                &mut canvas,
+                page_size,
+                &model.key_descriptors,
+                tail,
+                live_is_page * page_size,
+            )?;
+        }
+        if let Some(tail) = &model.v6_stale_page_tail {
+            write_v6_page_tail(
+                &mut canvas,
+                page_size,
+                &model.v6_stale_key_descriptors,
+                tail,
+                stale_is_page * page_size,
+            )?;
+        }
+
+        for (index, block) in model.v6_allocation_blocks.iter().enumerate() {
+            let (first, second) = alloc::pair_position(page_size, index + 1);
+            let (live_pos, stale_pos) = if block.live_is_first { (first, second) } else { (second, first) };
+            write_v6_allocation_copy(&mut canvas, &block.live, live_pos * page_size, page_size)?;
+            write_v6_allocation_copy(&mut canvas, &block.stale, stale_pos * page_size, page_size)?;
+        }
+
+        for page in &model.v6_pages {
+            write_v6_page(&mut canvas, page, page_size)?;
+        }
+
         return canvas.finish();
     };
 
@@ -868,6 +1002,11 @@ mod tests {
             key_descriptors: Vec::new(),
             page_zero_tail: Vec::new(),
             pages: Vec::new(),
+            v6_stale_key_descriptors: Vec::new(),
+            v6_page_tail: None,
+            v6_stale_page_tail: None,
+            v6_allocation_blocks: Vec::new(),
+            v6_pages: Vec::new(),
             len: (2 * page_size) as u64,
         };
 

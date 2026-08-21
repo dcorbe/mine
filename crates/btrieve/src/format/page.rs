@@ -86,6 +86,83 @@ pub fn fields() -> Vec<Field> {
     ]
 }
 
+/// v6's own six-byte ordinary page header (harvest 3 SS2): three clean
+/// fields, no bit-packing -- unlike v5's `counter`, where `data`/`stamp`
+/// share one word with no byte boundary between them, v6's `tag`, `logical`
+/// and `stamp` each occupy their own two bytes, so each is its own [`Field`]
+/// with nothing to split apart later the way `crate::model::Page` splits
+/// v5's `counter`.
+///
+/// This is the same six bytes harvest 3 SS2's table calls "Ordinary page
+/// header (both families, 6 bytes)" -- kept in this module, next to v5's
+/// shape, because it is literally the harvest's own next row, not a
+/// separate structure.
+pub mod v6 {
+    use super::super::Field;
+
+    /// Byte offsets of the three fields in an ordinary v6 page header.
+    pub mod at {
+        /// Page kind tag: `TAG_DATA`, `TAG_TEMPLATE` or `TAG_VARIABLE`.
+        pub const TAG: usize = 0x00;
+        /// The page's own self-reported logical id -- decorative; page
+        /// addressing never consults it (harvest 3 SS3, `format::alloc`'s own
+        /// module doc).
+        pub const LOGICAL: usize = 0x02;
+        /// Modification stamp/generation for an ordinary page.
+        pub const STAMP: usize = 0x04;
+    }
+
+    /// Total bytes in the header -- the same six as v5's, at different
+    /// field boundaries.
+    pub const LEN: usize = 6;
+
+    /// `0x4400`: a data or index page (harvest 3 SS2). This crate decodes
+    /// content for this tag only when a file declares no keys at all
+    /// (`model::V6Page`'s own doc comment) -- with any key, this tag alone
+    /// cannot tell a data page from an index descendant, and that walk is a
+    /// later task's (Task 19).
+    pub const TAG_DATA: u16 = 0x4400;
+    /// `0x8000`: a template/empty page -- not decoded by this crate.
+    pub const TAG_TEMPLATE: u16 = 0x8000;
+    /// `0x5600` (`'V'` in the low byte): a variable-length file's
+    /// fragment/overflow page -- not decoded by this crate (Task 20).
+    pub const TAG_VARIABLE: u16 = 0x5600;
+
+    /// Every named field of the six-byte v6 header, cited.
+    #[must_use]
+    pub fn fields() -> Vec<Field> {
+        vec![
+            Field {
+                name: "tag",
+                index: None,
+                at: at::TAG,
+                len: 2,
+                cite: "harvest 3 SS2 -- page kind tag: 0x4400 data/index, \
+                       0x8000 template/empty, 0x5600 ('V' low byte) variable",
+            },
+            Field {
+                name: "logical",
+                index: None,
+                at: at::LOGICAL,
+                len: 2,
+                cite: "harvest 3 SS2/SS3 -- the page's own self-reported \
+                       logical id, plain little-endian (not the high-word- \
+                       first long convention v5's page number uses); \
+                       decorative -- resolution never consults it",
+            },
+            Field {
+                name: "stamp",
+                index: None,
+                at: at::STAMP,
+                len: 2,
+                cite: "harvest 3 SS2 -- modification stamp for an ordinary \
+                       page; the same offset is the live-copy discriminator \
+                       for FCR and allocation-table pages instead",
+            },
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +181,22 @@ mod tests {
     #[test]
     fn every_field_is_cited() {
         for field in fields() {
+            assert!(!field.cite.trim().is_empty(), "{} has no citation", field.name);
+        }
+    }
+
+    /// The v6 header's three clean fields tile completely too -- no
+    /// bit-packing to leave a gap or overlap.
+    #[test]
+    fn the_v6_six_byte_header_tiles_completely() {
+        let layout = Layout { what: "v6 page header", len: v6::LEN, fields: v6::fields() };
+        assert_eq!(layout.tiling_fault(), None);
+    }
+
+    /// Every v6 field carries the evidence that established it.
+    #[test]
+    fn every_v6_field_is_cited() {
+        for field in v6::fields() {
             assert!(!field.cite.trim().is_empty(), "{} has no citation", field.name);
         }
     }

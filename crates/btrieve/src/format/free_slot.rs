@@ -3,8 +3,10 @@
 //! after it. Distinct from `format::variable`'s fragment slots -- this is
 //! what an *ordinary*, fixed-length record's own slot becomes once its
 //! record is deleted, on any v5 file, not only a variable-length one; and
-//! distinct from v6's analogous shape (harvest 5 SS2.2), which this crate
-//! does not yet read at all.
+//! distinct from v6's analogous shape (harvest 5 SS2.2, this module's own
+//! [`v6`] submodule) -- v6 offsets the identical link-plus-fill shape by a
+//! 2-byte per-slot marker every slot carries, live or free, that v5 has no
+//! equivalent of at all.
 //!
 //! # What a delete leaves, measured against genuine Pervasive Btrieve 6.15
 //!
@@ -103,6 +105,138 @@ pub fn fields(physical: usize) -> Vec<Field> {
                    DataPage::slack already applies",
         },
     ]
+}
+
+/// v6's own per-slot shape (harvest 5 SS1.2, SS2.2): every physical record
+/// slot in a v6 data page opens with its **own** 2-byte marker, ahead of the
+/// same forwarding-link-plus-zero-fill shape v5's free slot uses -- "the same
+/// forwarding-link shape, at the same place in the slot (the 4 bytes right
+/// after the 2-byte marker...)". Distinct from v5 in one load-bearing way:
+/// this marker, not free-chain membership, is what tells a v6 slot's own
+/// liveness apart (harvest 5 SS2.3's `walk_v6` reads it directly, `continue`s
+/// past a `0` rather than `break`ing) -- and per harvest 5 SS2.2's own trap,
+/// a non-empty free list on a v6 file is **not** deletion evidence the way
+/// it is for v5 (every claimed page arrives pre-threaded onto it), so this
+/// crate never uses the free list to decide a slot's liveness at all, only
+/// the marker.
+pub mod v6 {
+    use super::super::Field;
+
+    /// Byte offsets within a v6 slot itself (not the page it sits on).
+    pub mod at {
+        /// The marker: `0` for free (see this module's own doc comment),
+        /// nonzero for live -- and for a live slot, not merely a liveness
+        /// flag: it counts updates (1 on first insert, incremented --
+        /// wrapping past 0 back to 1, never landing on 0 -- on each update,
+        /// harvest 5 SS1.2). What a specific nonzero value means beyond
+        /// "live" is not established by this corpus (harvest 5 SS1.2's own
+        /// gap), so this crate stores it, never interprets it further.
+        pub const MARKER: usize = 0x00;
+        /// Width of the marker field.
+        pub const MARKER_LEN: usize = 2;
+        /// The forwarding link sits immediately after the marker -- the same
+        /// [`super::at::LINK`]/[`super::decode_link`] shape v5 uses, just
+        /// offset by [`MARKER_LEN`] (harvest 5 SS2.2).
+        pub const LINK: usize = MARKER_LEN;
+    }
+
+    /// A freed v6 slot's fields, cited, covering the whole slot: the marker
+    /// (always `0` here -- `Field` describes the byte range for tiling
+    /// purposes even though `crate::model::V6RecordSlot::Free` does not
+    /// store it as data, the same way `format::alloc`'s "PP" magic is a
+    /// tiled `Field` nowhere stored in its model), the link, then zero fill.
+    #[must_use]
+    pub fn free_fields(physical: usize) -> Vec<Field> {
+        vec![
+            Field {
+                name: "marker",
+                index: None,
+                at: at::MARKER,
+                len: at::MARKER_LEN,
+                cite: "harvest 5 SS2.2 -- 0 marks a free slot; not stored as \
+                       data in crate::model::V6RecordSlot::Free, since 0 is \
+                       what \"free\" means here, not a fact that could \
+                       disagree",
+            },
+            Field {
+                name: "link",
+                index: None,
+                at: at::LINK,
+                len: super::at::LINK_LEN,
+                cite: "harvest 5 SS2.2 -- same forwarding-link shape as v5's \
+                       free slot, offset by the 2-byte marker",
+            },
+            Field {
+                name: "fill",
+                index: None,
+                at: at::LINK + super::at::LINK_LEN,
+                len: physical.saturating_sub(at::LINK + super::at::LINK_LEN),
+                cite: "harvest 5 SS2.2 -- oracle-measured zero on a fresh v6 \
+                       delete; stored verbatim rather than assumed, \
+                       DataPage::slack's own discipline",
+            },
+        ]
+    }
+
+    /// A live v6 slot's fields, cited: the marker itself, then the record
+    /// body.
+    ///
+    /// Unlike [`free_fields`], the marker *is* one of these fields -- a live
+    /// slot's marker is a genuine stored fact (it counts updates), not a
+    /// constant this crate writes without reading.
+    #[must_use]
+    pub fn live_fields(physical: usize) -> Vec<Field> {
+        vec![
+            Field {
+                name: "marker",
+                index: None,
+                at: at::MARKER,
+                len: at::MARKER_LEN,
+                cite: "harvest 5 SS1.2 -- nonzero marks a live slot, and \
+                       counts updates (1 on first insert, incremented on \
+                       each update)",
+            },
+            Field {
+                name: "body",
+                index: None,
+                at: at::MARKER_LEN,
+                len: physical.saturating_sub(at::MARKER_LEN),
+                cite: "harvest 5 SS1.2 -- the logical record body, verbatim, \
+                       starting immediately after the marker",
+            },
+        ]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::format::Layout;
+
+        /// The free shape's three fields (marker, link, fill) tile a whole
+        /// slot exactly.
+        #[test]
+        fn the_free_shapes_fields_tile_a_whole_slot() {
+            let layout = Layout { what: "v6 free_slot", len: 1072, fields: free_fields(1072) };
+            assert_eq!(layout.tiling_fault(), None);
+        }
+
+        /// The live shape's two fields (marker plus body) tile a whole slot
+        /// exactly.
+        #[test]
+        fn the_live_shapes_fields_tile_a_whole_slot() {
+            let layout = Layout { what: "v6 live slot", len: 1072, fields: live_fields(1072) };
+            assert_eq!(layout.tiling_fault(), None);
+        }
+
+        /// Every field in both shapes carries the evidence that established
+        /// it.
+        #[test]
+        fn every_field_is_cited() {
+            for field in free_fields(1072).into_iter().chain(live_fields(1072)) {
+                assert!(!field.cite.trim().is_empty(), "{} has no citation", field.name);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

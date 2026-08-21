@@ -18,7 +18,7 @@ use crate::format::variable;
 use crate::model::{
     AcsBlock, Control, ControlRecord, DataPage, File, FragmentPage, FragmentSlot, IndexEntry,
     IndexPage, KeyDescriptor, Page, PageKind, RecordSlot, V6AllocationBlock, V6AllocationBlockCopy,
-    V6AllocationEntry, V6ControlRecord, V6PageTail,
+    V6AllocationEntry, V6ControlRecord, V6Page, V6PageTail,
 };
 
 /// Read a plain little-endian `u16` at `at`.
@@ -546,6 +546,70 @@ fn v6_allocation_table(
     }
 
     Ok((blocks, physical))
+}
+
+/// Read a v6 data page's content: every slot's own 2-byte marker decides
+/// live versus free directly (harvest 5 SS1.2, SS2.2/SS2.3) -- never the
+/// free chain, which v5's [`read_data_page`] must walk instead, because a
+/// v6 slot's liveness is self-contained. This is the load-bearing
+/// consequence of harvest 5 SS2.2's own trap: v6's free-list head
+/// (`fcr::v6::FREE_V6`) is pre-threaded on every claimed page, so a
+/// non-empty free list is not deletion evidence, and this function never
+/// consults it at all -- only the marker in front of each slot.
+///
+/// `physical` must be nonzero and large enough to hold a free slot's own
+/// marker-plus-forwarding-link (`format::free_slot::v6::at::LINK` +
+/// `format::free_slot::at::LINK_LEN`); the caller only calls this when
+/// `physical` is nonzero (`file`'s own guard, mirroring `resolve_pages`'s
+/// for v5).
+///
+/// # Errors
+///
+/// If `physical` is too short to hold a v6 slot's own marker plus the
+/// 4-byte forwarding link a free slot must carry.
+fn read_v6_data_page(
+    bytes: &[u8],
+    page_start: usize,
+    page_size: usize,
+    physical: usize,
+) -> Result<crate::model::V6DataPage, NotBtrieve> {
+    use crate::model::{V6DataPage, V6RecordSlot};
+
+    let free_shape_len = free_slot::v6::at::LINK + free_slot::at::LINK_LEN;
+    if physical < free_shape_len {
+        return Err(NotBtrieve {
+            why: format!(
+                "page {page_start:#x}: this file's {physical}-byte physical \
+                 record is too short to hold a v6 slot's own 2-byte marker \
+                 plus the 4-byte forwarding link a free slot must carry \
+                 (harvest 5 SS1.2/SS2.2)"
+            ),
+        });
+    }
+
+    let per_page = (page_size - page::v6::LEN) / physical;
+    let mut slots = Vec::with_capacity(per_page);
+    for i in 0..per_page {
+        let start = page_start + page::v6::LEN + i * physical;
+        let marker = get_u16(bytes, start + free_slot::v6::at::MARKER);
+        let slot = if marker == 0 {
+            let link_at = start + free_slot::v6::at::LINK;
+            let link: [u8; free_slot::at::LINK_LEN] =
+                bytes[link_at..link_at + free_slot::at::LINK_LEN].try_into().expect("4 bytes");
+            V6RecordSlot::Free {
+                next: free_slot::decode_link(link),
+                fill: bytes[link_at + free_slot::at::LINK_LEN..start + physical].to_vec(),
+            }
+        } else {
+            V6RecordSlot::Live {
+                marker,
+                body: bytes[start + free_slot::v6::at::MARKER_LEN..start + physical].to_vec(),
+            }
+        };
+        slots.push(slot);
+    }
+    let used = page::v6::LEN + per_page * physical;
+    Ok(V6DataPage { slots, slack: bytes[page_start + used..page_start + page_size].to_vec() })
 }
 
 /// Read a fixed-length-record data page's content: every slot in order,
@@ -1784,7 +1848,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         }
 
         let control = resolve_shadow(bytes, page_size)?;
-        let Control::Shadowed { live, live_is_page, .. } = &control else {
+        let Control::Shadowed { live, stale, live_is_page } = &control else {
             unreachable!("resolve_shadow only ever returns Control::Shadowed")
         };
 
@@ -1806,8 +1870,20 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         // portion and key array. A malformed trailer (a slot disagreeing
         // with what this crate's own census-derived formula expects) is
         // refused by that function's own, more specific message.
-        let _live_page_tail =
-            v6_page_tail(&bytes[live_page_start..], page_size, &live_descriptors)?;
+        let live_page_tail = v6_page_tail(&bytes[live_page_start..], page_size, &live_descriptors)?;
+
+        // The stale copy's own key/segment definitions and trailer, read
+        // independently off *its* physical page -- never assumed to equal
+        // the live copy's. A page caught mid-flip (harvest 0 ruling 7) is a
+        // genuine snapshot of the file's schema at some earlier moment; its
+        // exact bytes past 0x110 must still round-trip, the same reasoning
+        // that keeps `Control::Shadowed` holding both fixed portions in
+        // full rather than the live one plus a flag.
+        let stale_page_start = (1 - live_is_page) * page_size;
+        let stale_descriptors =
+            key_descriptors(&bytes[stale_page_start..], page_size, stale.keys)?;
+        let stale_page_tail =
+            v6_page_tail(&bytes[stale_page_start..], page_size, &stale_descriptors)?;
 
         // Task 17: the allocation table is the mechanism that makes v6
         // pages addressable at all, and it needs a whole-number-of-pages
@@ -1839,36 +1915,135 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         let (allocation_blocks, physical_map) =
             v6_allocation_table(bytes, page_size, total_pages)?;
 
-        // Ruling 7, part 3: identification stays on page 0 -- already true,
-        // `identify` never moves. What must not come from page 0 is
-        // geometry, and page 0 plus the allocation table (Task 17) is now
-        // everything this crate can resolve without ordinary v6 page
-        // content: the refusal moves here, past addressing, not just past
-        // the control record and its key/segment definitions.
-        return Err(NotBtrieve {
-            why: format!(
-                "identified as {:?} with {page_size}-byte pages; the live \
-                 control record is physical page {live_is_page} (generation \
-                 {}), KEYS={} realized as {} key/segment definitions plus a \
-                 validated definition-offset trailer (page 0 is fully \
-                 described), RECLEN={}, PHYSICAL={}, RECORDS={}, PAGES={} \
-                 (logical, not physical); the allocation table has {} \
-                 block(s) resolving {} logical page(s) to physical pages \
-                 out of {total_pages} physical pages total, but this crate \
-                 does not yet describe ordinary v6 page headers, records \
-                 or index pages, so it cannot resolve page content past \
-                 addressing",
-                id.generation,
-                live.generation,
-                live.keys,
-                live_descriptors.len(),
-                live.reclen,
-                live.physical,
-                live.records,
-                live.pages,
-                allocation_blocks.len(),
-                physical_map.len(),
-            ),
+        // Task 18: an ordinary v6 page's header, per-slot marker and
+        // fixed-length-record content (harvest 5 SS1.2, SS2.2; harvest 3
+        // SS2) are described now -- but only for a file declaring no keys
+        // at all. With any key, a page tagged TAG_DATA (0x4400, harvest 3
+        // SS2) could equally be a genuine data page or an index-tree
+        // descendant no pointer names directly; telling the two apart needs
+        // the walk from a key's own root that Task 19 builds, and guessing
+        // here would repeat exactly the mistake `model::PageKind::Orphan`'s
+        // own doc records a v5 task once made (defaulting an unclassified
+        // page to a kind it merely resembled, and mislabelling 9,058 real
+        // pages that way). So this crate refuses any v6 file with `keys >
+        // 0` rather than guess -- past both the control record and the
+        // allocation table, further than before this task, but still a
+        // refusal for every real corpus file: no v6-family corpus file
+        // declares zero keys.
+        if !live_descriptors.is_empty() {
+            return Err(NotBtrieve {
+                why: format!(
+                    "identified as {:?} with {page_size}-byte pages; the \
+                     live control record is physical page {live_is_page} \
+                     (generation {}), KEYS={} realized as {} key/segment \
+                     definitions plus a validated definition-offset trailer \
+                     (page 0 is fully described), RECLEN={}, PHYSICAL={}, \
+                     RECORDS={}, PAGES={} (logical, not physical); the \
+                     allocation table has {} block(s) resolving {} logical \
+                     page(s) to physical pages out of {total_pages} \
+                     physical pages total; this crate can describe an \
+                     ordinary v6 data page's header, per-slot marker and \
+                     records now (Task 18), but only for a file declaring no \
+                     keys at all -- with KEYS={}, a TAG_DATA page could \
+                     equally be a genuine data page or an index-tree \
+                     descendant, and distinguishing the two needs a walk \
+                     from each key's own root this crate does not build \
+                     until Task 19, so it refuses rather than guess which \
+                     TAG_DATA pages are which",
+                    id.generation,
+                    live.generation,
+                    live.keys,
+                    live_descriptors.len(),
+                    live.reclen,
+                    live.physical,
+                    live.records,
+                    live.pages,
+                    allocation_blocks.len(),
+                    physical_map.len(),
+                    live.keys,
+                ),
+            });
+        }
+
+        // KEYS == 0: no index root can exist, so every physical page this
+        // file claims through the allocation table is unambiguously a
+        // TAG_DATA page or something this task does not decode
+        // (TAG_TEMPLATE/TAG_VARIABLE) -- never an index descendant, since
+        // there is no key to grow a B-tree under. Every claimed physical
+        // page is read; every physical page in the file must be either the
+        // control record's own shadow pair, an allocation-table page, or a
+        // page some entry resolves to -- an unclaimed leftover physical
+        // page is refused by name (trap: a page this crate cannot classify
+        // is a refusal, never a silently dropped range).
+        let mut claimed: Vec<u32> = physical_map.values().copied().collect();
+        claimed.sort_unstable();
+        claimed.dedup();
+        if claimed.len() != physical_map.len() {
+            return Err(NotBtrieve {
+                why: format!(
+                    "identified as {:?}: the allocation table resolves two \
+                     different logical ids to the same physical page -- a \
+                     genuine contradiction this crate refuses rather than \
+                     picking one",
+                    id.generation
+                ),
+            });
+        }
+
+        let mut v6_pages = Vec::with_capacity(claimed.len());
+        for physical_page in &claimed {
+            let page_start = *physical_page as usize * page_size;
+            let tag = get_u16(bytes, page_start + page::v6::at::TAG);
+            let logical = get_u16(bytes, page_start + page::v6::at::LOGICAL);
+            let stamp = get_u16(bytes, page_start + page::v6::at::STAMP);
+            let content = if tag == page::v6::TAG_DATA
+                && live.variable_mark == 0
+                && live.physical != 0
+            {
+                Some(read_v6_data_page(bytes, page_start, page_size, live.physical as usize)?)
+            } else {
+                None
+            };
+            v6_pages.push(V6Page { physical_page: *physical_page, tag, logical, stamp, content });
+        }
+
+        let mut accounted: HashSet<u32> = HashSet::new();
+        accounted.insert(0);
+        accounted.insert(1);
+        for (index, _) in allocation_blocks.iter().enumerate() {
+            let (first, second) = alloc::pair_position(page_size, index + 1);
+            accounted.insert(first as u32);
+            accounted.insert(second as u32);
+        }
+        accounted.extend(claimed.iter().copied());
+        for physical_page in 0..total_pages as u32 {
+            if !accounted.contains(&physical_page) {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "identified as {:?}: physical page {physical_page} \
+                         is none of the control record's own shadow pair, an \
+                         allocation-table page, or a page the allocation \
+                         table resolves some logical id to -- this crate \
+                         cannot classify it and refuses rather than \
+                         silently dropping its bytes",
+                        id.generation
+                    ),
+                });
+            }
+        }
+
+        return Ok(File {
+            id,
+            control,
+            key_descriptors: live_descriptors,
+            page_zero_tail: Vec::new(),
+            pages: Vec::new(),
+            v6_stale_key_descriptors: stale_descriptors,
+            v6_page_tail: Some(live_page_tail),
+            v6_stale_page_tail: Some(stale_page_tail),
+            v6_allocation_blocks: allocation_blocks,
+            v6_pages,
+            len: bytes.len() as u64,
         });
     }
 
@@ -1924,6 +2099,11 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         key_descriptors,
         page_zero_tail,
         pages,
+        v6_stale_key_descriptors: Vec::new(),
+        v6_page_tail: None,
+        v6_stale_page_tail: None,
+        v6_allocation_blocks: Vec::new(),
+        v6_pages: Vec::new(),
         len: bytes.len() as u64,
     })
 }
@@ -1999,6 +2179,158 @@ mod tests {
         b[0x04..0x06].copy_from_slice(&gen0.to_le_bytes());
         b[PAGE_SIZE + 0x04..PAGE_SIZE + 0x06].copy_from_slice(&gen1.to_le_bytes());
         b
+    }
+
+    /// A synthetic, zero-key v6 file this task's Step 1: a whole file
+    /// this crate can now read *and* emit completely, past a real corpus
+    /// file's own reach -- every real v6-family corpus file declares at
+    /// least one key (this task's own census: `KEYS` is never 0 across all
+    /// 507 v6 corpus files), so no real file exercises the write path this
+    /// synthetic fixture proves, the same reasoning Task 8's own
+    /// zero-key fixture used for v5.
+    ///
+    /// Five physical pages, 512 bytes each: 0/1 the control record's own
+    /// shadow pair (page 1 live, generation 2 > page 0's 1); 2/3 allocation-
+    /// table block 1's own shadow pair (page 3 live, generation 20 > page
+    /// 2's 10), one entry (logical 1) claiming physical page 4; 4 the one
+    /// data page, `TAG_DATA`, holding two live 60-byte slots ("Sysop",
+    /// "Test") and six slots already on the free list (harvest 5 SS2.2's
+    /// own "every claimed page arrives pre-threaded" shape, not evidence of
+    /// a deletion this fixture never performed).
+    fn v6_no_key_data_page_file() -> Vec<u8> {
+        const PAGE_SIZE: usize = 512;
+        const PHYSICAL: usize = 60;
+        let mut b = vec![0u8; 5 * PAGE_SIZE];
+
+        // Physical pages 0/1: the control record's own shadow pair. Page 1
+        // is live (generation 2 > page 0's 1).
+        for (page, generation) in [(0usize, 1u16), (1usize, 2u16)] {
+            let base = page * PAGE_SIZE;
+            b[base..base + 4].copy_from_slice(&[b'F', b'C', 0, 0]);
+            b[base + 0x4a..base + 0x4c].copy_from_slice(&0x600u16.to_le_bytes());
+            b[base + 0x04..base + 0x06].copy_from_slice(&generation.to_le_bytes());
+            b[base + 0x08..base + 0x0a].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+            b[base + 0x10..base + 0x14].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // FREE
+            b[base + 0x14..base + 0x16].copy_from_slice(&0u16.to_le_bytes()); // KEYS = 0
+            b[base + 0x16..base + 0x18].copy_from_slice(&(PHYSICAL as u16).to_le_bytes()); // RECLEN
+            b[base + 0x18..base + 0x1a].copy_from_slice(&(PHYSICAL as u16).to_le_bytes()); // PHYSICAL
+            // RECORDS (0x1a, high-word-first long) = 2
+            b[base + 0x1a..base + 0x1c].copy_from_slice(&0u16.to_le_bytes());
+            b[base + 0x1c..base + 0x1e].copy_from_slice(&2u16.to_le_bytes());
+            // PAGES (0x26, high-word-first long) = 1 (logical)
+            b[base + 0x26..base + 0x28].copy_from_slice(&0u16.to_le_bytes());
+            b[base + 0x28..base + 0x2a].copy_from_slice(&1u16.to_le_bytes());
+            // VARIABLE_MARK (0x38) = 0: fixed-length records
+            b[base + 0x38..base + 0x3c].copy_from_slice(&0u32.to_le_bytes());
+            // VARIABLE_HEAD (0xa0) = NO_VARIABLE_HEAD
+            b[base + 0xa0..base + 0xa4].copy_from_slice(&0xff00_ffffu32.to_le_bytes());
+        }
+
+        // Physical pages 2/3: allocation-table block 1's own shadow pair.
+        // Page 3 is live (generation 20 > page 2's 10). One entry (logical
+        // 1, slot 0) claims physical page 4 as TAG_DATA.
+        for (page, generation) in [(2usize, 10u16), (3usize, 20u16)] {
+            let base = page * PAGE_SIZE;
+            b[base..base + 2].copy_from_slice(alloc::MAGIC);
+            b[base + alloc::at::BLOCK..base + alloc::at::BLOCK + 2].copy_from_slice(&1u16.to_le_bytes());
+            b[base + alloc::at::GENERATION..base + alloc::at::GENERATION + 2]
+                .copy_from_slice(&generation.to_le_bytes());
+            let entry0 = base + alloc::at::ENTRIES;
+            b[entry0..entry0 + 2].copy_from_slice(&page::v6::TAG_DATA.to_le_bytes());
+            b[entry0 + 2..entry0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        }
+
+        // Physical page 4: the one data page. Header: TAG_DATA, logical id
+        // 1 (self-reported, decorative), stamp 5.
+        let base = 4 * PAGE_SIZE;
+        b[base + page::v6::at::TAG..base + page::v6::at::TAG + 2]
+            .copy_from_slice(&page::v6::TAG_DATA.to_le_bytes());
+        b[base + page::v6::at::LOGICAL..base + page::v6::at::LOGICAL + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
+        b[base + page::v6::at::STAMP..base + page::v6::at::STAMP + 2]
+            .copy_from_slice(&5u16.to_le_bytes());
+
+        // Slot 0: live, marker 1, body "Sysop" padded with zeros.
+        let slot0 = base + page::v6::LEN;
+        b[slot0..slot0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        b[slot0 + 2..slot0 + 2 + 5].copy_from_slice(b"Sysop");
+
+        // Slot 1: live, marker 1, body "Test" padded with zeros.
+        let slot1 = slot0 + PHYSICAL;
+        b[slot1..slot1 + 2].copy_from_slice(&1u16.to_le_bytes());
+        b[slot1 + 2..slot1 + 2 + 4].copy_from_slice(b"Test");
+
+        // Slots 2..7: free, threaded onto the free list, ending in NOWHERE
+        // -- harvest 5 SS2.2's "every claimed page arrives pre-threaded"
+        // shape. Slot 2's own link is the file's own free-list head
+        // (arbitrary but nonzero, to prove `decode_link` is exercised
+        // rather than every free slot happening to read zero); the rest
+        // chain to the slot before them, slot 7 (the chain's tail) reading
+        // NOWHERE.
+        let mut next = 0xffff_ffffu32; // slot 7 (the last one built) reads NOWHERE
+        for i in (2..8).rev() {
+            let slot = base + page::v6::LEN + i * PHYSICAL;
+            b[slot..slot + 2].copy_from_slice(&0u16.to_le_bytes()); // marker = 0 (free)
+            b[slot + 2..slot + 6].copy_from_slice(&free_slot::encode_link(next));
+            // fill (slot + 6..slot + PHYSICAL) stays zero.
+            next = slot as u32; // not a real file position, just distinct per slot
+        }
+
+        b
+    }
+
+    /// Step 1/5 of this task, end to end: a v6 file with no keys at all has
+    /// no index root to leave undescribed (Task 19's own scope), so its one
+    /// data page -- header, per-slot marker, two live records and six free
+    /// slots, plus the trailing slack -- is everything past page 0 and the
+    /// allocation table, and the whole file now round-trips completely.
+    #[test]
+    fn a_v6_data_page_with_no_keys_round_trips_completely() {
+        use crate::model::V6RecordSlot;
+
+        let original = v6_no_key_data_page_file();
+        let model = file(&original).expect("a zero-key v6 file describes completely");
+
+        let Control::Shadowed { live_is_page, .. } = &model.control else {
+            panic!("a v6 file has a shadowed control record")
+        };
+        assert_eq!(*live_is_page, 1, "generation 2 (page 1) beats generation 1 (page 0)");
+        assert!(model.key_descriptors.is_empty(), "KEYS = 0");
+        assert_eq!(model.v6_pages.len(), 1, "one claimed logical page, physical 4");
+
+        let page = &model.v6_pages[0];
+        assert_eq!(page.physical_page, 4);
+        assert_eq!(page.tag, crate::format::page::v6::TAG_DATA);
+        assert_eq!(page.logical, 1);
+        assert_eq!(page.stamp, 5);
+
+        let content = page.content.as_ref().expect("a TAG_DATA page on a zero-key file is Data");
+        assert_eq!(content.slots.len(), 8, "(512 - 6) / 60 == 8");
+        match &content.slots[0] {
+            V6RecordSlot::Live { marker, body } => {
+                assert_eq!(*marker, 1);
+                assert!(body.starts_with(b"Sysop"));
+            }
+            other => panic!("slot 0 must be live: {other:?}"),
+        }
+        match &content.slots[1] {
+            V6RecordSlot::Live { marker, body } => {
+                assert_eq!(*marker, 1);
+                assert!(body.starts_with(b"Test"));
+            }
+            other => panic!("slot 1 must be live: {other:?}"),
+        }
+        for (i, slot) in content.slots.iter().enumerate().skip(2) {
+            match slot {
+                V6RecordSlot::Free { .. } => {}
+                other => panic!("slot {i} must be free: {other:?}"),
+            }
+        }
+        assert_eq!(content.slack.len(), 512 - 6 - 8 * 60, "26 bytes of trailing slack");
+
+        let emitted = crate::emit::file(&model)
+            .expect("a zero-key v6 file with one described data page leaves nothing unwritten");
+        assert_eq!(emitted.bytes(), original.as_slice());
     }
 
     /// Physical page 0 of this file describes an empty three-page database.
@@ -2359,7 +2691,7 @@ mod tests {
         let mut canvas = crate::canvas::Canvas::new(page_size);
         crate::emit::write_v6_fixed_portion(&mut canvas, id.generation, id.page_size, &control, 0)
             .expect("the fixed portion is fully described");
-        crate::emit::write_v6_page_tail(&mut canvas, page_size, &descriptors, &tail)
+        crate::emit::write_v6_page_tail(&mut canvas, page_size, &descriptors, &tail, 0)
             .expect("the key/segment definitions and trailer are fully described");
         let emitted = canvas.finish().expect("every byte of page 0 written exactly once");
 
@@ -2495,11 +2827,21 @@ mod tests {
             "names the total physical page count, correctly labeled: {}",
             e.why
         );
+        // Task 18: the refusal moved past addressing again -- it now says
+        // this crate *can* describe an ordinary v6 data page (header,
+        // per-slot marker, records), just not for a file with any key,
+        // since a TAG_DATA page could be a genuine data page or an
+        // index-tree descendant this crate cannot yet tell apart without
+        // Task 19's walk. `wccmp002.vir` has KEYS=1, so it still refuses --
+        // for a content reason now, not an addressing one.
         assert!(
-            e.why.contains("cannot resolve page content past addressing"),
-            "the refusal is now about content, not addressing: {}",
+            e.why.contains("a TAG_DATA page could equally be a genuine data \
+                            page or an index-tree descendant"),
+            "the refusal is now about which TAG_DATA pages are which, not \
+             addressing: {}",
             e.why
         );
+        assert!(e.why.contains("Task 19"), "names the task that would resolve it: {}", e.why);
     }
 
     /// A tie is refused rather than resolved. No corpus file has ever tied,
