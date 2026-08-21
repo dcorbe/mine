@@ -329,4 +329,59 @@ mod tests {
         assert_eq!(emitted.owner_of(3).map(|o| o.field), Some("version"));
         assert_eq!(emitted.owner_of(4), None, "past the end nobody owns");
     }
+
+    /// The coverage bitmap is one `u64` per 64 bytes. Every other test in
+    /// this module fits inside 8 bytes, so `at / 64` is always `0` and the
+    /// word-selection arithmetic is never actually exercised -- a bug that
+    /// only breaks word 1 or later would sail through them. 200 is
+    /// deliberately not a multiple of 64: it needs four words, and its last
+    /// word is only partly occupied (bytes 192..200).
+    #[test]
+    fn a_write_across_a_word_boundary_reads_back_correctly() {
+        let mut canvas = Canvas::new(200);
+        canvas.put(0, &[0u8; 60], owner("head")).expect("in range");
+        // Bytes 60..70 straddle the boundary between word 0 (bits 0..64)
+        // and word 1 (bits 64..128).
+        let crossing: Vec<u8> = (60..70).collect();
+        canvas.put(60, &crossing, owner("cross")).expect("in range");
+        canvas.put(70, &[0u8; 130], owner("tail")).expect("in range");
+        let emitted = canvas.finish().expect("all 200 bytes written");
+        assert_eq!(&emitted.bytes()[60..70], crossing.as_slice());
+        assert_eq!(
+            emitted.owner_of(64).map(|o| o.field),
+            Some("cross"),
+            "byte 64 is the first bit of word 1, and still belongs to the field that wrote it"
+        );
+    }
+
+    /// An unwritten byte living in word 1 or later (not word 0, which every
+    /// other test in this file exercises) must still be found and named.
+    #[test]
+    fn an_unwritten_byte_in_a_later_word_is_a_fault_that_names_its_range() {
+        let mut canvas = Canvas::new(200);
+        canvas.put(0, &[0u8; 100], owner("head")).expect("in range");
+        // Byte 100 (word 100 / 64 == 1) is deliberately skipped.
+        canvas.put(101, &[0u8; 99], owner("tail")).expect("in range");
+        let fault = canvas.finish().expect_err("byte 100 was never written");
+        let said = fault.to_string();
+        assert!(said.contains("100..101"), "names exactly the one missing byte, in word 1: {said}");
+    }
+
+    /// The last word of a 200-byte canvas covers bits 192..256, but the
+    /// canvas itself ends at byte 200. If the missing-range scan walked to
+    /// the end of the word instead of the end of the canvas, leaving only
+    /// byte 199 unwritten would be misreported as `199..256` (or panic
+    /// indexing bytes that do not exist). It must report exactly `199..200`.
+    #[test]
+    fn the_last_byte_of_a_non_word_aligned_canvas_is_reported_exactly() {
+        let mut canvas = Canvas::new(200);
+        canvas.put(0, &[0u8; 199], owner("body")).expect("in range");
+        // Byte 199, the canvas's last byte, is deliberately left unwritten.
+        let fault = canvas.finish().expect_err("byte 199 was never written");
+        let said = fault.to_string();
+        assert!(
+            said.contains("199..200"),
+            "names exactly the last byte, not the word it happens to live in: {said}"
+        );
+    }
 }
