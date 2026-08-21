@@ -13,23 +13,26 @@
 //! not a silent zero. [`crate::model::File`] describes a v5 file's control
 //! record fixed portion (`0x00..0x110`), its key/segment definition array,
 //! every physical page's six-byte header (`format::page`) plus what the page
-//! graph says it is, and now -- for a `Data`/`Free` page of a non-variable-
-//! length file -- that page's fixed-length-record content too: every slot,
-//! verbatim, plus the trailing slack (`crate::model::DataPage`). An
-//! index/ACS page's content, and a variable-length file's fragment-page
-//! content, are both still a later task, so [`file`] still faults on any
-//! real corpus file that has one -- every v5 file measured does, since a
-//! file needs at least one key to be useful and a key's root is always an
-//! index page -- but the fault names the first byte range *this* crate
-//! still cannot describe, which for a file whose first page happens to be a
-//! data page (no preceding undescribed index page) is now past the end of
-//! the file entirely: nothing left unwritten. That is why the round-trip
-//! pin can still be 0 while this task closes real ground underneath it.
+//! graph says it is, a `Data`/`Free` page of a non-variable-length file's
+//! fixed-length-record content (every slot, verbatim, plus the trailing
+//! slack -- `crate::model::DataPage`), and now an `Index` page's own entry
+//! array too: the entry count, the two boundary pointers, every entry --
+//! key, `head`, the duplicate-only `tail`, and the possibly-omitted `child`
+//! -- plus trailing padding (`crate::model::IndexPage`). `USRACC.DAT`
+//! round-trips completely as of this task -- the first real corpus file to
+//! do so. An `IndexChild` page's content (a B-tree node no key's root
+//! names, whose owning key this task does not resolve), the ACS block's
+//! content, and a variable-length file's fragment-page content are all
+//! still later tasks, so [`file`] still faults on any real corpus file that
+//! has one of those -- but the fault names the first byte range *this*
+//! crate still cannot describe, and 102 of 652 corpus files have none of
+//! them.
 
 use crate::canvas::{Canvas, Emitted, Fault, Owner};
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
 use crate::format::generation::Generation;
+use crate::format::index;
 use crate::format::page;
 use crate::model::File;
 
@@ -92,6 +95,66 @@ fn write_page_content(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
             offset += slot.len();
         }
         canvas.put(offset, &content.slack, page_owner("slack", page_number))?;
+    }
+    Ok(())
+}
+
+/// Write every index page's content -- entry count, the two boundary
+/// pointers, every entry, then trailing padding -- for every page whose
+/// model carries one (`Page::index`, `Some` for an `Index` page; `None` for
+/// a `Data`/`Free`/`Acs` page, or an `IndexChild` page whose owning key is
+/// not yet resolved, both a later task, so those pages' bodies stay
+/// unwritten and `Canvas::finish` reports them).
+///
+/// Every field is written from the model's own stored value, never
+/// derived -- in particular the last entry's `child` field is written
+/// exactly as `read::read_index_page` captured it (typically a literal
+/// zero placeholder, not `NOWHERE`), and is not written at all when the
+/// model says it was never on disk to begin with (`IndexEntry::child`
+/// `None`, the `WCCSPELS.VIR`-style full-page omission).
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_index_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for (i, p) in model.pages.iter().enumerate() {
+        let Some(idx) = &p.index else { continue };
+        let page_number = i + 1;
+        let at = page_number * page_size;
+
+        // A page this small cannot physically hold anywhere near 65,536
+        // entries (`read::read_index_page` would have refused first), so
+        // this narrowing is sound rather than a silent truncation risk.
+        let count = idx.entries.len() as u16;
+        canvas.put_u16(at + index::at::COUNT, count, page_owner("index_count", page_number))?;
+        canvas.put_long(
+            at + index::at::RIGHTMOST,
+            idx.rightmost,
+            page_owner("index_rightmost", page_number),
+        )?;
+        canvas.put_long(
+            at + index::at::LEFTMOST,
+            idx.leftmost,
+            page_owner("index_leftmost", page_number),
+        )?;
+
+        let mut offset = at + index::at::ENTRIES;
+        for entry in &idx.entries {
+            canvas.put(offset, &entry.key, page_owner("index_key", page_number))?;
+            offset += entry.key.len();
+            canvas.put_long(offset, entry.head, page_owner("index_head", page_number))?;
+            offset += 4;
+            if let Some(tail) = entry.tail {
+                canvas.put_long(offset, tail, page_owner("index_tail", page_number))?;
+                offset += 4;
+            }
+            if let Some(child) = entry.child {
+                canvas.put_long(offset, child, page_owner("index_child", page_number))?;
+                offset += 4;
+            }
+        }
+        canvas.put(offset, &idx.padding, page_owner("index_padding", page_number))?;
     }
     Ok(())
 }
@@ -240,12 +303,15 @@ fn write_fixed_portion(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 /// If the model does not yet describe every byte of the file. A v6 file's
 /// control record is entirely undescribed. A v5 file's page 0 (the control
 /// record plus its key/segment definitions) is fully described and will
-/// round-trip on its own; every page's six-byte header round-trips too; and
-/// now a `Data`/`Free` page of a non-variable-length file has its slots and
-/// slack described as well. An index/ACS page's content, and a
-/// variable-length file's fragment-page content, are not, so a real corpus
-/// file that has one of those still leaves the canvas with unwritten bytes
-/// and `Canvas::finish` reports them.
+/// round-trip on its own; every page's six-byte header round-trips too; a
+/// `Data`/`Free` page of a non-variable-length file has its slots and slack
+/// described; and now an `Index` page (a key's own root) has its entry
+/// array described too. An `IndexChild` page's content, the ACS block's
+/// content, and a variable-length file's fragment-page content are not, so
+/// a real corpus file that has one of those still leaves the canvas with
+/// unwritten bytes and `Canvas::finish` reports them -- but a file small
+/// enough that every key's whole tree fits on its own root page (no
+/// `IndexChild` pages at all) now round-trips completely.
 pub fn file(model: &File) -> Result<Emitted, Fault> {
     let mut canvas = Canvas::new(model.len as usize);
     if model.id.generation.is_v6() {
@@ -255,6 +321,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
     write_key_descriptors(&mut canvas, model)?;
     write_page_headers(&mut canvas, model)?;
     write_page_content(&mut canvas, model)?;
+    write_index_pages(&mut canvas, model)?;
     canvas.finish()
 }
 
@@ -303,26 +370,42 @@ mod tests {
         assert_eq!(emitted.bytes(), original.as_slice());
     }
 
-    /// `file` faults rather than succeeding on a real (multi-page) corpus
-    /// file: page 0 (fixed portion, key/segment definitions, zero padding)
-    /// is now fully described and writes without a fault, and so is every
-    /// page's own six-byte header -- but a page's content past that header
-    /// is not, so the fault must name the range starting exactly at
-    /// `page_size + 6` (right after page 1's header), not at `0x110` and
-    /// not at `page_size`.
+    /// `file` still faults on a real corpus file that has an `IndexChild`
+    /// page -- a B-tree node no key's root names, whose owning key this
+    /// task does not resolve (`model::Page::index`'s own doc): `USRACC.DAT`
+    /// itself is now fully described (see
+    /// `usracc_dat_round_trips_byte_for_byte` below), so this test uses
+    /// `FW_QSQDB.DA_` instead, the same real file `read`'s own
+    /// `a_real_files_unrooted_btree_nodes_classify_as_index_children` test
+    /// measures: pages 3, 5, 7, 9, 11, 12 are `IndexChild`. Page 0, every
+    /// page's own six-byte header, both `Index` roots' content (pages 1
+    /// and 2), and every `Data` page's content (4, 6, 10) are all described
+    /// now -- so the fault must name the earliest undescribed range, which
+    /// is page 3's content, starting right after its own header.
     #[test]
-    fn file_faults_on_bytes_past_page_one_header_for_a_multi_page_file() {
-        // USRACC.DAT itself: page_size 512, 3 pages, 1536 bytes total.
-        let original = usracc_dat();
-        let model = read::file(&original).expect("reads");
-        assert_eq!(model.len, 1536);
+    fn file_still_faults_on_a_real_files_unresolved_index_child_page() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("emit: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join(
+            "modules/butt-care/DOS Software/BBS/MajorBBS/4EVER/Addons/Farwest Trivia v3.23a/COPY/FW_QSQDB.DA_",
+        );
+        let Ok(original) = std::fs::read(&path) else {
+            eprintln!("emit: FW_QSQDB.DA_ not present, nothing verified");
+            return;
+        };
+        let model = read::file(&original).expect("FW_QSQDB.DA_ is a valid v5 file");
 
-        let fault = file(&model).expect_err("page 1 and 2's content is not yet described");
+        let page_size = model.id.page_size as usize;
+        let page_3_content_start = 3 * page_size + page::LEN;
+
+        let fault = file(&model).expect_err("page 3's IndexChild content is not yet described");
         let said = fault.to_string();
         assert!(
-            said.contains("518") && said.contains("1024"),
-            "names the range starting right after page 1's header (518) up \
-             to page 2's own header (1024): {said}"
+            said.contains(&page_3_content_start.to_string()),
+            "names the range starting right after page 3's header \
+             ({page_3_content_start}): {said}"
         );
     }
 
@@ -371,6 +454,23 @@ mod tests {
 
         let emitted = file(&model)
             .expect("zero keys leaves nothing undescribed: page 0 plus one fully-described data page");
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// Step 1/4 of this task, and the whole point of it: `USRACC.DAT`
+    /// round-trips completely for the first time. Page 0 (fixed portion,
+    /// key descriptor, zero padding), page 1's header plus its index
+    /// content (2 entries), and page 2's header plus its 2 data slots and
+    /// slack are now *all* described -- nothing left for the canvas to
+    /// fault on.
+    #[test]
+    fn usracc_dat_round_trips_byte_for_byte() {
+        let original = usracc_dat();
+        let model = read::file(&original).expect("reads");
+        let emitted = file(&model).expect(
+            "USRACC.DAT has one key, one index root page, and one data page -- \
+             every byte of it is now described",
+        );
         assert_eq!(emitted.bytes(), original.as_slice());
     }
 

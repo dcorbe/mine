@@ -9,8 +9,9 @@ use std::collections::{HashMap, HashSet};
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
 use crate::format::generation::{identify, NotBtrieve};
+use crate::format::index;
 use crate::format::page;
-use crate::model::{ControlRecord, DataPage, File, KeyDescriptor, Page, PageKind};
+use crate::model::{ControlRecord, DataPage, File, IndexEntry, IndexPage, KeyDescriptor, Page, PageKind};
 
 /// Read a plain little-endian `u16` at `at`.
 fn get_u16(bytes: &[u8], at: usize) -> u16 {
@@ -191,6 +192,99 @@ fn read_data_page(bytes: &[u8], page_start: usize, page_size: usize, physical: u
     DataPage { slots, slack: bytes[page_start + used..page_start + page_size].to_vec() }
 }
 
+/// Read an index page's content (harvest 4 SS4): the entry count and the
+/// two boundary pointers, then every entry -- key, `head`, the
+/// duplicate-only `tail`, and the possibly-omitted `child` -- and finally
+/// whatever bytes remain to the end of the page.
+///
+/// `key_length` and `attributes` are the owning key descriptor's own
+/// values -- they cannot be recovered from the page itself, which is why
+/// they are parameters. `entry_size` is cross-checked against
+/// `key_length`/`attributes` rather than trusted alone: harvest 4 SS4 says
+/// it is `key_length + 8`, or `+12` when [`key_descriptor::DUPLICATES`] is
+/// set, and a descriptor whose stored `entry_size` agrees with neither is a
+/// genuine contradiction between two independently-stored fields, refused
+/// by name rather than silently guessed at.
+///
+/// # The last entry's `child` field: written as a literal zero, or omitted
+///
+/// Every entry's `child` is read **verbatim**, never derived from "this is
+/// a leaf so it must be NOWHERE" -- the last entry of a page reads literal
+/// zero there (a placeholder, not a pointer to page 0), which this function
+/// stores exactly as found. When the page has no room left at all for
+/// those trailing 4 bytes (`WCCSPELS.VIR` page 1: fifty 10-byte entries in
+/// a 512-byte page, four bytes more than fits), `child` is `None` and zero
+/// bytes are consumed for it -- distinct from a *present* value of zero.
+///
+/// # Errors
+///
+/// If `entry_size` matches neither the unique- nor duplicate-key formula,
+/// or an entry (even without its possibly-omitted `child` field) would run
+/// past the page.
+fn read_index_page(
+    bytes: &[u8],
+    page_start: usize,
+    page_size: usize,
+    key_length: usize,
+    entry_size: usize,
+    attributes: u16,
+) -> Result<IndexPage, NotBtrieve> {
+    let duplicates = attributes & key_descriptor::DUPLICATES != 0;
+    let expected = index::entry_width(key_length, duplicates);
+    if entry_size != expected {
+        return Err(NotBtrieve {
+            why: format!(
+                "page {page_start:#x}: entry_size {entry_size} disagrees \
+                 with key_length {key_length} and duplicates={duplicates} \
+                 -- harvest 4 SS4 says this should be {expected}"
+            ),
+        });
+    }
+
+    let count = usize::from(get_u16(bytes, page_start + index::at::COUNT));
+    let rightmost = get_long(bytes, page_start + index::at::RIGHTMOST);
+    let leftmost = get_long(bytes, page_start + index::at::LEFTMOST);
+
+    let page_end = page_start + page_size;
+    let mut entries = Vec::with_capacity(count);
+    let mut offset = page_start + index::at::ENTRIES;
+    for n in 0..count {
+        let is_last = n + 1 == count;
+        let without_child = entry_size - 4;
+        if offset + without_child > page_end {
+            return Err(NotBtrieve {
+                why: format!(
+                    "page {page_start:#x}: entry {n} of {count} (width \
+                     {entry_size}) would run past the {page_size}-byte page \
+                     even without its trailing child field"
+                ),
+            });
+        }
+        let key = bytes[offset..offset + key_length].to_vec();
+        let mut at = offset + key_length;
+        let head = get_long(bytes, at);
+        at += 4;
+        let tail = if duplicates {
+            let t = get_long(bytes, at);
+            at += 4;
+            Some(t)
+        } else {
+            None
+        };
+        let full_end = offset + entry_size;
+        let (child, consumed) = if is_last && full_end > page_end {
+            (None, at)
+        } else {
+            (Some(get_long(bytes, at)), full_end)
+        };
+        entries.push(IndexEntry { key, head, tail, child });
+        offset = consumed;
+    }
+
+    let padding = bytes[offset..page_end].to_vec();
+    Ok(IndexPage { rightmost, leftmost, entries, padding })
+}
+
 /// How `page_number` is already spoken for, for a conflict message.
 fn describe_claim(kind: PageKind) -> String {
     match kind {
@@ -262,6 +356,11 @@ fn resolve_pages(
     key_descriptors: &[KeyDescriptor],
 ) -> Result<Vec<Page>, NotBtrieve> {
     let mut claim: HashMap<u32, PageKind> = HashMap::new();
+    // Which key descriptor a root page belongs to -- needed once a page is
+    // known to be `Index`, so its entries can be decoded with the right
+    // `key_length`/`entry_size`/`attributes` (none of which the page itself
+    // carries).
+    let mut root_owner: HashMap<u32, usize> = HashMap::new();
 
     // Index: every key descriptor's own root page (0 means "no root" --
     // either a continuation definition or an as-yet-empty key).
@@ -280,6 +379,7 @@ fn resolve_pages(
             });
         }
         claim.insert(d.root_page, PageKind::Index);
+        root_owner.insert(d.root_page, i);
     }
 
     // ACS: gated on content (harvest 4 SS6a), not on FCR 0x10a alone.
@@ -462,7 +562,32 @@ fn resolve_pages(
             None
         };
 
-        pages.push(Page { number, data_bit, stamp, kind, content });
+        // An index page's entries, described whenever this page is a key's
+        // own root: its owning key descriptor is known directly (via
+        // `root_owner`), so `key_length`/`entry_size`/`attributes` need no
+        // walking to find. An `IndexChild` page's owning key is not yet
+        // known -- that requires walking child pointers down from a root,
+        // out of this task's scope -- so it stays `None` and `emit` faults
+        // on it honestly, the same way it faults on a variable-length
+        // fragment page today.
+        let index_content = if kind == PageKind::Index {
+            let &n = root_owner
+                .get(&(page_number as u32))
+                .unwrap_or_else(|| panic!("page {page_number} is Index but claims no owner"));
+            let d = &key_descriptors[n];
+            Some(read_index_page(
+                bytes,
+                at,
+                page_size,
+                d.key_length as usize,
+                d.entry_size as usize,
+                d.attributes,
+            )?)
+        } else {
+            None
+        };
+
+        pages.push(Page { number, data_bit, stamp, kind, content, index: index_content });
     }
     Ok(pages)
 }
@@ -757,6 +882,45 @@ mod tests {
         assert_eq!(content.slack, vec![0u8, 0], "the trailing 2 bytes, described and zero here");
     }
 
+    /// This task's own anchor case: `USRACC.DAT` page 1's index content,
+    /// decoded byte by byte against the raw bytes the controller measured
+    /// when this task was dispatched. `count` 2, `rightmost`/`leftmost`
+    /// both `NOWHERE` (a leaf with no children). Entry 0's key is `Sysop`
+    /// (NUL-padded to 10 bytes), `head` `0x406` (file byte 1030 -- page 2
+    /// starts at 1024, and the `Sysop` slot sits at page offset `0x06`),
+    /// no `tail` (this key permits no duplicates), `child` `Some(NOWHERE)`
+    /// -- a leaf, not the last entry. Entry 1's key is `Test`, `head`
+    /// `0x502` (file byte 1282 -- page offset `0x102`), `child`
+    /// `Some(0)` -- the last entry's literal-zero placeholder, not
+    /// `NOWHERE`, exactly as harvest 4 SS4 describes. The 460 bytes after
+    /// the last entry (`512 - 0x34`) are zero in this real file.
+    #[test]
+    fn usracc_dats_index_page_decodes_its_two_entries() {
+        let buf = usracc_dat();
+        let file = file(&buf).expect("a valid three-page v5 file");
+        let page1 = &file.pages[0];
+        assert_eq!(page1.kind, PageKind::Index);
+
+        let idx = page1.index.as_ref().expect("an Index page's content is described");
+        assert_eq!(idx.rightmost, 0xffff_ffff, "a leaf: no rightmost child");
+        assert_eq!(idx.leftmost, 0xffff_ffff, "a leaf: no leftmost child");
+        assert_eq!(idx.entries.len(), 2, "USRACC.DAT has exactly 2 records");
+
+        let sysop = &idx.entries[0];
+        assert_eq!(sysop.key, b"Sysop\0\0\0\0\0");
+        assert_eq!(sysop.head, 0x0406, "file byte 1030 -- page 2 offset 0x06");
+        assert_eq!(sysop.tail, None, "this key permits no duplicates");
+        assert_eq!(sysop.child, Some(0xffff_ffff), "not the last entry: a leaf's NOWHERE");
+
+        let test = &idx.entries[1];
+        assert_eq!(test.key, b"Test\0\0\0\0\0\0");
+        assert_eq!(test.head, 0x0502, "file byte 1282 -- page 2 offset 0x102");
+        assert_eq!(test.tail, None);
+        assert_eq!(test.child, Some(0), "the last entry's literal-zero placeholder, not NOWHERE");
+
+        assert_eq!(idx.padding, vec![0u8; 512 - 0x34], "460 zero bytes after the last entry");
+    }
+
     /// A real corpus file with deletions on record: `TTIHORBT.DAT`, 12
     /// 512-byte pages, `records` 0 (every record ever inserted has since
     /// been deleted). Its two keys' roots claim pages 1 and 2; the free
@@ -891,6 +1055,65 @@ mod tests {
         buf[0x206..0x20a].copy_from_slice(&[0x00, 0x00, 0x06, 0x02]); // next = 518 too
         let e = file(&buf).expect_err("the chain points back at itself");
         assert!(e.why.contains("revisits"), "{}", e.why);
+    }
+
+    /// The three page-kind *disagreement* refusal arms have no corpus
+    /// fixture -- 281/281 index roots, 15/15 ACS pages, and 22/22
+    /// free-chain pages agree with their own `data_bit` across the whole
+    /// v5 corpus (`resolve_pages`'s own doc comment). Reachable but
+    /// untested until now: three synthetic fixtures, one per arm.
+    ///
+    /// Arm 1: a key's root claims page 1 as an index root, but page 1's
+    /// own header sets `data_bit` -- the page says it holds records, which
+    /// contradicts the root claim.
+    #[test]
+    fn an_index_roots_own_data_bit_set_is_refused() {
+        let mut buf = usracc_first_page(); // keys = 1, root = 1
+        buf.resize(1024, 0); // page 0 plus page 1
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // page 1's own number = 1
+        buf[516..518].copy_from_slice(&0x8003u16.to_le_bytes()); // data_bit set, stamp 3
+        let e = file(&buf).expect_err("page 1 is an index root but data_bit is set");
+        assert!(e.why.contains("index root"), "{}", e.why);
+        assert!(e.why.contains("data_bit is set"), "{}", e.why);
+    }
+
+    /// Arm 2: a key declares `ALT_COLLATING`, which harvest 4 SS6a places
+    /// the ACS block at physical page 1 -- but page 1's own header sets
+    /// `data_bit`, contradicting the ACS claim.
+    #[test]
+    fn the_acs_pages_own_data_bit_set_is_refused() {
+        let mut buf = usracc_first_page(); // keys = 1
+        let def0 = 0x110;
+        buf[def0 + 0x08..def0 + 0x0a].copy_from_slice(&0x20u16.to_le_bytes()); // ALT_COLLATING
+        buf[0x14..0x16].copy_from_slice(&1u16.to_le_bytes()); // keys = 1
+        // Point this key's own root elsewhere so it does not also claim
+        // page 1 as an index root (that would hit arm 1's check first).
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]); // root = 2
+        buf.resize(1536, 0); // page 0, page 1 (ACS), page 2 (the root)
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // page 1's own number = 1
+        buf[516..518].copy_from_slice(&0x8003u16.to_le_bytes()); // data_bit set, stamp 3
+        buf[1024..1028].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]); // page 2's own number = 2
+        buf[1028..1030].copy_from_slice(&0x0003u16.to_le_bytes()); // data_bit clear
+        let e = file(&buf).expect_err("page 1 is the ACS block but data_bit is set");
+        assert!(e.why.contains("ACS"), "{}", e.why);
+        assert!(e.why.contains("data_bit is set"), "{}", e.why);
+    }
+
+    /// Arm 3: the free chain from FCR `0x10` reaches page 1, but page 1's
+    /// own header clears `data_bit` -- the page says it holds a B-tree
+    /// node, contradicting the free-chain claim that a record slot lives
+    /// there.
+    #[test]
+    fn a_free_pages_own_data_bit_clear_is_refused() {
+        let mut buf = usracc_fixed_portion(); // no keys, so nothing else claims page 1
+        buf.resize(1024, 0); // page 0 plus page 1
+        buf[0x10..0x14].copy_from_slice(&[0x00, 0x00, 0x06, 0x02]); // free = 518 (page 1, offset 6)
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // page 1's own number = 1
+        buf[516..518].copy_from_slice(&0x0003u16.to_le_bytes()); // data_bit clear, stamp 3
+        buf[518..522].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]); // this slot's own [prev/next] terminates the chain
+        let e = file(&buf).expect_err("the free chain reaches page 1 but data_bit is clear");
+        assert!(e.why.contains("free chain"), "{}", e.why);
+        assert!(e.why.contains("data_bit is clear"), "{}", e.why);
     }
 
     /// A free chain entry naming a position past the end of the file is

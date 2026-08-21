@@ -113,6 +113,16 @@ pub mod key_descriptor {
     /// row before a key must close) a file may have.
     pub const SEGMAX: usize = 24;
 
+    /// Bit 0 of `ATTRIBUTES`: more than one record may carry this key's
+    /// value. Harvest 4 SS1b (`keys.rs:78`, `flag::DUPLICATES`). This is
+    /// what `read::read_index_page` trusts to decide whether an index
+    /// entry carries a trailing `tail` field -- cross-checked, not assumed,
+    /// against the key descriptor's own stored `ENTRY_SIZE`
+    /// (`key_length+8` unique, `key_length+12` duplicate): a descriptor
+    /// whose `ENTRY_SIZE` agrees with neither is refused rather than
+    /// silently guessed at.
+    pub const DUPLICATES: u16 = 1 << 0;
+
     /// Bit 4 of `ATTRIBUTES`: another segment of *this same key* follows in
     /// the next definition. `BTVSTF.H:59`'s `ANOSEG 0x10`.
     pub const ANOSEG: u16 = 1 << 4;

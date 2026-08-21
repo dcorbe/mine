@@ -15,6 +15,7 @@
 
 pub mod fcr;
 pub mod generation;
+pub mod index;
 pub mod page;
 
 /// One described range of bytes.
