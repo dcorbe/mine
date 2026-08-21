@@ -413,7 +413,7 @@ fn write_key_descriptors(canvas: &mut Canvas, model: &File) -> Result<(), Fault>
 /// `tail.padding` are written verbatim; the trailer's own `u16` slots are
 /// not stored in `tail` at all, since they are a pure function of
 /// `descriptors` -- see `model::V6PageTail`'s own doc comment for why, and
-/// `format::fcr::trailer::expected_entry` for the one formula both this and
+/// `format::fcr::trailer::expected_entries` for the one formula both this and
 /// `read::v6_page_tail` share.
 ///
 /// When `page_size` has no trailer at all (512), `tail.padding` is empty
@@ -438,8 +438,8 @@ pub(crate) fn write_v6_page_tail(
     };
 
     canvas.put(after_definitions, &tail.gap, owner("trailer_gap"))?;
-    for (n, d) in descriptors.iter().enumerate() {
-        let value = fcr::trailer::expected_entry(n, d.self_tag);
+    let self_tags: Vec<u8> = descriptors.iter().map(|d| d.self_tag).collect();
+    for (n, value) in fcr::trailer::expected_entries(&self_tags).into_iter().enumerate() {
         canvas.put_u16(trailer_pos + n * 2, value, key_owner("definition_offset", n))?;
     }
     let after_trailer = trailer_pos + descriptors.len() * 2;

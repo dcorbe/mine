@@ -292,7 +292,7 @@ fn key_descriptors(
 /// If `descriptors` run past `format::fcr::trailer::position(page_size)`
 /// (never observed -- max 4 definitions in the corpus, every measured
 /// trailer position leaves room for far more), or any trailer slot's value
-/// disagrees with `format::fcr::trailer::expected_entry` -- a disagreement
+/// disagrees with `format::fcr::trailer::expected_entries` -- a disagreement
 /// this crate's own census found in 0 of 493 corpus files.
 fn v6_page_tail(
     bytes: &[u8],
@@ -327,20 +327,27 @@ fn v6_page_tail(
     }
     let gap = bytes[after_definitions..trailer_pos].to_vec();
 
-    for (n, d) in descriptors.iter().enumerate() {
+    // The compacted rule (`format::fcr::trailer::expected_entries`'s own
+    // doc): a slot's expected value is NOT a function of its own index, so
+    // this compares the whole array at once rather than one definition's
+    // SELF_TAG against one slot.
+    let self_tags: Vec<u8> = descriptors.iter().map(|d| d.self_tag).collect();
+    let expected = fcr::trailer::expected_entries(&self_tags);
+    for (n, exp) in expected.iter().enumerate() {
         let at = trailer_pos + n * 2;
         let actual = get_u16(bytes, at);
-        let expected = fcr::trailer::expected_entry(n, d.self_tag);
-        if actual != expected {
+        if actual != *exp {
             return Err(NotBtrieve {
                 why: format!(
                     "definition-offset trailer slot {n} at byte {at:#x} reads \
-                     {actual:#06x}, but key_descriptor[{n}]'s SELF_TAG is \
-                     {:#04x} so this crate's own derivation (harvest 2 \
-                     'Definition-offset trailer, worked', corrected by this \
-                     task's census of 493 corpus files) expects \
-                     {expected:#06x}",
-                    d.self_tag
+                     {actual:#06x}, but this crate's own compacted \
+                     derivation (harvest 2 'Definition-offset trailer, \
+                     worked', corrected by this task's census of 493 \
+                     corpus files: each independent segment's own offset \
+                     packed into the next free slot, in definition order, \
+                     zero-padded thereafter -- not one slot per definition \
+                     index) expects {exp:#06x} here given SELF_TAGs {:?}",
+                    self_tags
                 ),
             });
         }
@@ -1995,11 +2002,37 @@ mod tests {
     /// (harvest 2's own "PAGES, worked" file) -- its trailer exercises the
     /// zero-padded continuation slot this task's own census found (one real
     /// offset, one zero), not just the trivial single-definition case the
-    /// other four files above give.
+    /// other four files above give. Its continuation (`def1`) is the *last*
+    /// definition in the file, so this alone cannot distinguish the
+    /// compacted rule from the (wrong) positional one -- see
+    /// `galtela_dat_page_size_4096_whole_page_zero_round_trips` below for
+    /// the fixture that can.
     #[test]
     fn wccbank2_vir_page_size_4096_whole_page_zero_round_trips() {
         assert_whole_page_zero_round_trips(
             "archive/modules/majormud-nt/wccnt8pj/out/WCCBANK2.VIR",
+            4096,
+        );
+    }
+
+    /// `GALTELA.DAT` has `KEYS=3` realized as 4 definitions: `def0`
+    /// independent, `def1` a continuation, then `def2`/`def3` independent
+    /// -- a continuation that is *not* the last definition in the file.
+    /// This is the shape a code review found missing from every other
+    /// fixture in this file: the positional rule (slot `n` = `base(n)` when
+    /// definition `n` is independent, `0` otherwise) and the true compacted
+    /// rule (`format::fcr::trailer::expected_entries`: each independent
+    /// segment's offset packed into the *next free slot*, in order) only
+    /// disagree once an independent segment follows a continuation, and
+    /// none of `ELWGLOBN.DAT`/`wccacms2.nu1`/`WCCTEXT2.VIR`/`ELWGLOBU.DAT`/
+    /// `WCCBANK2.VIR` has that shape. `GALTELA.DAT`'s own measured trailer
+    /// is `0x0110, 0x014c, 0x016a, 0x0000` -- `def3`'s offset (`0x016a`)
+    /// compacted into slot 2, not sitting at slot 3 where its own
+    /// definition index would place it.
+    #[test]
+    fn galtela_dat_page_size_4096_whole_page_zero_round_trips() {
+        assert_whole_page_zero_round_trips(
+            "archive/tooling/wbtrv32/assets/GALTELA.DAT",
             4096,
         );
     }

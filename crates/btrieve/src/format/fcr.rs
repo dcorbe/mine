@@ -86,12 +86,22 @@
 //! This task's own census of all 493 corpus v6 files whose page size
 //! exceeds 512 (0 exceptions) confirms the file, not the harvest's prose:
 //! **the trailer holds one entry per *key*, not per definition** -- each
-//! independent segment's (`SELF_TAG != 0`) own absolute offset, packed in
-//! definition order, then zero for every `ANOSEG` continuation slot that
-//! follows. `key_descriptors.len()` slots exist (matching this crate's own
-//! "one entry per definition" capacity, per harvest 2 GAP 9's still-open
-//! question of whether more are reserved), but only `KEYS` of them are ever
-//! nonzero. See [`trailer`]'s own module doc for the corrected rule, and
+//! independent segment's (`SELF_TAG != 0`) own absolute offset, **packed
+//! into the next free slot in definition order**, with every leftover slot
+//! reading zero. This is a compaction, not a per-definition-index mapping:
+//! an `ANOSEG` continuation does not leave a zero at its *own* definition
+//! index -- it contributes nothing at all, so every independent segment
+//! after it is packed one slot *earlier* than its own index, and the
+//! zeros end up trailing the array instead. `MULTIACS.DAT` itself proves
+//! the distinction (`def2` is a continuation, `def3` -- independent --
+//! comes after it): the array reads `0x0110, 0x012e, 0x016a, 0x0000`, with
+//! `def3`'s offset (`0x016a`) compacted into slot 2, not sitting at slot 3
+//! where its own definition index would place it. `key_descriptors.len()`
+//! slots exist (matching this crate's own "one entry per definition"
+//! capacity, per harvest 2 GAP 9's still-open question of whether more are
+//! reserved), but only `KEYS` of them are ever nonzero. See [`trailer`]'s
+//! own module doc (particularly [`trailer::expected_entries`]) for the
+//! corrected rule worked in full, and
 //! `read::v6_page_tail`/`emit::write_v6_page_tail` for where it is read,
 //! validated and re-derived rather than stored as a redundant `Vec<u16>`.
 
@@ -412,23 +422,38 @@ pub mod key_descriptor {
 /// Task 16's own direct census (see this module's own top-level doc for the
 /// harvest transcription this correction supersedes).
 ///
-/// # What an entry actually holds
+/// # What an entry actually holds -- COMPACTED, not positional
 ///
-/// Each of `key_descriptors.len()` little-endian `u16` slots corresponds,
-/// in order, to one on-disk key/segment definition -- but the *value*
-/// stored is not that definition's own offset unconditionally. It is:
-/// - that definition's own absolute byte offset (`key_descriptor::base(n)`),
-///   when the definition is an independent segment (`SELF_TAG != 0` --
-///   `key_descriptor::at::SELF_TAG`, this crate's own harvest-2-sourced
-///   field);
-/// - `0x0000`, when the definition is an `ANOSEG` continuation of the
-///   previous one (`SELF_TAG == 0`).
+/// The array has `key_descriptors.len()` little-endian `u16` slots -- one
+/// per on-disk definition -- but a slot's *value* is not a function of that
+/// slot's own index. Walking the definitions in order, each *independent*
+/// segment (`SELF_TAG != 0` -- `key_descriptor::at::SELF_TAG`) contributes
+/// its own absolute byte offset (`key_descriptor::base`) to the **next
+/// free slot**, not to the slot at its own definition index; an `ANOSEG`
+/// continuation (`SELF_TAG == 0`) contributes nothing at all -- it does
+/// not even reserve a zero at its own position. Every slot left over once
+/// every independent segment has been packed in reads `0x0000`.
 ///
-/// Measured across all 493 corpus v6 files whose page size exceeds 512: 0
-/// exceptions. This is why the number of *nonzero* slots always equals
-/// `KEYS` (`fcr::v6::KEYS` / `fcr::at::KEYS`) even though the array itself
-/// has one slot per *definition* -- a segmented key's continuation slots
-/// are real, allocated, and zero.
+/// This is a real correction, not a restatement: a naive first
+/// implementation of this task modeled the array *positionally* -- slot
+/// `n` = `base(n)` when definition `n` is independent, `0` otherwise --
+/// which silently agrees with the compacted rule whenever every
+/// continuation happens to be the *last* definition in its file (so
+/// nothing ever needs to shift left to fill the hole it leaves). Two
+/// corpus files have a continuation that is *not* last: `GALTELA.DAT`
+/// (`def1` is a continuation, followed by `def2`/`def3`) and, ironically,
+/// `MULTIACS.DAT` itself (`def2` is a continuation, followed by `def3`) --
+/// the very file whose bytes overturned harvest 2's own transcription in
+/// the first place. Both are refused by the positional rule and pass the
+/// compacted one; see [`expected_entries`]'s own doc for the worked
+/// arithmetic.
+///
+/// Measured against the compacted rule across all 493 corpus v6 files
+/// whose page size exceeds 512: 0 exceptions. This is why the number of
+/// *nonzero* slots always equals `KEYS` (`fcr::v6::KEYS` / `fcr::at::KEYS`)
+/// even though the array itself has one slot per *definition* -- a
+/// segmented key's continuation slots are real, allocated, and zero, just
+/// not necessarily at the continuation's own definition index.
 pub mod trailer {
     /// The trailer's own fixed absolute byte offset, one entry per page
     /// size this corpus's v6 family has ever been measured at above 512
@@ -457,16 +482,37 @@ pub mod trailer {
     /// The one formula both `read::v6_page_tail` (which refuses a file
     /// whose bytes disagree) and `emit::write_v6_page_tail` (which
     /// regenerates the array from scratch) share -- one canonical
-    /// definition of what a slot holds, not two copies that could drift
-    /// apart. See this module's own doc for the census this is measured
-    /// against.
+    /// definition of what the whole array holds, not two copies that could
+    /// drift apart, and not a per-slot function of that slot's own index
+    /// (see this module's own doc for why that distinction is
+    /// load-bearing).
+    ///
+    /// `self_tags[i]` is definition `i`'s own `SELF_TAG` byte
+    /// (`key_descriptor::at::SELF_TAG`), in file order. Returns exactly
+    /// `self_tags.len()` entries.
+    ///
+    /// ```text
+    /// GALTELA.DAT (page_size 4096): self_tags = [0x80, 0x00, 0x81, 0x82]
+    ///   def0 independent -> next free slot 0: base(0) = 0x0110
+    ///   def1 continuation -> contributes nothing, no slot reserved
+    ///   def2 independent -> next free slot 1: base(2) = 0x014c
+    ///   def3 independent -> next free slot 2: base(3) = 0x016a
+    ///   slot 3 unused -> 0x0000
+    ///   expected_entries == [0x0110, 0x014c, 0x016a, 0x0000]
+    ///   -- matches GALTELA.DAT's own measured bytes exactly; the
+    ///   positional rule (slot n = base(n) if independent else 0) would
+    ///   instead predict [0x0110, 0x0000, 0x014c, 0x016a], which does not.
+    /// ```
     #[must_use]
-    pub fn expected_entry(index: usize, self_tag: u8) -> u16 {
-        if self_tag != 0 {
-            super::key_descriptor::base(index) as u16
-        } else {
-            0
+    pub fn expected_entries(self_tags: &[u8]) -> Vec<u16> {
+        let mut out = Vec::with_capacity(self_tags.len());
+        for (index, &tag) in self_tags.iter().enumerate() {
+            if tag != 0 {
+                out.push(super::key_descriptor::base(index) as u16);
+            }
         }
+        out.resize(self_tags.len(), 0);
+        out
     }
 }
 
