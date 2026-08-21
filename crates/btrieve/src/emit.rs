@@ -15,20 +15,23 @@
 //! every physical page's six-byte header (`format::page`) plus what the page
 //! graph says it is, a `Data`/`Free` page of a non-variable-length file's
 //! fixed-length-record content (every slot, verbatim, plus the trailing
-//! slack -- `crate::model::DataPage`), and now an `Index` page's own entry
-//! array too: the entry count, the two boundary pointers, every entry --
-//! key, `head`, the duplicate-only `tail`, and the possibly-omitted `child`
-//! -- plus trailing padding (`crate::model::IndexPage`). `USRACC.DAT`
-//! round-trips completely as of this task -- the first real corpus file to
-//! do so. An `IndexChild` page's content (a B-tree node no key's root
-//! names, whose owning key this task does not resolve), the ACS block's
-//! content, and a variable-length file's fragment-page content are all
+//! slack -- `crate::model::DataPage`), an `Index` page's own entry array
+//! too: the entry count, the two boundary pointers, every entry -- key,
+//! `head`, the duplicate-only `tail`, and the possibly-omitted `child` --
+//! plus trailing padding (`crate::model::IndexPage`); and now a v5 file's
+//! alternate collating sequence block (`crate::model::AcsBlock`), found by
+//! the page graph on content -- a key's own `ALT_COLLATING` bit -- rather
+//! than trusted from the control record's own (on 2 corpus files, lying)
+//! `0x10a` pointer. `USRACC.DAT` round-trips completely as of an earlier
+//! task -- the first real corpus file to do so. An `IndexChild` page's
+//! content (a B-tree node no key's root names, whose owning key this task
+//! does not resolve) and a variable-length file's fragment-page content are
 //! still later tasks, so [`file`] still faults on any real corpus file that
 //! has one of those -- but the fault names the first byte range *this*
-//! crate still cannot describe, and 102 of 652 corpus files have none of
-//! them.
+//! crate still cannot describe.
 
 use crate::canvas::{Canvas, Emitted, Fault, Owner};
+use crate::format::acs;
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
 use crate::format::generation::Generation;
@@ -155,6 +158,37 @@ fn write_index_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
             }
         }
         canvas.put(offset, &idx.padding, page_owner("index_padding", page_number))?;
+    }
+    Ok(())
+}
+
+/// Write every ACS page's content -- tag, name, table, then trailing
+/// padding -- for every page whose model carries one (`Page::acs`, `Some`
+/// only for an `Acs` page).
+///
+/// Every field is written from the model's own stored value, never
+/// derived: the name is written exactly as read, never re-padded or
+/// normalised, and `padding` is written verbatim the same way
+/// `write_page_content`'s slack is -- see this task's mutation test for why
+/// that matters.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_acs_blocks(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for (i, p) in model.pages.iter().enumerate() {
+        let Some(block) = &p.acs else { continue };
+        let page_number = i + 1;
+        let at = page_number * page_size;
+        canvas.put(at + acs::at::TAG, &[block.tag], page_owner("acs_tag", page_number))?;
+        canvas.put(at + acs::at::NAME, &block.name, page_owner("acs_name", page_number))?;
+        canvas.put(at + acs::at::TABLE, &block.table, page_owner("acs_table", page_number))?;
+        canvas.put(
+            at + acs::at::TABLE + acs::at::TABLE_LEN,
+            &block.padding,
+            page_owner("acs_padding", page_number),
+        )?;
     }
     Ok(())
 }
@@ -305,13 +339,14 @@ fn write_fixed_portion(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 /// record plus its key/segment definitions) is fully described and will
 /// round-trip on its own; every page's six-byte header round-trips too; a
 /// `Data`/`Free` page of a non-variable-length file has its slots and slack
-/// described; and now an `Index` page (a key's own root) has its entry
-/// array described too. An `IndexChild` page's content, the ACS block's
-/// content, and a variable-length file's fragment-page content are not, so
-/// a real corpus file that has one of those still leaves the canvas with
-/// unwritten bytes and `Canvas::finish` reports them -- but a file small
-/// enough that every key's whole tree fits on its own root page (no
-/// `IndexChild` pages at all) now round-trips completely.
+/// described; an `Index` page (a key's own root) has its entry array
+/// described too; and now a v5 file's ACS block (`Page::acs`) has its tag,
+/// name, table and trailing padding described as well. An `IndexChild`
+/// page's content and a variable-length file's fragment-page content are
+/// not, so a real corpus file that has one of those still leaves the
+/// canvas with unwritten bytes and `Canvas::finish` reports them -- but a
+/// file small enough that every key's whole tree fits on its own root page
+/// (no `IndexChild` pages at all) now round-trips completely.
 pub fn file(model: &File) -> Result<Emitted, Fault> {
     let mut canvas = Canvas::new(model.len as usize);
     if model.id.generation.is_v6() {
@@ -322,6 +357,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
     write_page_headers(&mut canvas, model)?;
     write_page_content(&mut canvas, model)?;
     write_index_pages(&mut canvas, model)?;
+    write_acs_blocks(&mut canvas, model)?;
     canvas.finish()
 }
 
@@ -553,5 +589,62 @@ mod tests {
             original.as_slice(),
             "the 874 non-zero slack bytes must come back verbatim, not as zeroes"
         );
+    }
+
+    /// This task, end to end on a named ACS-bearing corpus file:
+    /// `WLDSLOTS.DAT` (V5R4, `GALCAPS` table, a correct `0x10a` pointer)
+    /// round-trips completely -- page 0, its one key's index root, its one
+    /// data page, and now its ACS block are all described.
+    #[test]
+    fn wldslots_dat_round_trips_byte_for_byte() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("emit: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join(
+            "modules/butt-care/DOS Software/BBS/MajorBBS/4EVER/Addons/\
+             Wilderlands Slotto America v1.1R/COPY/WLDSLOTS.DAT",
+        );
+        let Ok(original) = std::fs::read(&path) else {
+            eprintln!("emit: WLDSLOTS.DAT not present, nothing verified");
+            return;
+        };
+        let model = read::file(&original).expect("WLDSLOTS.DAT is a valid v5 file");
+        assert!(
+            model.pages.iter().any(|p| p.acs.is_some()),
+            "WLDSLOTS.DAT carries a real ACS block"
+        );
+        let emitted = file(&model)
+            .expect("WLDSLOTS.DAT's ACS block, index root, and data page are all described");
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// The task brief's own target, and the harder of the two: `CLASSADS.DAT`
+    /// reads **zero** at FCR `0x10a` while genuinely holding an ACS block on
+    /// physical page 1 (harvest 4 SS6a). `read::resolve_pages` finds the page
+    /// from a key's own `ALT_COLLATING` bit rather than trusting the lying
+    /// pointer, and this test proves emit reproduces that page's real bytes
+    /// -- not a page of zeroes matching the pointer's own claim of "no ACS
+    /// here."
+    #[test]
+    fn classads_dat_round_trips_byte_for_byte_despite_the_lying_pointer() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("emit: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join("galacticomm/hosts/majorbbs/CLASSADS.DAT");
+        let Ok(original) = std::fs::read(&path) else {
+            eprintln!("emit: CLASSADS.DAT not present, nothing verified");
+            return;
+        };
+        let model = read::file(&original).expect("CLASSADS.DAT is a valid v5 file");
+        assert_eq!(model.control.acs_page_pointer, 0, "the lying pointer");
+        assert!(
+            model.pages.iter().any(|p| p.acs.is_some()),
+            "a real block is found by content despite the pointer"
+        );
+        let emitted = file(&model)
+            .expect("CLASSADS.DAT's ACS block, index root, and data page are all described");
+        assert_eq!(emitted.bytes(), original.as_slice());
     }
 }

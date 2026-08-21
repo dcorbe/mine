@@ -6,12 +6,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::format::acs;
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
 use crate::format::generation::{identify, NotBtrieve};
 use crate::format::index;
 use crate::format::page;
-use crate::model::{ControlRecord, DataPage, File, IndexEntry, IndexPage, KeyDescriptor, Page, PageKind};
+use crate::model::{
+    AcsBlock, ControlRecord, DataPage, File, IndexEntry, IndexPage, KeyDescriptor, Page, PageKind,
+};
 
 /// Read a plain little-endian `u16` at `at`.
 fn get_u16(bytes: &[u8], at: usize) -> u16 {
@@ -304,6 +307,45 @@ fn read_index_page(
     Ok(IndexPage { rightmost, leftmost, entries, padding })
 }
 
+/// Read an ACS page's content (harvest 4 SS6): the tag byte, the 8-byte
+/// name, and the 256-byte table, then whatever bytes remain to the end of
+/// the page -- like `read_data_page`'s `slack` and `read_index_page`'s
+/// `padding`, captured verbatim rather than assumed zero.
+///
+/// # Errors
+///
+/// If the page is too short to hold the 265-byte block at all, or the tag
+/// byte is neither `0xac` nor `0xad` (`acs::TAGS`) -- the engine's own
+/// predicate for "this is really an ACS block," refused by name rather than
+/// decoded past a byte that fails it.
+fn read_acs_block(bytes: &[u8], page_start: usize, page_size: usize) -> Result<AcsBlock, NotBtrieve> {
+    let page_end = page_start + page_size;
+    if page_start + acs::at::TABLE + acs::at::TABLE_LEN > page_end {
+        return Err(NotBtrieve {
+            why: format!(
+                "page {page_start:#x}: a {page_size}-byte page cannot hold \
+                 the {}-byte ACS block (harvest 4 SS6)",
+                acs::LEN
+            ),
+        });
+    }
+
+    let tag = bytes[page_start + acs::at::TAG];
+    if !acs::TAGS.contains(&tag) {
+        return Err(NotBtrieve {
+            why: format!(
+                "page {page_start:#x}: ACS tag byte is {tag:#04x}, but the \
+                 engine only accepts 0xac or 0xad (harvest 4 SS6)"
+            ),
+        });
+    }
+
+    let name = get_array(bytes, page_start + acs::at::NAME);
+    let table = get_array(bytes, page_start + acs::at::TABLE);
+    let padding = bytes[page_start + acs::at::TABLE + acs::at::TABLE_LEN..page_end].to_vec();
+    Ok(AcsBlock { tag, name, table, padding })
+}
+
 /// How `page_number` is already spoken for, for a conflict message.
 fn describe_claim(kind: PageKind) -> String {
     match kind {
@@ -402,29 +444,29 @@ fn resolve_pages(
     }
 
     // ACS: gated on content (harvest 4 SS6a), not on FCR 0x10a alone.
-    const V5_ACS_PAGE: u32 = 1;
+    let v5_acs_page = acs::V5_PAGE;
     let acs_declared =
         key_descriptors.iter().any(|d| d.attributes & key_descriptor::ALT_COLLATING != 0);
     if acs_declared {
-        if let Some(existing) = claim.get(&V5_ACS_PAGE).copied() {
+        if let Some(existing) = claim.get(&v5_acs_page).copied() {
             return Err(NotBtrieve {
                 why: format!(
                     "a key descriptor declares an alternate collating \
                      sequence, which harvest 4 SS6a places at physical page \
-                     {V5_ACS_PAGE} on every v5 corpus file measured, but \
-                     page {V5_ACS_PAGE} is already {} -- the ACS block and \
+                     {v5_acs_page} on every v5 corpus file measured, but \
+                     page {v5_acs_page} is already {} -- the ACS block and \
                      an index root cannot be the same page",
                     describe_claim(existing)
                 ),
             });
         }
-        claim.insert(V5_ACS_PAGE, PageKind::Acs);
-        if control.acs_page_pointer != 0 && control.acs_page_pointer != V5_ACS_PAGE {
+        claim.insert(v5_acs_page, PageKind::Acs);
+        if control.acs_page_pointer != 0 && control.acs_page_pointer != v5_acs_page {
             return Err(NotBtrieve {
                 why: format!(
                     "FCR 0x10a names page {} as the ACS block, but a key \
                      descriptor's ALT_COLLATING bit places it at physical \
-                     page {V5_ACS_PAGE} instead (harvest 4 SS6a) -- the two \
+                     page {v5_acs_page} instead (harvest 4 SS6a) -- the two \
                      disagree",
                     control.acs_page_pointer
                 ),
@@ -606,7 +648,22 @@ fn resolve_pages(
             None
         };
 
-        pages.push(Page { number, data_bit, stamp, kind, content, index: index_content });
+        // The ACS block's content, described whenever this page is the
+        // file's collating-sequence page (`kind == Acs`, harvest 4 SS6a
+        // gates its very presence on a key's own `ALT_COLLATING` bit, above
+        // -- never on FCR 0x10a alone).
+        let acs_content =
+            if kind == PageKind::Acs { Some(read_acs_block(bytes, at, page_size)?) } else { None };
+
+        pages.push(Page {
+            number,
+            data_bit,
+            stamp,
+            kind,
+            content,
+            index: index_content,
+            acs: acs_content,
+        });
     }
     Ok(pages)
 }
@@ -1217,5 +1274,74 @@ mod tests {
         let e = file(&buf).expect_err("the free chain reaches page 1, an index root");
         assert!(e.why.contains("page 1"), "{}", e.why);
         assert!(e.why.contains("index root"), "{}", e.why);
+    }
+
+    /// A real corpus file whose control record's own `0x10a` pointer agrees
+    /// with the page graph: `WLDSLOTS.DAT` (V5R4, one key declaring
+    /// `ALT_COLLATING`, table name `GALCAPS `). Its ACS block decodes at
+    /// physical page 1, its tag is one of the two the engine accepts, its
+    /// name matches the control record's own `acs_name` at `0x3c`, and its
+    /// table is the corpus's uppercase fold (harvest 4 SS6b: `GALCAPS`
+    /// names the same table as `UPPER`).
+    #[test]
+    fn a_real_files_acs_block_decodes_with_the_uppercase_fold() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join(
+            "modules/butt-care/DOS Software/BBS/MajorBBS/4EVER/Addons/\
+             Wilderlands Slotto America v1.1R/COPY/WLDSLOTS.DAT",
+        );
+        let Ok(buf) = std::fs::read(&path) else {
+            eprintln!("read: WLDSLOTS.DAT not present, nothing verified");
+            return;
+        };
+        let model = file(&buf).expect("WLDSLOTS.DAT is a valid v5 file");
+        assert_eq!(model.control.acs_page_pointer, 1, "0x10a agrees here");
+        assert_eq!(&model.control.acs_name, b"GALCAPS ", "FCR 0x3c");
+
+        assert_eq!(model.pages[0].kind, PageKind::Acs, "physical page 1");
+        let block = model.pages[0].acs.as_ref().expect("an Acs page carries a block");
+        assert!(acs::TAGS.contains(&block.tag), "tag is one the engine accepts");
+        assert_eq!(&block.name, b"GALCAPS ", "the block's own name agrees with FCR 0x3c");
+        assert_eq!(block.table[b'a' as usize], b'A', "the uppercase fold");
+        assert_eq!(block.table[b'A' as usize], b'A', "idempotent on an already-upper byte");
+        assert_eq!(block.table[b'0' as usize], b'0', "digits pass through unchanged");
+    }
+
+    /// The case harvest 4 SS6a exists to name: `CLASSADS.DAT` (V5R3) reads
+    /// **zero** at FCR `0x10a` while genuinely holding a real ACS block on
+    /// physical page 1 -- the pointer that lies. `read::resolve_pages`
+    /// finds the page from a key's own `ALT_COLLATING` bit, not from
+    /// `0x10a`, so this file's block must decode exactly the same as
+    /// `WLDSLOTS.DAT`'s despite the pointer disagreeing.
+    #[test]
+    fn classads_dat_holds_a_real_acs_block_despite_a_zero_pointer() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join("galacticomm/hosts/majorbbs/CLASSADS.DAT");
+        let Ok(buf) = std::fs::read(&path) else {
+            eprintln!("read: CLASSADS.DAT not present, nothing verified");
+            return;
+        };
+        let model = file(&buf).expect("CLASSADS.DAT is a valid v5 file");
+        assert_eq!(
+            model.control.acs_page_pointer, 0,
+            "the known-lying pointer -- CLASSADS.DAT reads zero here regardless"
+        );
+        assert_eq!(&model.control.acs_name, b"UPPER   ", "FCR 0x3c is still set correctly");
+
+        assert_eq!(
+            model.pages[0].kind,
+            PageKind::Acs,
+            "found by content (a key's own ALT_COLLATING bit), not by the lying pointer"
+        );
+        let block = model.pages[0].acs.as_ref().expect("a real block despite the zero pointer");
+        assert_eq!(block.tag, 0xac);
+        assert_eq!(&block.name, b"UPPER   ");
+        assert_eq!(block.table[b'a' as usize], b'A', "the same uppercase fold");
     }
 }

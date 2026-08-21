@@ -13,6 +13,7 @@
 //! that: a structure's fields must account for every byte of it, so a range
 //! nobody has described is a reported fault instead of a silent omission.
 
+pub mod acs;
 pub mod fcr;
 pub mod generation;
 pub mod index;
