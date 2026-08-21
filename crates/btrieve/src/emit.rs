@@ -530,9 +530,14 @@ fn v6_page_owner(field: &'static str, physical_page: u32) -> Owner {
 /// (`format::free_slot::encode_link`) and the model's own stored fill,
 /// never re-zeroed.
 ///
-/// `content` is `None` for any page this crate does not yet decode
-/// (`V6Page`'s own doc comment): only the header is written for those, and
-/// the rest of that physical page stays unwritten, `Canvas::finish`
+/// `content` is `None` for a page this function does not write content
+/// for -- an index page (`V6Page::index`, written by
+/// `write_v6_index_pages` instead) or an ACS block (`V6Page::acs`, written
+/// by `write_v6_acs_blocks`), both called separately by [`file`] right
+/// after this one. Only a page where **all three** of `content`/`index`/
+/// `acs` are `None` -- which `read::file` never actually produces, since it
+/// refuses rather than build a `V6Page` it cannot fully classify (`V6Page`'s
+/// own doc comment) -- would leave its body unwritten here, `Canvas::finish`
 /// reporting it the same way an undescribed v5 page's content once did.
 ///
 /// # Errors

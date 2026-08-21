@@ -2160,17 +2160,26 @@ fn resolve_pages(
 /// contradictions it checks for. Page 0's tail past the last key/segment
 /// definition is never a refusal reason -- see `model::File::page_zero_tail`.
 ///
-/// A v6 file is always refused today, but not until after page 0 *and* the
-/// allocation table have been read and validated: the live control-record
-/// copy (harvest 0 ruling 7, harvest 2 "FCR shadowing") is resolved first,
-/// then its key/segment definitions (Task 15), then its definition-offset
+/// A v6 file's own control record is always resolved the same way: the
+/// live copy (harvest 0 ruling 7, harvest 2 "FCR shadowing") first, then
+/// its key/segment definitions (Task 15), then its definition-offset
 /// trailer (Task 16, [`v6_page_tail`]), then every "PP" allocation-table
 /// block's own shadow pair and the logical-to-physical map its entries
-/// encode (Task 17, [`v6_allocation_table`]) -- and the refusal names all of
-/// it (which physical page is live, at what generation, KEYS realized as how
-/// many definitions, how many allocation-table blocks and logical pages
-/// resolved), because ordinary v6 page headers, records and index pages
-/// past addressing are later work -- see [`resolve_shadow`].
+/// encode (Task 17, [`v6_allocation_table`]) -- see [`resolve_shadow`].
+/// Past that, this crate no longer refuses every v6 file outright (Task 19
+/// removed that blanket gate): every key's own B-tree is walked from its
+/// root ([`v6_walk_index_trees`]), every `ALT_COLLATING` key's own ACS
+/// binding is cross-checked ([`v6_validate_acs_bindings`]), and every
+/// physical page the allocation table claims is classified as index
+/// content, the ACS block, or a genuine data page. What still refuses: a
+/// page attributed to no key's tree and tagged neither `TAG_ACS` nor
+/// (on a fixed-length-record file) `TAG_DATA` -- a `TAG_TEMPLATE`/
+/// `TAG_VARIABLE` page, or a `TAG_DATA` page on a variable-length file
+/// (`variable_mark != 0`, Task 20's own scope) -- and a physical page the
+/// allocation table never claims at all (an abandoned page from an earlier
+/// rebalance this crate does not yet have an `Orphan`-style rule for). Every
+/// such refusal names the specific page and predicate, the same "no
+/// residue, ever" discipline the v5 path already enforces.
 pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
     let id = identify(bytes)?;
     let page_size = id.page_size as usize;
