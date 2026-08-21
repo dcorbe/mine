@@ -574,6 +574,26 @@ fn read_fragment_page(
     Ok(FragmentPage { free_chain, fragments, free_space_entry, trailing })
 }
 
+/// Whether the raw header at `at` looks like what an abandoned page leaves
+/// behind: either the engine zeroed the whole 6-byte header outright, or the
+/// header survives and the page still reads as a genuine B-tree leaf
+/// (`rightmost` `NOWHERE`, `leftmost` `NOWHERE` or literal `0` --
+/// `model::IndexPage::leftmost`'s own doc already allows both). A pure
+/// function of the page's own bytes, so it can check a page not yet
+/// resolved -- see `resolve_pages`'s `None` arm, which uses it both on the
+/// page being classified and, for the one shape neither self-corroborates,
+/// on its physically adjacent neighbour.
+fn orphan_header_shape(bytes: &[u8], at: usize) -> bool {
+    let number = get_long(bytes, at + page::at::NUMBER);
+    let counter = get_u16(bytes, at + page::at::COUNTER);
+    if number == 0 && counter == 0 {
+        return true;
+    }
+    let rightmost = get_long(bytes, at + index::at::RIGHTMOST);
+    let leftmost = get_long(bytes, at + index::at::LEFTMOST);
+    rightmost == crate::pages::NOWHERE && (leftmost == crate::pages::NOWHERE || leftmost == 0)
+}
+
 /// How `page_number` is already spoken for, for a conflict message.
 fn describe_claim(kind: PageKind) -> String {
     match kind {
@@ -1152,6 +1172,82 @@ fn resolve_pages(
                 // outcome, not evidence of a parsing gap -- `PageKind::Orphan`
                 // asserts exactly that and nothing more; see its own
                 // documentation for the corpus evidence.
+                //
+                // But that is only safe if this page's own bytes actually
+                // corroborate abandonment -- a review of Task 13 pointed out
+                // that `Orphan` had no in-crate check of its own, so a future
+                // bug that silently under-visits a live subtree (rather than
+                // erroring, which every real `?` in `walk_index_trees` would)
+                // would deposit a real, reachable page here, carried
+                // byte-identical and undetectable by the round trip alone.
+                //
+                // `orphan_header_shape` (below) names the two shapes this
+                // crate can verify on a page's own bytes alone: the engine
+                // zeroed the whole 6-byte header outright (`wccitem2.vir`
+                // page 593 under `wccnt7pz`, `wccupda2.dat`'s own two
+                // orphans -- `number == 0 && counter == 0`), or the header
+                // survives and the page still looks like a genuine B-tree
+                // leaf (`TTIHORSS.DAT`/`.VIR` page 251, `wccitem2.vir` page
+                // 592 under `wccnt7py` -- `rightmost` reads `NOWHERE` and
+                // `leftmost` reads `NOWHERE` or literal `0`, the same two
+                // leaf shapes `IndexPage::leftmost`'s own doc already
+                // allows).
+                //
+                // Enforcing the review's check directly against every
+                // corpus file this task could reach turned up a *third*
+                // shape neither this crate nor the review had seen:
+                // physical page 594 of `wccitem2.vir`/`wccITEM2.nu1` under
+                // `wccnt7pz`, and page 17565 of `wccupda2.dat` under
+                // `wccnt7py`, are each unclaimed, `data_bit` clear, and hold
+                // *nothing but* leftover monster/item-description prose --
+                // starting right at byte 0, so it overwrites what would be
+                // the header too (measured: page 594's own "header" bytes
+                // are literally `b" you."`; page 17565's are `b"ces ha"`).
+                // Neither is zeroed nor leaf-shaped; `data_bit` only reads
+                // clear because printable ASCII text never sets a byte's
+                // high bit, a coincidence of the encoding, not a structural
+                // signal. But each sits *immediately after* the file's own
+                // already-corroborated zero-header orphan (593, 17564) and
+                // *immediately before* a genuine live `Data` page resumes
+                // (595, 17566 -- both measured `data_bit` set) -- the same
+                // abandoned span, one page longer than this task first
+                // measured, not a different kind of page. This crate does
+                // not trust such a page's own shape at all (a coincidence
+                // is not corroboration); it accepts it as `Orphan` only
+                // because a *physically adjacent* page independently
+                // corroborates abandonment on its own terms. A page that is
+                // neither self-corroborating nor adjacent to a page that is
+                // is refused, naming the page and what its own header held.
+                let this_shape = orphan_header_shape(bytes, at);
+                let prev_established_orphan = page_number > 1
+                    && pages.get(page_number - 2).is_some_and(|p: &Page| p.kind == PageKind::Orphan);
+                let next_corroborates = page_number + 1 < total_pages
+                    && claim.get(&((page_number + 1) as u32)).is_none()
+                    && {
+                        let next_at = (page_number + 1) * page_size;
+                        let next_data_bit =
+                            get_u16(bytes, next_at + page::at::COUNTER) & page::DATA_BIT != 0;
+                        !next_data_bit && orphan_header_shape(bytes, next_at)
+                    };
+                if !this_shape && !prev_established_orphan && !next_corroborates {
+                    let rightmost = get_long(bytes, at + index::at::RIGHTMOST);
+                    let leftmost = get_long(bytes, at + index::at::LEFTMOST);
+                    return Err(NotBtrieve {
+                        why: format!(
+                            "page {page_number} is not named by any key's root, \
+                             not the ACS block, not on the free chain, its own \
+                             header says it holds a B-tree node rather than \
+                             records, and no key's B-tree walk ever reached it \
+                             -- but its header is not the zero an abandoned page \
+                             leaves (number {number:#x}, counter {counter:#x}), its \
+                             own rightmost/leftmost ({rightmost:#x}/{leftmost:#x}) do \
+                             not look like an abandoned leaf's either, and no \
+                             physically adjacent page corroborates abandonment on \
+                             its own terms -- so this crate refuses rather than \
+                             assuming it is orphaned"
+                        ),
+                    });
+                }
                 PageKind::Orphan
             }
         };
@@ -2539,6 +2635,89 @@ mod tests {
 
         let emitted = crate::emit::file(&model).expect("wccitem2.vir: nothing undescribed");
         assert_eq!(emitted.bytes(), original.as_slice(), "the orphan page round-trips, body included");
+    }
+
+    /// The follow-up review's whole point, proven directly: a genuinely
+    /// unclaimed, `data_bit`-clear page whose header is neither zero nor
+    /// leaf-shaped, and which sits next to no established orphan either,
+    /// must be refused by name -- not silently accepted as `Orphan` just
+    /// because no key's walk happened to visit it. This is the synthetic
+    /// counterpart to `nonzero_page_zero_tail_is_carried_verbatim_not_refused`:
+    /// a small, fully-controlled fixture rather than a real corpus file,
+    /// so the corroborating check's own refusal path has direct coverage
+    /// independent of which real files happen to exercise it.
+    #[test]
+    fn an_unclaimed_page_shaped_like_neither_zero_nor_a_leaf_nor_adjacent_to_one_is_refused() {
+        let mut buf = usracc_fixed_portion();
+        buf[0x14..0x16].copy_from_slice(&1u16.to_le_bytes()); // keys = 1
+        let def0 = 0x110;
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1
+        buf[def0 + 0x0a..def0 + 0x0c].copy_from_slice(&2u16.to_le_bytes()); // key_length
+        buf[def0 + 0x0c..def0 + 0x0e].copy_from_slice(&10u16.to_le_bytes()); // entry_size
+        buf.resize(1536, 0); // page 0, page 1 (key 0's root), page 2 (the page under test)
+
+        // Page 1: key 0's root, a genuine empty leaf -- the walk visits
+        // only this page and finishes cleanly.
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        buf[512 + 8..512 + 12].copy_from_slice(&[0xff; 4]); // rightmost = NOWHERE
+        buf[512 + 12..512 + 16].copy_from_slice(&[0xff; 4]); // leftmost = NOWHERE
+
+        // Page 2: unclaimed, data_bit clear, but its header is not zero
+        // (number = 2) and its rightmost/leftmost (5/7) are real, non-NOWHERE
+        // values -- not a leaf's shape either. No other page is orphaned, so
+        // adjacency cannot corroborate it.
+        buf[1024..1028].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]);
+        buf[1024 + 8..1024 + 12].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // rightmost = 5
+        buf[1024 + 12..1024 + 16].copy_from_slice(&[0x00, 0x00, 0x00, 0x07]); // leftmost = 7
+
+        let e = file(&buf).expect_err("page 2 corroborates nothing -- neither shape nor adjacency");
+        assert!(e.why.contains("page 2"), "{}", e.why);
+        assert!(e.why.contains("not the zero an abandoned page"), "{}", e.why);
+        assert!(e.why.contains("do not look like an abandoned leaf's either"), "{}", e.why);
+        assert!(e.why.contains("no physically adjacent page corroborates"), "{}", e.why);
+    }
+
+    /// Task 13's follow-up review: enforcing `orphan_header_shape` against
+    /// the whole corpus turned up a *third* orphan shape, previously
+    /// undiscovered because it was silently accepted before the review's
+    /// corroborating check existed. `wccitem2.vir` under `wccnt7pz` has TWO
+    /// consecutive orphans, not one: physical page 593 (zeroed header,
+    /// self-corroborating) and page 594 immediately after it (unclaimed,
+    /// `data_bit` clear, but its own "header" bytes are literally leftover
+    /// prose -- neither zero nor leaf-shaped). Page 594 is accepted only
+    /// because it is physically adjacent to page 593's own corroborated
+    /// orphan; a genuine live `Data` page (595) resumes right after.
+    #[test]
+    fn wccitem2_virs_second_consecutive_orphan_is_accepted_by_adjacency_not_its_own_shape() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join("modules/majormud-nt/wccnt7pz/out/wccitem2.vir");
+        let Ok(original) = std::fs::read(&path) else {
+            eprintln!("read: wccitem2.vir not present, nothing verified");
+            return;
+        };
+
+        let model = file(&original).expect("both consecutive orphans are accepted");
+        assert_eq!(model.id.page_size, 4096);
+
+        let anchor = &model.pages[593 - 1];
+        assert_eq!(anchor.kind, PageKind::Orphan);
+        assert_eq!(anchor.number, 0, "page 593's own header.number is literally zeroed");
+        assert_eq!(anchor.stamp, 0, "page 593's own header.counter is literally zeroed");
+
+        let second = &model.pages[594 - 1];
+        assert_eq!(second.kind, PageKind::Orphan, "accepted via adjacency, not its own shape");
+        assert!(!second.data_bit, "data_bit reads clear only because the leftover bytes are ASCII");
+        let body = second.orphan.as_ref().expect("Orphan carries its whole body");
+        assert!(body.starts_with(b" He wears soft leather"), "leftover prose, not structure");
+
+        let resumed = &model.pages[595 - 1];
+        assert_eq!(resumed.kind, PageKind::Data, "a genuine live data page resumes right after");
+
+        let emitted = crate::emit::file(&model).expect("wccitem2.vir: nothing undescribed");
+        assert_eq!(emitted.bytes(), original.as_slice(), "both orphans round-trip, bodies included");
     }
 }
 
