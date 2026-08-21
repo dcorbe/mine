@@ -12,14 +12,19 @@
 //! into directly: a byte the model does not describe is a reported fault,
 //! not a silent zero. [`crate::model::File`] describes a v5 file's control
 //! record fixed portion (`0x00..0x110`), its key/segment definition array,
-//! and now every physical page's six-byte header (`format::page`) plus what
-//! the page graph says it is -- but a page's *content* past that header
-//! (records, index entries, the ACS table) is still a later task, so
-//! [`file`] still faults on every real (multi-page) corpus file, just
-//! further along than it used to: page 0 round-trips completely, every
-//! other page's header round-trips too, and the fault names the first byte
-//! range past a header that this crate has no description for yet. That is
-//! why the round-trip pin stays at zero.
+//! every physical page's six-byte header (`format::page`) plus what the page
+//! graph says it is, and now -- for a `Data`/`Free` page of a non-variable-
+//! length file -- that page's fixed-length-record content too: every slot,
+//! verbatim, plus the trailing slack (`crate::model::DataPage`). An
+//! index/ACS page's content, and a variable-length file's fragment-page
+//! content, are both still a later task, so [`file`] still faults on any
+//! real corpus file that has one -- every v5 file measured does, since a
+//! file needs at least one key to be useful and a key's root is always an
+//! index page -- but the fault names the first byte range *this* crate
+//! still cannot describe, which for a file whose first page happens to be a
+//! data page (no preceding undescribed index page) is now past the end of
+//! the file entirely: nothing left unwritten. That is why the round-trip
+//! pin can still be 0 while this task closes real ground underneath it.
 
 use crate::canvas::{Canvas, Emitted, Fault, Owner};
 use crate::format::fcr;
@@ -57,6 +62,36 @@ fn write_page_headers(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
         let counter = data_bit | (p.stamp & !page::DATA_BIT);
         canvas.put_long(at + page::at::NUMBER, p.number, page_owner("number", page_number))?;
         canvas.put_u16(at + page::at::COUNTER, counter, page_owner("counter", page_number))?;
+    }
+    Ok(())
+}
+
+/// Write every page's fixed-length-record content -- slots, then trailing
+/// slack -- for every page whose model carries one (`Page::content`,
+/// `Some` for a `Data`/`Free` page of a non-variable-length file; `None`
+/// for an index/ACS page or a variable-length file's fragment page, both
+/// still a later task, so those pages' bodies stay unwritten and
+/// `Canvas::finish` reports them as before).
+///
+/// Slack is written from the model's own stored bytes, never re-derived as
+/// zero -- `read::read_data_page`'s doc measures 5 real corpus pages where
+/// that would be wrong.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_page_content(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for (i, p) in model.pages.iter().enumerate() {
+        let Some(content) = &p.content else { continue };
+        let page_number = i + 1;
+        let at = page_number * page_size;
+        let mut offset = at + page::LEN;
+        for slot in &content.slots {
+            canvas.put(offset, slot, page_owner("record", page_number))?;
+            offset += slot.len();
+        }
+        canvas.put(offset, &content.slack, page_owner("slack", page_number))?;
     }
     Ok(())
 }
@@ -205,9 +240,12 @@ fn write_fixed_portion(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 /// If the model does not yet describe every byte of the file. A v6 file's
 /// control record is entirely undescribed. A v5 file's page 0 (the control
 /// record plus its key/segment definitions) is fully described and will
-/// round-trip on its own, but records and index pages -- page 1 onward --
-/// are not, so any real (multi-page) corpus file still leaves the canvas
-/// with unwritten bytes and `Canvas::finish` reports them.
+/// round-trip on its own; every page's six-byte header round-trips too; and
+/// now a `Data`/`Free` page of a non-variable-length file has its slots and
+/// slack described as well. An index/ACS page's content, and a
+/// variable-length file's fragment-page content, are not, so a real corpus
+/// file that has one of those still leaves the canvas with unwritten bytes
+/// and `Canvas::finish` reports them.
 pub fn file(model: &File) -> Result<Emitted, Fault> {
     let mut canvas = Canvas::new(model.len as usize);
     if model.id.generation.is_v6() {
@@ -216,6 +254,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
     write_fixed_portion(&mut canvas, model)?;
     write_key_descriptors(&mut canvas, model)?;
     write_page_headers(&mut canvas, model)?;
+    write_page_content(&mut canvas, model)?;
     canvas.finish()
 }
 
@@ -308,5 +347,91 @@ mod tests {
         let emitted = canvas.finish().expect("512 + 6 bytes, all written");
 
         assert_eq!(emitted.bytes(), &original[..512 + page::LEN]);
+    }
+
+    /// Step 4/5 of this task, end to end: a file with no keys at all has no
+    /// index page to leave undescribed, so its one data page -- carrying
+    /// `USRACC.DAT`'s own real two records, reused from [`usracc_dat`] --
+    /// is the *only* thing past page 0, and the whole file now round-trips
+    /// completely. This is the concrete case the task brief's "EXPECTED
+    /// OUTCOME" describes: data pages stop being the reason a file faults.
+    #[test]
+    fn a_data_page_with_no_preceding_index_page_round_trips_completely() {
+        use crate::model::PageKind;
+
+        let mut original = usracc_fixed_portion();
+        original[0x14..0x16].copy_from_slice(&0u16.to_le_bytes()); // keys = 0
+        original.resize(1024, 0);
+        let real_page_two = &usracc_dat()[1024..1536];
+        original[512..1024].copy_from_slice(real_page_two);
+
+        let model = read::file(&original).expect("reads");
+        assert_eq!(model.pages.len(), 1, "page 1 only, and nothing claims it");
+        assert_eq!(model.pages[0].kind, PageKind::Data, "unclaimed, data_bit set");
+
+        let emitted = file(&model)
+            .expect("zero keys leaves nothing undescribed: page 0 plus one fully-described data page");
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// This task's mutation case (brief Step 6), against a genuine corpus
+    /// file rather than a contrived one: `wccnt7pz/out/wccitem2.vir`,
+    /// page 592, is one of exactly 5 real data/free pages this task's own
+    /// corpus measurement found with non-zero slack (874 bytes of leftover
+    /// item-description text past the page's 3 live 1072-byte slots). A
+    /// synthetic zero-key control record puts this real page directly after
+    /// page 0, so the whole file is fully described and must round-trip
+    /// byte for byte -- including those 874 bytes. If `write_page_content`
+    /// were mutated to emit `vec![0; content.slack.len()]` instead of
+    /// `content.slack` itself, this assertion is exactly what would catch
+    /// it: the emitted bytes would differ from the real file at the slack
+    /// range, this test would go red, and no other test in this module
+    /// would notice (every other model here has all-zero slack).
+    #[test]
+    fn a_real_files_nonzero_slack_round_trips_and_would_catch_a_zeroing_mutation() {
+        use crate::model::PageKind;
+
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("emit: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join("modules/majormud-nt/wccnt7pz/out/wccitem2.vir");
+        let Ok(real) = std::fs::read(&path) else {
+            eprintln!("emit: wccitem2.vir not present, nothing verified");
+            return;
+        };
+
+        const PAGE_SIZE: usize = 4096;
+        const PHYSICAL: u16 = 1072;
+        let page_592 = &real[592 * PAGE_SIZE..593 * PAGE_SIZE];
+
+        let mut original = vec![0u8; PAGE_SIZE];
+        original[0x06..0x08].copy_from_slice(&[0, 4]); // version -> V5R4, this file's own generation
+        original[0x08..0x0a].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+        original[0x0c..0x10].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // unknown_0c = NOWHERE
+        original[0x10..0x14].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // free = NOWHERE
+        original[0x14..0x16].copy_from_slice(&0u16.to_le_bytes()); // keys = 0
+        original[0x16..0x18].copy_from_slice(&PHYSICAL.to_le_bytes()); // reclen
+        original[0x18..0x1a].copy_from_slice(&PHYSICAL.to_le_bytes()); // physical
+        original.extend_from_slice(page_592);
+
+        let model = read::file(&original).expect("reads: a synthetic zero-key file");
+        assert_eq!(model.pages.len(), 1);
+        assert_eq!(model.pages[0].kind, PageKind::Data);
+        let content = model.pages[0].content.as_ref().expect("a data page's content is described");
+        assert_eq!(content.slots.len(), 3, "3 whole 1072-byte slots fit in 4096 - 6 bytes");
+        assert!(
+            content.slack.iter().any(|&b| b != 0),
+            "this is the real, measured non-zero-slack page -- if this assertion \
+             ever fails, the fixture stopped pointing at the right page"
+        );
+
+        let emitted =
+            file(&model).expect("zero keys leaves nothing undescribed but this one data page");
+        assert_eq!(
+            emitted.bytes(),
+            original.as_slice(),
+            "the 874 non-zero slack bytes must come back verbatim, not as zeroes"
+        );
     }
 }

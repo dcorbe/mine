@@ -10,7 +10,7 @@ use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
 use crate::format::generation::{identify, NotBtrieve};
 use crate::format::page;
-use crate::model::{ControlRecord, File, KeyDescriptor, Page, PageKind};
+use crate::model::{ControlRecord, DataPage, File, KeyDescriptor, Page, PageKind};
 
 /// Read a plain little-endian `u16` at `at`.
 fn get_u16(bytes: &[u8], at: usize) -> u16 {
@@ -160,6 +160,35 @@ fn key_descriptors(
         }
     }
     Ok(out)
+}
+
+/// Read a fixed-length-record data page's content: every slot in order,
+/// then whatever is left between the last slot and the end of the page.
+///
+/// `physical` must be nonzero -- the caller only calls this when it is (see
+/// `resolve_pages`'s guard).
+///
+/// # Slack is measured, not assumed
+///
+/// Every v5 corpus file this crate can currently read (143 files) was walked
+/// this way for this task: 42,571 data/free pages whose geometry leaves a
+/// nonzero-length trailing region. 42,566 of those are all zero. The
+/// remaining 5 -- 2 pages apiece in `archive/modules/majormud-nt/wccnt7pz/`
+/// `out/wccitem2.vir` (byte-identical to `wccITEM2.nu1` in the same
+/// directory) and 1 in `wccnt7py/out/wccupda2.dat` -- carry genuine leftover
+/// bytes: readable item-description text past the last live slot, matching
+/// no live record. This is why `slack` is stored verbatim rather than
+/// asserted zero -- the general case is zero, but it is not a rule the
+/// format enforces, and 5 real pages disagree with it.
+fn read_data_page(bytes: &[u8], page_start: usize, page_size: usize, physical: usize) -> DataPage {
+    let per_page = (page_size - page::LEN) / physical;
+    let mut slots = Vec::with_capacity(per_page);
+    for i in 0..per_page {
+        let start = page_start + page::LEN + i * physical;
+        slots.push(bytes[start..start + physical].to_vec());
+    }
+    let used = page::LEN + per_page * physical;
+    DataPage { slots, slack: bytes[page_start + used..page_start + page_size].to_vec() }
 }
 
 /// How `page_number` is already spoken for, for a conflict message.
@@ -415,7 +444,25 @@ fn resolve_pages(
             }
         };
 
-        pages.push(Page { number, data_bit, stamp, kind });
+        // A fixed-length-record data page's content -- slots plus trailing
+        // slack -- is described whenever the page actually holds records
+        // (`data_bit` set: `Data` or `Free`, never `Index`/`IndexChild`/
+        // `Acs`) and this task's scope actually covers it: `physical`
+        // nonzero (a sound slot width to divide by) and the file is not
+        // variable-length (harvest 5 SS3.1's `usrflgs` bit 0 -- a
+        // variable-length file's data-bit-set pages are `'V'`-tagged
+        // fragment pages, a different structure entirely, a later task's
+        // job). `USRACC.DAT` itself is not variable and every corpus file
+        // this task measured agrees: content is `None` only for a page kind
+        // this task does not yet describe, never as a residual guess.
+        let variable = control.usrflgs & fcr::usrflgs::VARIABLE != 0;
+        let content = if data_bit && !variable && control.physical != 0 {
+            Some(read_data_page(bytes, at, page_size, control.physical as usize))
+        } else {
+            None
+        };
+
+        pages.push(Page { number, data_bit, stamp, kind, content });
     }
     Ok(pages)
 }
@@ -680,6 +727,34 @@ mod tests {
         assert_eq!(page2.stamp, 6, "page 2's stamp");
         assert!(page2.data_bit, "page 2 holds USRACC.DAT's two records");
         assert_eq!(page2.kind, PageKind::Data, "claimed by no root, ACS, or free chain");
+    }
+
+    /// Step 1 of this task: `USRACC.DAT` page 2 holds exactly two records at
+    /// the measured offsets (`0x06` and `0x102`, `physical` 252 bytes
+    /// apart), and the page's trailing 2 bytes (`512 - 6 - 2*252`, the same
+    /// arithmetic `PAGE_USABLE` corroborates) are described rather than
+    /// silently dropped -- they are zero in this real file, but the model
+    /// must carry them explicitly, not assume it.
+    #[test]
+    fn usracc_dats_page_two_holds_exactly_two_records_at_the_measured_offsets() {
+        let buf = usracc_dat();
+        let file = file(&buf).expect("a valid three-page v5 file");
+        let page2 = &file.pages[1];
+        assert_eq!(page2.kind, PageKind::Data, "page 2 holds USRACC.DAT's two records");
+
+        let content = page2.content.as_ref().expect("a data page's content is described");
+        assert_eq!(content.slots.len(), 2, "two 252-byte slots fit in a 512-byte page");
+        assert_eq!(content.slots[0].len(), 252);
+        assert_eq!(content.slots[1].len(), 252);
+        assert!(
+            content.slots[0].starts_with(b"Sysop"),
+            "slot 0 at page offset 0x06 is the Sysop record"
+        );
+        assert!(
+            content.slots[1].starts_with(b"Test"),
+            "slot 1 at page offset 0x102 is the Test record"
+        );
+        assert_eq!(content.slack, vec![0u8, 0], "the trailing 2 bytes, described and zero here");
     }
 
     /// A real corpus file with deletions on record: `TTIHORBT.DAT`, 12

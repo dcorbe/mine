@@ -77,6 +77,18 @@ pub mod at {
     pub const FIXED_LEN: usize = 0x110;
 }
 
+/// Bits of `USRFLGS` (`at::USRFLGS`) this crate currently names.
+pub mod usrflgs {
+    /// Bit 0: the file holds variable-length records (harvest 5 SS3.1,
+    /// corroborated there by `physical - reclen >= 4` and byte `0x38 ==
+    /// 0xff`, measured with 0 mismatches across all 612 corpus files).
+    /// `read::resolve_pages`'s fixed-length data-page description (this
+    /// task) is gated on this bit being clear -- a variable-length file's
+    /// data-bit-set pages are `'V'`-tagged fragment pages (harvest 5 SS3.3),
+    /// a different structure entirely and a later task's job.
+    pub const VARIABLE: u16 = 0b1;
+}
+
 /// One 30-byte key/segment definition, repeating at `at::FIXED_LEN + n*WIDTH`
 /// -- the first structure in the format whose repetition count is read from
 /// the file rather than known at compile time. See harvest 4 SS1a for the
