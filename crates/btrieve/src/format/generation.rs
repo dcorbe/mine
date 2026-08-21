@@ -53,9 +53,19 @@ pub enum Generation {
 
 impl Generation {
     /// Whether this is the `"FC"` family.
+    ///
+    /// Written as an exhaustive `match`, not `matches!` -- `matches!`
+    /// expands to a match with an implicit `_ => false` underneath, so it
+    /// would silently classify a future seventh `Generation` variant as
+    /// "not v6" instead of failing to compile. Every arm here names its
+    /// variant explicitly, so adding a variant without updating this
+    /// function is a compile error, not a silent wrong answer (Task 22).
     #[must_use]
     pub fn is_v6(self) -> bool {
-        matches!(self, Self::V600 | Self::V610 | Self::V620)
+        match self {
+            Self::V5R3 | Self::V5R4 | Self::V5R5 => false,
+            Self::V600 | Self::V610 | Self::V620 => true,
+        }
     }
 }
 
