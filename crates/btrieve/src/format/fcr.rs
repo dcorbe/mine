@@ -20,109 +20,135 @@ use super::generation::Generation;
 use super::{Field, Layout};
 
 /// `W32MKDE_decompiled.c:33874` reads page 0 as `0x200` bytes before checking
-/// anything, so the control record is 512 bytes whatever the file's page size.
-const FCR_LEN: usize = 512;
+/// anything -- a minimum readable header, not the record's length. It is,
+/// however, as far as any field is harvested today, so it is where the fixed
+/// portion below ends and the generic trailing range picks up.
+const FIXED_LEN: usize = 512;
 
-static V5_FIELDS: &[Field] = &[
-    Field {
-        name: "lead",
-        at: 0,
-        len: 4,
-        cite: "W32MKDE FUN_00435970: `*param_1 == 0` selects the pre-v6 family",
-    },
-    Field {
-        name: "undescribed_4",
-        at: 4,
-        len: 2,
-        cite: "NOT YET HARVESTED -- between the lead and the version word",
-    },
-    Field {
-        name: "version",
-        at: 6,
-        len: 2,
-        cite: "W32MKDE FUN_00435970: abs(i16 at 6) is 0x300, 0x400 or 0x500",
-    },
-    Field {
-        name: "page_size",
-        at: 8,
-        len: 2,
-        cite: "W32MKDE FUN_00435970: u16 at 8, non-zero, <= 0x1000, multiple of 0x200",
-    },
-    Field {
-        name: "undescribed",
-        at: 10,
-        len: FCR_LEN - 10,
-        cite: "NOT YET HARVESTED -- this range shrinks to nothing before the \
-               round-trip pin can reach 612",
-    },
-];
+/// The pre-v6 family's fixed fields, up to [`FIXED_LEN`]. Task 5 rebuilds this
+/// into the full `0x00..0x110` field table from harvest 1; today it is
+/// exactly what the crate already knew.
+fn v5_fixed() -> Vec<Field> {
+    vec![
+        Field {
+            name: "lead",
+            index: None,
+            at: 0,
+            len: 4,
+            cite: "W32MKDE FUN_00435970: `*param_1 == 0` selects the pre-v6 family",
+        },
+        Field {
+            name: "undescribed_4",
+            index: None,
+            at: 4,
+            len: 2,
+            cite: "NOT YET HARVESTED -- between the lead and the version word",
+        },
+        Field {
+            name: "version",
+            index: None,
+            at: 6,
+            len: 2,
+            cite: "W32MKDE FUN_00435970: abs(i16 at 6) is 0x300, 0x400 or 0x500",
+        },
+        Field {
+            name: "page_size",
+            index: None,
+            at: 8,
+            len: 2,
+            cite: "W32MKDE FUN_00435970: u16 at 8, non-zero, <= 0x1000, multiple of 0x200",
+        },
+        Field {
+            name: "undescribed",
+            index: None,
+            at: 10,
+            len: FIXED_LEN - 10,
+            cite: "NOT YET HARVESTED -- this range shrinks to nothing before the \
+                   round-trip pin can reach 612",
+        },
+    ]
+}
 
-static V6_FIELDS: &[Field] = &[
-    Field {
-        name: "lead",
-        at: 0,
-        len: 4,
-        cite: "W32MKDE FUN_00435970: `*param_1 == 0x4346` (\"FC\") selects v6",
-    },
-    Field {
-        name: "undescribed_4",
-        at: 4,
-        len: 4,
-        cite: "NOT YET HARVESTED -- between the lead and the page size",
-    },
-    Field {
-        name: "page_size",
-        at: 8,
-        len: 2,
-        cite: "W32MKDE FUN_00435970: u16 at 8, non-zero, <= 0x1000, multiple of 0x200",
-    },
-    Field {
-        name: "undescribed_a",
-        at: 10,
-        len: 0x4a - 10,
-        cite: "NOT YET HARVESTED",
-    },
-    Field {
-        name: "version",
-        at: 0x4a,
-        len: 2,
-        cite: "W32MKDE FUN_00435970: abs(i16 at 0x4a) is 0x600, 0x610 or 0x620",
-    },
-    Field {
-        name: "undescribed_b",
-        at: 0x4c,
-        len: FCR_LEN - 0x4c,
-        cite: "NOT YET HARVESTED -- this range shrinks to nothing before the \
-               round-trip pin can reach 612",
-    },
-];
+/// The v6 family's fixed fields, up to [`FIXED_LEN`]. Task 5 rebuilds this
+/// into the full `0x00..0x110` field table from harvest 1; today it is
+/// exactly what the crate already knew.
+fn v6_fixed() -> Vec<Field> {
+    vec![
+        Field {
+            name: "lead",
+            index: None,
+            at: 0,
+            len: 4,
+            cite: "W32MKDE FUN_00435970: `*param_1 == 0x4346` (\"FC\") selects v6",
+        },
+        Field {
+            name: "undescribed_4",
+            index: None,
+            at: 4,
+            len: 4,
+            cite: "NOT YET HARVESTED -- between the lead and the page size",
+        },
+        Field {
+            name: "page_size",
+            index: None,
+            at: 8,
+            len: 2,
+            cite: "W32MKDE FUN_00435970: u16 at 8, non-zero, <= 0x1000, multiple of 0x200",
+        },
+        Field {
+            name: "undescribed_a",
+            index: None,
+            at: 10,
+            len: 0x4a - 10,
+            cite: "NOT YET HARVESTED",
+        },
+        Field {
+            name: "version",
+            index: None,
+            at: 0x4a,
+            len: 2,
+            cite: "W32MKDE FUN_00435970: abs(i16 at 0x4a) is 0x600, 0x610 or 0x620",
+        },
+        Field {
+            name: "undescribed_b",
+            index: None,
+            at: 0x4c,
+            len: FIXED_LEN - 0x4c,
+            cite: "NOT YET HARVESTED -- this range shrinks to nothing before the \
+                   round-trip pin can reach 612",
+        },
+    ]
+}
 
-static V5_LAYOUT: Layout = Layout {
-    what: "pre-v6 file control record",
-    len: FCR_LEN,
-    fields: V5_FIELDS,
-};
-
-static V6_LAYOUT: Layout = Layout {
-    what: "v6 file control record",
-    len: FCR_LEN,
-    fields: V6_FIELDS,
-};
-
-/// The control-record layout for a generation.
-///
-/// The three v5-family generations share one layout and the three v6 ones
-/// share another, because no evidence yet distinguishes the records within a
-/// family. When evidence appears -- a v6.1 file's variable-tail allocation
-/// table, for instance -- this function is where the split lands, and the
-/// signature already takes the specific generation so that split costs no
-/// caller a change.
+/// The control record is the whole of page 0. The engine reads only its
+/// first 512 bytes before it knows anything (`W32MKDE_decompiled.c:33874`),
+/// but that is a minimum readable header, not the record's length: page_size
+/// is a field *inside* this record, the crate's own writer has always
+/// allocated page_size bytes for it, and the format's 24-segment ceiling
+/// needs 0x3e0 bytes of key definitions. See harvest 1.
 #[must_use]
-pub fn layout(generation: Generation) -> &'static Layout {
-    if generation.is_v6() {
-        &V6_LAYOUT
-    } else {
-        &V5_LAYOUT
+pub fn layout(generation: Generation, page_size: usize) -> Layout {
+    let mut fields = if generation.is_v6() { v6_fixed() } else { v5_fixed() };
+    let described = fields.iter().map(|f| f.at + f.len).max().unwrap_or(0);
+    if page_size > described {
+        fields.push(Field {
+            name: "page_tail",
+            index: None,
+            at: described,
+            len: page_size - described,
+            cite: "NOT YET HARVESTED -- the remainder of page 0. Zero padding \
+                   for 94 of 96 large-page v5 files and unexplained content \
+                   for 493 of 493 large-page v6 files; see harvest 0 ruling 6",
+        });
+    }
+    Layout {
+        what: if generation.is_v6() {
+            "v6 file control record"
+        } else {
+            "pre-v6 file control record"
+        },
+        len: page_size,
+        fields,
     }
 }
 
@@ -143,7 +169,7 @@ mod tests {
             Generation::V610,
             Generation::V620,
         ] {
-            let layout = layout(generation);
+            let layout = layout(generation, 512);
             assert_eq!(
                 layout.tiling_fault(),
                 None,
@@ -158,7 +184,7 @@ mod tests {
     #[test]
     fn every_field_is_cited() {
         for generation in [Generation::V5R4, Generation::V600] {
-            for field in layout(generation).fields {
+            for field in &layout(generation, 512).fields {
                 assert!(
                     !field.cite.trim().is_empty(),
                     "{generation:?} field {} has no citation",
@@ -172,7 +198,7 @@ mod tests {
     /// offsets it reads them from -- see W32MKDE FUN_00435970.
     #[test]
     fn the_fields_the_engine_checks_are_where_it_checks_them() {
-        let v5 = layout(Generation::V5R4);
+        let v5 = layout(Generation::V5R4, 512);
         let version = v5
             .fields
             .iter()
@@ -180,7 +206,7 @@ mod tests {
             .expect("v5 describes its version field");
         assert_eq!((version.at, version.len), (6, 2));
 
-        let v6 = layout(Generation::V600);
+        let v6 = layout(Generation::V600, 512);
         let version = v6
             .fields
             .iter()
@@ -189,12 +215,48 @@ mod tests {
         assert_eq!((version.at, version.len), (0x4a, 2));
 
         for generation in [Generation::V5R4, Generation::V600] {
-            let page = layout(generation)
+            let l = layout(generation, 512);
+            let page = l
                 .fields
                 .iter()
                 .find(|f| f.name == "page_size")
                 .expect("page size is described");
             assert_eq!((page.at, page.len), (8, 2), "{generation:?}");
+        }
+    }
+
+    /// A layout function that ignores its generation would pass every tiling
+    /// test ever written, because both families tile. This is the assertion
+    /// that can tell them apart: the engine reads the version word at 6 for
+    /// one family and at 0x4a for the other, so the descriptions must differ.
+    #[test]
+    fn the_two_families_do_not_share_a_layout() {
+        let v5 = layout(Generation::V5R4, 512);
+        let v6 = layout(Generation::V600, 512);
+        let at = |l: &Layout, name: &str| {
+            l.fields.iter().find(|f| f.name == name).map(|f| f.at)
+        };
+        assert_eq!(at(&v5, "version"), Some(6));
+        assert_eq!(at(&v6, "version"), Some(0x4a));
+        assert_ne!(
+            at(&v5, "version"),
+            at(&v6, "version"),
+            "the families must not share one description"
+        );
+    }
+
+    /// The control record is the whole of page 0, so its description is as
+    /// long as the file says its pages are -- not a constant 512.
+    #[test]
+    fn the_control_record_is_as_long_as_a_page() {
+        for page_size in [512usize, 1024, 1536, 2048, 4096] {
+            let l = layout(Generation::V5R4, page_size);
+            assert_eq!(l.len, page_size, "page_size {page_size}");
+            assert_eq!(
+                l.tiling_fault(),
+                None,
+                "a {page_size}-byte control record must still tile"
+            );
         }
     }
 }

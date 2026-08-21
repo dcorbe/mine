@@ -20,6 +20,10 @@ pub mod generation;
 pub struct Field {
     /// What this range is, in the vendor's vocabulary where one exists.
     pub name: &'static str,
+    /// Which repetition this is, for a field that repeats -- a key
+    /// descriptor's segment index, for instance. `None` for a field that
+    /// occurs once.
+    pub index: Option<usize>,
     /// Byte offset from the start of the structure.
     pub at: usize,
     /// Length in bytes.
@@ -29,6 +33,19 @@ pub struct Field {
     pub cite: &'static str,
 }
 
+impl Field {
+    /// How this field is named in a message. A repeated field says which
+    /// repetition, so `key_descriptor[3]` cannot be mistaken for
+    /// `key_descriptor[0]`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self.index {
+            Some(index) => format!("{}[{index}]", self.name),
+            None => self.name.to_string(),
+        }
+    }
+}
+
 /// A structure, described completely.
 pub struct Layout {
     /// What this describes, for messages.
@@ -36,8 +53,10 @@ pub struct Layout {
     /// The structure's total length in bytes.
     pub len: usize,
     /// Its fields, which must tile `len` exactly. Order is not significant;
-    /// [`Layout::tiling_fault`] sorts.
-    pub fields: &'static [Field],
+    /// [`Layout::tiling_fault`] sorts. Built at runtime because the file
+    /// declares its own extent -- a page-size and a key-descriptor count read
+    /// from the file, not a compile-time constant.
+    pub fields: Vec<Field>,
 }
 
 impl Layout {
@@ -49,8 +68,8 @@ impl Layout {
     /// wrong whether or not a corpus file happens to catch it.
     #[must_use]
     pub fn tiling_fault(&self) -> Option<String> {
-        let mut ranges: Vec<(usize, usize, &'static str)> =
-            self.fields.iter().map(|f| (f.at, f.len, f.name)).collect();
+        let mut ranges: Vec<(usize, usize, String)> =
+            self.fields.iter().map(|f| (f.at, f.len, f.label())).collect();
         ranges.sort_unstable();
 
         let mut next = 0usize;
@@ -75,7 +94,7 @@ impl Layout {
                 return Some(format!(
                     "{}: bytes {next}..{at} are described by no field, and an \
                      undescribed range is a fault rather than a blob to \
-                     preserve",
+                     preserve (the next field is {name})",
                     self.what
                 ));
             }
@@ -107,23 +126,23 @@ mod tests {
     /// A layout whose fields cover every byte exactly once is sound.
     #[test]
     fn a_complete_layout_has_no_tiling_fault() {
-        static FIELDS: &[Field] = &[
-            Field { name: "lead", at: 0, len: 4, cite: "test" },
-            Field { name: "rest", at: 4, len: 4, cite: "test" },
+        let fields = vec![
+            Field { name: "lead", index: None, at: 0, len: 4, cite: "test" },
+            Field { name: "rest", index: None, at: 4, len: 4, cite: "test" },
         ];
-        static LAYOUT: Layout = Layout { what: "sample", len: 8, fields: FIELDS };
-        assert_eq!(LAYOUT.tiling_fault(), None);
+        let layout = Layout { what: "sample", len: 8, fields };
+        assert_eq!(layout.tiling_fault(), None);
     }
 
     /// The whole point: an undescribed range is a fault, not a preserved blob.
     #[test]
     fn a_gap_is_a_fault_and_the_message_names_the_range() {
-        static FIELDS: &[Field] = &[
-            Field { name: "lead", at: 0, len: 4, cite: "test" },
-            Field { name: "rest", at: 6, len: 2, cite: "test" },
+        let fields = vec![
+            Field { name: "lead", index: None, at: 0, len: 4, cite: "test" },
+            Field { name: "rest", index: None, at: 6, len: 2, cite: "test" },
         ];
-        static LAYOUT: Layout = Layout { what: "sample", len: 8, fields: FIELDS };
-        let fault = LAYOUT.tiling_fault().expect("a gap is a fault");
+        let layout = Layout { what: "sample", len: 8, fields };
+        let fault = layout.tiling_fault().expect("a gap is a fault");
         assert!(fault.contains("4..6"), "the message names the gap: {fault}");
         assert!(fault.contains("sample"), "and the structure: {fault}");
     }
@@ -132,12 +151,12 @@ mod tests {
     /// is wrong and nothing says which.
     #[test]
     fn an_overlap_is_a_fault() {
-        static FIELDS: &[Field] = &[
-            Field { name: "lead", at: 0, len: 5, cite: "test" },
-            Field { name: "rest", at: 4, len: 4, cite: "test" },
+        let fields = vec![
+            Field { name: "lead", index: None, at: 0, len: 5, cite: "test" },
+            Field { name: "rest", index: None, at: 4, len: 4, cite: "test" },
         ];
-        static LAYOUT: Layout = Layout { what: "sample", len: 8, fields: FIELDS };
-        let fault = LAYOUT.tiling_fault().expect("an overlap is a fault");
+        let layout = Layout { what: "sample", len: 8, fields };
+        let fault = layout.tiling_fault().expect("an overlap is a fault");
         assert!(fault.contains("overlap"), "the message says so: {fault}");
     }
 
@@ -145,12 +164,12 @@ mod tests {
     /// it -- the structure's length is part of the description.
     #[test]
     fn a_field_past_the_end_is_a_fault() {
-        static FIELDS: &[Field] = &[
-            Field { name: "lead", at: 0, len: 4, cite: "test" },
-            Field { name: "rest", at: 4, len: 8, cite: "test" },
+        let fields = vec![
+            Field { name: "lead", index: None, at: 0, len: 4, cite: "test" },
+            Field { name: "rest", index: None, at: 4, len: 8, cite: "test" },
         ];
-        static LAYOUT: Layout = Layout { what: "sample", len: 8, fields: FIELDS };
-        let fault = LAYOUT.tiling_fault().expect("running past the end is a fault");
+        let layout = Layout { what: "sample", len: 8, fields };
+        let fault = layout.tiling_fault().expect("running past the end is a fault");
         assert!(fault.contains("past the end"), "the message says so: {fault}");
     }
 
@@ -158,9 +177,25 @@ mod tests {
     /// stop, are equally a fault -- the trailing bytes are undescribed too.
     #[test]
     fn a_layout_that_stops_short_of_len_is_a_fault() {
-        static FIELDS: &[Field] = &[Field { name: "lead", at: 0, len: 4, cite: "test" }];
-        static LAYOUT: Layout = Layout { what: "sample", len: 8, fields: FIELDS };
-        let fault = LAYOUT.tiling_fault().expect("stopping short of len is a fault");
+        let fields = vec![Field { name: "lead", index: None, at: 0, len: 4, cite: "test" }];
+        let layout = Layout { what: "sample", len: 8, fields };
+        let fault = layout.tiling_fault().expect("stopping short of len is a fault");
         assert!(fault.contains("4..8"), "the message names the trailing gap: {fault}");
+    }
+
+    /// A repeated structure's fault must say *which* repetition, or a fault
+    /// in key 3 reads exactly like a fault in key 0.
+    #[test]
+    fn a_repeated_fields_fault_names_its_index() {
+        let layout = Layout {
+            what: "sample",
+            len: 8,
+            fields: vec![
+                Field { name: "entry", index: Some(0), at: 0, len: 4, cite: "test" },
+                Field { name: "entry", index: Some(1), at: 5, len: 3, cite: "test" },
+            ],
+        };
+        let fault = layout.tiling_fault().expect("a gap is a fault");
+        assert!(fault.contains("entry[1]"), "the message names the repetition: {fault}");
     }
 }
