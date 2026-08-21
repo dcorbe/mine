@@ -2213,9 +2213,9 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         // -- just against the live copy's own physical page, not physical
         // page 0 unconditionally. A malformed array (a chain that runs past
         // the page, or never terminates) is refused by that walk's own,
-        // more specific message; a well-formed one still cannot produce a
-        // `File` today, since the allocation table and page addressing past
-        // the control record are later work.
+        // more specific message; a well-formed one still needs the
+        // allocation table and per-key B-tree walk below before this
+        // function can return `Ok` (Task 17, Task 19).
         let live_page_start = live_is_page * page_size;
         let live_descriptors = key_descriptors(&bytes[live_page_start..], page_size, live.keys)?;
 
@@ -2264,9 +2264,9 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         // physical map its entries encode. A malformed table (a bad
         // shadow pair, a block claiming the control record's own pages, a
         // claim past the end of the file) is refused by that function's
-        // own, more specific message; a well-formed one still cannot
-        // produce a `File` today, since ordinary v6 page headers, records
-        // and index pages past the addressing layer are later work.
+        // own, more specific message; a well-formed one still needs every
+        // key's own B-tree walked and every claimed physical page
+        // classified below before this function can return `Ok` (Task 19).
         let (allocation_blocks, physical_map) =
             v6_allocation_table(bytes, page_size, total_pages)?;
 
@@ -2794,13 +2794,16 @@ mod tests {
     /// been refused and has always been wrong.
     ///
     /// This tests [`resolve_shadow`] directly rather than the full [`file`]
-    /// pipeline. `file` itself still refuses every v6 file (the allocation
-    /// table, page addressing, and the rest of v6's own pages are later
-    /// work), so it cannot return `Ok` for a real v6 file yet -- but the
-    /// shadow resolution Ruling 7 requires happens unconditionally, before
-    /// that later refusal, and is independently correct and testable here.
-    /// `the_refusal_names_the_live_copy_it_resolved` below is the companion
-    /// check: that `file`'s own refusal for this same file changed shape.
+    /// pipeline: `resolve_shadow` runs unconditionally, before anything
+    /// else `file` does with a v6 file, so it is independently correct and
+    /// testable here regardless of whether `file` itself goes on to succeed
+    /// or refuse for this particular file. (`wccmp002.vir` itself still
+    /// refuses today, past this task's own walk -- an abandoned physical
+    /// page from an earlier rebalance, not a shadow-resolution problem; see
+    /// `the_refusal_now_names_an_abandoned_physical_page_past_the_walk`
+    /// below, the companion check that `file`'s own refusal for this same
+    /// file names that specific page rather than the pre-Task-19 blanket
+    /// `keys > 0` gate.)
     #[test]
     fn the_live_control_record_is_the_one_with_the_higher_generation() {
         let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";

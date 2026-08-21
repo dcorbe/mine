@@ -1076,11 +1076,17 @@ mod tests {
     ///
     /// `page_size` is deliberately `fcr::at::FIXED_LEN` (`0x110`) here, not
     /// a real v6 page size -- that leaves no trailing tail past the fixed
-    /// portion for either copy to model, since a v6 file's own page trailer
-    /// (harvest 2 "FCR size") is later work this task does not own. Nothing
-    /// about `read::file` produces this shape today (it refuses every v6
-    /// file before building one); this test constructs the model by hand to
-    /// exercise `emit`'s side of ruling 7 in isolation.
+    /// portion for either copy to model, which is convenient here but is
+    /// not a shape `read::file` would ever produce: `identify` itself
+    /// requires a v6 page size to be a nonzero multiple of `0x200`
+    /// (`fcr::v6_fixed`'s own `page_size` citation), and `0x110` is
+    /// neither. This model is also otherwise empty (no key descriptors, no
+    /// allocation blocks, no `v6_pages`) in a way no real read produces
+    /// either. So this test constructs the model by hand -- not because
+    /// `read::file` cannot yet produce a `Control::Shadowed` `File` (it can,
+    /// as of Task 19, for real v6 files with a real page size) -- to
+    /// exercise `emit`'s side of ruling 7 in isolation from everything else
+    /// a real v6 file would also need described.
     #[test]
     fn a_v6_shadow_pair_writes_both_copies_not_the_live_one_twice() {
         use crate::format::generation::Identified;

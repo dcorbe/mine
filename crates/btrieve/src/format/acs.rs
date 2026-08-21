@@ -5,7 +5,11 @@
 //! families (harvest 4 SS6, confirmed on `MULTIACS.DAT`'s two v6 blocks and
 //! 15 further v5 corpus files this task measured).
 //!
-//! This crate reads only v5 today (`read::file` refuses every v6 file), and
+//! This module's own content layout (`fields`, [`LEN`]) is shared by both
+//! families (`read::read_acs_block` reads a v6 block through the exact
+//! same offsets, Task 19) -- what differs is how each family *finds* its
+//! block, which this module deliberately does not own:
+//!
 //! v5 finds its one block a different way than v6 does: not by scanning for
 //! a page-type tag (v5 pages carry none), but at a **fixed** physical page,
 //! [`V5_PAGE`] -- measured on all 15 v5 corpus files this task found
@@ -17,6 +21,13 @@
 //! `0x10a` pointer, which harvest 4 SS6a measured unreliable on 2 of those
 //! 15 files (`CLASSADS.DAT`, `EMAIL.DAT`, both `V5R3`, both copies): this
 //! module only describes the block's *content*, once that page is found.
+//!
+//! v6 finds its block (or blocks -- `MULTIACS.DAT` has two) by scanning
+//! every claimed page for `format::page::v6::TAG_ACS` instead (harvest 4
+//! SS6a: v6 pages carry a type tag, so there is no fixed page to trust the
+//! way v5's is), which `read::file`'s own v6 branch does directly -- see
+//! that function's own doc comment, not this module, for the v6 finding
+//! rule.
 
 use super::Field;
 

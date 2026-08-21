@@ -62,10 +62,14 @@ pub const UNUSED_ENTRY: u16 = 0xffff;
 
 /// Bit 15 of a live entry: whether the fragment leads with a 4-byte
 /// continuation pointer. **v5 only** -- harvest 5 SS3.4's version gate
-/// (`W32MKDE_decompiled.c:19045`): below version `0x600` this bit decides,
-/// and this crate does not yet describe a v6 control record at all
-/// (`read::file` refuses every v6 file today), so the v6 branch (every
-/// fragment carries the pointer unconditionally) is not implemented here.
+/// (`W32MKDE_decompiled.c:19045`): below version `0x600` this bit decides.
+/// `read::read_fragment_page` (which uses this constant) is only ever
+/// called from `read::resolve_pages`, the v5-only page graph -- `read::
+/// file`'s v6 branch never reaches it, since a variable-length v6 file's
+/// `TAG_VARIABLE` pages are refused outright (Task 20's own scope, not a
+/// gap in describing the v6 control record, which Task 15 already fully
+/// covers), so the v6 branch (every fragment carries the pointer
+/// unconditionally) is not implemented here.
 pub const CONTINUED_BIT: u16 = 0x8000;
 
 /// The low 15 bits of an entry: the fragment's start offset within the page.
