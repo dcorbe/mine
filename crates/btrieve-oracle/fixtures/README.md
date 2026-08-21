@@ -1,0 +1,137 @@
+# Oracle fixtures
+
+Each `*.fixture` file here is a recorded conversation with a real copy of
+Pervasive Btrieve 6.15, running under Wine, driven over TCP through
+`tools/btrieve-oracle/btrvprobe serve` (wire format documented at
+`crates/btrieve-oracle/src/lib.rs:1-11`). A fixture is a `Scenario` (the
+sequence of `BTRCALL`s sent) paired with a `Transcript` (the genuine engine's
+answer to each one, plus the resulting file's bytes read back off disk). The
+scenarios themselves are defined in `crates/btrieve-oracle/src/scenario.rs`'s
+`all_scenarios()`; the recording test (`record_fixtures_from_the_genuine_
+engine`) is `#[ignore]`d and never runs in an ordinary `cargo test` — it
+requires the Wine setup, which is why the recordings are committed rather
+than regenerated on demand.
+
+Replaying them (`crates/btrieve/tests/differential.rs`) diffs status codes,
+successful-Get `databuf`, and post-scenario record contents against what the
+engine under test produced for the same calls. It never compares `posblk`
+(genuine Btrieve's is 128 bytes of engine-private cursor state; this
+project's is a host-side handle — neither shape is scenario data) and never
+compares raw file bytes (every seed file here is genuine Btrieve's own v6
+layout; nothing this project builds is byte-identical to that in principle).
+
+## `open_close.fixture` (3,963 bytes)
+
+**Scenario:** create an 8-byte-record, single-key file (`OPENCLOSE.DAT`),
+then Open, then Close. The smallest possible scenario.
+
+**Engine:** genuine Pervasive Btrieve 6.15 under Wine.
+
+**Confirmed by reading the file:** contains the literal path
+`C:\btrieve\3586646OPENCLOSE.DAT` (three times — once per call that carries
+a KeySpec/FileSpec referencing it), the two-byte `"FC"` v6 control-record
+signature, and two `"PP"` allocation-table page markers.
+
+**What it proves:** a baseline. If the recorded engine and the engine under
+test disagree on Open/Close against the simplest file that can exist, no
+other fixture's disagreement means anything either.
+
+## `insert_get_step_stat.fixture` (15,668 bytes)
+
+**Scenario:** create an 8-byte-record file (`GETSTEPSTAT.DAT`), then insert
+keys 100, 200, 50 in that physical order, then read them back through every
+positioning call the engine's Get and Step families offer: Get First/Next×3
+(key order 50, 100, 200, then status 9 end-of-file), Get Equal 100, Get
+Previous, Get Last, Get Greater 100, Get At Most 150, Step First/Next×4
+(physical/insertion order 100, 200, 50, then end-of-file), Stat, Close.
+
+**Engine:** genuine Pervasive Btrieve 6.15 under Wine.
+
+**What it proves:** key order and physical/insertion order are different
+things, and this scenario is built so the two diverge (50, 100, 200 by key;
+100, 200, 50 by insertion). A Get that silently answered in physical order
+instead of key order, or a Step that answered in key order instead of
+physical order, would be caught by this fixture and no other.
+
+## `update_and_delete.fixture` (9,180 bytes)
+
+**Scenario:** create an 8-byte-record file (`UPDDEL.DAT`), insert key 42,
+Get Equal (establishes currency), Update (payload only, key unchanged), Get
+Equal (confirms the payload changed), Delete (removes the record Get just
+positioned on), Get Equal (status 4: gone), Close.
+
+**Engine:** genuine Pervasive Btrieve 6.15 under Wine.
+
+**What it proves:** the currency-then-mutate-then-reverify pattern, and
+specifically that a Get Equal against a key whose only record was just
+deleted answers status **4** ("end of file" / not found), not status 9 or
+some other code an implementation might guess at.
+
+## `status_ten_refusal_and_same_value_rewrite.fixture` (9,838 bytes)
+
+**Scenario:** create an 8-byte-record file (`MODKEY.DAT`) whose one key is
+declared **not modifiable**, insert key 42, Get Equal (currency), Update to
+99 — **refused, status 10, nothing written** — Get Equal 42 (still there,
+untouched), Get Equal 99 (status 4: nothing was written under the new key),
+Get Equal 42 (re-establish currency), Update 42→9 (**allowed**: same key
+value, payload-only change), Get Equal 42 (payload changed).
+
+**Engine:** genuine Pervasive Btrieve 6.15 under Wine.
+
+**What it proves:** both halves of the unmodifiable-key rule in one
+scenario — a real value change is refused with status 10 and writes
+nothing, while an identical rewrite of the same key value is allowed and
+changes only the payload. This matches `docs/2026-08-16-v6-update-delete-
+oracle.md`'s narration of the same rule measured through the raw C probe
+(`delprobe.exe modsame`), so this fixture confirms the same behaviour again
+through the wire this crate's own Rust client uses, not only through a
+probe transcript.
+
+## Why these are kept, and what changed
+
+The design spec that pitches the old census machinery (`census.rs`,
+`census_pin.rs`, `tests/data/census/CORPUS.tsv` — see the doc comment on
+`crates/btrieve/src/census.rs`) flagged these four fixtures for a separate
+decision, "so it can be overruled": keeping the *data* while moving
+`differential.rs` (the harness that replays it) out of the active suite
+until an engine exists to replay it against.
+
+That recommendation is now load-bearing rather than merely prudent. This
+plan implemented the v6 fragment/overflow-page path (`TAG_VARIABLE` pages,
+Task 20) from the decompiled engine and from these recordings, because at
+the time no corpus file was known to exercise it. Deleting the fixtures
+then would have left that code with no ground truth at all.
+
+**That has since changed, partially.** The final task of Stage C
+(`crates/btrieve/src/read.rs`, `emit.rs`, `model.rs`) found that the corpus
+itself carries 17 files with 19,231 genuine `TAG_VARIABLE` fragment pages
+and 35,442 live entries. The fragment/overflow-page path is no longer
+unwitnessed — the corpus now confirms it independently, at a scale (35,442
+entries) these four fixtures cannot approach. So for that one behaviour,
+the fixtures' role has changed from *sole* ground truth to a second,
+independent source.
+
+**What the corpus still cannot witness, and these fixtures are the only
+ground truth for:**
+
+- **Genuine v6 deletion.** `update_and_delete.fixture` records a real
+  Delete call against a real v6 file and the real engine's answer to the
+  Get Equal that follows it. A static corpus file is a single snapshot; it
+  cannot show what deleting a record does, only what a file looks like
+  after some unknown history of edits.
+- **Mutation behaviour of any kind** — Update, the modifiable/unmodifiable
+  key rule, currency after a mutating call. Same reason: a corpus file is a
+  snapshot, not a sequence of operations.
+- **Variable-tail Allocation Tables (VATs).** None of these four fixtures
+  cover this either — every scenario here creates a fixed-length,
+  single-key file (`create_request`'s `record_len` is a plain byte count,
+  and the FileSpec's flags word is always built with no variable-length
+  bit set). VATs remain unwitnessed by both the corpus (harvest 5 found
+  zero corpus evidence and zero mentions in the 45,175-line decompile) and
+  by every fixture recorded so far. That gap is not closed by anything in
+  this repository today.
+
+A recording nobody can interpret is not evidence — that is why each section
+above states the scenario, the engine, and what was directly confirmed by
+reading the file, rather than only citing the harvest document that first
+measured them.
