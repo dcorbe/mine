@@ -178,32 +178,39 @@ fn the_harness_reports_whether_it_verified_anything() {
     }
 }
 
-/// Task 20's own honest tripwire.
+/// Superseded Task 20 tripwire, now a positive witness (Task 21).
 ///
-/// The v6 free list is established by the round trip (harvest 5 SS2.2's
-/// per-slot shape is exercised by every one of the 337+ v6 corpus files that
-/// pass). The v6 **variable-length/fragment path is not** -- harvest 5
-/// SS4.3 measured zero of this corpus's 507 v6-family files combining
-/// populated records with variable-length data, and a hole-walk over every
-/// one found no genuine `TAG_VARIABLE` page either. So `read::
-/// read_fragment_page`'s `is_v6` branch and `V6Page::fragment` are written
-/// from `W32MKDE_decompiled.c` and from the oracle fixtures this project's
-/// own `variable.rs` module cites (`variable.rs:340-353,493-501`), not from
-/// anything this test could drive across the corpus and watch pass.
+/// Task 20 shipped `read::read_fragment_page`'s `is_v6` branch and
+/// `V6Page::fragment` from `W32MKDE_decompiled.c` and from oracle fixtures
+/// alone, because at the time every v6 file that combined populated
+/// records with variable-length data, or carried a genuine `TAG_VARIABLE`
+/// page, was refused before `read::file` ever reached that code -- by the
+/// unrelated "unclaimed physical page" gate Task 21 closed
+/// (`V6Page::orphan`). Removing that gate exposed the evidence directly:
+/// this corpus has real fragment pages after all, just every one of them
+/// sat behind a file that also happened to carry at least one physical
+/// page Task 20's own round trip could not yet describe.
 ///
-/// This asserts the two claims that grounded that choice stay true, driven
-/// through the *shipped* `read::file` -- not a reimplementation of its own
-/// rule (Trap 3 from earlier tasks in this plan): no v6 file combines
-/// `variable_mark != 0` with `records > 0`, and no `V6Page` this crate has
-/// ever decoded carries `fragment: Some(_)`. If this test ever fails, that
-/// means a real v6 file finally showing the variable-length/fragment path
-/// has turned up -- go re-open harvest 5 SS3/SS4 and re-check this crate's
-/// only-fixture-tested assumptions against it (the entry continuation bit
-/// always clear, on emit and on read; the page-level free list still
-/// unestablished) before trusting the round trip's pass/fail verdict for
-/// that file, or for this path in general.
+/// Measured once this task's fix landed, driven through the *shipped*
+/// `read::file` -- not a reimplementation of its own rule (Trap 3 from
+/// earlier tasks in this plan): 17 v6-family files combine
+/// `variable_mark != 0` with `records > 0` (16 `wcctext2.vir`/`.nu1` copies
+/// plus `WGSMENU2.DAT`, the same file this task's own brief named as the
+/// flagship "unclaimed physical page" refusal); together they carry 19,231
+/// genuine `TAG_VARIABLE` pages holding 35,442 live fragment entries, and
+/// every one of the 652 corpus files still round-trips byte-identically
+/// (`the_round_trip_count_only_grows`, same run). This asserts the exact
+/// counts (a regression either way -- fewer real fragment pages found, or
+/// more appearing without a re-check -- is worth noticing by name) and the
+/// one invariant harvest 5 SS3.4 could previously only cite from four
+/// oracle fixtures: every live entry's own continuation bit (`0x8000`,
+/// `format::variable::CONTINUED_BIT`) reads clear, read directly off the
+/// original file's raw bytes rather than through the model (the model
+/// never consults this bit for v6 at all -- `read::read_fragment_page`'s
+/// `is_v6` parameter skips it -- so a bug that silently flipped it on
+/// write would not otherwise be caught by anything in this file).
 #[test]
-fn no_corpus_file_witnesses_the_v6_variable_path() {
+fn the_v6_fragment_path_is_now_corpus_witnessed() {
     let files = corpus::walk();
     if files.is_empty() {
         eprintln!(
@@ -214,42 +221,61 @@ fn no_corpus_file_witnesses_the_v6_variable_path() {
     }
 
     let mut populated_variable_v6: Vec<String> = Vec::new();
-    let mut fragment_pages_found: Vec<String> = Vec::new();
+    let mut fragment_pages_found: Vec<(String, u32)> = Vec::new();
+    let mut live_entries = 0usize;
+    let mut continuation_bit_set: Vec<String> = Vec::new();
     for entry in &files {
         let Ok(original) = std::fs::read(&entry.path) else { continue };
         let Ok(model) = read::file(&original) else { continue };
-        let btrieve::model::Control::Shadowed { live, .. } = &model.control else { continue };
-        if live.variable_mark != 0 && live.records > 0 {
-            populated_variable_v6.push(entry.path.display().to_string());
+        let page_size = model.id.page_size as usize;
+        if let btrieve::model::Control::Shadowed { live, .. } = &model.control {
+            if live.variable_mark != 0 && live.records > 0 {
+                populated_variable_v6.push(entry.path.display().to_string());
+            }
         }
         for page in &model.v6_pages {
-            if page.fragment.is_some() {
-                fragment_pages_found.push(format!(
-                    "{} physical page {}",
-                    entry.path.display(),
-                    page.physical_page
-                ));
+            let Some(fp) = &page.fragment else { continue };
+            fragment_pages_found.push((entry.path.display().to_string(), page.physical_page));
+            let page_start = page.physical_page as usize * page_size;
+            for which in 0..fp.fragments.len() {
+                let Some(entry_off) = btrieve::format::variable::entry_at(page_size, which)
+                else {
+                    continue;
+                };
+                let at = page_start + entry_off;
+                let raw = u16::from_le_bytes([original[at], original[at + 1]]);
+                if raw == btrieve::format::variable::UNUSED_ENTRY {
+                    continue;
+                }
+                live_entries += 1;
+                if raw & btrieve::format::variable::CONTINUED_BIT != 0 {
+                    continuation_bit_set.push(format!(
+                        "{} physical page {}, entry {which}",
+                        entry.path.display(),
+                        page.physical_page
+                    ));
+                }
             }
         }
     }
 
-    assert!(
-        populated_variable_v6.is_empty(),
-        "a v6 file combining variable-length records with actual data now \
-         exists in the corpus -- Task 20's own report said this evidence did \
-         not exist. Go re-derive the fragment/free-list rules against it \
-         (harvest 5 SS2.2/SS3) before trusting anything this crate currently \
-         assumes about the v6 variable-length path. Files: {populated_variable_v6:?}"
+    assert_eq!(
+        populated_variable_v6.len(),
+        17,
+        "populated variable-length v6 files: {populated_variable_v6:?}"
     );
+    assert_eq!(
+        fragment_pages_found.len(),
+        19_231,
+        "genuine TAG_VARIABLE pages found across those files"
+    );
+    assert_eq!(live_entries, 35_442, "live fragment entries across every one of those pages");
     assert!(
-        fragment_pages_found.is_empty(),
-        "a genuine TAG_VARIABLE ('V') page now exists in a corpus file -- \
-         this crate's v6 fragment-page code (`read::read_fragment_page`'s \
-         `is_v6` branch, `write_v6_fragment_pages`) has never been run \
-         against real data before now. Re-check the always-clear \
-         continuation bit and the pointer scramble against it (harvest 5 \
-         SS3.2/SS3.4) before trusting the round trip's verdict on this file. \
-         Pages: {fragment_pages_found:?}"
+        continuation_bit_set.is_empty(),
+        "harvest 5 SS3.4's 'every real v6 fragment leaves this bit clear' claim rested on \
+         four oracle fixtures (165/165 entries); this corpus now has 35,442 real ones and \
+         at least one disagrees -- re-open harvest 5 SS3.4 before trusting \
+         `read::read_fragment_page`'s `is_v6` branch on it: {continuation_bit_set:?}"
     );
 }
 

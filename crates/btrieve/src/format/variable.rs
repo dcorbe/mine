@@ -42,10 +42,12 @@
 //! `MAX_FRAGMENTS`, `UNUSED_ENTRY`, `OFFSET_MASK`, `POINTER_LEN`,
 //! `Pointer`, `entry_at`, `fields`) identical in both families, so
 //! `read::read_fragment_page`/`emit`'s writer reuse them unchanged; only
-//! [`CONTINUED_BIT`] is v5-only, per its own doc comment. **No v6 file in
-//! this project's corpus carries a `TAG_VARIABLE` page at all** -- see
+//! [`CONTINUED_BIT`] is v5-only, per its own doc comment. Believed to carry
+//! no `TAG_VARIABLE` page at all when this module was written -- Task 21
+//! found 19,231 real ones across 17 corpus files, hidden until then behind
+//! an unrelated refusal (`crate::model::V6Page::orphan`'s own gap) -- see
 //! `crate::model::FragmentPage`'s own doc comment for what grounds the v6
-//! side of this module instead.
+//! side of this module now.
 
 use super::Field;
 
@@ -86,11 +88,11 @@ pub const UNUSED_ENTRY: u16 = 0xffff;
 ///
 /// On emit, this crate never *sets* it for a v6 entry either, matching
 /// measured reality rather than deriving it from `next.is_some()` the way
-/// the v5 write path does: every real v6 fragment this project has ever
-/// produced leaves it clear (`variable.rs:340-353`, 165/165 entries across
-/// four oracle-written fixtures) even though the pointer is unconditionally
-/// present. **No v6 file in this project's corpus has ever exercised this
-/// bit at all** -- see `crate::model::FragmentPage`'s own doc comment.
+/// the v5 write path does: originally checked against four oracle-written
+/// fixtures only (165/165 entries clear), and now (Task 21) independently
+/// confirmed against every real v6 fragment this corpus actually has --
+/// 35,442 live entries across 19,231 pages in 17 files, all clear -- see
+/// `crate::model::FragmentPage`'s own doc comment.
 pub const CONTINUED_BIT: u16 = 0x8000;
 
 /// The low 15 bits of an entry: the fragment's start offset within the page.

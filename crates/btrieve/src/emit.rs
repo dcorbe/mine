@@ -355,9 +355,11 @@ fn write_fragment_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> 
 /// tagged `TAG_VARIABLE`). See [`write_one_fragment_page`] for the shared
 /// mechanics and what distinguishes the v6 write from v5's.
 ///
-/// **No v6 file in this project's corpus has a `TAG_VARIABLE` page** -- see
-/// `model::FragmentPage`'s own doc comment for what grounds this function
-/// instead.
+/// Believed unwitnessed in this corpus when Task 20 shipped this function --
+/// Task 21 found 19,231 real `TAG_VARIABLE` pages across 17 files, all
+/// hidden behind an unrelated refusal until then, every one of which now
+/// round-trips byte-identically through this function -- see
+/// `model::FragmentPage`'s own doc comment.
 ///
 /// # Errors
 ///
@@ -367,6 +369,29 @@ fn write_v6_fragment_pages(canvas: &mut Canvas, model: &File) -> Result<(), Faul
     for p in &model.v6_pages {
         let Some(fp) = &p.fragment else { continue };
         write_one_fragment_page(canvas, p.physical_page as usize, page_size, fp, true)?;
+    }
+    Ok(())
+}
+
+/// Write every v6 abandoned page's whole body back verbatim (`V6Page::
+/// orphan`, Task 21), for every page whose model carries one. Written as
+/// one opaque block past the six-byte header (`write_v6_page` already wrote
+/// that), exactly as `read::file` captured it -- this crate makes no claim
+/// about what, if anything, inside it is still meaningful; see
+/// `V6Page::orphan`'s own doc comment for the evidence this is relocation-
+/// on-write's own abandoned litter, not an unparsed live structure. The v6
+/// counterpart to `write_orphan_pages`, which does the identical thing for
+/// v5's positionally-indexed `pages` vec.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_v6_orphan_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for p in &model.v6_pages {
+        let Some(body) = &p.orphan else { continue };
+        let at = p.physical_page as usize * page_size;
+        canvas.put(at + page::v6::LEN, body, v6_page_owner("orphan_body", p.physical_page))?;
     }
     Ok(())
 }
@@ -585,14 +610,15 @@ fn v6_page_owner(field: &'static str, physical_page: u32) -> Owner {
 /// `content` is `None` for a page this function does not write content
 /// for -- an index page (`V6Page::index`, written by
 /// `write_v6_index_pages` instead), an ACS block (`V6Page::acs`, written by
-/// `write_v6_acs_blocks`), or a fragment/overflow page (`V6Page::fragment`,
-/// Task 20, written by `write_v6_fragment_pages`), all three called
-/// separately by [`file`] right after this one. Only a page where **all
-/// four** of `content`/`index`/`acs`/`fragment` are `None` -- which
-/// `read::file` never actually produces, since it refuses rather than build
-/// a `V6Page` it cannot fully classify (`V6Page`'s own doc comment) --
-/// would leave its body unwritten here, `Canvas::finish` reporting it the
-/// same way an undescribed v5 page's content once did.
+/// `write_v6_acs_blocks`), a fragment/overflow page (`V6Page::fragment`,
+/// Task 20, written by `write_v6_fragment_pages`), or an abandoned page
+/// (`V6Page::orphan`, Task 21, written by `write_v6_orphan_pages`), all four
+/// called separately by [`file`] right after this one. Only a page where
+/// **all five** of `content`/`index`/`acs`/`fragment`/`orphan` are `None`
+/// -- which `read::file` never actually produces, since it refuses rather
+/// than build a `V6Page` it cannot fully classify (`V6Page`'s own doc
+/// comment) -- would leave its body unwritten here, `Canvas::finish`
+/// reporting it the same way an undescribed v5 page's content once did.
 ///
 /// # Errors
 ///
@@ -954,11 +980,17 @@ pub(crate) fn write_v6_fixed_portion(
 /// fragment`, Task 20 -- `write_v6_fragment_pages`), found by its own
 /// `TAG_VARIABLE` tag, whether or not the file also holds ordinary
 /// `TAG_DATA` pages (Task 20 also removed the `variable_mark` gate that used
-/// to keep a variable-length file's `TAG_DATA` pages unread). `read::file`
-/// refuses a v6 file whose allocation table claims a page this crate cannot
-/// classify this way -- a `TAG_TEMPLATE` page, or a tag it does not
-/// recognize, that no key's walk claims -- so this function never has to
-/// guess at one either. A v5 file's
+/// to keep a variable-length file's `TAG_DATA` pages unread); and a
+/// physical page no allocation-table entry currently resolves to at all has
+/// its whole body, past the six-byte header, written back verbatim
+/// (`V6Page::orphan`, Task 21 -- `write_v6_orphan_pages`), the same
+/// relocation-on-write litter v5's own `Page::orphan` describes for a
+/// different mechanism. `read::file` refuses a v6 file whose allocation
+/// table claims a page this crate cannot classify this way -- a
+/// `TAG_TEMPLATE` page, or a tag it does not recognize, that no key's walk
+/// claims -- so this function never has to guess at one either; an
+/// *unclaimed* page's tag is never consulted at all, since `orphan` makes
+/// no claim about it either way. A v5 file's
 /// page 0 (the control record plus its key/segment definitions) is fully
 /// described and will round-trip on its own; every page's six-byte header
 /// round-trips too; a `Data`/`Free` page's slots and slack described
@@ -1022,6 +1054,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
         write_v6_index_pages(&mut canvas, model)?;
         write_v6_acs_blocks(&mut canvas, model)?;
         write_v6_fragment_pages(&mut canvas, model)?;
+        write_v6_orphan_pages(&mut canvas, model)?;
 
         return canvas.finish();
     };

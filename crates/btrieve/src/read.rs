@@ -885,8 +885,9 @@ fn looks_like_fragment_page(bytes: &[u8], page_start: usize, page_size: usize) -
 /// where the fragments before it actually end, and a file that disagrees is
 /// refused rather than read past its own bounds.
 ///
-/// **No v6 file in this project's corpus reaches the `is_v6: true` branch**
-/// -- see `crate::model::FragmentPage`'s own doc comment.
+/// This corpus now reaches the `is_v6: true` branch 19,231 times, across 17
+/// files -- see `crate::model::FragmentPage`'s own doc comment for how that
+/// evidence stayed hidden behind an unrelated refusal until Task 21.
 ///
 /// # Errors
 ///
@@ -2195,15 +2196,20 @@ fn resolve_pages(
 /// the file holds variable-length records -- Task 20 removed the
 /// `variable_mark` gate this crate used to impose here, since a data page's
 /// slot layout does not depend on it), or a fragment/overflow page
-/// (`TAG_VARIABLE`, Task 20, [`read_fragment_page`] -- never witnessed on a
-/// real v6 file in this project's corpus, see `model::FragmentPage`'s own
-/// doc comment). What still refuses: a page attributed to no key's tree,
-/// tagged neither `TAG_ACS`/`TAG_DATA`/`TAG_VARIABLE` -- a `TAG_TEMPLATE`
-/// page, or any tag this crate does not recognize -- and a physical page
-/// the allocation table never claims at all (an abandoned page from an
-/// earlier rebalance this crate does not yet have an `Orphan`-style rule
-/// for). Every such refusal names the specific page and predicate, the
-/// same "no residue, ever" discipline the v5 path already enforces.
+/// (`TAG_VARIABLE`, Task 20, [`read_fragment_page`] -- 19,231 real pages
+/// across 17 corpus files, once Task 21 stopped an unrelated refusal from
+/// hiding them; see `model::FragmentPage`'s own doc comment). And every
+/// physical page the allocation table does *not* currently claim at all is
+/// stored as an abandoned page rather than refused (`V6Page::orphan`, Task
+/// 21 -- relocation-on-write's own litter, harvest 3 SS3/SS4, whose
+/// page-level free list this crate still makes no claim about). What still
+/// refuses: a page the allocation table *does* currently claim, attributed
+/// to no key's tree, tagged neither `TAG_ACS`/`TAG_DATA`/`TAG_VARIABLE` -- a
+/// `TAG_TEMPLATE` page, or any tag this crate does not recognize -- since
+/// guessing at a page's kind when something still actively points at it
+/// would be guessing at live content, not preserving abandoned bytes. Every
+/// such refusal names the specific page and predicate, the same "no
+/// residue, ever" discipline the v5 path already enforces.
 pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
     let id = identify(bytes)?;
     let page_size = id.page_size as usize;
@@ -2332,22 +2338,20 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
         // trusted.
         v6_validate_acs_bindings(bytes, page_size, &live_descriptors, &physical_map)?;
 
-        // Every claimed physical page is read; every physical page in the
-        // file must be either the control record's own shadow pair, an
-        // allocation-table page, or a page some entry resolves to -- an
-        // unclaimed leftover physical page is refused by name (trap: a page
-        // this crate cannot classify is a refusal, never a silently dropped
-        // range). A page the walk attributed to a key is that key's index
-        // content; a page tagged TAG_ACS (and not attributed, since no
-        // key's tree and the ACS block are ever the same page) is the ACS
-        // block; a page tagged TAG_DATA and not attributed is a genuine
-        // data page, decoded the same way Task 18 already does, whether or
-        // not the file holds variable-length records (Task 20 removed the
-        // fixed-length-only gate this used to have); a page tagged
-        // TAG_VARIABLE and not attributed is a fragment/overflow page (Task
-        // 20, never witnessed on a real v6 file in this corpus); anything
-        // else (a TAG_TEMPLATE page no key claims, or a tag this crate does
-        // not recognize) is refused rather than guessed.
+        // Every claimed physical page is read. A page the walk attributed
+        // to a key is that key's index content; a page tagged TAG_ACS (and
+        // not attributed, since no key's tree and the ACS block are ever
+        // the same page) is the ACS block; a page tagged TAG_DATA and not
+        // attributed is a genuine data page, decoded the same way Task 18
+        // already does, whether or not the file holds variable-length
+        // records (Task 20 removed the fixed-length-only gate this used to
+        // have); a page tagged TAG_VARIABLE and not attributed is a
+        // fragment/overflow page (Task 20 -- 19,231 real pages across 17
+        // corpus files, Task 21); anything else claimed (a TAG_TEMPLATE page
+        // no key claims, or a tag this crate does not recognize) is refused
+        // rather than guessed -- this is a *claimed* page (the allocation
+        // table currently resolves some logical id to it), so guessing its
+        // kind would be guessing at live content, not abandoned litter.
         let mut v6_pages = Vec::with_capacity(claimed.len());
         for physical_page in &claimed {
             let page_start = *physical_page as usize * page_size;
@@ -2374,6 +2378,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     index: Some(index_page),
                     acs: None,
                     fragment: None,
+                    orphan: None,
                 });
                 continue;
             }
@@ -2389,6 +2394,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     index: None,
                     acs: Some(block),
                     fragment: None,
+                    orphan: None,
                 });
                 continue;
             }
@@ -2413,6 +2419,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     index: None,
                     acs: None,
                     fragment: None,
+                    orphan: None,
                 });
                 continue;
             }
@@ -2420,9 +2427,10 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
             // Task 20: a variable-length file's fragment/overflow page,
             // found by its own tag rather than a heuristic (v6 tags this
             // shape explicitly, unlike v5 -- `format::variable`'s own
-            // module doc). Never witnessed on a real v6 file in this
-            // project's corpus; see `model::FragmentPage`'s own doc
-            // comment for what grounds this branch instead.
+            // module doc). Believed never witnessed on a real v6 file when
+            // Task 20 shipped this; Task 21 found 19,231 real ones across
+            // 17 corpus files once an unrelated refusal stopped hiding
+            // them -- see `model::FragmentPage`'s own doc comment.
             if tag == page::v6::TAG_VARIABLE {
                 let fragment = read_fragment_page(bytes, page_start, page_size, true)?;
                 v6_pages.push(V6Page {
@@ -2434,6 +2442,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     index: None,
                     acs: None,
                     fragment: Some(fragment),
+                    orphan: None,
                 });
                 continue;
             }
@@ -2460,18 +2469,36 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
             accounted.insert(second as u32);
         }
         accounted.extend(claimed.iter().copied());
+
+        // Task 21: a physical page that is none of the control record's own
+        // shadow pair, an allocation-table page, or a page some entry
+        // currently resolves to is not read further -- no allocation-table
+        // entry names it, so there is no `TAG_ACS`/`TAG_DATA`/`TAG_VARIABLE`
+        // classification to attempt and none of Task 19/20's checks apply.
+        // This crate makes no positive claim about such a page (see
+        // `model::V6Page::orphan`'s own doc comment for the evidence this
+        // is relocation-on-write's expected litter, harvest 3 SS3/SS4,
+        // rather than a walk this crate's own code failed to complete) --
+        // it stores the whole body verbatim so the file still round-trips,
+        // the same discipline v5's `PageKind::Orphan` (Task 13) already
+        // established for its own page-level free list gap.
         for physical_page in 0..total_pages as u32 {
             if !accounted.contains(&physical_page) {
-                return Err(NotBtrieve {
-                    why: format!(
-                        "identified as {:?}: physical page {physical_page} \
-                         is none of the control record's own shadow pair, an \
-                         allocation-table page, or a page the allocation \
-                         table resolves some logical id to -- this crate \
-                         cannot classify it and refuses rather than \
-                         silently dropping its bytes",
-                        id.generation
-                    ),
+                let page_start = physical_page as usize * page_size;
+                let tag = get_u16(bytes, page_start + page::v6::at::TAG);
+                let logical = get_u16(bytes, page_start + page::v6::at::LOGICAL);
+                let stamp = get_u16(bytes, page_start + page::v6::at::STAMP);
+                let body = bytes[page_start + page::v6::LEN..page_start + page_size].to_vec();
+                v6_pages.push(V6Page {
+                    physical_page,
+                    tag,
+                    logical,
+                    stamp,
+                    content: None,
+                    index: None,
+                    acs: None,
+                    fragment: None,
+                    orphan: Some(body),
                 });
             }
         }
@@ -2556,6 +2583,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
 mod tests {
     use super::*;
     use crate::format::generation::Generation;
+
     use crate::model::fixtures::{
         full_index_page_with_an_omitted_last_child, two_key_fixed_portion, usracc_dat,
         usracc_first_page, usracc_fixed_portion, variable_length_file_with_a_real_fragment_page,
@@ -2834,6 +2862,87 @@ mod tests {
         assert_eq!(emitted.bytes(), original.as_slice());
     }
 
+    /// A synthetic, zero-key v6 file carrying one genuine data page (as
+    /// `v6_no_key_data_page_file`) **plus one physical page no
+    /// allocation-table entry names at all** (Task 21). Unlike the
+    /// `TAG_VARIABLE` fixture below, this one *is* witnessed on real
+    /// corpus files -- every one of the 157 files this task's own census
+    /// found refusing before this task did so on exactly this shape
+    /// (harvest 3 SS3/SS4: relocation-on-write abandons a physical page,
+    /// and whether it is ever reclaimed is not established) -- this
+    /// fixture just gives it a fixed, minimal, independent ground truth
+    /// rather than relying on any one corpus file's own incidental bytes.
+    ///
+    /// Six physical pages, 512 bytes each: 0-4 identical to
+    /// `v6_no_key_data_page_file` (the control record's own shadow pair,
+    /// the allocation table's own shadow pair with its one entry naming
+    /// physical page 4, and physical page 4 itself, the one claimed data
+    /// page); 5 is new -- **no allocation-table entry, no key's walk, and
+    /// no formula position names it** -- carrying a header that reads
+    /// like a stale, once-live `TAG_DATA` page (tag `0x4400`, logical 1 --
+    /// the same logical id physical page 4 currently answers for, which is
+    /// exactly what relocation-on-write leaving a stale twin behind would
+    /// produce) and an arbitrary non-zero body this crate makes no claim
+    /// about.
+    fn v6_file_with_one_data_page_and_one_orphan_page() -> Vec<u8> {
+        const PAGE_SIZE: usize = 512;
+        let mut b = v6_no_key_data_page_file();
+        b.resize(6 * PAGE_SIZE, 0);
+
+        // Physical page 5: unclaimed. Header reads like a stale twin of
+        // physical page 4 (same tag, same self-reported logical id), body
+        // arbitrary and non-zero -- literal offsets, the same independence
+        // `v6_no_key_data_page_file`'s own doc comment explains.
+        let base = 5 * PAGE_SIZE;
+        b[base..base + 2].copy_from_slice(&0x4400u16.to_le_bytes()); // tag
+        b[base + 2..base + 4].copy_from_slice(&1u16.to_le_bytes()); // logical
+        b[base + 4..base + 6].copy_from_slice(&3u16.to_le_bytes()); // stamp (older than page 4's 5)
+        b[base + 6..base + 6 + 12].copy_from_slice(b"OLD LEFTOVER");
+
+        b
+    }
+
+    /// Task 21, end to end: a v6 file with a genuine data page *and* a
+    /// physical page no allocation-table entry names now describes
+    /// completely rather than refusing -- the unclaimed page becomes a
+    /// `V6Page` whose `orphan` field carries its whole body, past the
+    /// six-byte header, verbatim.
+    #[test]
+    fn a_v6_file_with_one_unclaimed_physical_page_round_trips_completely() {
+        let original = v6_file_with_one_data_page_and_one_orphan_page();
+        let model = file(&original).expect(
+            "an unclaimed physical page is now described as V6Page::orphan, not refused",
+        );
+
+        assert_eq!(model.v6_pages.len(), 2, "the claimed data page plus the orphan");
+
+        let claimed = model.v6_pages.iter().find(|p| p.physical_page == 4).expect("physical 4");
+        assert!(claimed.content.is_some(), "physical page 4 is still the genuine data page");
+        assert!(claimed.orphan.is_none(), "a claimed page is never also an orphan");
+
+        let orphan = model.v6_pages.iter().find(|p| p.physical_page == 5).expect("physical 5");
+        assert_eq!(orphan.tag, 0x4400, "the orphan's own header round-trips, stored not decoded");
+        assert_eq!(orphan.logical, 1);
+        assert_eq!(orphan.stamp, 3);
+        assert!(orphan.content.is_none(), "an orphan page's body is opaque, never decoded as Data");
+        assert!(orphan.index.is_none());
+        assert!(orphan.acs.is_none());
+        assert!(orphan.fragment.is_none());
+        let body = orphan.orphan.as_ref().expect("V6Page::orphan is Some for an unclaimed page");
+        assert_eq!(body.len(), 512 - 6, "the whole page body, past the six-byte header");
+        assert!(body.starts_with(b"OLD LEFTOVER"));
+        assert_eq!(
+            &body[..12],
+            &original[5 * 512 + 6..5 * 512 + 18],
+            "the orphan body must equal the file's own literal bytes past offset 6, \
+             not wherever the header-width constant currently claims"
+        );
+
+        let emitted = crate::emit::file(&model)
+            .expect("a v6 file with one described orphan page leaves nothing unwritten");
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
     /// A synthetic, zero-key v6 file carrying one `TAG_VARIABLE` fragment
     /// page (Task 20). **Wholly synthetic, hand-built -- no corpus file
     /// contains anything like it.** Harvest 3 SS4.3 measured zero of this
@@ -3033,13 +3142,11 @@ mod tests {
     /// pipeline: `resolve_shadow` runs unconditionally, before anything
     /// else `file` does with a v6 file, so it is independently correct and
     /// testable here regardless of whether `file` itself goes on to succeed
-    /// or refuse for this particular file. (`wccmp002.vir` itself still
-    /// refuses today, past this task's own walk -- an abandoned physical
-    /// page from an earlier rebalance, not a shadow-resolution problem; see
-    /// `the_refusal_now_names_an_abandoned_physical_page_past_the_walk`
-    /// below, the companion check that `file`'s own refusal for this same
-    /// file names that specific page rather than the pre-Task-19 blanket
-    /// `keys > 0` gate.)
+    /// or refuse for this particular file. (`wccmp002.vir` itself now
+    /// round-trips completely -- Task 21 closed the abandoned-physical-page
+    /// gap this file exercised past Task 19's own walk; see
+    /// `wccmp002_vir_round_trips_with_nine_orphan_pages` below, which
+    /// asserts the specific shape those nine pages have.)
     #[test]
     fn the_live_control_record_is_the_one_with_the_higher_generation() {
         let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
@@ -3628,61 +3735,50 @@ mod tests {
         );
     }
 
-    /// `file`'s own refusal, for the same file, names the copy Ruling 7
-    /// resolved rather than repeating the old blanket "v6 is not described"
-    /// -- the shift this task exists to make: not just refused, but refused
-    /// for a later, more specific reason than before.
+    /// Task 21 closes the gap `the_live_control_record_is_the_one_with_the_
+    /// higher_generation`'s own doc comment named: `wccmp002.vir` (55,734,272
+    /// bytes, 13,607 physical pages -- this project's largest v6 corpus
+    /// file) carries nine physical pages the allocation table's live copy no
+    /// longer claims at all, an earlier root/interior page and eight later
+    /// pages this file's own history abandoned (a controller-run Python walk
+    /// of this exact file independently found the same nine, first at
+    /// physical 13528, before this task's own `V6Page::orphan` existed to
+    /// describe them). This asserts the specific measured shape, not just
+    /// that the file happens to round-trip: nine orphans, the first at
+    /// physical 13528 still carrying a genuine `0x8000`-tagged header (the
+    /// same `TAG_TEMPLATE`/key-0 collision `format::page::v6::TAG_TEMPLATE`'s
+    /// own doc comment names) but resolved by no live logical id.
     #[test]
-    fn the_refusal_now_names_an_abandoned_physical_page_past_the_walk() {
+    fn wccmp002_vir_round_trips_with_nine_orphan_pages() {
         let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
         let Ok(bytes) = std::fs::read(corpus_path(path)) else {
             eprintln!("no archive/ on this box, nothing verified");
             return;
         };
 
-        // Before Task 19: refused at the `keys > 0` gate, naming KEYS,
-        // RECORDS, PAGES, the allocation table's own block/logical counts,
-        // and "Task 19" as the task that would resolve it (this test's own
-        // prior name, `the_refusal_names_the_live_copy_it_resolved`). Task
-        // 19's own walk resolves `wccmp002.vir`'s single key's B-tree (208
-        // pages, root logical 137) and its own claimed data pages
-        // completely -- but this specific corpus file also carries physical
-        // pages the allocation table's *live* copy no longer claims at all
-        // (a controller-run Python walk of this exact file found 9 such
-        // pages, the first at physical 13528 -- an earlier root/interior
-        // page this file's own history abandoned, still carrying a genuine
-        // `0x8000`-tagged header, but named by no live logical id). Deciding
-        // whether that is a genuinely abandoned page (the same shape v5's
-        // `PageKind::Orphan`, Task 13, accepts) or a fault this crate should
-        // refuse is out of this task's own scope (harvest 4 does not cover
-        // it) -- so this crate refuses by name rather than guess, which is
-        // what this test now asserts.
-        let e = file(&bytes).expect_err("an abandoned physical page is still unresolved");
-        assert!(
-            !e.why.contains("every byte of a v6 control record"),
-            "the old blanket refusal text must be gone: {}",
-            e.why
+        let model = file(&bytes).expect(
+            "wccmp002.vir's nine abandoned physical pages are now V6Page::orphan, not a refusal",
         );
-        assert!(
-            !e.why.contains("a TAG_DATA page could equally be a genuine data \
-                            page or an index-tree descendant"),
-            "the pre-Task-19 keys>0 gate must be gone -- this file's own \
-             walk now runs: {}",
-            e.why
+
+        let orphans: Vec<_> = model.v6_pages.iter().filter(|p| p.orphan.is_some()).collect();
+        assert_eq!(
+            orphans.len(),
+            9,
+            "the controller's own independent Python walk found exactly nine \
+             physical pages this file's live allocation table resolves to nothing"
         );
-        assert!(
-            e.why.contains("physical page 13528"),
-            "names the specific abandoned page, deterministically the \
-             first found by the ascending 0..total_pages residue scan: {}",
-            e.why
+        assert_eq!(
+            orphans[0].physical_page, 13528,
+            "the first abandoned page this file's own history left behind"
         );
-        assert!(
-            e.why.contains("cannot classify it and refuses rather than \
-                            silently dropping its bytes"),
-            "the same no-residue wording the v5 side already uses for an \
-             unaccounted page: {}",
-            e.why
+        assert_eq!(
+            orphans[0].tag, 0x8000,
+            "still carrying a genuine header from when it was last live"
         );
+
+        let emitted = crate::emit::file(&model)
+            .expect("every one of wccmp002.vir's own bytes is now described");
+        assert_eq!(emitted.bytes(), bytes.as_slice());
     }
 
     /// A tie is refused rather than resolved. No corpus file has ever tied,
