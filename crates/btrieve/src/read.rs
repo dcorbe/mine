@@ -1193,43 +1193,66 @@ fn resolve_pages(
                 // leaf shapes `IndexPage::leftmost`'s own doc already
                 // allows).
                 //
-                // Enforcing the review's check directly against every
-                // corpus file this task could reach turned up a *third*
-                // shape neither this crate nor the review had seen:
-                // physical page 594 of `wccitem2.vir`/`wccITEM2.nu1` under
-                // `wccnt7pz`, and page 17565 of `wccupda2.dat` under
-                // `wccnt7py`, are each unclaimed, `data_bit` clear, and hold
-                // *nothing but* leftover monster/item-description prose --
-                // starting right at byte 0, so it overwrites what would be
-                // the header too (measured: page 594's own "header" bytes
-                // are literally `b" you."`; page 17565's are `b"ces ha"`).
-                // Neither is zeroed nor leaf-shaped; `data_bit` only reads
-                // clear because printable ASCII text never sets a byte's
-                // high bit, a coincidence of the encoding, not a structural
-                // signal. But each sits *immediately after* the file's own
-                // already-corroborated zero-header orphan (593, 17564) and
-                // *immediately before* a genuine live `Data` page resumes
-                // (595, 17566 -- both measured `data_bit` set) -- the same
-                // abandoned span, one page longer than this task first
-                // measured, not a different kind of page. This crate does
-                // not trust such a page's own shape at all (a coincidence
-                // is not corroboration); it accepts it as `Orphan` only
-                // because a *physically adjacent* page independently
-                // corroborates abandonment on its own terms. A page that is
-                // neither self-corroborating nor adjacent to a page that is
-                // is refused, naming the page and what its own header held.
+                // Enforcing that check against every corpus file turned up a
+                // *third* shape: physical page 594 of
+                // `wccitem2.vir`/`wccITEM2.nu1` under `wccnt7pz`, and page
+                // 17565 of `wccupda2.dat` under `wccnt7py`, are each
+                // unclaimed, `data_bit` clear, and hold *nothing but*
+                // leftover monster/item-description prose -- starting right
+                // at byte 0, so it overwrites what would be the header too.
+                // Neither zeroed nor leaf-shaped; `data_bit` reads clear only
+                // because printable ASCII text never sets a byte's high bit,
+                // a coincidence of the encoding, not a structural signal.
+                //
+                // A second review caught the first fix for this shape being
+                // weaker than its own comment claimed: it accepted a page as
+                // `Orphan` if EITHER neighbour looked right, checked "is the
+                // neighbour already `Orphan`" rather than "does the neighbour
+                // self-corroborate," and never actually verified a live
+                // `Data` page bounded the run at all. That combination lets
+                // one self-corroborating page bootstrap an unbounded chain:
+                // page N self-corroborates, page N+1 is accepted because N
+                // is `Orphan` (not because N+1 itself proves anything), page
+                // N+2 is then accepted because N+1 is now `Orphan` too,
+                // forever -- every page in the chain carried verbatim, every
+                // test green, and not one byte of it examined. That is
+                // exactly the wrong-but-lossless classification this whole
+                // check exists to catch.
+                //
+                // The rule actually enforced now, matching the only two
+                // witnesses this crate has ever measured (both a chain of
+                // exactly one such page): a page whose own shape does not
+                // self-corroborate is `Orphan` only when BOTH neighbours
+                // independently prove it -- the *immediately preceding* page
+                // is itself unclaimed, `data_bit` clear, and passes
+                // `orphan_header_shape` **on its own raw bytes** (never "is
+                // already `Orphan`," which is exactly the transitive trust
+                // that bootstraps), and the *immediately following* page's
+                // own `data_bit` is set, so it is by construction a genuine
+                // record-holding page (`Data` or `Free`, never another
+                // candidate for this same rule) -- the live `Data` page this
+                // crate actually measured resuming at 595 and 17566. Because
+                // only a page that self-corroborates on its own bytes can
+                // ever serve as the preceding anchor, this page itself can
+                // never in turn anchor a third -- the chain this rule
+                // accepts is always exactly one page long, not because of an
+                // explicit counter but as a structural consequence of never
+                // trusting a neighbour's *classification*, only its bytes.
                 let this_shape = orphan_header_shape(bytes, at);
-                let prev_established_orphan = page_number > 1
-                    && pages.get(page_number - 2).is_some_and(|p: &Page| p.kind == PageKind::Orphan);
-                let next_corroborates = page_number + 1 < total_pages
-                    && claim.get(&((page_number + 1) as u32)).is_none()
+                let extends_a_corroborated_anchor = page_number > 1
+                    && page_number + 1 < total_pages
+                    && claim.get(&((page_number - 1) as u32)).is_none()
                     && {
-                        let next_at = (page_number + 1) * page_size;
-                        let next_data_bit =
-                            get_u16(bytes, next_at + page::at::COUNTER) & page::DATA_BIT != 0;
-                        !next_data_bit && orphan_header_shape(bytes, next_at)
+                        let prev_at = at - page_size;
+                        let prev_data_bit =
+                            get_u16(bytes, prev_at + page::at::COUNTER) & page::DATA_BIT != 0;
+                        !prev_data_bit && orphan_header_shape(bytes, prev_at)
+                    }
+                    && {
+                        let next_at = at + page_size;
+                        get_u16(bytes, next_at + page::at::COUNTER) & page::DATA_BIT != 0
                     };
-                if !this_shape && !prev_established_orphan && !next_corroborates {
+                if !this_shape && !extends_a_corroborated_anchor {
                     let rightmost = get_long(bytes, at + index::at::RIGHTMOST);
                     let leftmost = get_long(bytes, at + index::at::LEFTMOST);
                     return Err(NotBtrieve {
@@ -1241,10 +1264,12 @@ fn resolve_pages(
                              -- but its header is not the zero an abandoned page \
                              leaves (number {number:#x}, counter {counter:#x}), its \
                              own rightmost/leftmost ({rightmost:#x}/{leftmost:#x}) do \
-                             not look like an abandoned leaf's either, and no \
-                             physically adjacent page corroborates abandonment on \
-                             its own terms -- so this crate refuses rather than \
-                             assuming it is orphaned"
+                             not look like an abandoned leaf's either, and it does \
+                             not extend a corroborated anchor either (the immediately \
+                             preceding page must itself self-corroborate and the \
+                             immediately following page must be a genuine \
+                             record-holding page) -- so this crate refuses rather \
+                             than assuming it is orphaned"
                         ),
                     });
                 }
@@ -2674,7 +2699,65 @@ mod tests {
         assert!(e.why.contains("page 2"), "{}", e.why);
         assert!(e.why.contains("not the zero an abandoned page"), "{}", e.why);
         assert!(e.why.contains("do not look like an abandoned leaf's either"), "{}", e.why);
-        assert!(e.why.contains("no physically adjacent page corroborates"), "{}", e.why);
+        assert!(e.why.contains("it does not extend a corroborated anchor either"), "{}", e.why);
+    }
+
+    /// A third review's exact concern, proven directly: a chain of TWO
+    /// ambiguous pages must not bootstrap off a single corroborated seed.
+    /// Page 2 self-corroborates (zeroed header). Page 3 is ambiguous
+    /// (neither zero nor leaf-shaped) and sits immediately after page 2 --
+    /// under the tightened rule this is not enough on its own, because
+    /// page 3's own *following* page (4) must independently be a genuine
+    /// record-holding page (`data_bit` set), and it is not: page 4 is
+    /// itself ambiguous, the same shape as page 3. So page 3 is refused --
+    /// and critically, it is refused even though its immediately preceding
+    /// page (2) genuinely self-corroborates, because a real anchor is not
+    /// enough by itself; the run must also actually terminate. Had the
+    /// earlier (looser) rule still been in place, page 3 would have been
+    /// wrongly accepted via "page 2 is Orphan" alone, and page 4 would then
+    /// have been accepted via "page 3 is now Orphan" -- an unbounded,
+    /// unexaminable chain, every page carried verbatim, every test green.
+    /// This test is the fixture that catches exactly that regression.
+    #[test]
+    fn a_two_page_chain_of_ambiguous_pages_does_not_bootstrap_off_one_corroborated_seed() {
+        let mut buf = usracc_fixed_portion();
+        buf[0x14..0x16].copy_from_slice(&1u16.to_le_bytes()); // keys = 1
+        let def0 = 0x110;
+        buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1
+        buf[def0 + 0x0a..def0 + 0x0c].copy_from_slice(&2u16.to_le_bytes()); // key_length
+        buf[def0 + 0x0c..def0 + 0x0e].copy_from_slice(&10u16.to_le_bytes()); // entry_size
+        // page 0 (control), page 1 (root), page 2 (anchor), page 3 (B,
+        // ambiguous), page 4 (C, ambiguous) -- 5 pages of 512 bytes.
+        buf.resize(2560, 0);
+
+        // Page 1: key 0's root, a genuine empty leaf.
+        buf[512..516].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        buf[512 + 8..512 + 12].copy_from_slice(&[0xff; 4]); // rightmost = NOWHERE
+        buf[512 + 12..512 + 16].copy_from_slice(&[0xff; 4]); // leftmost = NOWHERE
+
+        // Page 2: the anchor -- header left entirely zero, self-corroborating.
+
+        // Page 3 ("B"): unclaimed, data_bit clear, ambiguous shape (nonzero
+        // header, rightmost/leftmost neither NOWHERE nor 0).
+        buf[1536..1540].copy_from_slice(&[0x00, 0x00, 0x03, 0x00]);
+        buf[1536 + 8..1536 + 12].copy_from_slice(&[0x00, 0x00, 0x00, 0x05]); // rightmost = 5
+        buf[1536 + 12..1536 + 16].copy_from_slice(&[0x00, 0x00, 0x00, 0x07]); // leftmost = 7
+
+        // Page 4 ("C"): the same ambiguous shape as B, deliberately NOT a
+        // genuine data_bit-set page -- this is what must stop B's own
+        // acceptance, and what a bootstrap-vulnerable rule would instead
+        // wrongly accept off B.
+        buf[2048..2052].copy_from_slice(&[0x00, 0x00, 0x04, 0x00]);
+        buf[2048 + 8..2048 + 12].copy_from_slice(&[0x00, 0x00, 0x00, 0x09]); // rightmost = 9
+        buf[2048 + 12..2048 + 16].copy_from_slice(&[0x00, 0x00, 0x00, 0x0b]); // leftmost = 11
+
+        let e = file(&buf).expect_err("neither ambiguous page may bootstrap off the other");
+        assert!(e.why.contains("page 3"), "must name the first page the chain fails at: {}", e.why);
+        assert!(
+            e.why.contains("it does not extend a corroborated anchor either"),
+            "{}",
+            e.why
+        );
     }
 
     /// Task 13's follow-up review: enforcing `orphan_header_shape` against
