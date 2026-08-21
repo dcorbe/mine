@@ -33,11 +33,11 @@ fn describe_mismatch(emitted: &Emitted, original: &[u8]) -> String {
         .position(|(a, b)| a != b)
         .unwrap_or_else(|| produced.len().min(original.len()));
     let owner = match emitted.owner_of(at) {
-        Some(owner) => owner.label(),
-        None => "no field claims this byte".to_string(),
+        Some(owner) => format!("owned by {}", owner.label()),
+        None => "but no field claims that byte".to_string(),
     };
     format!(
-        "first difference at byte {at:#x}, owned by {owner} \
+        "first difference at byte {at:#x}, {owner} \
          (produced {} bytes, original {})",
         produced.len(),
         original.len()
@@ -234,7 +234,8 @@ fn a_mismatch_past_every_placement_says_no_field_claims_it() {
 
     let message = describe_mismatch(&emitted, &original);
     assert!(
-        message.contains("no field claims this byte"),
-        "an unowned byte is named as such, not silently omitted: {message}"
+        message.contains("but no field claims that byte"),
+        "an unowned byte is named as such, in a sentence, not silently \
+         omitted or stapled onto a fragment: {message}"
     );
 }
