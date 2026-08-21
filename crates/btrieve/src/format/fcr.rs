@@ -12,15 +12,19 @@
 //! that range is transcribed from harvest 1's field table, cited, and tiles
 //! completely.
 //!
-//! Past `0x110`, v5 still has two ranges this crate does not describe:
-//! `key_area` (`0x110` up to the historical 512-byte control record) is the
-//! key/segment definition table, a later task's work, and genuinely not
-//! zero for a populated file -- `read` does not inspect it. Beyond that,
-//! when `page_size > 512`, `zero_padding` is measured zero on 94 of 96
-//! corpus files with headroom that large, and `read` asserts it. v6's fixed
-//! portion is untouched by this task and still has three undescribed
-//! ranges (`undescribed_4`, `undescribed_a`, `undescribed_b`); a later task
-//! owns it.
+//! Past `0x110`, v5 now describes the key/segment definition array too: one
+//! [`key_descriptor_fields`] group of named, cited fields per definition,
+//! `index: Some(n)` so a fault names which repetition. The array's length is
+//! not `KEYS` (`0x14`) -- a segmented key consumes one definition per
+//! segment, so the count comes from walking the file (`read::file`), not
+//! from a formula. Whatever page bytes remain after the last definition, up
+//! to `page_size`, are `zero_padding`: harvest 1's `tail_check.py` measured
+//! this zero on 112 of 112 v5 corpus files, re-measured for this task on all
+//! 145 currently-identified v5 corpus files (143 of 145 confirmed; the 2
+//! exceptions -- `wccitems.nu1` and its sibling -- are refused by `read`'s
+//! assertion, not accommodated). v6's fixed portion is untouched by this
+//! task and still has three undescribed ranges (`undescribed_4`,
+//! `undescribed_a`, `undescribed_b`); a later task owns it.
 
 use super::generation::{Generation, FCR_MIN};
 use super::{Field, Layout};
@@ -71,6 +75,235 @@ pub mod at {
     /// End of the harvested fixed portion: `0x00..FIXED_LEN` tiles
     /// completely, every byte cited.
     pub const FIXED_LEN: usize = 0x110;
+}
+
+/// One 30-byte key/segment definition, repeating at `at::FIXED_LEN + n*WIDTH`
+/// -- the first structure in the format whose repetition count is read from
+/// the file rather than known at compile time. See harvest 4 SS1a for the
+/// field table this transcribes, and harvest 1's "Field table: the
+/// key/segment definition" section for how the array sits inside the
+/// control record.
+///
+/// # `KEYS` counts keys, not definitions
+///
+/// A key with `N` segments consumes `N` consecutive definitions, chained by
+/// [`ANOSEG`] on every definition but the last of the key. The array is
+/// walked definition by definition until [`super::at::KEYS`] *keys* -- not
+/// definitions -- have been assembled (`read::file` does the walking; this
+/// module only describes one definition's byte layout).
+pub mod key_descriptor {
+    use super::Field;
+
+    /// Bytes of one key/segment definition.
+    pub const WIDTH: usize = 0x1e;
+
+    /// `BTVSTF.H:13` -- the most segments (and so the most definitions in a
+    /// row before a key must close) a file may have.
+    pub const SEGMAX: usize = 24;
+
+    /// Bit 4 of `ATTRIBUTES`: another segment of *this same key* follows in
+    /// the next definition. `BTVSTF.H:59`'s `ANOSEG 0x10`.
+    pub const ANOSEG: u16 = 1 << 4;
+
+    /// Byte offsets of one key/segment definition's fields, relative to the
+    /// definition's own start.
+    pub mod at {
+        pub const ROOT: usize = 0x00;
+        pub const RECORDS: usize = 0x04;
+        pub const ATTRIBUTES: usize = 0x08;
+        pub const KEY_LENGTH: usize = 0x0a;
+        pub const ENTRY_SIZE: usize = 0x0c;
+        pub const MAX_ENTRIES: usize = 0x0e;
+        pub const HALF_ENTRIES: usize = 0x10;
+        pub const CHAIN: usize = 0x12;
+        pub const OFFSET: usize = 0x14;
+        pub const LENGTH: usize = 0x16;
+        pub const SELF_TAG: usize = 0x18;
+        pub const ACS_PAGE_HIGH: usize = 0x19;
+        pub const ACS_PAGE_LOW: usize = 0x1a;
+        pub const ACS_PAGE_MID: usize = 0x1b;
+        pub const EXTENDED: usize = 0x1c;
+        pub const NULL_VALUE: usize = 0x1d;
+    }
+
+    /// Absolute offset, within the control record, of definition `n`'s own
+    /// start.
+    #[must_use]
+    pub fn base(n: usize) -> usize {
+        super::at::FIXED_LEN + n * WIDTH
+    }
+
+    /// Every named field of definition `n`, cited and carrying
+    /// `index: Some(n)` so a tiling fault names `root[3]` rather than
+    /// `root` -- see `format::Field::label`.
+    #[must_use]
+    pub fn fields(n: usize) -> Vec<Field> {
+        let base = base(n);
+        vec![
+            Field {
+                name: "root",
+                index: Some(n),
+                at: base + at::ROOT,
+                len: 4,
+                cite: "harvest 4 SS1a (create.rs:117-118 at::ROOT; pages.rs:57-74 \
+                       ROOT_PAGE mask) and SS2 -- high-word-first long; top byte \
+                       0x80|keynum, low 24 bits the root index page, 0 on a \
+                       continuation. Reconciled with harvest 1's v5-specific \
+                       claim ('a plain page number, no top-byte tag ... no \
+                       masking needed'): not a real conflict in effect -- this \
+                       task's own scan of all 307 v5 corpus definitions (145 \
+                       files) found the top byte reads 0 in every one, so \
+                       masking to 24 bits is a no-op on every v5 file measured. \
+                       Modeled as key_number+root_page per harvest 4's general \
+                       rule anyway, since harvest 4 SS2's 0x7fffffff-vs-0x00ffffff \
+                       worked example (MULTIACS.DAT) is v6, not v5, and is the \
+                       reason the mask is written at all",
+            },
+            Field {
+                name: "records",
+                index: Some(n),
+                at: base + at::RECORDS,
+                len: 4,
+                cite: "harvest 4 SS1a (v6.rs:907-908, pages.rs KEY_RECORDS); \
+                       harvest 1 (create.rs::at::RECORDS, stat.rs) -- how many \
+                       records this key indexes; meaningless on a continuation",
+            },
+            Field {
+                name: "attributes",
+                index: Some(n),
+                at: base + at::ATTRIBUTES,
+                len: 2,
+                cite: "harvest 4 SS1b (keys.rs::flag module) -- the flag word; \
+                       see ANOSEG above for the bit this array's own walk reads",
+            },
+            Field {
+                name: "key_length",
+                index: Some(n),
+                at: base + at::KEY_LENGTH,
+                len: 2,
+                cite: "harvest 4 SS1a (create.rs::at::KEY_LENGTH); harvest 1 -- \
+                       total width of the key, every segment summed; 0 on a \
+                       continuation",
+            },
+            Field {
+                name: "entry_size",
+                index: Some(n),
+                at: base + at::ENTRY_SIZE,
+                len: 2,
+                cite: "harvest 4 SS1a (pages.rs:788-797 Shape::entry_size, \
+                       W32MKDE_decompiled.c:18398-18410) -- key_length+8, or +12 \
+                       if the key permits duplicates",
+            },
+            Field {
+                name: "max_entries",
+                index: Some(n),
+                at: base + at::MAX_ENTRIES,
+                len: 2,
+                cite: "harvest 4 SS1a (pages.rs:799-806 Shape::capacity) -- index \
+                       entries of this key that fit one page",
+            },
+            Field {
+                name: "half_entries",
+                index: Some(n),
+                at: base + at::HALF_ENTRIES,
+                len: 2,
+                cite: "harvest 4 SS1a (create.rs::at::HALF_ENTRIES); harvest 1 -- \
+                       max_entries/2 exactly, confirmed on all 229 definitions \
+                       measured there",
+            },
+            Field {
+                name: "chain",
+                index: Some(n),
+                at: base + at::CHAIN,
+                len: 2,
+                cite: "harvest 4 SS1a (keys.rs:43-73 at::CHAIN) -- byte offset, \
+                       within the record's physical slot, of the duplicate \
+                       [prev][next] chain pair; physical-8 when duplicates are \
+                       permitted, else 0",
+            },
+            Field {
+                name: "offset",
+                index: Some(n),
+                at: base + at::OFFSET,
+                len: 2,
+                cite: "harvest 4 SS1a (keys.rs:58 at::OFFSET) -- this segment's \
+                       byte offset within the logical record",
+            },
+            Field {
+                name: "length",
+                index: Some(n),
+                at: base + at::LENGTH,
+                len: 2,
+                cite: "harvest 4 SS1a (keys.rs:60 at::LENGTH) -- this segment's \
+                       length in bytes",
+            },
+            Field {
+                name: "self_tag",
+                index: Some(n),
+                at: base + at::SELF_TAG,
+                len: 1,
+                cite: "harvest 4 SS1a/SS8 flags this byte as an unclaimed GAP -- \
+                       no field in keys.rs or create.rs reads it, and its only \
+                       nonzero measurement there is MULTIACS.DAT (v6.10, out of \
+                       this task's v5-only scope). Harvest 2 (the v6 FCR \
+                       harvest) independently names the same byte SELF_TAG = \
+                       0x80|keynum on an independent segment's first \
+                       definition, 0 on an ANOSEG continuation -- a v6 finding. \
+                       This task's own scan of all 307 v5 corpus definitions \
+                       (145 files) found this byte reads 0 in every one \
+                       (matching harvest 1's key18.py, 229/229 on an older \
+                       corpus snapshot), so it is modeled here as a plain byte \
+                       that is always zero on every v5 file measured, not as a \
+                       self-tag: v5 never exercises whatever mechanism sets it \
+                       in v6",
+            },
+            Field {
+                name: "acs_page_high",
+                index: Some(n),
+                at: base + at::ACS_PAGE_HIGH,
+                len: 1,
+                cite: "harvest 4 SS1a (acs.rs::PAGE_HIGH_IN_KEY) -- v6-only; \
+                       always 0 on the 16 v5 ACS-flagged keys measured there",
+            },
+            Field {
+                name: "acs_page_low",
+                index: Some(n),
+                at: base + at::ACS_PAGE_LOW,
+                len: 1,
+                cite: "harvest 4 SS1a (acs.rs::PAGE_LOW_IN_KEY) -- v6-only; \
+                       always 0 on v5",
+            },
+            Field {
+                name: "acs_page_mid",
+                index: Some(n),
+                at: base + at::ACS_PAGE_MID,
+                len: 1,
+                cite: "harvest 4 SS1a (acs.rs::PAGE_MID_IN_KEY) -- v6-only; \
+                       always 0 on v5; the three bytes assemble discontiguously \
+                       as byte@0x19<<16 | byte@0x1b<<8 | byte@0x1a, not a u16 \
+                       at 0x1a",
+            },
+            Field {
+                name: "extended",
+                index: Some(n),
+                at: base + at::EXTENDED,
+                len: 1,
+                cite: "harvest 4 SS1a/SS1c (keys.rs:61-62 at::EXTENDED) -- the \
+                       segment's data-type code, when ATTRIBUTES bit 8 \
+                       (EXTENDED) is set",
+            },
+            Field {
+                name: "null_value",
+                index: Some(n),
+                at: base + at::NULL_VALUE,
+                len: 1,
+                cite: "harvest 4 SS1a (keys.rs:63-72 at::NULL_VALUE) -- the byte \
+                       value this key's null-omission rule tests against, \
+                       located by an oracle A/B test (null 0x00 vs 0xaa) that \
+                       also incidentally moved FCR offset 0x68",
+            },
+        ]
+    }
 }
 
 /// The pre-v6 family's fixed-portion fields, `0x00` through [`at::FIXED_LEN`]
@@ -434,8 +667,15 @@ fn v6_fixed() -> Vec<Field> {
 /// is a field *inside* this record, the crate's own writer has always
 /// allocated page_size bytes for it, and the format's 24-segment ceiling
 /// needs 0x3e0 bytes of key definitions. See harvest 1.
+///
+/// `key_descriptors` is how many key/segment definitions this particular
+/// file's array actually holds -- data-dependent, read from the file by
+/// walking `KEYS` ANOSEG-terminated runs (`read::file` does the walking; see
+/// `format::fcr::key_descriptor`'s module doc for why the count cannot be a
+/// formula). Ignored for a v6 file, whose key array this task does not
+/// describe.
 #[must_use]
-pub fn layout(generation: Generation, page_size: usize) -> Layout {
+pub fn layout(generation: Generation, page_size: usize, key_descriptors: usize) -> Layout {
     let mut fields = if generation.is_v6() { v6_fixed() } else { v5_fixed() };
     let described = fields.iter().map(|f| f.at + f.len).max().unwrap_or(0);
 
@@ -455,38 +695,25 @@ pub fn layout(generation: Generation, page_size: usize) -> Layout {
         }
     } else {
         // v5: `described` is now at::FIXED_LEN (0x110) -- the fully
-        // harvested fixed portion. What historically fit in the first 512
-        // bytes past that is the key/segment definition table: not yet
-        // harvested (a later task's work), and genuinely non-zero for any
-        // populated file, so it is named but not asserted. Only past that
-        // 512-byte boundary, when page_size is larger still, is the
-        // remainder measured zero (harvest 1's tail_check.py, 94 of 96
-        // corpus files with that much headroom) -- that range alone is
-        // what `read` asserts.
-        let key_area_end = FCR_MIN.min(page_size).max(described);
-        if key_area_end > described {
-            fields.push(Field {
-                name: "key_area",
-                index: None,
-                at: described,
-                len: key_area_end - described,
-                cite: "NOT YET HARVESTED -- key/segment definitions (and any \
-                       trailing free space up to the historical 512-byte \
-                       control record); a later task's work. Genuinely \
-                       non-zero for a populated file, so read does not \
-                       assert anything about it",
-            });
+        // harvested fixed portion. Each of `key_descriptors` definitions
+        // gets its own named, cited fields, `index: Some(n)`.
+        for n in 0..key_descriptors {
+            fields.extend(key_descriptor::fields(n));
         }
-        if page_size > key_area_end {
+        let after_definitions = key_descriptor::base(key_descriptors);
+        if page_size > after_definitions {
             fields.push(Field {
                 name: "zero_padding",
                 index: None,
-                at: key_area_end,
-                len: page_size - key_area_end,
-                cite: "harvest 1 tail_check.py -- zero on 94 of 96 v5 corpus \
-                       files with page_size > 512; the 2 exceptions \
-                       (wccitems.nu1 and its sibling) are refused by read's \
-                       assertion, not accommodated",
+                at: after_definitions,
+                len: page_size - after_definitions,
+                cite: "harvest 1 tail_check.py (112/112 v5 corpus files: every \
+                       byte from the end of the last actual key/segment \
+                       definition to the end of the page is zero); re-measured \
+                       for this task across all 145 currently-identified v5 \
+                       corpus files (143/145 confirmed; the 2 exceptions -- \
+                       wccitems.nu1 and its sibling -- are refused by read's \
+                       assertion, not accommodated)",
             });
         }
     }
@@ -519,7 +746,7 @@ mod tests {
             Generation::V610,
             Generation::V620,
         ] {
-            let layout = layout(generation, 512);
+            let layout = layout(generation, 512, 0);
             assert_eq!(
                 layout.tiling_fault(),
                 None,
@@ -534,7 +761,7 @@ mod tests {
     #[test]
     fn every_field_is_cited() {
         for generation in [Generation::V5R4, Generation::V600] {
-            for field in &layout(generation, 512).fields {
+            for field in &layout(generation, 512, 0).fields {
                 assert!(
                     !field.cite.trim().is_empty(),
                     "{generation:?} field {} has no citation",
@@ -548,7 +775,7 @@ mod tests {
     /// offsets it reads them from -- see W32MKDE FUN_00435970.
     #[test]
     fn the_fields_the_engine_checks_are_where_it_checks_them() {
-        let v5 = layout(Generation::V5R4, 512);
+        let v5 = layout(Generation::V5R4, 512, 0);
         let version = v5
             .fields
             .iter()
@@ -556,7 +783,7 @@ mod tests {
             .expect("v5 describes its version field");
         assert_eq!((version.at, version.len), (6, 2));
 
-        let v6 = layout(Generation::V600, 512);
+        let v6 = layout(Generation::V600, 512, 0);
         let version = v6
             .fields
             .iter()
@@ -565,7 +792,7 @@ mod tests {
         assert_eq!((version.at, version.len), (0x4a, 2));
 
         for generation in [Generation::V5R4, Generation::V600] {
-            let l = layout(generation, 512);
+            let l = layout(generation, 512, 0);
             let page = l
                 .fields
                 .iter()
@@ -581,8 +808,8 @@ mod tests {
     /// one family and at 0x4a for the other, so the descriptions must differ.
     #[test]
     fn the_two_families_do_not_share_a_layout() {
-        let v5 = layout(Generation::V5R4, 512);
-        let v6 = layout(Generation::V600, 512);
+        let v5 = layout(Generation::V5R4, 512, 0);
+        let v6 = layout(Generation::V600, 512, 0);
         let at = |l: &Layout, name: &str| {
             l.fields.iter().find(|f| f.name == name).map(|f| f.at)
         };
@@ -600,7 +827,7 @@ mod tests {
     #[test]
     fn the_control_record_is_as_long_as_a_page() {
         for page_size in [512usize, 1024, 1536, 2048, 4096] {
-            let l = layout(Generation::V5R4, page_size);
+            let l = layout(Generation::V5R4, page_size, 0);
             assert_eq!(l.len, page_size, "page_size {page_size}");
             assert_eq!(
                 l.tiling_fault(),
@@ -611,12 +838,12 @@ mod tests {
     }
 
     /// The fixed portion (`0x00..0x110`) must be fully described for v5 --
-    /// no field in that range may carry a "NOT YET HARVESTED" citation.
-    /// What remains undescribed is `key_area` and (conditionally)
-    /// `zero_padding`, both past `0x110`.
+    /// no field in that range may carry a "NOT YET HARVESTED" citation. Past
+    /// `0x110`, key/segment definitions and (conditionally) `zero_padding`
+    /// are now harvested too, but this test only concerns the fixed portion.
     #[test]
     fn the_v5_fixed_portion_has_no_not_yet_harvested_fields() {
-        let l = layout(Generation::V5R4, 512);
+        let l = layout(Generation::V5R4, 512, 0);
         for field in &l.fields {
             if field.at < at::FIXED_LEN {
                 assert!(
@@ -635,11 +862,72 @@ mod tests {
     /// two 2-byte halves -- the exact correction harvest 0 ruling 5 made.
     #[test]
     fn records_and_highest_are_each_one_long_not_two_halves() {
-        let l = layout(Generation::V5R4, 512);
+        let l = layout(Generation::V5R4, 512, 0);
         for name in ["records", "highest"] {
             let matches: Vec<&Field> = l.fields.iter().filter(|f| f.name == name).collect();
             assert_eq!(matches.len(), 1, "{name} must be exactly one field");
             assert_eq!(matches[0].len, 4, "{name} must be 4 bytes wide");
         }
+    }
+
+    /// USRACC.DAT's real shape: 1 key, 1 definition. The layout with exactly
+    /// that one definition must tile completely -- fixed portion, one
+    /// definition's worth of fields, then zero_padding out to 512.
+    #[test]
+    fn a_layout_with_one_key_descriptor_tiles_completely() {
+        let l = layout(Generation::V5R3, 512, 1);
+        assert_eq!(
+            l.tiling_fault(),
+            None,
+            "the fixed portion plus one key descriptor plus zero_padding must \
+             tile a 512-byte control record exactly"
+        );
+    }
+
+    /// A layout with more than one definition must still tile -- this is
+    /// what a segmented key or a multi-key file needs, and 94 of 145 v5
+    /// corpus files have more than one definition (this task's own
+    /// measurement).
+    #[test]
+    fn a_layout_with_several_key_descriptors_tiles_completely() {
+        for n in [0, 1, 2, 4] {
+            let l = layout(Generation::V5R4, 512, n);
+            assert_eq!(l.tiling_fault(), None, "{n} definitions must tile");
+        }
+    }
+
+    /// Every field of key_descriptor::fields(n) must carry index Some(n) --
+    /// this is what lets a tiling fault name `root[3]` instead of `root`.
+    /// Mutation: setting `index: None` on any of these fields must turn this
+    /// test red.
+    #[test]
+    fn key_descriptor_fields_carry_their_repetition_index() {
+        for n in [0usize, 1, 3, 23] {
+            let fields = key_descriptor::fields(n);
+            assert_eq!(fields.len(), 16, "one entry per named sub-field of a 30-byte definition");
+            for field in &fields {
+                assert_eq!(
+                    field.index,
+                    Some(n),
+                    "{} must carry index Some({n}), not {:?}",
+                    field.name,
+                    field.index
+                );
+            }
+        }
+    }
+
+    /// `key_descriptor::fields` must tile its own 30 bytes exactly, in
+    /// isolation from the rest of the control record -- this is the
+    /// per-definition version of the whole-structure tiling check.
+    #[test]
+    fn one_key_descriptor_tiles_its_own_thirty_bytes() {
+        let base = key_descriptor::base(2);
+        let layout = Layout { what: "key descriptor", len: base + key_descriptor::WIDTH, fields: {
+            let mut f = vec![Field { name: "prefix", index: None, at: 0, len: base, cite: "test" }];
+            f.extend(key_descriptor::fields(2));
+            f
+        }};
+        assert_eq!(layout.tiling_fault(), None);
     }
 }

@@ -10,20 +10,76 @@
 //!
 //! Bytes are produced through a [`Canvas`], never a `vec![0; len]` written
 //! into directly: a byte the model does not describe is a reported fault,
-//! not a silent zero. Today [`crate::model::File`] describes a v5 file's
-//! control record fixed portion (`0x00..0x110`) and nothing past it -- no
-//! key/segment table, no records, no index pages -- so [`file`] faults on
-//! every real corpus file, just further along than it used to: the fixed
-//! portion round-trips, and the fault names the pages this crate has no
-//! description for yet. That is why the round-trip pin stays at zero.
+//! not a silent zero. [`crate::model::File`] describes a v5 file's control
+//! record fixed portion (`0x00..0x110`) and its key/segment definition
+//! array, so [`file`] now writes the whole of page 0 for a v5 file -- but
+//! records and index pages (page 1 onward) are still later tasks, so
+//! [`file`] still faults on every real (multi-page) corpus file, just
+//! further along than it used to: page 0 round-trips, and the fault names
+//! the pages this crate has no description for yet. That is why the
+//! round-trip pin stays at zero.
 
 use crate::canvas::{Canvas, Emitted, Fault, Owner};
 use crate::format::fcr;
+use crate::format::fcr::key_descriptor;
 use crate::format::generation::Generation;
 use crate::model::File;
 
 fn owner(field: &'static str) -> Owner {
     Owner { structure: "fcr", field, index: None }
+}
+
+fn key_owner(field: &'static str, index: usize) -> Owner {
+    Owner { structure: "fcr", field, index: Some(index) }
+}
+
+/// Write the key/segment definition array (`0x110` onward) and the zero
+/// padding that follows it, out to `page_size`, into `canvas`.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_key_descriptors(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    for (n, d) in model.key_descriptors.iter().enumerate() {
+        let start = key_descriptor::base(n);
+        let root = (u32::from(d.key_number) << 24) | (d.root_page & 0x00ff_ffff);
+        canvas.put_long(start + key_descriptor::at::ROOT, root, key_owner("root", n))?;
+        canvas.put_long(start + key_descriptor::at::RECORDS, d.records, key_owner("records", n))?;
+        canvas.put_u16(start + key_descriptor::at::ATTRIBUTES, d.attributes, key_owner("attributes", n))?;
+        canvas.put_u16(start + key_descriptor::at::KEY_LENGTH, d.key_length, key_owner("key_length", n))?;
+        canvas.put_u16(start + key_descriptor::at::ENTRY_SIZE, d.entry_size, key_owner("entry_size", n))?;
+        canvas.put_u16(start + key_descriptor::at::MAX_ENTRIES, d.max_entries, key_owner("max_entries", n))?;
+        canvas.put_u16(start + key_descriptor::at::HALF_ENTRIES, d.half_entries, key_owner("half_entries", n))?;
+        canvas.put_u16(start + key_descriptor::at::CHAIN, d.chain, key_owner("chain", n))?;
+        canvas.put_u16(start + key_descriptor::at::OFFSET, d.offset, key_owner("offset", n))?;
+        canvas.put_u16(start + key_descriptor::at::LENGTH, d.length, key_owner("length", n))?;
+        canvas.put(start + key_descriptor::at::SELF_TAG, &[d.self_tag], key_owner("self_tag", n))?;
+        canvas.put(
+            start + key_descriptor::at::ACS_PAGE_HIGH,
+            &[d.acs_page_high],
+            key_owner("acs_page_high", n),
+        )?;
+        canvas.put(
+            start + key_descriptor::at::ACS_PAGE_LOW,
+            &[d.acs_page_low],
+            key_owner("acs_page_low", n),
+        )?;
+        canvas.put(
+            start + key_descriptor::at::ACS_PAGE_MID,
+            &[d.acs_page_mid],
+            key_owner("acs_page_mid", n),
+        )?;
+        canvas.put(start + key_descriptor::at::EXTENDED, &[d.extended], key_owner("extended", n))?;
+        canvas.put(start + key_descriptor::at::NULL_VALUE, &[d.null_value], key_owner("null_value", n))?;
+    }
+
+    let after_definitions = key_descriptor::base(model.key_descriptors.len());
+    let page_size = model.id.page_size as usize;
+    if page_size > after_definitions {
+        let zeros = vec![0u8; page_size - after_definitions];
+        canvas.put(after_definitions, &zeros, owner("zero_padding"))?;
+    }
+    Ok(())
 }
 
 /// Write the v5 control record's fixed portion (`0x00..0x110`) into `canvas`.
@@ -118,24 +174,26 @@ fn write_fixed_portion(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 ///
 /// # Errors
 ///
-/// If the model does not yet describe every byte of the file. Today that is
-/// every real file: a v6 file's control record is entirely undescribed, and
-/// a v5 file's key/segment table, records and index pages are all past what
-/// [`crate::model::File`] carries, so the canvas is left with unwritten
-/// bytes and `Canvas::finish` reports them.
+/// If the model does not yet describe every byte of the file. A v6 file's
+/// control record is entirely undescribed. A v5 file's page 0 (the control
+/// record plus its key/segment definitions) is fully described and will
+/// round-trip on its own, but records and index pages -- page 1 onward --
+/// are not, so any real (multi-page) corpus file still leaves the canvas
+/// with unwritten bytes and `Canvas::finish` reports them.
 pub fn file(model: &File) -> Result<Emitted, Fault> {
     let mut canvas = Canvas::new(model.len as usize);
     if model.id.generation.is_v6() {
         return canvas.finish();
     }
     write_fixed_portion(&mut canvas, model)?;
+    write_key_descriptors(&mut canvas, model)?;
     canvas.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::fixtures::usracc_fixed_portion;
+    use crate::model::fixtures::{usracc_fixed_portion, usracc_first_page, two_key_fixed_portion};
     use crate::read;
 
     /// The fixed portion round-trips byte for byte: read it, emit it back
@@ -153,19 +211,46 @@ mod tests {
         assert_eq!(emitted.bytes(), &original[..fcr::at::FIXED_LEN]);
     }
 
-    /// `file` faults rather than succeeding on a real file, because the
-    /// key/segment table, records and index pages past the fixed portion
-    /// are not yet described -- this is the "faulted, not refused, not
-    /// mismatched" outcome the round trip is expected to show for v5 files
-    /// after this task.
+    /// Page 0 as a whole -- fixed portion, key/segment definition, and zero
+    /// padding out to `page_size` -- round-trips byte for byte for a
+    /// single-page model (`model.len == page_size`, the shape a virgin
+    /// one-page file would have).
     #[test]
-    fn file_faults_on_bytes_past_the_fixed_portion() {
-        let original = usracc_fixed_portion();
+    fn a_single_page_v5_file_round_trips_completely() {
+        let original = usracc_first_page();
         let model = read::file(&original).expect("reads");
-        let fault = file(&model).expect_err("bytes past 0x110 are not yet described");
+        let emitted = file(&model).expect("page 0 is fully described -- fixed portion plus one key descriptor plus zero_padding");
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// The same, with two key descriptors -- proving the writer handles more
+    /// than one repetition, not just the single-definition USRACC.DAT case.
+    #[test]
+    fn a_single_page_v5_file_with_two_keys_round_trips_completely() {
+        let original = two_key_fixed_portion();
+        let model = read::file(&original).expect("reads");
+        let emitted = file(&model).expect("two key descriptors plus zero_padding tile page 0");
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// `file` faults rather than succeeding on a real (multi-page) corpus
+    /// file: page 0 (fixed portion, key/segment definitions, zero padding)
+    /// is now fully described and writes without a fault, but records and
+    /// index pages -- page 1 onward -- are not, so the fault must name the
+    /// range starting exactly at `page_size`, not at `0x110`.
+    #[test]
+    fn file_faults_on_bytes_past_page_zero_for_a_multi_page_file() {
+        // USRACC.DAT itself: page_size 512, 3 pages, 1536 bytes total.
+        let mut original = usracc_first_page();
+        original.resize(1536, 0);
+        let model = read::file(&original).expect("reads");
+        assert_eq!(model.len, 1536);
+
+        let fault = file(&model).expect_err("pages 1 and 2 are not yet described");
+        let said = fault.to_string();
         assert!(
-            fault.to_string().contains("0x110") || fault.to_string().contains("272"),
-            "names the range starting where the fixed portion ends: {fault}"
+            said.contains("512") && said.contains("1536"),
+            "names the range starting at page_size (512) up to the file's own length (1536): {said}"
         );
     }
 }
