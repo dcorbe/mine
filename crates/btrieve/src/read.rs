@@ -16,7 +16,7 @@ use crate::format::page;
 use crate::format::variable;
 use crate::model::{
     AcsBlock, Control, ControlRecord, DataPage, File, FragmentPage, FragmentSlot, IndexEntry,
-    IndexPage, KeyDescriptor, Page, PageKind, RecordSlot,
+    IndexPage, KeyDescriptor, Page, PageKind, RecordSlot, V6ControlRecord,
 };
 
 /// Read a plain little-endian `u16` at `at`.
@@ -37,6 +37,15 @@ fn get_long(bytes: &[u8], at: usize) -> u32 {
 
 fn get_array<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
     bytes[at..at + N].try_into().expect("slice of the requested width")
+}
+
+/// Read a plain little-endian `u32` at `at` -- distinct from [`get_long`]:
+/// this is for a field harvest 2 does *not* name among the "high word first"
+/// family (`RECORDS`, `PAGES`, `FREE`, `FREE_V6`, `VARIABLE_HEAD`, `ROOT`),
+/// where reading it the other way would be an unevidenced assumption rather
+/// than a transcription.
+fn get_u32(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(get_array(bytes, at))
 }
 
 /// Read one control record's fixed portion (`0x00..0x110`) out of `bytes`,
@@ -79,16 +88,70 @@ fn control_record(bytes: &[u8]) -> ControlRecord {
     }
 }
 
+/// Read one v6 control record's fixed portion (`0x00..0x110`) out of
+/// `bytes`, which must be at least that long. `bytes` starts at that copy's
+/// own physical page (0 or 1) -- see [`resolve_shadow`]. Task 15's
+/// transcription of harvest 2's field table (`format::fcr::v6_fixed`); every
+/// offset here is `fcr::v6::*`, not `fcr::at::*` -- the two families'
+/// fixed-portion layouts genuinely diverge past `0x20` (see
+/// `model::V6ControlRecord`'s own doc comment), so this is not
+/// [`control_record`] with different constants plugged in, it is a
+/// different structure.
+fn v6_control_record(bytes: &[u8]) -> V6ControlRecord {
+    V6ControlRecord {
+        generation: get_u16(bytes, fcr::v6::GENERATION),
+        reserved_06: get_array(bytes, fcr::v6::RESERVED_06),
+        reserved_0a: get_array(bytes, fcr::v6::RESERVED_0A),
+        reserved_0c: get_u32(bytes, fcr::v6::RESERVED_0C),
+        free: get_long(bytes, fcr::v6::FREE),
+        keys: get_u16(bytes, fcr::v6::KEYS),
+        reclen: get_u16(bytes, fcr::v6::RECLEN),
+        physical: get_u16(bytes, fcr::v6::PHYSICAL),
+        records: get_long(bytes, fcr::v6::RECORDS),
+        highest: get_u16(bytes, fcr::v6::HIGHEST),
+        reserved_20: get_u16(bytes, fcr::v6::RESERVED_20),
+        sentinel_22: get_u16(bytes, fcr::v6::SENTINEL_22),
+        sentinel_24: get_u16(bytes, fcr::v6::SENTINEL_24),
+        pages: get_long(bytes, fcr::v6::PAGES),
+        reserved_2a: get_u16(bytes, fcr::v6::RESERVED_2A),
+        reserved_2c: get_array(bytes, fcr::v6::RESERVED_2C),
+        variable_mark: get_u32(bytes, fcr::v6::VARIABLE_MARK),
+        acs_name: get_array(bytes, fcr::v6::ACS_NAME),
+        reserved_44: get_array(bytes, fcr::v6::RESERVED_44),
+        usage_4c: get_u16(bytes, fcr::v6::USAGE_4C),
+        index_alloc_4e: get_u16(bytes, fcr::v6::INDEX_ALLOC_4E),
+        mirror_50: get_u16(bytes, fcr::v6::MIRROR_50),
+        usage_52: get_u16(bytes, fcr::v6::USAGE_52),
+        reserved_54: get_u16(bytes, fcr::v6::RESERVED_54),
+        stamp_56: get_array(bytes, fcr::v6::STAMP_56),
+        reserved_5a: get_array(bytes, fcr::v6::RESERVED_5A),
+        reserved_60: get_array(bytes, fcr::v6::RESERVED_60),
+        write_counter: get_u16(bytes, fcr::v6::WRITE_COUNTER),
+        reserved_6a: get_array(bytes, fcr::v6::RESERVED_6A),
+        reserved_72: get_array(bytes, fcr::v6::RESERVED_72),
+        reserved_7c: get_array(bytes, fcr::v6::RESERVED_7C),
+        reserved_90: get_array(bytes, fcr::v6::RESERVED_90),
+        free_v6: get_long(bytes, fcr::v6::FREE_V6),
+        variable_head: get_long(bytes, fcr::v6::VARIABLE_HEAD),
+        reserved_a4: get_array(bytes, fcr::v6::RESERVED_A4),
+        reserved_d4: get_array(bytes, fcr::v6::RESERVED_D4),
+        reserved_100: get_array(bytes, fcr::v6::RESERVED_100),
+        reserved_106: get_array(bytes, fcr::v6::RESERVED_106),
+        acs_page: get_long(bytes, fcr::v6::ACS_PAGE),
+        reserved_10e: get_array(bytes, fcr::v6::RESERVED_10E),
+    }
+}
+
 /// Resolve a v6 file's shadowed control record -- Ruling 7 (harvest 0
 /// ruling 7; harvest 2 "FCR shadowing"): physical pages 0 and 1 are each a
 /// complete `page_size`-byte control record, and the `u16` generation
-/// counter at page-relative `0x04` (`ControlRecord::page_gen` in this v6
-/// role) says which one is live -- higher wins. This is the *first* thing
-/// this crate does with a v6 file's bytes, before any other field of either
-/// copy is treated as meaningful: reading physical page 0 unconditionally
-/// (the bug this ruling exists to close) is silently wrong on 157 of 507
-/// corpus files, because it is not corrupt, just stale, and parses
-/// perfectly either way.
+/// counter at page-relative `0x04` (`V6ControlRecord::generation`) says
+/// which one is live -- higher wins. This is the *first* thing this crate
+/// does with a v6 file's bytes, before any other field of either copy is
+/// treated as meaningful: reading physical page 0 unconditionally (the bug
+/// this ruling exists to close) is silently wrong on 157 of 507 corpus
+/// files, because it is not corrupt, just stale, and parses perfectly
+/// either way.
 ///
 /// `bytes` must already be at least `2 * page_size` long -- the caller
 /// checks this before calling, so the two slices below never panic.
@@ -99,10 +162,10 @@ fn control_record(bytes: &[u8]) -> ControlRecord {
 /// ever tied (0 of 507), so this rejects a shape never observed rather than
 /// one observed and merely inconvenient.
 fn resolve_shadow(bytes: &[u8], page_size: usize) -> Result<Control, NotBtrieve> {
-    let page0 = control_record(&bytes[0..page_size]);
-    let page1 = control_record(&bytes[page_size..2 * page_size]);
+    let page0 = v6_control_record(&bytes[0..page_size]);
+    let page1 = v6_control_record(&bytes[page_size..2 * page_size]);
 
-    match page0.page_gen.cmp(&page1.page_gen) {
+    match page0.generation.cmp(&page1.generation) {
         std::cmp::Ordering::Greater => {
             Ok(Control::Shadowed { live: page0, stale: page1, live_is_page: 0 })
         }
@@ -116,7 +179,7 @@ fn resolve_shadow(bytes: &[u8], page_size: usize) -> Result<Control, NotBtrieve>
                  shadow copies has no answer, and no corpus file has ever \
                  produced one, so this is refused rather than resolved \
                  (harvest 0 ruling 7)",
-                page0.page_gen
+                page0.generation
             ),
         }),
     }
@@ -1450,22 +1513,44 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
             unreachable!("resolve_shadow only ever returns Control::Shadowed")
         };
 
+        // Task 15: the live copy's own key/segment definitions are the same
+        // 30-byte, ANOSEG-chained structure v5 uses (harvest 2's field
+        // table transcribes to identical offsets), so the same walk applies
+        // -- just against the live copy's own physical page, not physical
+        // page 0 unconditionally. A malformed array (a chain that runs past
+        // the page, or never terminates) is refused by that walk's own,
+        // more specific message; a well-formed one still cannot produce a
+        // `File` today, since the allocation table and page addressing past
+        // the control record are later work.
+        let live_page_start = live_is_page * page_size;
+        let live_descriptors = key_descriptors(&bytes[live_page_start..], page_size, live.keys)?;
+
         // Ruling 7, part 3: identification stays on page 0 -- already true,
         // `identify` never moves. What must not come from page 0 is
-        // geometry, and that is everything past the shadow pair itself:
-        // the allocation table, page addressing, and the rest of a v6
-        // file's own pages are not yet described by this crate, so the
-        // refusal moves here, naming the copy Ruling 7 actually resolved
-        // rather than repeating the blanket "v6 is not described" this
-        // crate used to say before it knew which page that even was.
+        // geometry, and that is everything past the shadow pair and its key
+        // descriptors: the allocation table, page addressing, and the rest
+        // of a v6 file's own pages are not yet described by this crate, so
+        // the refusal moves here -- further along than Task 15 found it,
+        // naming the live copy's own fixed-portion geometry and key count,
+        // not just which physical page and generation Ruling 7 resolved.
         return Err(NotBtrieve {
             why: format!(
                 "identified as {:?} with {page_size}-byte pages; the live \
                  control record is physical page {live_is_page} (generation \
-                 {}), but this crate does not yet describe v6 pages, the \
-                 allocation table, or page addressing beyond the \
-                 control-record shadow pair",
-                id.generation, live.page_gen
+                 {}), KEYS={} realized as {} key/segment definitions, \
+                 RECLEN={}, PHYSICAL={}, RECORDS={}, PAGES={} (logical, not \
+                 physical), but this crate does not yet describe the \
+                 allocation table or page addressing, so it cannot resolve \
+                 v6 pages or records past the control record and its key \
+                 descriptors",
+                id.generation,
+                live.generation,
+                live.keys,
+                live_descriptors.len(),
+                live.reclen,
+                live.physical,
+                live.records,
+                live.pages,
             ),
         });
     }
@@ -1630,6 +1715,123 @@ mod tests {
         assert_eq!(stale.records, 0);
     }
 
+    /// Task 15's own failing-test-first: the live control record of a named
+    /// v6 file reads its full measured geometry, not just `records` and
+    /// `live_is_page` -- `WCCBANK2.VIR` (24,576 bytes, page_size 4096, a
+    /// single un-flipped generation) independently re-measured by this
+    /// task's own controller directly off the raw bytes (`xxd`/a small
+    /// Python script), before `V6ControlRecord` existed to hold most of
+    /// these fields. Before Task 15 this would not compile: `free_v6`,
+    /// `variable_head`, `acs_page`, `sentinel_22`/`sentinel_24` and the
+    /// logical/physical `pages` distinction had no field to assert against.
+    #[test]
+    fn wccbank2_vir_live_control_record_reads_its_full_measured_geometry() {
+        let path = "archive/modules/majormud-nt/wccnt8pj/out/WCCBANK2.VIR";
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let id = identify(&bytes).expect("a v6 file with two control records");
+        let control = resolve_shadow(&bytes, id.page_size as usize)
+            .expect("two control records, generations must differ");
+        let Control::Shadowed { live, live_is_page, .. } = &control else {
+            panic!("a v6 file has two control records")
+        };
+        assert_eq!(*live_is_page, 0, "gen0=1, gen1=0 -- page 0 is live");
+        assert_eq!(live.keys, 1, "KEYS");
+        assert_eq!(live.reclen, 76, "RECLEN");
+        assert_eq!(live.physical, 86, "PHYSICAL");
+        assert_eq!(live.records, 0, "a virgin file");
+        assert_eq!(live.pages, 3, "PAGES is LOGICAL: 3, not the 6 physical pages a 24,576-byte, 4096-byte-page file actually has");
+        assert_eq!(live.sentinel_22, 0xffff);
+        assert_eq!(live.sentinel_24, 1, "raw bytes 01 00, read little-endian: 0x0001, not the harvest prose's own 0x0100 gloss");
+        assert_eq!(live.free_v6, 8198);
+        assert_eq!(live.variable_head, 0xff00_ffff, "NO_VARIABLE_HEAD: a fixed-length-record file");
+        assert_eq!(live.acs_page, 0, "no ACS declared");
+        assert_eq!(live.acs_name, [0u8; 8]);
+    }
+
+    /// MULTIACS.DAT (harvest 2's own worked example): `KEYS` at `0x14`
+    /// counts 3 *keys*, but the key/segment definition array actually holds
+    /// 4 definitions, because the second key has two segments chained by
+    /// `ANOSEG`. Reusing `key_descriptors` -- the same walk v5 uses,
+    /// unmodified -- against the live copy's own bytes produces exactly
+    /// that: proof the two families' key/segment shapes genuinely match, not
+    /// just superficially.
+    ///
+    /// This also exercises `SELF_TAG` (relative `0x18`), harvest 2's other
+    /// new finding: `0x80|keynum` on an independent segment, `0x00` on an
+    /// `ANOSEG` continuation.
+    #[test]
+    fn multiacs_dat_keys_counts_keys_not_definitions_and_self_tag_matches_harvest_2() {
+        let path = "archive/tooling/wbtrv32/assets/MULTIACS.DAT";
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let id = identify(&bytes).expect("a v6.10 file");
+        assert_eq!(id.generation, crate::format::generation::Generation::V610);
+        let control = resolve_shadow(&bytes, id.page_size as usize).expect("resolves");
+        let Control::Shadowed { live, live_is_page, .. } = &control else {
+            panic!("a v6 file has two control records")
+        };
+        assert_eq!(live.keys, 3, "KEYS counts 3 keys");
+
+        let live_start = live_is_page * id.page_size as usize;
+        let descriptors = key_descriptors(&bytes[live_start..], id.page_size as usize, live.keys)
+            .expect("a well-formed ANOSEG chain");
+        assert_eq!(descriptors.len(), 4, "3 keys realized as 4 definitions -- one key has 2 segments");
+
+        let self_tags: Vec<u8> = descriptors.iter().map(|d| d.self_tag).collect();
+        assert_eq!(
+            self_tags,
+            vec![0x80, 0x81, 0x00, 0x82],
+            "def0/def1/def3 are independent segments (0x80|keynum); def2 is \
+             def1's ANOSEG continuation (0x00)"
+        );
+        assert_eq!(descriptors[2].root_page, 0, "a continuation's root is 0");
+    }
+
+    /// `wccmp002.vir`'s live control record's fixed portion (`0x00..0x110`)
+    /// round-trips through `V6ControlRecord` and
+    /// `emit::write_v6_fixed_portion` byte for byte -- including `PAGES`
+    /// (13,572, logical), the field this task's own required mutation
+    /// targets. This is the site that mutation must turn red: if `emit`
+    /// wrote the file's *physical* page count (13,607) instead of the
+    /// model's own stored (logical) value, this assertion is what would
+    /// catch it.
+    #[test]
+    fn wccmp002_virs_live_fixed_portion_round_trips_including_the_logical_pages_field() {
+        let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let id = identify(&bytes).expect("a v6 file");
+        let page_size = id.page_size as usize;
+        assert_eq!(bytes.len() % page_size, 0, "13,607 physical pages, no partial page");
+        let physical_pages = bytes.len() / page_size;
+        assert_eq!(physical_pages, 13_607, "the measured physical page count");
+
+        let control = resolve_shadow(&bytes, page_size).expect("resolves");
+        let Control::Shadowed { live, live_is_page, .. } = &control else {
+            panic!("a v6 file has two control records")
+        };
+        assert_eq!(live.pages, 13_572, "PAGES is logical, not the 13,607 physical pages above");
+
+        let mut canvas = crate::canvas::Canvas::new(fcr::v6::FIXED_LEN);
+        crate::emit::write_v6_fixed_portion(&mut canvas, id.generation, id.page_size, live, 0)
+            .expect("the fixed portion is fully described");
+        let emitted = canvas.finish().expect("every byte written exactly once");
+
+        let live_start = live_is_page * page_size;
+        assert_eq!(
+            emitted.bytes(),
+            &bytes[live_start..live_start + fcr::v6::FIXED_LEN],
+            "the live copy's fixed portion must reproduce byte for byte"
+        );
+    }
+
     /// `file`'s own refusal, for the same file, names the copy Ruling 7
     /// resolved rather than repeating the old blanket "v6 is not described"
     /// -- the shift this task exists to make: not just refused, but refused
@@ -1647,6 +1849,30 @@ mod tests {
         assert!(
             !e.why.contains("every byte of a v6 control record"),
             "the old blanket refusal text must be gone: {}",
+            e.why
+        );
+
+        // Task 15: the refusal moved further along than Ruling 7's own
+        // shadow-pair message -- it now names the live copy's own
+        // fixed-portion geometry and how many key/segment definitions its
+        // walk actually assembled, not just which physical page and
+        // generation is live.
+        assert!(e.why.contains("KEYS=1"), "names the key count: {}", e.why);
+        assert!(
+            e.why.contains("1 key/segment definitions"),
+            "names the definition count the walk assembled: {}",
+            e.why
+        );
+        assert!(e.why.contains("RECORDS=26720"), "names the live record count: {}", e.why);
+        assert!(
+            e.why.contains("PAGES=13572"),
+            "names the LOGICAL page count (13,572), not the file's 13,607 \
+             physical pages: {}",
+            e.why
+        );
+        assert!(
+            !e.why.contains("13607") && !e.why.contains("13,607"),
+            "must not report the physical page count as PAGES: {}",
             e.why
         );
     }
@@ -2982,4 +3208,3 @@ mod tests {
         assert_eq!(emitted.bytes(), original.as_slice(), "both orphans round-trip, bodies included");
     }
 }
-

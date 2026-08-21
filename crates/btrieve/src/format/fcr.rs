@@ -23,12 +23,55 @@
 //! 145 currently-identified v5 corpus files (143 of 145 confirmed; the 2
 //! exceptions -- `wccitems.nu1` and its sibling -- carry genuine leftover
 //! record prose here, not corruption, so `read` carries the region verbatim
-//! rather than asserting it zero -- see `model::File::page_zero_tail`). v6's
-//! fixed portion is untouched by this task and still has three undescribed
-//! ranges (`undescribed_4`, `undescribed_a`, `undescribed_b`); a later task
-//! owns it.
+//! rather than asserting it zero -- see `model::File::page_zero_tail`).
+//!
+//! # v6's fixed portion (Task 15)
+//!
+//! Harvest 2 (`docs/superpowers/harvest/2026-08-20-btrieve-harvest-2-fcr-v6.md`)
+//! transcribed here as [`v6`]/[`v6_fixed`]: 43 named fields tiling
+//! `0x00..0x110` exactly -- harvest 2's field table has 42 offset-addressed
+//! rows there, and this crate splits its one two-value row (`0x22`,
+//! "constant `0xffff` then `0x0100`") into `sentinel_22`/`sentinel_24`,
+//! since a [`Field`] carries one value, not two. `PAGE_SIZE` and `VERSION`
+//! are read through [`super::generation::Identified`], not duplicated in
+//! `model::V6ControlRecord` -- the same exclusion v5's `at` module makes for
+//! `lead`/`page_gen`/`page_size` in `model::ControlRecord`. Eighteen of the
+//! remaining forty are fully understood and
+//! cited to a decompile line or a clean corpus-measured formula; nineteen are
+//! constant and fully reproducible but of unresolved semantic meaning
+//! (named `reserved`/`sentinel`, each carrying the corpus count that pins its
+//! value rather than a guess at its purpose); three (`0x4c`, `0x4e`/`0x50`/
+//! `0x52`, `0x56`) are usage-dependent counters with a virgin-file baseline
+//! formula but no confirmed live-growth rule -- see the harvest's own GAPS
+//! section, quoted in each field's citation rather than upgraded into an
+//! explanation this crate cannot back.
+//!
+//! Two corrections this harvest made to the old crate's understanding, both
+//! load-bearing: `SELF_TAG` (key/segment definition relative `0x18`) is
+//! `0x80|keynum` on an independent segment, `0` on an `ANOSEG` continuation
+//! -- present in 199 of 201 sampled v6 definitions and unnamed anywhere
+//! before this harvest (v5's own 307 definitions all read 0 there, so v5
+//! models the same byte as an always-zero plain field, not a tag -- see
+//! `key_descriptor::fields`'s `self_tag` citation). And `PAGES` (`0x26`) is
+//! a **logical** page count, not physical: `wccmp002.vir` reads 13,572
+//! against 13,607 physical pages, the difference being the fixed shadow
+//! (control record + allocation table) overhead -- see the harvest's
+//! "PAGES, worked" section.
+//!
+//! Past `0x110`, v6's key/segment definitions are the *same* 30-byte,
+//! `ANOSEG`-chained structure v5 uses -- [`key_descriptor`] is shared, not
+//! duplicated, because harvest 2's own field table (`ROOT` through
+//! `NULL_VALUE`) transcribes to identical offsets and widths; `KEYS` (`0x14`)
+//! counts *keys*, not definitions, exactly as it does for v5 (harvest 2's
+//! `MULTIACS.DAT` worked example: 3 keys, 4 definitions, the second key's
+//! two segments chained by `ANOSEG`). Whatever remains after the last
+//! definition -- the definition-offset trailer (one `u16` per definition,
+//! its own absolute byte offset, at a page-size-dependent fixed position)
+//! plus trailing zero padding -- is `page_tail`, still `NOT YET HARVESTED`:
+//! harvest 2 measured its position and content but not its exact capacity
+//! (GAP 9), and decomposing it is the next task's job, not this one's.
 
-use super::generation::{Generation, FCR_MIN};
+use super::generation::Generation;
 use super::{Field, Layout};
 
 /// Byte offsets of the v5 control record's fixed-portion fields, `0x00`
@@ -643,8 +686,89 @@ fn v5_fixed() -> Vec<Field> {
     ]
 }
 
-/// The v6 family's fixed fields, up to a fixed 512. Untouched by this task
-/// -- a later task rebuilds this into its own full field table.
+/// Byte offsets of the v6 control record's fixed-portion fields, `0x00`
+/// through `0x110` -- harvest 2's field table, transcribed directly (one
+/// name per row) so `v6_fixed`, `read::v6_control_record` and
+/// `emit::write_v6_fixed_portion` share this one set of offsets rather than
+/// three copies of the same magic numbers. `PAGE_SIZE` and `VERSION` are
+/// listed for [`v6_fixed`]'s own tiling, but the runtime side of this crate
+/// reads them through [`super::generation::Identified`], not through
+/// `model::V6ControlRecord` -- the same exclusion v5's `at` module makes for
+/// `lead`/`version`/`page_size`.
+pub mod v6 {
+    pub const GENERATION: usize = 0x04;
+    pub const RESERVED_06: usize = 0x06;
+    pub const PAGE_SIZE: usize = 0x08;
+    pub const RESERVED_0A: usize = 0x0a;
+    pub const RESERVED_0C: usize = 0x0c;
+    pub const FREE: usize = 0x10;
+    pub const KEYS: usize = 0x14;
+    pub const RECLEN: usize = 0x16;
+    pub const PHYSICAL: usize = 0x18;
+    pub const RECORDS: usize = 0x1a;
+    pub const HIGHEST: usize = 0x1e;
+    pub const RESERVED_20: usize = 0x20;
+    pub const SENTINEL_22: usize = 0x22;
+    pub const SENTINEL_24: usize = 0x24;
+    pub const PAGES: usize = 0x26;
+    pub const RESERVED_2A: usize = 0x2a;
+    pub const RESERVED_2C: usize = 0x2c;
+    pub const RESERVED_2C_LEN: usize = 12;
+    pub const VARIABLE_MARK: usize = 0x38;
+    pub const ACS_NAME: usize = 0x3c;
+    pub const ACS_NAME_LEN: usize = 8;
+    pub const RESERVED_44: usize = 0x44;
+    pub const RESERVED_44_LEN: usize = 6;
+    pub const VERSION: usize = 0x4a;
+    pub const USAGE_4C: usize = 0x4c;
+    pub const INDEX_ALLOC_4E: usize = 0x4e;
+    pub const MIRROR_50: usize = 0x50;
+    pub const USAGE_52: usize = 0x52;
+    pub const RESERVED_54: usize = 0x54;
+    pub const STAMP_56: usize = 0x56;
+    pub const STAMP_56_LEN: usize = 4;
+    pub const RESERVED_5A: usize = 0x5a;
+    pub const RESERVED_5A_LEN: usize = 6;
+    pub const RESERVED_60: usize = 0x60;
+    pub const RESERVED_60_LEN: usize = 8;
+    pub const WRITE_COUNTER: usize = 0x68;
+    pub const RESERVED_6A: usize = 0x6a;
+    pub const RESERVED_6A_LEN: usize = 8;
+    pub const RESERVED_72: usize = 0x72;
+    pub const RESERVED_72_LEN: usize = 10;
+    pub const RESERVED_7C: usize = 0x7c;
+    pub const RESERVED_7C_LEN: usize = 20;
+    pub const RESERVED_90: usize = 0x90;
+    pub const RESERVED_90_LEN: usize = 12;
+    pub const FREE_V6: usize = 0x9c;
+    pub const VARIABLE_HEAD: usize = 0xa0;
+    pub const RESERVED_A4: usize = 0xa4;
+    pub const RESERVED_A4_LEN: usize = 48;
+    pub const RESERVED_D4: usize = 0xd4;
+    pub const RESERVED_D4_LEN: usize = 44;
+    pub const RESERVED_100: usize = 0x100;
+    pub const RESERVED_100_LEN: usize = 6;
+    pub const RESERVED_106: usize = 0x106;
+    pub const RESERVED_106_LEN: usize = 4;
+    pub const ACS_PAGE: usize = 0x10a;
+    pub const RESERVED_10E: usize = 0x10e;
+    pub const RESERVED_10E_LEN: usize = 2;
+
+    /// End of the harvested fixed portion: `0x00..FIXED_LEN` tiles
+    /// completely, every byte cited, and this is where the (shared, see
+    /// `super::key_descriptor`) key/segment definition array begins.
+    pub const FIXED_LEN: usize = 0x110;
+}
+
+/// The v6 family's fixed fields, `0x00` through [`v6::FIXED_LEN`] (`0x110`).
+/// Transcribed from harvest 2's field table (Task 15); do not re-derive an
+/// offset from anything else, and do not add a field the table does not
+/// list. 43 fields (harvest 2's 42 rows, with `0x22` split in two), tiling
+/// exactly -- 18 fully understood and cited, 19
+/// constant and reproducible but of unresolved semantic meaning, 3
+/// (`USAGE_4C`, the `INDEX_ALLOC_4E`/`MIRROR_50`/`USAGE_52` group and
+/// `STAMP_56`) usage-dependent with a virgin-file baseline but no confirmed
+/// live-growth formula -- see this module's own doc comment.
 fn v6_fixed() -> Vec<Field> {
     vec![
         Field {
@@ -655,40 +779,389 @@ fn v6_fixed() -> Vec<Field> {
             cite: "W32MKDE FUN_00435970: `*param_1 == 0x4346` (\"FC\") selects v6",
         },
         Field {
-            name: "undescribed_4",
+            name: "generation",
             index: None,
-            at: 4,
-            len: 4,
-            cite: "NOT YET HARVESTED -- between the lead and the page size",
+            at: v6::GENERATION,
+            len: 2,
+            cite: "harvest 2 'FCR shadowing' -- the shadow pair's own generation \
+                   counter, page-relative 0x04 on both physical pages 0 and 1; \
+                   higher wins, a tie is refused (0 of 500 corpus files have \
+                   ever tied). Same byte offset v5 calls page_gen, a different \
+                   role.",
+        },
+        Field {
+            name: "reserved_06",
+            index: None,
+            at: v6::RESERVED_06,
+            len: 2,
+            cite: "harvest 2 field table (0x06) -- constant 0x0000 on all 226 \
+                   unique live copies measured",
         },
         Field {
             name: "page_size",
             index: None,
-            at: 8,
+            at: v6::PAGE_SIZE,
             len: 2,
-            cite: "W32MKDE FUN_00435970: u16 at 8, non-zero, <= 0x1000, multiple of 0x200",
+            cite: "W32MKDE FUN_00435970: u16 at 8, non-zero, <= 0x1000, multiple \
+                   of 0x200",
         },
         Field {
-            name: "undescribed_a",
+            name: "reserved_0a",
             index: None,
-            at: 10,
-            len: 0x4a - 10,
-            cite: "NOT YET HARVESTED",
+            at: v6::RESERVED_0A,
+            len: 2,
+            cite: "harvest 2 field table (0x0a) -- constant 0x0000 on all 226 \
+                   live copies; earlier drafts of the harvest measured this \
+                   varying 0x0000/0x4000 from reading stale page-0 copies of \
+                   files whose live copy is page 1 -- against the live copy \
+                   it is constant (harvest 2 'Zero' section)",
+        },
+        Field {
+            name: "reserved_0c",
+            index: None,
+            at: v6::RESERVED_0C,
+            len: 4,
+            cite: "harvest 2 field table (0x0c) -- constant 0xffffffff on all \
+                   226 live copies",
+        },
+        Field {
+            name: "free",
+            index: None,
+            at: v6::FREE,
+            len: 4,
+            cite: "harvest 2 field table (0x10) -- v5's free-list-head slot; v6 \
+                   always reads 0xffffffff here ('no free slots', forever), \
+                   226/226",
+        },
+        Field {
+            name: "keys",
+            index: None,
+            at: v6::KEYS,
+            len: 2,
+            cite: "harvest 2 field table (0x14) -- count of distinct keys, not \
+                   of on-disk key/segment definitions; a segmented key still \
+                   counts once (MULTIACS.DAT: KEYS=3, 4 definitions)",
+        },
+        Field {
+            name: "reclen",
+            index: None,
+            at: v6::RECLEN,
+            len: 2,
+            cite: "harvest 2 field table (0x16) -- logical record length",
+        },
+        Field {
+            name: "physical",
+            index: None,
+            at: v6::PHYSICAL,
+            len: 2,
+            cite: "harvest 2 field table (0x18) -- physical (on-disk) record \
+                   slot length",
+        },
+        Field {
+            name: "records",
+            index: None,
+            at: v6::RECORDS,
+            len: 4,
+            cite: "harvest 2 field table (0x1a) -- record count, one 4-byte \
+                   high-word-first long; 0 on virgin files, 26720 on \
+                   wccmp002.vir's live copy",
+        },
+        Field {
+            name: "highest",
+            index: None,
+            at: v6::HIGHEST,
+            len: 2,
+            cite: "harvest 2 field table (0x1e) -- v5 semantics (highest page \
+                   number in use); v6 behaviour on a populated file is \
+                   unmeasured -- every sampled live copy, including the \
+                   26,720-record wccmp002.vir, reads 0 (GAP 8). Unlike v5, \
+                   this is a plain 2-byte u16 here, not half of a 4-byte long \
+                   -- the other half is reserved_20, a separate field",
+        },
+        Field {
+            name: "reserved_20",
+            index: None,
+            at: v6::RESERVED_20,
+            len: 2,
+            cite: "harvest 2 field table (0x20) -- constant 0x0000 on all 226 \
+                   live copies; v5's analogous position (ALLOCATED, 'keys+1') \
+                   is not reused here -- v6's index-page-count-shaped field \
+                   lives at 0x4e instead (CONTRADICTIONS item 2)",
+        },
+        Field {
+            name: "sentinel_22",
+            index: None,
+            at: v6::SENTINEL_22,
+            len: 2,
+            cite: "harvest 2 field table (0x22) / GAP 1 -- constant 0xffff on \
+                   all 226 live copies",
+        },
+        Field {
+            name: "sentinel_24",
+            index: None,
+            at: v6::SENTINEL_24,
+            len: 2,
+            cite: "harvest 2 field table (0x22) / GAP 1 -- constant on all 226 \
+                   live copies; the raw bytes are `01 00`, so read little- \
+                   endian (this crate's own convention for a plain u16 -- see \
+                   canvas.rs's module doc) the value is 0x0001, not the \
+                   harvest prose's own 0x0100/256 gloss, which reads the two \
+                   bytes in file order rather than swapping them. Transcribed \
+                   as the measured bytes, not the harvest's arithmetic on \
+                   them; the field's meaning is unresolved either way",
+        },
+        Field {
+            name: "pages",
+            index: None,
+            at: v6::PAGES,
+            len: 4,
+            cite: "harvest 2 'PAGES, worked' -- LOGICAL page count (the control \
+                   record itself counts as logical page 0), NOT the physical \
+                   page count: wccmp002.vir reads 13,572 here against 13,607 \
+                   physical pages, the difference being the fixed control- \
+                   record + allocation-table shadow overhead. One 4-byte \
+                   high-word-first long, like v5's PAGES",
+        },
+        Field {
+            name: "reserved_2a",
+            index: None,
+            at: v6::RESERVED_2A,
+            len: 2,
+            cite: "harvest 2 field table (0x2a) -- constant 0x0000 on all 226 \
+                   live copies; v5's PAGE_USABLE lived here but v6 does not \
+                   appear to reuse it",
+        },
+        Field {
+            name: "reserved_2c",
+            index: None,
+            at: v6::RESERVED_2C,
+            len: v6::RESERVED_2C_LEN,
+            cite: "harvest 2 field table (0x2c) -- constant all-zero on all \
+                   226 live copies; the 12 bytes v5 splits into \
+                   lock_transaction/negative_version_a/b/c/d",
+        },
+        Field {
+            name: "variable_mark",
+            index: None,
+            at: v6::VARIABLE_MARK,
+            len: 4,
+            cite: "harvest 2 field table (0x38); acs.rs -- 0x00000000 for a \
+                   fixed-length file, 0xffffffff for a variable-length one",
+        },
+        Field {
+            name: "acs_name",
+            index: None,
+            at: v6::ACS_NAME,
+            len: v6::ACS_NAME_LEN,
+            cite: "harvest 2 field table (0x3c); acs.rs -- name of the file's \
+                   (first) alternate collating sequence, space/NUL-padded, \
+                   all-zero when none declared",
+        },
+        Field {
+            name: "reserved_44",
+            index: None,
+            at: v6::RESERVED_44,
+            len: v6::RESERVED_44_LEN,
+            cite: "harvest 2 field table (0x44) -- constant all-zero on all \
+                   226 live copies",
         },
         Field {
             name: "version",
             index: None,
-            at: 0x4a,
+            at: v6::VERSION,
             len: 2,
-            cite: "W32MKDE FUN_00435970: abs(i16 at 0x4a) is 0x600, 0x610 or 0x620",
+            cite: "W32MKDE FUN_00435970: abs(i16 at 0x4a) is 0x600, 0x610 or \
+                   0x620",
         },
         Field {
-            name: "undescribed_b",
+            name: "usage_4c",
             index: None,
-            at: 0x4c,
-            len: FCR_MIN - 0x4c,
-            cite: "NOT YET HARVESTED -- this range shrinks to nothing before the \
-                   round-trip pin can reach 612",
+            at: v6::USAGE_4C,
+            len: 2,
+            cite: "harvest 2 field table (0x4c) / GAP 2 -- always equals the \
+                   field at 0x50 (226/226); 1 on every virgin file regardless \
+                   of key count, grows with real usage (up to 14 observed); \
+                   exact meaning (candidate: index-tree depth) unresolved",
+        },
+        Field {
+            name: "index_alloc_4e",
+            index: None,
+            at: v6::INDEX_ALLOC_4E,
+            len: 2,
+            cite: "harvest 2 field table (0x4e) / GAP 2 -- on a virgin file, \
+                   8*(nkeys+1) (16 for 1 key, 24 for 2, 32 for 3); grows with \
+                   usage (up to 188 observed); plausibly index pages \
+                   allocated for the file's key structures, unconfirmed",
+        },
+        Field {
+            name: "mirror_50",
+            index: None,
+            at: v6::MIRROR_50,
+            len: 2,
+            cite: "harvest 2 field table (0x50) / GAP 2 -- identical to \
+                   usage_4c in all 226 samples",
+        },
+        Field {
+            name: "usage_52",
+            index: None,
+            at: v6::USAGE_52,
+            len: 2,
+            cite: "harvest 2 field table (0x52) / GAP 2 -- on a virgin file, \
+                   2*nkeys+1 (3 for 1 key, 5 for 2, 7 for 3); grows with usage",
+        },
+        Field {
+            name: "reserved_54",
+            index: None,
+            at: v6::RESERVED_54,
+            len: 2,
+            cite: "harvest 2 field table (0x54) -- constant 0x0000 on all 226 \
+                   live copies",
+        },
+        Field {
+            name: "stamp_56",
+            index: None,
+            at: v6::STAMP_56,
+            len: v6::STAMP_56_LEN,
+            cite: "harvest 2 field table (0x56) / GAP 3 -- high entropy, 86 \
+                   distinct leading bytes across 226 files; not a DOS packed \
+                   date/time (decodes to implausible years, e.g. 2045); \
+                   probably a creation stamp or per-file unique value, \
+                   unresolved",
+        },
+        Field {
+            name: "reserved_5a",
+            index: None,
+            at: v6::RESERVED_5A,
+            len: v6::RESERVED_5A_LEN,
+            cite: "harvest 2 field table (0x5a) -- constant 0xffffffffffff \
+                   on all 226 live copies",
+        },
+        Field {
+            name: "reserved_60",
+            index: None,
+            at: v6::RESERVED_60,
+            len: v6::RESERVED_60_LEN,
+            cite: "harvest 2 field table (0x60) -- constant \
+                   ff ff 00 ff ff ff 00 00 on all 226 live copies",
+        },
+        Field {
+            name: "write_counter",
+            index: None,
+            at: v6::WRITE_COUNTER,
+            len: 2,
+            cite: "harvest 2 field table (0x68); keys.rs:63-72 doc -- a \
+                   modification/write counter, constant on virgin files, \
+                   grows with real activity (87 distinct values across 226 \
+                   live copies)",
+        },
+        Field {
+            name: "reserved_6a",
+            index: None,
+            at: v6::RESERVED_6A,
+            len: v6::RESERVED_6A_LEN,
+            cite: "harvest 2 field table (0x6a) / GAP 4 -- 0x00 in the \
+                   overwhelming majority; rare nonzero, uncorrelated with \
+                   anything else measured",
+        },
+        Field {
+            name: "reserved_72",
+            index: None,
+            at: v6::RESERVED_72,
+            len: v6::RESERVED_72_LEN,
+            cite: "harvest 2 field table (0x72) / GAP 4 -- mostly zero, small \
+                   nonzero variations uncorrelated with key count, reclen, \
+                   ACS or variable-length",
+        },
+        Field {
+            name: "reserved_7c",
+            index: None,
+            at: v6::RESERVED_7C,
+            len: v6::RESERVED_7C_LEN,
+            cite: "harvest 2 field table (0x7c) -- constant all-zero on all \
+                   226 live copies",
+        },
+        Field {
+            name: "reserved_90",
+            index: None,
+            at: v6::RESERVED_90,
+            len: v6::RESERVED_90_LEN,
+            cite: "harvest 2 field table (0x90) -- constant 00 x8 then \
+                   ffffffff on all 226 live copies",
+        },
+        Field {
+            name: "free_v6",
+            index: None,
+            at: v6::FREE_V6,
+            len: 4,
+            cite: "harvest 2 field table (0x9c); pages.rs::fcr::FREE_V6 -- \
+                   free-list head, a record position (logical page * page \
+                   length + slot offset), not a NOWHERE-style sentinel; 0 on \
+                   a virgin file's single page, real positions on populated \
+                   ones",
+        },
+        Field {
+            name: "variable_head",
+            index: None,
+            at: v6::VARIABLE_HEAD,
+            len: 4,
+            cite: "harvest 2 field table (0xa0); pages.rs::fcr::VARIABLE_HEAD \
+                   -- head of the variable free-space chain; 0xff00ffff \
+                   (NO_VARIABLE_HEAD) when none",
+        },
+        Field {
+            name: "reserved_a4",
+            index: None,
+            at: v6::RESERVED_A4,
+            len: v6::RESERVED_A4_LEN,
+            cite: "harvest 2 field table (0xa4) / GAP 6 -- constant on all \
+                   226 live copies regardless of page size, key count, ACS or \
+                   variable-length: the 12-byte unit \
+                   00 ff ff ff ff ff ff ff ff ff ff ff repeated 4 times; role \
+                   beyond a fixed template unconfirmed",
+        },
+        Field {
+            name: "reserved_d4",
+            index: None,
+            at: v6::RESERVED_D4,
+            len: v6::RESERVED_D4_LEN,
+            cite: "harvest 2 field table (0xd4) / GAP 7 -- constant all-zero \
+                   on 224/226; 2 files (ELWDIPCV.DAT's sibling pair, byte \
+                   0xd8 specifically) read 0x11 instead of 0x00, unexplained",
+        },
+        Field {
+            name: "reserved_100",
+            index: None,
+            at: v6::RESERVED_100,
+            len: v6::RESERVED_100_LEN,
+            cite: "harvest 2 field table (0x100) -- constant all-zero on all \
+                   226 live copies",
+        },
+        Field {
+            name: "reserved_106",
+            index: None,
+            at: v6::RESERVED_106,
+            len: v6::RESERVED_106_LEN,
+            cite: "harvest 2 field table (0x106) / GAP 5 -- 0x00000000 on \
+                   207/226; four other exact values on 19 files, uncorrelated \
+                   with ACS presence, key count or page size",
+        },
+        Field {
+            name: "acs_page",
+            index: None,
+            at: v6::ACS_PAGE,
+            len: 4,
+            cite: "harvest 2 field table (0x10a); acs.rs::PAGE_IN_FCR -- \
+                   logical page of the file's (first) ACS table, \
+                   word-swapped long, 0 when none declared; v6-only \
+                   predicate, unreliable on v5",
+        },
+        Field {
+            name: "reserved_10e",
+            index: None,
+            at: v6::RESERVED_10E,
+            len: v6::RESERVED_10E_LEN,
+            cite: "harvest 2 field table (0x10e) -- constant all-zero on all \
+                   226 live copies",
         },
     ]
 }
@@ -709,47 +1182,44 @@ fn v6_fixed() -> Vec<Field> {
 #[must_use]
 pub fn layout(generation: Generation, page_size: usize, key_descriptors: usize) -> Layout {
     let mut fields = if generation.is_v6() { v6_fixed() } else { v5_fixed() };
-    let described = fields.iter().map(|f| f.at + f.len).max().unwrap_or(0);
 
-    if generation.is_v6() {
-        // v6's trailing placeholder is untouched by this task -- a later
-        // task owns it.
-        if page_size > described {
-            fields.push(Field {
-                name: "page_tail",
-                index: None,
-                at: described,
-                len: page_size - described,
-                cite: "NOT YET HARVESTED -- the remainder of page 0. \
-                       Unexplained content for 493 of 493 large-page v6 \
-                       files; see harvest 0 ruling 6",
-            });
-        }
-    } else {
-        // v5: `described` is now at::FIXED_LEN (0x110) -- the fully
-        // harvested fixed portion. Each of `key_descriptors` definitions
-        // gets its own named, cited fields, `index: Some(n)`.
-        for n in 0..key_descriptors {
-            fields.extend(key_descriptor::fields(n));
-        }
-        let after_definitions = key_descriptor::base(key_descriptors);
-        if page_size > after_definitions {
-            fields.push(Field {
-                name: "page_zero_tail",
-                index: None,
-                at: after_definitions,
-                len: page_size - after_definitions,
-                cite: "harvest 1 tail_check.py (112/112 v5 corpus files: every \
-                       byte from the end of the last actual key/segment \
-                       definition to the end of the page is zero); re-measured \
-                       for Task 13 across all 145 currently-identified v5 \
-                       corpus files (143/145 confirmed; the 2 exceptions -- \
-                       wccitems.nu1 and its sibling -- hold genuine leftover \
-                       record prose here (Task 13), so this region is unused \
-                       space carried verbatim, not an invariant this crate \
-                       enforces -- see model::File::page_zero_tail)",
-            });
-        }
+    // Both families now describe the same shape past their fixed portion
+    // (`at::FIXED_LEN` / `v6::FIXED_LEN`, both `0x110`): one
+    // `key_descriptor::fields(n)` group per on-disk definition -- the same
+    // 30-byte, `ANOSEG`-chained structure for both, per harvest 2's own
+    // field table -- then whatever bytes remain, up to `page_size`, as one
+    // named tail field.
+    for n in 0..key_descriptors {
+        fields.extend(key_descriptor::fields(n));
+    }
+    let after_definitions = key_descriptor::base(key_descriptors);
+    if page_size > after_definitions {
+        fields.push(Field {
+            name: if generation.is_v6() { "page_tail" } else { "page_zero_tail" },
+            index: None,
+            at: after_definitions,
+            len: page_size - after_definitions,
+            cite: if generation.is_v6() {
+                "harvest 2 'Definition-offset trailer, worked' + GAP 9 -- this \
+                 region is a fixed-position array of little-endian u16s, one \
+                 per consumed definition, each holding that definition's own \
+                 absolute byte offset, followed by trailing zero padding; its \
+                 exact capacity (whether it reserves SEGMAX=24 entries always \
+                 or only as many as the file's key count needs) is not \
+                 determined by this harvest (GAP 9) -- decomposing it into \
+                 named fields is the next task's job, not this one's"
+            } else {
+                "harvest 1 tail_check.py (112/112 v5 corpus files: every \
+                 byte from the end of the last actual key/segment \
+                 definition to the end of the page is zero); re-measured \
+                 for Task 13 across all 145 currently-identified v5 \
+                 corpus files (143/145 confirmed; the 2 exceptions -- \
+                 wccitems.nu1 and its sibling -- hold genuine leftover \
+                 record prose here (Task 13), so this region is unused \
+                 space carried verbatim, not an invariant this crate \
+                 enforces -- see model::File::page_zero_tail)"
+            },
+        });
     }
 
     Layout {
@@ -892,8 +1362,75 @@ mod tests {
         }
     }
 
+    /// Task 15: the v6 fixed portion (`0x00..0x110`) must be fully described
+    /// too -- no field in that range may carry a "NOT YET HARVESTED"
+    /// citation. `page_tail` (past `0x110`) is explicitly excepted: the
+    /// definition-offset trailer it covers is the next task's work.
+    #[test]
+    fn the_v6_fixed_portion_has_no_not_yet_harvested_fields() {
+        for generation in [Generation::V600, Generation::V610, Generation::V620] {
+            let l = layout(generation, 512, 0);
+            for field in &l.fields {
+                if field.at < v6::FIXED_LEN {
+                    assert!(
+                        !field.cite.contains("NOT YET HARVESTED"),
+                        "{generation:?} field {} at {:#x} is inside the v6 \
+                         fixed portion and must be harvested: {}",
+                        field.name,
+                        field.at,
+                        field.cite
+                    );
+                }
+            }
+        }
+    }
+
+    /// `v6_fixed` is exactly 43 fields tiling `0x00..0x110` -- harvest 2's
+    /// own field table has 42 offset-addressed rows there, and this crate
+    /// splits its one two-value row (`0x22`, "constant `0xffff` then
+    /// `0x0100`") into `sentinel_22`/`sentinel_24`, two named fields instead
+    /// of one, since a `Field` has no way to say "two values live here." A
+    /// regression here (a merged or split field) would still tile if the
+    /// merge happened to preserve total width, so this pins the row count
+    /// independently of the tiling check. Tested against `v6_fixed` itself,
+    /// not `layout`, so `page_tail` (added only when `page_size` leaves
+    /// room for it) cannot be confused with a 44th fixed-portion field.
+    #[test]
+    fn the_v6_fixed_portion_is_forty_three_fields() {
+        assert_eq!(v6_fixed().len(), 43, "harvest 2's 42-row field table, with 0x22 split in two");
+    }
+
+    /// MULTIACS.DAT's real shape (harvest 2's own worked example): 3 keys,
+    /// realized as 4 key/segment definitions because the second key has two
+    /// segments chained by ANOSEG. The v6 layout with exactly that many
+    /// definitions must still tile -- proof that v6 reuses
+    /// `key_descriptor::fields` rather than needing its own copy.
+    #[test]
+    fn a_v6_layout_shaped_like_multiacs_dat_tiles_completely() {
+        let l = layout(Generation::V610, 4096, 4);
+        assert_eq!(
+            l.tiling_fault(),
+            None,
+            "the v6 fixed portion plus MULTIACS.DAT's four key/segment \
+             definitions plus page_tail must tile a 4096-byte control record \
+             exactly"
+        );
+    }
+
+    /// A v6 layout with several key descriptors must tile for a range of
+    /// counts, not just the one MULTIACS.DAT happens to need.
+    #[test]
+    fn a_v6_layout_with_several_key_descriptors_tiles_completely() {
+        for n in [0, 1, 2, 4] {
+            let l = layout(Generation::V600, 4096, n);
+            assert_eq!(l.tiling_fault(), None, "{n} definitions must tile");
+        }
+    }
+
     /// `records` and `highest` are each one 4-byte high-word-first long, not
     /// two 2-byte halves -- the exact correction harvest 0 ruling 5 made.
+    /// (v5 only -- v6's `highest` is a plain 2-byte field, a real
+    /// difference from v5 this harvest found, not an oversight.)
     #[test]
     fn records_and_highest_are_each_one_long_not_two_halves() {
         let l = layout(Generation::V5R4, 512, 0);

@@ -46,7 +46,7 @@ use crate::format::generation::Generation;
 use crate::format::index;
 use crate::format::page;
 use crate::format::variable;
-use crate::model::{Control, ControlRecord, File, FragmentSlot, RecordSlot};
+use crate::model::{Control, ControlRecord, File, FragmentSlot, RecordSlot, V6ControlRecord};
 
 fn owner(field: &'static str) -> Owner {
     Owner { structure: "fcr", field, index: None }
@@ -507,6 +507,86 @@ fn write_fixed_portion(
     Ok(())
 }
 
+/// Write one v6 control record's fixed portion (`0x00..0x110`) into `canvas`
+/// at `base` -- absolute offset `0` or `page_size`, once per shadow copy.
+/// Task 15's write-side counterpart to `read::v6_control_record`; every
+/// offset here is `fcr::v6::*`, a genuinely different structure from
+/// [`write_fixed_portion`]'s v5 one past `0x20` (see
+/// `model::V6ControlRecord`'s own doc comment), not the same function with
+/// different constants.
+///
+/// `generation` and `page_size` are not read off `control` -- like v5's
+/// `lead`/`version`/`page_size`, they are `Identified`'s job, carried by the
+/// caller rather than duplicated into `V6ControlRecord`.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+pub(crate) fn write_v6_fixed_portion(
+    canvas: &mut Canvas,
+    generation: Generation,
+    page_size: u16,
+    control: &V6ControlRecord,
+    base: usize,
+) -> Result<(), Fault> {
+    let version: [u8; 2] = match generation {
+        Generation::V600 => 0x600u16.to_le_bytes(),
+        Generation::V610 => 0x610u16.to_le_bytes(),
+        Generation::V620 => 0x620u16.to_le_bytes(),
+        Generation::V5R3 | Generation::V5R4 | Generation::V5R5 => unreachable!(
+            "write_v6_fixed_portion is only ever called for a v6 generation"
+        ),
+    };
+    canvas.put(base + fcr::at::LEAD, &[b'F', b'C', 0, 0], owner("lead"))?;
+    canvas.put_u16(base + fcr::v6::GENERATION, control.generation, owner("generation"))?;
+    canvas.put(base + fcr::v6::RESERVED_06, &control.reserved_06, owner("reserved_06"))?;
+    canvas.put_u16(base + fcr::v6::PAGE_SIZE, page_size, owner("page_size"))?;
+    canvas.put(base + fcr::v6::RESERVED_0A, &control.reserved_0a, owner("reserved_0a"))?;
+    canvas.put(base + fcr::v6::RESERVED_0C, &control.reserved_0c.to_le_bytes(), owner("reserved_0c"))?;
+    canvas.put_long(base + fcr::v6::FREE, control.free, owner("free"))?;
+    canvas.put_u16(base + fcr::v6::KEYS, control.keys, owner("keys"))?;
+    canvas.put_u16(base + fcr::v6::RECLEN, control.reclen, owner("reclen"))?;
+    canvas.put_u16(base + fcr::v6::PHYSICAL, control.physical, owner("physical"))?;
+    canvas.put_long(base + fcr::v6::RECORDS, control.records, owner("records"))?;
+    canvas.put_u16(base + fcr::v6::HIGHEST, control.highest, owner("highest"))?;
+    canvas.put_u16(base + fcr::v6::RESERVED_20, control.reserved_20, owner("reserved_20"))?;
+    canvas.put_u16(base + fcr::v6::SENTINEL_22, control.sentinel_22, owner("sentinel_22"))?;
+    canvas.put_u16(base + fcr::v6::SENTINEL_24, control.sentinel_24, owner("sentinel_24"))?;
+    canvas.put_long(base + fcr::v6::PAGES, control.pages, owner("pages"))?;
+    canvas.put_u16(base + fcr::v6::RESERVED_2A, control.reserved_2a, owner("reserved_2a"))?;
+    canvas.put(base + fcr::v6::RESERVED_2C, &control.reserved_2c, owner("reserved_2c"))?;
+    canvas.put(
+        base + fcr::v6::VARIABLE_MARK,
+        &control.variable_mark.to_le_bytes(),
+        owner("variable_mark"),
+    )?;
+    canvas.put(base + fcr::v6::ACS_NAME, &control.acs_name, owner("acs_name"))?;
+    canvas.put(base + fcr::v6::RESERVED_44, &control.reserved_44, owner("reserved_44"))?;
+    canvas.put(base + fcr::v6::VERSION, &version, owner("version"))?;
+    canvas.put_u16(base + fcr::v6::USAGE_4C, control.usage_4c, owner("usage_4c"))?;
+    canvas.put_u16(base + fcr::v6::INDEX_ALLOC_4E, control.index_alloc_4e, owner("index_alloc_4e"))?;
+    canvas.put_u16(base + fcr::v6::MIRROR_50, control.mirror_50, owner("mirror_50"))?;
+    canvas.put_u16(base + fcr::v6::USAGE_52, control.usage_52, owner("usage_52"))?;
+    canvas.put_u16(base + fcr::v6::RESERVED_54, control.reserved_54, owner("reserved_54"))?;
+    canvas.put(base + fcr::v6::STAMP_56, &control.stamp_56, owner("stamp_56"))?;
+    canvas.put(base + fcr::v6::RESERVED_5A, &control.reserved_5a, owner("reserved_5a"))?;
+    canvas.put(base + fcr::v6::RESERVED_60, &control.reserved_60, owner("reserved_60"))?;
+    canvas.put_u16(base + fcr::v6::WRITE_COUNTER, control.write_counter, owner("write_counter"))?;
+    canvas.put(base + fcr::v6::RESERVED_6A, &control.reserved_6a, owner("reserved_6a"))?;
+    canvas.put(base + fcr::v6::RESERVED_72, &control.reserved_72, owner("reserved_72"))?;
+    canvas.put(base + fcr::v6::RESERVED_7C, &control.reserved_7c, owner("reserved_7c"))?;
+    canvas.put(base + fcr::v6::RESERVED_90, &control.reserved_90, owner("reserved_90"))?;
+    canvas.put_long(base + fcr::v6::FREE_V6, control.free_v6, owner("free_v6"))?;
+    canvas.put_long(base + fcr::v6::VARIABLE_HEAD, control.variable_head, owner("variable_head"))?;
+    canvas.put(base + fcr::v6::RESERVED_A4, &control.reserved_a4, owner("reserved_a4"))?;
+    canvas.put(base + fcr::v6::RESERVED_D4, &control.reserved_d4, owner("reserved_d4"))?;
+    canvas.put(base + fcr::v6::RESERVED_100, &control.reserved_100, owner("reserved_100"))?;
+    canvas.put(base + fcr::v6::RESERVED_106, &control.reserved_106, owner("reserved_106"))?;
+    canvas.put_long(base + fcr::v6::ACS_PAGE, control.acs_page, owner("acs_page"))?;
+    canvas.put(base + fcr::v6::RESERVED_10E, &control.reserved_10e, owner("reserved_10e"))?;
+    Ok(())
+}
+
 /// Produce the bytes of the file this model describes.
 ///
 /// # Errors
@@ -548,8 +628,20 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
         };
         let page_size = model.id.page_size as usize;
         let stale_is_page = 1 - live_is_page;
-        write_fixed_portion(&mut canvas, model, live, live_is_page * page_size)?;
-        write_fixed_portion(&mut canvas, model, stale, stale_is_page * page_size)?;
+        write_v6_fixed_portion(
+            &mut canvas,
+            model.id.generation,
+            model.id.page_size,
+            live,
+            live_is_page * page_size,
+        )?;
+        write_v6_fixed_portion(
+            &mut canvas,
+            model.id.generation,
+            model.id.page_size,
+            stale,
+            stale_is_page * page_size,
+        )?;
         return canvas.finish();
     };
 
@@ -572,6 +664,56 @@ mod tests {
         usracc_first_page, usracc_fixed_portion, variable_length_file_with_a_real_fragment_page,
     };
     use crate::read;
+
+    /// A hand-built `V6ControlRecord`, real enough to round-trip through a
+    /// canvas but not claiming to be any particular corpus file -- only
+    /// `generation` and `records` vary between calls, which is all
+    /// `a_v6_shadow_pair_writes_both_copies_not_the_live_one_twice` needs to
+    /// tell the two shadow copies apart.
+    fn sample_v6_control(generation: u16, records: u32) -> V6ControlRecord {
+        V6ControlRecord {
+            generation,
+            reserved_06: [0, 0],
+            reserved_0a: [0, 0],
+            reserved_0c: 0xffff_ffff,
+            free: 0xffff_ffff,
+            keys: 1,
+            reclen: 128,
+            physical: 128,
+            records,
+            highest: 0,
+            reserved_20: 0,
+            sentinel_22: 0xffff,
+            sentinel_24: 1,
+            pages: 3,
+            reserved_2a: 0,
+            reserved_2c: [0; 12],
+            variable_mark: 0,
+            acs_name: [0; 8],
+            reserved_44: [0; 6],
+            usage_4c: 1,
+            index_alloc_4e: 16,
+            mirror_50: 1,
+            usage_52: 3,
+            reserved_54: 0,
+            stamp_56: [0; 4],
+            reserved_5a: [0xff; 6],
+            reserved_60: [0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00],
+            write_counter: 0,
+            reserved_6a: [0; 8],
+            reserved_72: [0; 10],
+            reserved_7c: [0; 20],
+            reserved_90: [0; 12],
+            free_v6: 0,
+            variable_head: 0xff00_ffff,
+            reserved_a4: [0; 48],
+            reserved_d4: [0; 44],
+            reserved_100: [0; 6],
+            reserved_106: [0; 4],
+            acs_page: 0,
+            reserved_10e: [0; 2],
+        }
+    }
 
     /// The fixed portion round-trips byte for byte: read it, emit it back
     /// into a canvas sized to exactly `0x110`, and compare against the
@@ -608,18 +750,11 @@ mod tests {
     fn a_v6_shadow_pair_writes_both_copies_not_the_live_one_twice() {
         use crate::format::generation::Identified;
 
-        let mut stale_bytes = usracc_fixed_portion();
-        stale_bytes[0x04..0x06].copy_from_slice(&1u16.to_le_bytes()); // generation 1: stale
-        stale_bytes[0x1a..0x1e].copy_from_slice(&[0, 0, 0, 0]); // records = 0
-
-        let mut live_bytes = usracc_fixed_portion();
-        live_bytes[0x04..0x06].copy_from_slice(&2u16.to_le_bytes()); // generation 2: live
-
-        let stale = read::file(&stale_bytes).expect("a valid record").live_control().clone();
-        let live = read::file(&live_bytes).expect("a valid record").live_control().clone();
+        let stale = sample_v6_control(1, 0); // generation 1, records 0: stale
+        let live = sample_v6_control(2, 26_720); // generation 2, records 26720: live
         assert_ne!(live, stale, "the two copies must actually differ, or this test proves nothing");
 
-        let page_size = fcr::at::FIXED_LEN;
+        let page_size = fcr::v6::FIXED_LEN;
         let model = File {
             id: Identified { generation: Generation::V600, page_size: page_size as u16 },
             control: Control::Shadowed { live: live.clone(), stale: stale.clone(), live_is_page: 1 },
@@ -633,7 +768,8 @@ mod tests {
         let bytes = emitted.bytes();
 
         let mut want_page0 = Canvas::new(page_size);
-        write_fixed_portion(&mut want_page0, &model, &stale, 0).expect("stale, alone");
+        write_v6_fixed_portion(&mut want_page0, Generation::V600, page_size as u16, &stale, 0)
+            .expect("stale, alone");
         let want_page0 = want_page0.finish().expect("fully described");
         assert_eq!(
             &bytes[0..page_size],
@@ -642,7 +778,8 @@ mod tests {
         );
 
         let mut want_page1 = Canvas::new(page_size);
-        write_fixed_portion(&mut want_page1, &model, &live, 0).expect("live, alone");
+        write_v6_fixed_portion(&mut want_page1, Generation::V600, page_size as u16, &live, 0)
+            .expect("live, alone");
         let want_page1 = want_page1.finish().expect("fully described");
         assert_eq!(
             &bytes[page_size..2 * page_size],
