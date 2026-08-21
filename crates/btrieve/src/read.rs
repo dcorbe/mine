@@ -168,39 +168,63 @@ fn describe_claim(kind: PageKind) -> String {
         PageKind::Index => "an index root".to_string(),
         PageKind::Acs => "the ACS block".to_string(),
         PageKind::Free => "on the free chain".to_string(),
+        PageKind::IndexChild => "an index page (not a root)".to_string(),
         PageKind::Data => "a data page".to_string(),
     }
 }
 
 /// Resolve the v5 page graph: what every physical page from 1 to
-/// `total_pages - 1` *is*, derived from the control record's own pointers --
-/// there is no page-type tag in this family (harvest 3 SS2), so a page's kind
-/// cannot be read off the page itself.
+/// `total_pages - 1` *is*, derived from **two** independent sources -- the
+/// control record's own pointers, and each page's own header bit -- neither
+/// trusted alone.
 ///
-/// A page named by a key descriptor's `root_page` is an index page. A page
-/// is the ACS block when some key descriptor sets `ALT_COLLATING`: harvest 4
-/// SS6a measured this as always physical page 1 on every v5 corpus file that
-/// declares a sequence, with no exceptions, so that is the rule this
-/// function trusts. FCR `0x10a` is read only as corroboration -- harvest 4
-/// SS6a's own caution is that it is unreliable on v5 (`CLASSADS.DAT` and
-/// `EMAIL.DAT` both read zero there while genuinely holding a block on page
-/// 1), so a zero `0x10a` alongside a declared sequence is accepted rather
-/// than refused, while a **nonzero** `0x10a` that disagrees with what the
-/// key descriptors say is a genuine contradiction and is refused, naming
-/// both. A page reachable by walking the record-slot free chain from FCR
-/// `0x10` (a byte position, not a page number -- harvest 3 SS4) is free;
-/// v5 has no page-level free list, so this only records "at least one freed
+/// v5 has no page-*kind* tag (no byte anywhere says "this is an index page"
+/// versus "this is the ACS block" versus "this is free"), but it is not
+/// true that a page's own header carries no signal at all: bit 15 of the
+/// counter word is set iff the page holds records rather than a B-tree node
+/// (harvest 3 SS2). An earlier version of this function treated the
+/// pointers as the *only* signal and let a page with no pointer claim it
+/// default to `Data` -- a controller-run measurement caught this: across
+/// the 145 v5 corpus files, 9,058 pages in 39 files hold a B-tree node no
+/// key root names, and their own `data_bit` said so the whole time. This
+/// function now classifies from both sources and requires them to agree
+/// wherever a pointer speaks.
+///
+/// A page named by a key descriptor's `root_page` is an index root -- and
+/// its `data_bit` must be clear (a B-tree node, not records), or the file is
+/// refused. A page is the ACS block when some key descriptor sets
+/// `ALT_COLLATING`: harvest 4 SS6a measured this as always physical page 1
+/// on every v5 corpus file that declares a sequence, with no exceptions, so
+/// that is the rule this function trusts; its `data_bit` must also be clear.
+/// FCR `0x10a` is read only as corroboration -- harvest 4 SS6a's own caution
+/// is that it is unreliable on v5 (`CLASSADS.DAT` and `EMAIL.DAT` both read
+/// zero there while genuinely holding a block on page 1), so a zero `0x10a`
+/// alongside a declared sequence is accepted rather than refused, while a
+/// **nonzero** `0x10a` that disagrees with what the key descriptors say is a
+/// genuine contradiction and is refused, naming both. A page reachable by
+/// walking the record-slot free chain from FCR `0x10` (a byte position, not
+/// a page number -- harvest 3 SS4) is free, and its `data_bit` must be set
+/// (a freed record slot lives on a page that otherwise holds records); v5
+/// has no page-level free list, so this only records "at least one freed
 /// record slot lives here," never displacing an Index or Acs claim.
-/// Whatever remains is data.
+///
+/// A page no pointer claims is decided by `data_bit` alone: set means
+/// `Data`, clear means [`PageKind::IndexChild`] -- a B-tree node no key's
+/// root names. Measured 281/281 index roots, 15/15 ACS pages, and 22/22
+/// free pages agree with their own `data_bit` across the whole v5 corpus,
+/// so the checks below have never yet fired on real data -- but they are
+/// real checks, not formalities, and a corpus file that ever disagrees is
+/// refused rather than silently reclassified.
 ///
 /// # Errors
 ///
 /// If two keys claim the same root page, an index root and the ACS page
 /// coincide, FCR `0x10a` names an ACS page that contradicts what the key
-/// descriptors themselves declare (in either direction), or the free chain
+/// descriptors themselves declare (in either direction), the free chain
 /// does not terminate cleanly -- a position repeats, a link runs past the
 /// end of the file, or a link names a position inside the control record
-/// itself, or reaches a page an index root or the ACS block already claims.
+/// itself, or reaches a page an index root or the ACS block already claims
+/// -- or a page's own `data_bit` disagrees with what a pointer claims it is.
 fn resolve_pages(
     bytes: &[u8],
     page_size: usize,
@@ -318,21 +342,80 @@ fn resolve_pages(
         cur = get_long(bytes, at);
     }
 
-    // Whatever remains, 1..total_pages, is data -- not a default guess, but
-    // the necessarily-true residual once every other claim above has been
-    // checked for a contradiction.
+    // Every page's own header carries a second signal past the pointers
+    // above: bit 15 of the counter word, set iff the page holds records
+    // rather than a B-tree node (harvest 3 SS2). This crate's brief once
+    // said v5 has no page-type tag at all -- wrong, and a controller-run
+    // corpus measurement caught it: 9,058 pages across 39 v5 files hold a
+    // B-tree node no key root names, and their own `data_bit` says so. A
+    // page's kind is therefore never a residual "whatever the pointers
+    // didn't claim" -- every page is classified from *both* sources, and
+    // where a pointer claims a role, the bit must agree or the file is
+    // refused, naming the page, what the pointer claimed, and what the bit
+    // said. Measured across all 145 v5 corpus files: 281/281 index roots
+    // agree (`data_bit` clear), 15/15 ACS pages agree (`data_bit` clear),
+    // 22/22 free-chain pages agree (`data_bit` set) -- zero contradictions,
+    // so this check has never yet fired on real data, but it is a real
+    // check, not a formality.
     let mut pages = Vec::with_capacity(total_pages.saturating_sub(1));
     for page_number in 1..total_pages {
         let at = page_number * page_size;
         let number = get_long(bytes, at + page::at::NUMBER);
         let counter = get_u16(bytes, at + page::at::COUNTER);
-        let kind = claim.get(&(page_number as u32)).copied().unwrap_or(PageKind::Data);
-        pages.push(Page {
-            number,
-            data_bit: counter & page::DATA_BIT != 0,
-            stamp: counter & !page::DATA_BIT,
-            kind,
-        });
+        let data_bit = counter & page::DATA_BIT != 0;
+        let stamp = counter & !page::DATA_BIT;
+
+        let kind = match claim.get(&(page_number as u32)).copied() {
+            Some(PageKind::Index) if data_bit => {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "page {page_number} is an index root, but its own \
+                         header's data_bit is set -- a key's root claims it \
+                         as a B-tree node, but the page itself says it \
+                         holds records"
+                    ),
+                });
+            }
+            Some(existing @ PageKind::Acs) if data_bit => {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "page {page_number} is {}, but its own header's \
+                         data_bit is set -- FCR/key evidence claims a \
+                         B-tree-shaped page, but the page itself says it \
+                         holds records",
+                        describe_claim(existing)
+                    ),
+                });
+            }
+            Some(existing @ PageKind::Free) if !data_bit => {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "page {page_number} is {}, but its own header's \
+                         data_bit is clear -- the free chain claims a \
+                         record slot lives here, but the page itself says \
+                         it holds a B-tree node, not records",
+                        describe_claim(existing)
+                    ),
+                });
+            }
+            Some(kind @ (PageKind::Index | PageKind::Acs | PageKind::Free)) => kind,
+            Some(other) => {
+                unreachable!("claim only ever stores Index, Acs, or Free -- got {other:?}")
+            }
+            None if data_bit => PageKind::Data,
+            None => {
+                // Not named by any root, not the ACS block, not on the free
+                // chain, and its own header says "not records" -- a B-tree
+                // node no key's root claims, i.e. a child of some tree.
+                // Which tree is Task 9's business, once index entries are
+                // parsed and child pointers can actually be walked; this
+                // task only has to say honestly that the page is an index
+                // page, not that it knows whose.
+                PageKind::IndexChild
+            }
+        };
+
+        pages.push(Page { number, data_bit, stamp, kind });
     }
     Ok(pages)
 }
@@ -630,6 +713,46 @@ mod tests {
                 PageKind::Free,
                 "page {} should be free -- every record has been deleted",
                 i + 1
+            );
+        }
+    }
+
+    /// A real corpus file with B-tree nodes no key root names: `FW_QSQDB.DA_`
+    /// (13 1024-byte pages, three keys rooted at pages 1, 2, 8). Measured
+    /// directly off the file when this task's review was addressed: pages
+    /// 4, 6, and 10 hold records (`data_bit` set) and are `Data`; pages 3,
+    /// 5, 7, 9, 11, and 12 are B-tree nodes no root names (`data_bit`
+    /// clear) and are `IndexChild`. This is the exact case the review's
+    /// Critical finding caught -- the earlier `unwrap_or(PageKind::Data)`
+    /// residual mislabelled all six of the latter as `Data`.
+    #[test]
+    fn a_real_files_unrooted_btree_nodes_classify_as_index_children() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join(
+            "modules/butt-care/DOS Software/BBS/MajorBBS/4EVER/Addons/Farwest Trivia v3.23a/COPY/FW_QSQDB.DA_",
+        );
+        let Ok(buf) = std::fs::read(&path) else {
+            eprintln!("read: FW_QSQDB.DA_ not present, nothing verified");
+            return;
+        };
+        let file = file(&buf).expect("FW_QSQDB.DA_ is a valid v5 file");
+        assert_eq!(file.pages.len(), 12, "13 physical pages, less page 0");
+
+        let kind_of = |page_number: usize| file.pages[page_number - 1].kind;
+        for &root_page in &[1, 2, 8] {
+            assert_eq!(kind_of(root_page), PageKind::Index, "page {root_page} is a key's root");
+        }
+        for &data_page in &[4, 6, 10] {
+            assert_eq!(kind_of(data_page), PageKind::Data, "page {data_page} holds records");
+        }
+        for &child_page in &[3, 5, 7, 9, 11, 12] {
+            assert_eq!(
+                kind_of(child_page),
+                PageKind::IndexChild,
+                "page {child_page} is a B-tree node no root names"
             );
         }
     }

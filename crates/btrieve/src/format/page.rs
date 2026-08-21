@@ -1,17 +1,21 @@
 //! The ordinary v5 page header: six bytes, on every page of the file except
 //! page 0 (the control record, described by [`super::fcr`] instead).
 //!
-//! # There is no page-type tag
+//! # There is no page-*kind* tag, but there is one bit of real signal
 //!
-//! Both format families carry a tag-free header at this offset in one sense
-//! or another, but v6 at least stamps a 2-byte type (`0x4400` data/index,
-//! `0x5600` variable, `0x8000` template) at offset 0 (harvest 3 SS2). v5 has
-//! **nothing** -- the six bytes are a page number and a counter, full stop.
-//! A page's kind is therefore never read off the page itself; it is *derived*
-//! from the control record's own pointers (which key's `ROOT` names it, the
-//! ACS pointer, the free chain) -- `read::resolve_pages` does that
-//! resolution, and this module only describes the six bytes every page
-//! actually carries.
+//! v6 stamps a 2-byte type (`0x4400` data/index, `0x5600` variable, `0x8000`
+//! template) at offset 0 (harvest 3 SS2). v5 has no such tag -- no byte here
+//! says "this is an index page" versus "the ACS block" versus "free." An
+//! earlier version of this crate's brief over-read that as "the header
+//! carries no signal at all" and built `read::resolve_pages` to trust only
+//! the control record's own pointers (which key's `ROOT` names a page, the
+//! ACS pointer, the free chain), defaulting anything unclaimed to `Data`.
+//! That was wrong: bit 15 of the counter word (`DATA_BIT`, below) *is* a
+//! real signal -- records versus B-tree node -- and a controller-run
+//! measurement found 9,058 v5 pages across 39 corpus files where it is the
+//! only thing that says a page is a B-tree node no key root names.
+//! `read::resolve_pages` now classifies every page from both the pointers
+//! and this bit, and requires them to agree wherever a pointer speaks.
 //!
 //! # The counter word is one field, not two
 //!
@@ -40,11 +44,18 @@ pub mod at {
 pub const LEN: usize = 6;
 
 /// Bit 15 of the counter word: set iff the page holds records rather than a
-/// B-tree node (harvest 3 SS2). `crate::model::Page::kind` is what this
-/// crate actually trusts to describe a page's role -- see that type's own
-/// documentation for why a page can, in principle, disagree with its own
-/// `data_bit` without either being wrong (nothing in the corpus is known to
-/// do so; this task did not find or need such a file).
+/// B-tree node (harvest 3 SS2). This is a real, load-bearing signal, not a
+/// decoration -- an earlier version of this crate's brief claimed v5 had no
+/// page-type signal at all and treated this bit as something `read` could
+/// ignore in favour of the control record's pointers; a controller-run
+/// measurement against all 145 v5 corpus files disproved that directly:
+/// 9,058 pages across 39 files hold a B-tree node no key root names, and
+/// only this bit says so. `crate::model::Page::kind` (`read::resolve_pages`)
+/// now classifies every page from *both* this bit and the pointers, and
+/// requires them to agree wherever a pointer speaks -- measured 281/281
+/// index roots, 15/15 ACS pages, and 22/22 free-chain pages agree with their
+/// own `data_bit`, so the agreement check has never yet fired a refusal on
+/// real data, but it is enforced, not assumed.
 pub const DATA_BIT: u16 = 0x8000;
 
 /// Every named field of the six-byte header, cited.
