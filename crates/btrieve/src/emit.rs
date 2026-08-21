@@ -46,7 +46,7 @@ use crate::format::generation::Generation;
 use crate::format::index;
 use crate::format::page;
 use crate::format::variable;
-use crate::model::{File, FragmentSlot, RecordSlot};
+use crate::model::{Control, ControlRecord, File, FragmentSlot, RecordSlot};
 
 fn owner(field: &'static str) -> Owner {
     Owner { structure: "fcr", field, index: None }
@@ -387,91 +387,123 @@ fn write_key_descriptors(canvas: &mut Canvas, model: &File) -> Result<(), Fault>
     Ok(())
 }
 
-/// Write the v5 control record's fixed portion (`0x00..0x110`) into `canvas`.
-/// Shared by [`file`] and this module's own tests, which check the fixed
-/// portion in isolation from the pages this crate does not yet describe.
+/// Write one control record's fixed portion (`0x00..0x110`) into `canvas` at
+/// `base` -- absolute offset `0` for a v5 file (there is only one copy), or
+/// `0` / `page_size` for a v6 file's shadow pair, once per copy. Shared by
+/// [`file`] and this module's own tests, which check the fixed portion in
+/// isolation from the pages this crate does not yet describe.
+///
+/// `control` is the specific copy being written -- `model.control`'s single
+/// record for v5, or whichever of `live`/`stale` this call is writing for
+/// v6 -- never `model.live_control()`, which would write the live copy
+/// twice and lose the stale one (harvest 0 ruling 7, part 2: the model
+/// holds both copies in full, and emit must reproduce both, not the live
+/// copy plus a flag).
 ///
 /// # Errors
 ///
 /// See [`Canvas::put`].
-fn write_fixed_portion(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
-    let control = &model.control;
-
-    // lead: 4 zero bytes -- what identifies the pre-v6 family.
-    canvas.put(fcr::at::LEAD, &[0, 0, 0, 0], owner("lead"))?;
-    canvas.put_u16(fcr::at::PAGE_GEN, control.page_gen, owner("page_gen"))?;
-
-    // version: byte 6 is always zero in this corpus, byte 7 selects the
-    // generation -- the exact inverse of format::generation::identify.
-    let byte7 = match model.id.generation {
-        Generation::V5R3 => 3u8,
-        Generation::V5R4 => 4,
-        Generation::V5R5 => 5,
+fn write_fixed_portion(
+    canvas: &mut Canvas,
+    model: &File,
+    control: &ControlRecord,
+    base: usize,
+) -> Result<(), Fault> {
+    // lead + version: what `format::generation::identify` reads to decide
+    // family and generation -- this is its exact inverse. Byte `0x06` is
+    // always zero in this corpus for both families; v5 encodes the
+    // generation as `byte7` there, while v6's own version word lives at
+    // `0x4a` instead, inside `reserved_44` below, and is carried verbatim
+    // by that field rather than recomputed here.
+    let (lead, version): ([u8; 4], [u8; 2]) = match model.id.generation {
+        Generation::V5R3 => ([0, 0, 0, 0], [0, 3]),
+        Generation::V5R4 => ([0, 0, 0, 0], [0, 4]),
+        Generation::V5R5 => ([0, 0, 0, 0], [0, 5]),
         Generation::V600 | Generation::V610 | Generation::V620 => {
-            unreachable!(
-                "file() filters out v6 before calling write_fixed_portion"
-            );
+            ([b'F', b'C', 0, 0], [0, 0])
         }
     };
-    canvas.put(fcr::at::VERSION, &[0, byte7], owner("version"))?;
-    canvas.put_u16(fcr::at::PAGE_SIZE, model.id.page_size, owner("page_size"))?;
+    canvas.put(base + fcr::at::LEAD, &lead, owner("lead"))?;
+    canvas.put_u16(base + fcr::at::PAGE_GEN, control.page_gen, owner("page_gen"))?;
+    canvas.put(base + fcr::at::VERSION, &version, owner("version"))?;
+    canvas.put_u16(base + fcr::at::PAGE_SIZE, model.id.page_size, owner("page_size"))?;
     canvas.put(
-        fcr::at::COMPANION_SELECTOR,
+        base + fcr::at::COMPANION_SELECTOR,
         &[control.companion_selector],
         owner("companion_selector"),
     )?;
-    canvas.put(fcr::at::LOCK_FLAG, &[control.lock_flag], owner("lock_flag"))?;
-    canvas.put_long(fcr::at::UNKNOWN_0C, control.unknown_0c, owner("unknown_0c"))?;
-    canvas.put_long(fcr::at::FREE, control.free, owner("free"))?;
-    canvas.put_u16(fcr::at::KEYS, control.keys, owner("keys"))?;
-    canvas.put_u16(fcr::at::RECLEN, control.reclen, owner("reclen"))?;
-    canvas.put_u16(fcr::at::PHYSICAL, control.physical, owner("physical"))?;
-    canvas.put_long(fcr::at::RECORDS, control.records, owner("records"))?;
-    canvas.put_long(fcr::at::HIGHEST, control.highest, owner("highest"))?;
-    canvas.put_long(fcr::at::DATA_PAGE_COUNT, control.data_page_count, owner("data_page_count"))?;
-    canvas.put_long(fcr::at::PAGES, control.pages, owner("pages"))?;
-    canvas.put_u16(fcr::at::PAGE_USABLE, control.page_usable, owner("page_usable"))?;
+    canvas.put(base + fcr::at::LOCK_FLAG, &[control.lock_flag], owner("lock_flag"))?;
+    canvas.put_long(base + fcr::at::UNKNOWN_0C, control.unknown_0c, owner("unknown_0c"))?;
+    canvas.put_long(base + fcr::at::FREE, control.free, owner("free"))?;
+    canvas.put_u16(base + fcr::at::KEYS, control.keys, owner("keys"))?;
+    canvas.put_u16(base + fcr::at::RECLEN, control.reclen, owner("reclen"))?;
+    canvas.put_u16(base + fcr::at::PHYSICAL, control.physical, owner("physical"))?;
+    canvas.put_long(base + fcr::at::RECORDS, control.records, owner("records"))?;
+    canvas.put_long(base + fcr::at::HIGHEST, control.highest, owner("highest"))?;
+    canvas.put_long(
+        base + fcr::at::DATA_PAGE_COUNT,
+        control.data_page_count,
+        owner("data_page_count"),
+    )?;
+    canvas.put_long(base + fcr::at::PAGES, control.pages, owner("pages"))?;
+    canvas.put_u16(base + fcr::at::PAGE_USABLE, control.page_usable, owner("page_usable"))?;
     canvas.put_u16(
-        fcr::at::LOCK_TRANSACTION,
+        base + fcr::at::LOCK_TRANSACTION,
         control.lock_transaction,
         owner("lock_transaction"),
     )?;
     canvas.put_long(
-        fcr::at::NEGATIVE_VERSION_A,
+        base + fcr::at::NEGATIVE_VERSION_A,
         control.negative_version_a,
         owner("negative_version_a"),
     )?;
     canvas.put_long(
-        fcr::at::NEGATIVE_VERSION_B,
+        base + fcr::at::NEGATIVE_VERSION_B,
         control.negative_version_b,
         owner("negative_version_b"),
     )?;
     canvas.put(
-        fcr::at::NEGATIVE_VERSION_C,
+        base + fcr::at::NEGATIVE_VERSION_C,
         &[control.negative_version_c],
         owner("negative_version_c"),
     )?;
     canvas.put(
-        fcr::at::NEGATIVE_VERSION_D,
+        base + fcr::at::NEGATIVE_VERSION_D,
         &[control.negative_version_d],
         owner("negative_version_d"),
     )?;
-    canvas.put(fcr::at::VARIABLE_TAG, &[control.variable_tag], owner("variable_tag"))?;
-    canvas.put(fcr::at::VARIABLE_SUBFLAG, &[control.variable_subflag], owner("variable_subflag"))?;
-    canvas.put_u16(fcr::at::VARIABLE_HIGHEST, control.variable_highest, owner("variable_highest"))?;
-    canvas.put(fcr::at::ACS_NAME, &control.acs_name, owner("acs_name"))?;
-    canvas.put(fcr::at::RESERVED_44, &control.reserved_44, owner("reserved_44"))?;
-    canvas.put_u16(fcr::at::WRITE_COUNTER_68, control.write_counter_68, owner("write_counter_68"))?;
-    canvas.put(fcr::at::RESERVED_6A, &control.reserved_6a, owner("reserved_6a"))?;
-    canvas.put_u16(fcr::at::USRFLGS, control.usrflgs, owner("usrflgs"))?;
+    canvas.put(base + fcr::at::VARIABLE_TAG, &[control.variable_tag], owner("variable_tag"))?;
     canvas.put(
-        fcr::at::VARIABLE_PAGE_CAPACITY,
+        base + fcr::at::VARIABLE_SUBFLAG,
+        &[control.variable_subflag],
+        owner("variable_subflag"),
+    )?;
+    canvas.put_u16(
+        base + fcr::at::VARIABLE_HIGHEST,
+        control.variable_highest,
+        owner("variable_highest"),
+    )?;
+    canvas.put(base + fcr::at::ACS_NAME, &control.acs_name, owner("acs_name"))?;
+    canvas.put(base + fcr::at::RESERVED_44, &control.reserved_44, owner("reserved_44"))?;
+    canvas.put_u16(
+        base + fcr::at::WRITE_COUNTER_68,
+        control.write_counter_68,
+        owner("write_counter_68"),
+    )?;
+    canvas.put(base + fcr::at::RESERVED_6A, &control.reserved_6a, owner("reserved_6a"))?;
+    canvas.put_u16(base + fcr::at::USRFLGS, control.usrflgs, owner("usrflgs"))?;
+    canvas.put(
+        base + fcr::at::VARIABLE_PAGE_CAPACITY,
         &[control.variable_page_capacity],
         owner("variable_page_capacity"),
     )?;
-    canvas.put(fcr::at::RESERVED_109, &[control.reserved_109], owner("reserved_109"))?;
-    canvas.put_long(fcr::at::ACS_PAGE_POINTER, control.acs_page_pointer, owner("acs_page_pointer"))?;
-    canvas.put(fcr::at::RESERVED_10E, &control.reserved_10e, owner("reserved_10e"))?;
+    canvas.put(base + fcr::at::RESERVED_109, &[control.reserved_109], owner("reserved_109"))?;
+    canvas.put_long(
+        base + fcr::at::ACS_PAGE_POINTER,
+        control.acs_page_pointer,
+        owner("acs_page_pointer"),
+    )?;
+    canvas.put(base + fcr::at::RESERVED_10E, &control.reserved_10e, owner("reserved_10e"))?;
     Ok(())
 }
 
@@ -479,28 +511,49 @@ fn write_fixed_portion(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 ///
 /// # Errors
 ///
-/// If the model does not yet describe every byte of the file. A v6 file's
-/// control record is entirely undescribed. A v5 file's page 0 (the control
-/// record plus its key/segment definitions) is fully described and will
-/// round-trip on its own; every page's six-byte header round-trips too; a
-/// `Data`/`Free` page's slots and slack described (variable-length or not --
-/// harvest 5 SS1.1's slot layout does not change shape); every index page --
-/// a key's own root **and** every genuine descendant that key's own walk
-/// attributed it to (Task 11b) -- has its entry array described; a v5
-/// file's ACS block (`Page::acs`) has its tag, name, table and trailing
-/// padding described; and a variable-length file's fragment/overflow page
-/// (`Page::fragments`, harvest 5 SS3.3) has every fragment, the entry
-/// array's boundary member, and trailing free space described as well. An
-/// orphan page (`Page::orphan`, Task 13 -- a page no root, ACS claim, free
-/// chain, or key's walk reaches) has its whole body written back verbatim,
-/// unparsed. A file this crate could read at all now round-trips
-/// completely, multi-page B-tree and abandoned pages included.
+/// If the model does not yet describe every byte of the file. A v6 file
+/// today only ever reaches this function with `Control::Shadowed` through
+/// this crate's own tests -- `read::file` refuses every real v6 file before
+/// building one, since the allocation table, page addressing, and the rest
+/// of v6's own pages are later work -- but when it is given one, both
+/// control-record shadow copies are written in full, each through the
+/// canvas, at physical pages 0 and 1 (harvest 0 ruling 7, part 2); nothing
+/// past the shadow pair is written for v6 yet. A v5 file's page 0 (the
+/// control record plus its key/segment definitions) is fully described and
+/// will round-trip on its own; every page's six-byte header round-trips
+/// too; a `Data`/`Free` page's slots and slack described (variable-length
+/// or not -- harvest 5 SS1.1's slot layout does not change shape); every
+/// index page -- a key's own root **and** every genuine descendant that
+/// key's own walk attributed it to (Task 11b) -- has its entry array
+/// described; a v5 file's ACS block (`Page::acs`) has its tag, name, table
+/// and trailing padding described; and a variable-length file's
+/// fragment/overflow page (`Page::fragments`, harvest 5 SS3.3) has every
+/// fragment, the entry array's boundary member, and trailing free space
+/// described as well. An orphan page (`Page::orphan`, Task 13 -- a page no
+/// root, ACS claim, free chain, or key's walk reaches) has its whole body
+/// written back verbatim, unparsed. A file this crate could read at all now
+/// round-trips completely, multi-page B-tree and abandoned pages included.
 pub fn file(model: &File) -> Result<Emitted, Fault> {
     let mut canvas = Canvas::new(model.len as usize);
-    if model.id.generation.is_v6() {
+
+    let Control::Single(control) = &model.control else {
+        // `Control::Shadowed`: write both copies, in full, each at its own
+        // physical page. Not the live copy plus a flag and not the live
+        // copy written twice -- that would silently lose the stale copy's
+        // exact bytes, exactly the failure mode ruling 7 exists to
+        // forbid. Nothing past the shadow pair is described yet, so this
+        // is everything emit can do for v6 today.
+        let Control::Shadowed { live, stale, live_is_page } = &model.control else {
+            unreachable!("the Single arm above already matched")
+        };
+        let page_size = model.id.page_size as usize;
+        let stale_is_page = 1 - live_is_page;
+        write_fixed_portion(&mut canvas, model, live, live_is_page * page_size)?;
+        write_fixed_portion(&mut canvas, model, stale, stale_is_page * page_size)?;
         return canvas.finish();
-    }
-    write_fixed_portion(&mut canvas, model)?;
+    };
+
+    write_fixed_portion(&mut canvas, model, control, 0)?;
     write_key_descriptors(&mut canvas, model)?;
     write_page_headers(&mut canvas, model)?;
     write_page_content(&mut canvas, model)?;
@@ -529,10 +582,73 @@ mod tests {
         let model = read::file(&original).expect("reads");
 
         let mut canvas = Canvas::new(fcr::at::FIXED_LEN);
-        write_fixed_portion(&mut canvas, &model).expect("every field is in range");
+        write_fixed_portion(&mut canvas, &model, model.live_control(), 0).expect("every field is in range");
         let emitted = canvas.finish().expect("the fixed portion is fully described");
 
         assert_eq!(emitted.bytes(), &original[..fcr::at::FIXED_LEN]);
+    }
+
+    /// Harvest 0 ruling 7, part 2: the model holds both shadow copies in
+    /// full, and `emit` must reproduce both -- not the live copy plus a
+    /// flag, and not the live copy written twice. Two real, independently
+    /// measured control records (both derived from `usracc_fixed_portion`,
+    /// one edited so it is genuinely a different record, not a hand-typed
+    /// stand-in) are wrapped as `Control::Shadowed` with the live copy on
+    /// physical page 1, and `emit::file` must place each copy's own bytes
+    /// on its own physical page.
+    ///
+    /// `page_size` is deliberately `fcr::at::FIXED_LEN` (`0x110`) here, not
+    /// a real v6 page size -- that leaves no trailing tail past the fixed
+    /// portion for either copy to model, since a v6 file's own page trailer
+    /// (harvest 2 "FCR size") is later work this task does not own. Nothing
+    /// about `read::file` produces this shape today (it refuses every v6
+    /// file before building one); this test constructs the model by hand to
+    /// exercise `emit`'s side of ruling 7 in isolation.
+    #[test]
+    fn a_v6_shadow_pair_writes_both_copies_not_the_live_one_twice() {
+        use crate::format::generation::Identified;
+
+        let mut stale_bytes = usracc_fixed_portion();
+        stale_bytes[0x04..0x06].copy_from_slice(&1u16.to_le_bytes()); // generation 1: stale
+        stale_bytes[0x1a..0x1e].copy_from_slice(&[0, 0, 0, 0]); // records = 0
+
+        let mut live_bytes = usracc_fixed_portion();
+        live_bytes[0x04..0x06].copy_from_slice(&2u16.to_le_bytes()); // generation 2: live
+
+        let stale = read::file(&stale_bytes).expect("a valid record").live_control().clone();
+        let live = read::file(&live_bytes).expect("a valid record").live_control().clone();
+        assert_ne!(live, stale, "the two copies must actually differ, or this test proves nothing");
+
+        let page_size = fcr::at::FIXED_LEN;
+        let model = File {
+            id: Identified { generation: Generation::V600, page_size: page_size as u16 },
+            control: Control::Shadowed { live: live.clone(), stale: stale.clone(), live_is_page: 1 },
+            key_descriptors: Vec::new(),
+            page_zero_tail: Vec::new(),
+            pages: Vec::new(),
+            len: (2 * page_size) as u64,
+        };
+
+        let emitted = file(&model).expect("both copies are fully described");
+        let bytes = emitted.bytes();
+
+        let mut want_page0 = Canvas::new(page_size);
+        write_fixed_portion(&mut want_page0, &model, &stale, 0).expect("stale, alone");
+        let want_page0 = want_page0.finish().expect("fully described");
+        assert_eq!(
+            &bytes[0..page_size],
+            want_page0.bytes(),
+            "physical page 0 (stale, live_is_page == 1) must carry the STALE record's own bytes"
+        );
+
+        let mut want_page1 = Canvas::new(page_size);
+        write_fixed_portion(&mut want_page1, &model, &live, 0).expect("live, alone");
+        let want_page1 = want_page1.finish().expect("fully described");
+        assert_eq!(
+            &bytes[page_size..2 * page_size],
+            want_page1.bytes(),
+            "physical page 1 (live) must carry the LIVE record's own bytes"
+        );
     }
 
     /// Page 0 as a whole -- fixed portion, key/segment definition, and zero
@@ -667,7 +783,8 @@ mod tests {
         assert_eq!(model.pages.len(), 1, "page 1 only");
 
         let mut canvas = Canvas::new(512 + page::LEN);
-        write_fixed_portion(&mut canvas, &model).expect("page 0's fixed portion");
+        write_fixed_portion(&mut canvas, &model, model.live_control(), 0)
+            .expect("page 0's fixed portion");
         write_key_descriptors(&mut canvas, &model).expect("page 0's key descriptor and padding");
         write_page_headers(&mut canvas, &model).expect("page 1's header");
         let emitted = canvas.finish().expect("512 + 6 bytes, all written");
@@ -844,7 +961,7 @@ mod tests {
             return;
         };
         let model = read::file(&original).expect("CLASSADS.DAT is a valid v5 file");
-        assert_eq!(model.control.acs_page_pointer, 0, "the lying pointer");
+        assert_eq!(model.live_control().acs_page_pointer, 0, "the lying pointer");
         assert!(
             model.pages.iter().any(|p| p.acs.is_some()),
             "a real block is found by content despite the pointer"

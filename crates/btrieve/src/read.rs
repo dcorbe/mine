@@ -15,8 +15,8 @@ use crate::format::index;
 use crate::format::page;
 use crate::format::variable;
 use crate::model::{
-    AcsBlock, ControlRecord, DataPage, File, FragmentPage, FragmentSlot, IndexEntry, IndexPage,
-    KeyDescriptor, Page, PageKind, RecordSlot,
+    AcsBlock, Control, ControlRecord, DataPage, File, FragmentPage, FragmentSlot, IndexEntry,
+    IndexPage, KeyDescriptor, Page, PageKind, RecordSlot,
 };
 
 /// Read a plain little-endian `u16` at `at`.
@@ -39,8 +39,11 @@ fn get_array<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
     bytes[at..at + N].try_into().expect("slice of the requested width")
 }
 
-/// Read the v5 control record's fixed portion (`0x00..0x110`) out of `bytes`,
-/// which must be at least that long.
+/// Read one control record's fixed portion (`0x00..0x110`) out of `bytes`,
+/// which must be at least that long. `bytes` is expected to start at that
+/// copy's own page: absolute page 0 for a v5 file (there is only one copy),
+/// or the start of whichever physical page (0 or 1) is being read for a v6
+/// file's shadow pair -- see [`resolve_shadow`].
 fn control_record(bytes: &[u8]) -> ControlRecord {
     ControlRecord {
         page_gen: get_u16(bytes, fcr::at::PAGE_GEN),
@@ -73,6 +76,49 @@ fn control_record(bytes: &[u8]) -> ControlRecord {
         reserved_109: bytes[fcr::at::RESERVED_109],
         acs_page_pointer: get_long(bytes, fcr::at::ACS_PAGE_POINTER),
         reserved_10e: get_array(bytes, fcr::at::RESERVED_10E),
+    }
+}
+
+/// Resolve a v6 file's shadowed control record -- Ruling 7 (harvest 0
+/// ruling 7; harvest 2 "FCR shadowing"): physical pages 0 and 1 are each a
+/// complete `page_size`-byte control record, and the `u16` generation
+/// counter at page-relative `0x04` (`ControlRecord::page_gen` in this v6
+/// role) says which one is live -- higher wins. This is the *first* thing
+/// this crate does with a v6 file's bytes, before any other field of either
+/// copy is treated as meaningful: reading physical page 0 unconditionally
+/// (the bug this ruling exists to close) is silently wrong on 157 of 507
+/// corpus files, because it is not corrupt, just stale, and parses
+/// perfectly either way.
+///
+/// `bytes` must already be at least `2 * page_size` long -- the caller
+/// checks this before calling, so the two slices below never panic.
+///
+/// # Errors
+///
+/// If both copies carry the same generation counter. No corpus file has
+/// ever tied (0 of 507), so this rejects a shape never observed rather than
+/// one observed and merely inconvenient.
+fn resolve_shadow(bytes: &[u8], page_size: usize) -> Result<Control, NotBtrieve> {
+    let page0 = control_record(&bytes[0..page_size]);
+    let page1 = control_record(&bytes[page_size..2 * page_size]);
+
+    match page0.page_gen.cmp(&page1.page_gen) {
+        std::cmp::Ordering::Greater => {
+            Ok(Control::Shadowed { live: page0, stale: page1, live_is_page: 0 })
+        }
+        std::cmp::Ordering::Less => {
+            Ok(Control::Shadowed { live: page1, stale: page0, live_is_page: 1 })
+        }
+        std::cmp::Ordering::Equal => Err(NotBtrieve {
+            why: format!(
+                "physical pages 0 and 1 both carry generation {} at \
+                 page-relative 0x04 -- a tie between the two control-record \
+                 shadow copies has no answer, and no corpus file has ever \
+                 produced one, so this is refused rather than resolved \
+                 (harvest 0 ruling 7)",
+                page0.page_gen
+            ),
+        }),
     }
 }
 
@@ -1364,27 +1410,66 @@ fn resolve_pages(
 /// # Errors
 ///
 /// If [`identify`] refuses the control record, the file is shorter than its
-/// own declared page size, the file is a v6 file (not yet described by this
-/// crate), the key/segment definition array is malformed (runs past the
-/// page, or an `ANOSEG` chain never terminates), the file is not a whole
-/// number of pages, or [`resolve_pages`] cannot classify every page -- see
-/// that function's own documentation for the specific contradictions it
-/// checks for. Page 0's tail past the last key/segment definition is never a
-/// refusal reason -- see `model::File::page_zero_tail`.
+/// own declared page size, the file is not a whole number of pages, the
+/// key/segment definition array is malformed (runs past the page, or an
+/// `ANOSEG` chain never terminates), or [`resolve_pages`] cannot classify
+/// every page -- see that function's own documentation for the specific
+/// contradictions it checks for. Page 0's tail past the last key/segment
+/// definition is never a refusal reason -- see `model::File::page_zero_tail`.
+///
+/// A v6 file is always refused today, but not until after Ruling 7's shadow
+/// resolution runs: the live control-record copy (harvest 0 ruling 7,
+/// harvest 2 "FCR shadowing") is resolved first, and the refusal names which
+/// physical page turned out to be live and at what generation, because the
+/// allocation table, page addressing, and everything else v6 geometry needs
+/// past the control record are later work -- see [`resolve_shadow`].
 pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
     let id = identify(bytes)?;
+    let page_size = id.page_size as usize;
 
     if id.generation.is_v6() {
+        // Ruling 7, part 1: resolve the live copy before interpreting any
+        // other field. The control record is shadowed across physical pages
+        // 0 and 1, each `page_size` bytes, so both must actually be present
+        // before anything past `identify`'s own page-0-only check can be
+        // asked at all.
+        if bytes.len() < 2 * page_size {
+            return Err(NotBtrieve {
+                why: format!(
+                    "identified as {:?} with {page_size}-byte pages, but \
+                     this v6 file is only {} bytes -- shorter than the two \
+                     full pages its own shadowed control record requires",
+                    id.generation,
+                    bytes.len()
+                ),
+            });
+        }
+
+        let control = resolve_shadow(bytes, page_size)?;
+        let Control::Shadowed { live, live_is_page, .. } = &control else {
+            unreachable!("resolve_shadow only ever returns Control::Shadowed")
+        };
+
+        // Ruling 7, part 3: identification stays on page 0 -- already true,
+        // `identify` never moves. What must not come from page 0 is
+        // geometry, and that is everything past the shadow pair itself:
+        // the allocation table, page addressing, and the rest of a v6
+        // file's own pages are not yet described by this crate, so the
+        // refusal moves here, naming the copy Ruling 7 actually resolved
+        // rather than repeating the blanket "v6 is not described" this
+        // crate used to say before it knew which page that even was.
         return Err(NotBtrieve {
             why: format!(
-                "identified as {:?} with {}-byte pages, but this crate does \
-                 not yet describe every byte of a v6 control record",
-                id.generation, id.page_size
+                "identified as {:?} with {page_size}-byte pages; the live \
+                 control record is physical page {live_is_page} (generation \
+                 {}), but this crate does not yet describe v6 pages, the \
+                 allocation table, or page addressing beyond the \
+                 control-record shadow pair",
+                id.generation, live.page_gen
             ),
         });
     }
 
-    let page_size = id.page_size as usize;
     if bytes.len() < page_size {
         return Err(NotBtrieve {
             why: format!(
@@ -1433,7 +1518,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
 
     Ok(File {
         id,
-        control,
+        control: Control::Single(control),
         key_descriptors,
         page_zero_tail,
         pages,
@@ -1460,26 +1545,120 @@ mod tests {
         let file = file(&buf).expect("a valid v5 control record");
         assert_eq!(file.id.generation, Generation::V5R3);
         assert_eq!(file.id.page_size, 512);
-        assert_eq!(file.control.keys, 1, "KEYS");
-        assert_eq!(file.control.reclen, 0xfc, "RECLEN");
-        assert_eq!(file.control.physical, 0xfc, "PHYSICAL");
-        assert_eq!(file.control.records, 2, "RECORDS");
-        assert_eq!(file.control.highest, 2, "HIGHEST");
-        assert_eq!(file.control.pages, 3, "PAGES");
-        assert_eq!(file.control.usrflgs, 0, "USRFLGS");
+        assert_eq!(file.live_control().keys, 1, "KEYS");
+        assert_eq!(file.live_control().reclen, 0xfc, "RECLEN");
+        assert_eq!(file.live_control().physical, 0xfc, "PHYSICAL");
+        assert_eq!(file.live_control().records, 2, "RECORDS");
+        assert_eq!(file.live_control().highest, 2, "HIGHEST");
+        assert_eq!(file.live_control().pages, 3, "PAGES");
+        assert_eq!(file.live_control().usrflgs, 0, "USRFLGS");
         assert_eq!(file.len, 512);
     }
 
-    /// A v6 file is refused, naming the reason, not silently accepted with
-    /// an empty control record.
+    /// A v6 file one page long is refused before Ruling 7's shadow
+    /// resolution can even run: a v6 control record is *two* full-page
+    /// copies, so a file that is only one page cannot possibly hold both,
+    /// and this is caught before generation counters are ever compared.
     #[test]
-    fn a_v6_file_is_refused() {
+    fn a_one_page_v6_file_is_refused_before_the_shadow_pair_can_be_resolved() {
         let mut b = vec![0u8; 512];
         b[..4].copy_from_slice(&[b'F', b'C', 0, 0]);
         b[0x4a..0x4c].copy_from_slice(&0x600u16.to_le_bytes());
         b[8..10].copy_from_slice(&512u16.to_le_bytes());
-        let e = file(&b).expect_err("v6 is not yet described");
+        let e = file(&b).expect_err("one page cannot hold a shadow pair");
         assert!(e.why.contains("v6"), "{}", e.why);
+        assert!(e.why.contains("512"), "{}", e.why);
+    }
+
+    /// The workspace's `archive/`-relative path, joined onto the workspace
+    /// root the same way `corpus::root()` finds `archive/` itself --
+    /// `path` already includes the `archive/` prefix, so this is a plain
+    /// join, not a second copy of that lookup.
+    fn corpus_path(path: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/btrieve is two directories under the workspace root")
+            .join(path)
+    }
+
+    /// A synthetic two-page v6 buffer whose only interesting content is the
+    /// generation counter at page-relative `0x04` in each copy -- everything
+    /// else is just enough for `identify` to accept it as v6.
+    fn two_copies_with_generations(gen0: u16, gen1: u16) -> Vec<u8> {
+        const PAGE_SIZE: usize = 512;
+        let mut b = vec![0u8; 2 * PAGE_SIZE];
+        for page in [0usize, 1] {
+            let base = page * PAGE_SIZE;
+            b[base..base + 4].copy_from_slice(&[b'F', b'C', 0, 0]);
+            b[base + 0x4a..base + 0x4c].copy_from_slice(&0x600u16.to_le_bytes());
+            b[base + 8..base + 10].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+        }
+        b[0x04..0x06].copy_from_slice(&gen0.to_le_bytes());
+        b[PAGE_SIZE + 0x04..PAGE_SIZE + 0x06].copy_from_slice(&gen1.to_le_bytes());
+        b
+    }
+
+    /// Physical page 0 of this file describes an empty three-page database.
+    /// The file is 55,734,272 bytes. Nothing about page 0 is malformed --
+    /// it is simply not the current copy, which is why reading it has never
+    /// been refused and has always been wrong.
+    ///
+    /// This tests [`resolve_shadow`] directly rather than the full [`file`]
+    /// pipeline. `file` itself still refuses every v6 file (the allocation
+    /// table, page addressing, and the rest of v6's own pages are later
+    /// work), so it cannot return `Ok` for a real v6 file yet -- but the
+    /// shadow resolution Ruling 7 requires happens unconditionally, before
+    /// that later refusal, and is independently correct and testable here.
+    /// `the_refusal_names_the_live_copy_it_resolved` below is the companion
+    /// check: that `file`'s own refusal for this same file changed shape.
+    #[test]
+    fn the_live_control_record_is_the_one_with_the_higher_generation() {
+        let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let id = identify(&bytes).expect("a v6 file with two control records");
+        let control = resolve_shadow(&bytes, id.page_size as usize)
+            .expect("two control records, generations must differ");
+        let Control::Shadowed { live, stale, live_is_page } = &control else {
+            panic!("a v6 file has two control records")
+        };
+        assert_eq!(*live_is_page, 1);
+        assert_eq!(live.records, 26_720);
+        assert_eq!(stale.records, 0);
+    }
+
+    /// `file`'s own refusal, for the same file, names the copy Ruling 7
+    /// resolved rather than repeating the old blanket "v6 is not described"
+    /// -- the shift this task exists to make: not just refused, but refused
+    /// for a later, more specific reason than before.
+    #[test]
+    fn the_refusal_names_the_live_copy_it_resolved() {
+        let path = "archive/modules/majormud-nt/wccnt8pj/out/wccmp002.vir";
+        let Ok(bytes) = std::fs::read(corpus_path(path)) else {
+            eprintln!("no archive/ on this box, nothing verified");
+            return;
+        };
+        let e = file(&bytes).expect_err("v6 pages are not yet described");
+        assert!(e.why.contains("page 1"), "{}", e.why);
+        assert!(e.why.contains("285"), "{}", e.why);
+        assert!(
+            !e.why.contains("every byte of a v6 control record"),
+            "the old blanket refusal text must be gone: {}",
+            e.why
+        );
+    }
+
+    /// A tie is refused rather than resolved. No corpus file has ever tied,
+    /// so this rejects a shape never observed -- not one observed and merely
+    /// inconvenient.
+    #[test]
+    fn two_control_records_of_equal_generation_are_refused() {
+        let bytes = two_copies_with_generations(7, 7);
+        let refusal = file(&bytes).expect_err("a tie has no answer");
+        assert!(refusal.why.contains("generation"), "names the test that failed: {}", refusal.why);
     }
 
     /// A file shorter than its own declared page size is refused, naming
@@ -1781,8 +1960,8 @@ mod tests {
         };
 
         let model = file(&original).expect("TTIHORBT.DAT reads: 0 records, a threaded free chain");
-        assert_eq!(model.control.free, 0x1006, "FCR 0x10: the chain's own head, measured");
-        assert_eq!(model.control.physical, 116);
+        assert_eq!(model.live_control().free, 0x1006, "FCR 0x10: the chain's own head, measured");
+        assert_eq!(model.live_control().physical, 116);
 
         // Walk the model's own pages to find every free slot's decoded
         // link, keyed by this slot's own absolute file position -- so the
@@ -1932,7 +2111,7 @@ mod tests {
             return;
         };
         let file = file(&buf).expect("TTIHORBT.DAT is a valid v5 file");
-        assert_eq!(file.control.records, 0, "every record has been deleted");
+        assert_eq!(file.live_control().records, 0, "every record has been deleted");
         assert_eq!(file.pages.len(), 11, "12 physical pages, less page 0");
         assert_eq!(file.pages[0].kind, PageKind::Index, "page 1, key 0's root");
         assert_eq!(file.pages[1].kind, PageKind::Index, "page 2, key 1's root");
@@ -2418,8 +2597,8 @@ mod tests {
             return;
         };
         let model = file(&buf).expect("WLDSLOTS.DAT is a valid v5 file");
-        assert_eq!(model.control.acs_page_pointer, 1, "0x10a agrees here");
-        assert_eq!(&model.control.acs_name, b"GALCAPS ", "FCR 0x3c");
+        assert_eq!(model.live_control().acs_page_pointer, 1, "0x10a agrees here");
+        assert_eq!(&model.live_control().acs_name, b"GALCAPS ", "FCR 0x3c");
 
         assert_eq!(model.pages[0].kind, PageKind::Acs, "physical page 1");
         let block = model.pages[0].acs.as_ref().expect("an Acs page carries a block");
@@ -2449,10 +2628,10 @@ mod tests {
         };
         let model = file(&buf).expect("CLASSADS.DAT is a valid v5 file");
         assert_eq!(
-            model.control.acs_page_pointer, 0,
+            model.live_control().acs_page_pointer, 0,
             "the known-lying pointer -- CLASSADS.DAT reads zero here regardless"
         );
-        assert_eq!(&model.control.acs_name, b"UPPER   ", "FCR 0x3c is still set correctly");
+        assert_eq!(&model.live_control().acs_name, b"UPPER   ", "FCR 0x3c is still set correctly");
 
         assert_eq!(
             model.pages[0].kind,
