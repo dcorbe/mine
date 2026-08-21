@@ -329,7 +329,8 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
 mod tests {
     use super::*;
     use crate::model::fixtures::{
-        two_key_fixed_portion, usracc_dat, usracc_first_page, usracc_fixed_portion,
+        full_index_page_with_an_omitted_last_child, two_key_fixed_portion, usracc_dat,
+        usracc_first_page, usracc_fixed_portion,
     };
     use crate::read;
 
@@ -471,6 +472,25 @@ mod tests {
             "USRACC.DAT has one key, one index root page, and one data page -- \
              every byte of it is now described",
         );
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// The last-entry **omission** branch round-trips too, not just the
+    /// present-zero case `usracc_dat_round_trips_byte_for_byte` above
+    /// covers: a synthetic page styled after `WCCSPELS.VIR` (harvest 4
+    /// SS4) whose last entry's trailing 4-byte `child` field has no room
+    /// at all. `write_index_pages` must write *nothing* for that field --
+    /// the model says `None`, and the page is already exactly full.
+    /// Unwitnessed by any of the 102 real corpus files that pass today
+    /// (see `model::fixtures::full_index_page_with_an_omitted_last_child`'s
+    /// own doc for the 42%-fullest measurement); this is the fixture the
+    /// review asked for.
+    #[test]
+    fn a_full_index_pages_omitted_child_round_trips_completely() {
+        let original = full_index_page_with_an_omitted_last_child();
+        let model = read::file(&original).expect("reads");
+        let emitted = file(&model)
+            .expect("a full index root with no data page -- nothing left undescribed");
         assert_eq!(emitted.bytes(), original.as_slice());
     }
 

@@ -219,8 +219,12 @@ fn read_data_page(bytes: &[u8], page_start: usize, page_size: usize, physical: u
 /// # Errors
 ///
 /// If `entry_size` matches neither the unique- nor duplicate-key formula,
-/// or an entry (even without its possibly-omitted `child` field) would run
-/// past the page.
+/// if any entry (even without its possibly-omitted `child` field) would
+/// run past the page, or if a **non-last** entry would run past the page
+/// only counting its trailing `child` field -- omission is a rule for the
+/// last entry alone (harvest 4 SS4); a non-last entry that does not fully
+/// fit is a malformed file, refused by name rather than read past this
+/// page's own bounds.
 fn read_index_page(
     bytes: &[u8],
     page_start: usize,
@@ -260,6 +264,22 @@ fn read_index_page(
                 ),
             });
         }
+        let full_end = offset + entry_size;
+        // Only the LAST entry of a page may omit its trailing 4-byte
+        // child field (harvest 4 SS4, WCCSPELS.VIR). A non-last entry
+        // that does not fully fit is a malformed file -- refused by name
+        // here, before any read would run past this page's own bounds
+        // (and, for the last page of the file, past the buffer itself).
+        if !is_last && full_end > page_end {
+            return Err(NotBtrieve {
+                why: format!(
+                    "page {page_start:#x}: entry {n} of {count} (width \
+                     {entry_size}) would run past the {page_size}-byte page, \
+                     and only the last entry of a page may omit its \
+                     trailing child field (harvest 4 SS4)"
+                ),
+            });
+        }
         let key = bytes[offset..offset + key_length].to_vec();
         let mut at = offset + key_length;
         let head = get_long(bytes, at);
@@ -271,7 +291,6 @@ fn read_index_page(
         } else {
             None
         };
-        let full_end = offset + entry_size;
         let (child, consumed) = if is_last && full_end > page_end {
             (None, at)
         } else {
@@ -688,7 +707,8 @@ mod tests {
     use super::*;
     use crate::format::generation::Generation;
     use crate::model::fixtures::{
-        two_key_fixed_portion, usracc_dat, usracc_first_page, usracc_fixed_portion,
+        full_index_page_with_an_omitted_last_child, two_key_fixed_portion, usracc_dat,
+        usracc_first_page, usracc_fixed_portion,
     };
 
     /// The exact values the controller measured independently off
@@ -919,6 +939,63 @@ mod tests {
         assert_eq!(test.child, Some(0), "the last entry's literal-zero placeholder, not NOWHERE");
 
         assert_eq!(idx.padding, vec![0u8; 512 - 0x34], "460 zero bytes after the last entry");
+    }
+
+    /// The last-entry **omission** branch, unwitnessed by any of the 102
+    /// corpus files this task's own measurement found passing (fullest
+    /// real index root: 42% of its page) -- a synthetic fixture styled
+    /// after `WCCSPELS.VIR` (harvest 4 SS4): 50 entries of a 10-byte key
+    /// in one 512-byte page, four bytes more than fits. The last entry's
+    /// `child` is `None` (no bytes at all for it, not a present zero --
+    /// contrast `usracc_dats_index_page_decodes_its_two_entries` above,
+    /// which is the *present*-zero case), and `padding` is empty: the
+    /// crafted page tiles the 512 bytes exactly, with nothing left over.
+    #[test]
+    fn a_full_pages_last_entry_omits_its_child_field_entirely() {
+        let buf = full_index_page_with_an_omitted_last_child();
+        let file = file(&buf).expect("a valid two-page v5 file");
+        let page1 = &file.pages[0];
+        assert_eq!(page1.kind, PageKind::Index);
+
+        let idx = page1.index.as_ref().expect("an Index page's content is described");
+        assert_eq!(idx.entries.len(), 50);
+        for (n, entry) in idx.entries.iter().enumerate().take(49) {
+            assert_eq!(entry.child, Some(0xffff_ffff), "entry {n}: a leaf, not the last entry");
+        }
+        assert_eq!(
+            idx.entries[49].child, None,
+            "the last entry has no room at all for its trailing child field"
+        );
+        assert_eq!(idx.padding, Vec::<u8>::new(), "the page tiles exactly -- nothing left over");
+    }
+
+    /// Finding 2 of this task's review: a **non-last** entry that would
+    /// run past the page even counting its trailing `child` field must be
+    /// refused by name, not read past this page's own bounds (and, when
+    /// the page is the file's last, past the buffer itself, which used to
+    /// panic rather than refuse). Only the *last* entry of a page may omit
+    /// its child field (harvest 4 SS4) -- calling `read_index_page`
+    /// directly (a private function in this same module) rather than
+    /// building a whole synthetic file, since the malformed shape this
+    /// test needs has no other reason to exist.
+    #[test]
+    fn a_non_last_entry_that_lacks_room_for_its_child_is_refused_not_a_panic() {
+        // A self-contained 24-byte page: count 2, key_length 1, entry_size
+        // 9 (unique). Entry 0 (not the last of 2) needs key(1)+head(4)=5
+        // bytes to start (offset 16..21, which fits), but its child would
+        // need bytes 21..25 -- past this 24-byte page, and this buffer is
+        // exactly 24 bytes long, so an unchecked read would index past the
+        // end of the slice itself.
+        let page_size = 24usize;
+        let mut page = vec![0u8; page_size];
+        page[6..8].copy_from_slice(&2u16.to_le_bytes()); // count = 2
+        page[8..12].copy_from_slice(&[0xff; 4]); // rightmost = NOWHERE
+        page[12..16].copy_from_slice(&[0xff; 4]); // leftmost = NOWHERE
+
+        let e = read_index_page(&page, 0, page_size, 1, 9, 0)
+            .expect_err("entry 0 is not the last entry but has no room for its child");
+        assert!(e.why.contains("entry 0"), "{}", e.why);
+        assert!(e.why.contains("only the last entry"), "{}", e.why);
     }
 
     /// A real corpus file with deletions on record: `TTIHORBT.DAT`, 12
