@@ -15,6 +15,7 @@
 
 pub mod acs;
 pub mod fcr;
+pub mod free_slot;
 pub mod generation;
 pub mod index;
 pub mod page;

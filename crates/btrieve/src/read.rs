@@ -9,13 +9,14 @@ use std::collections::{HashMap, HashSet};
 use crate::format::acs;
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
+use crate::format::free_slot;
 use crate::format::generation::{identify, NotBtrieve};
 use crate::format::index;
 use crate::format::page;
 use crate::format::variable;
 use crate::model::{
     AcsBlock, ControlRecord, DataPage, File, FragmentPage, FragmentSlot, IndexEntry, IndexPage,
-    KeyDescriptor, Page, PageKind,
+    KeyDescriptor, Page, PageKind, RecordSlot,
 };
 
 /// Read a plain little-endian `u16` at `at`.
@@ -172,7 +173,13 @@ fn key_descriptors(
 /// then whatever is left between the last slot and the end of the page.
 ///
 /// `physical` must be nonzero -- the caller only calls this when it is (see
-/// `resolve_pages`'s guard).
+/// `resolve_pages`'s guard). `free_slots` is the set `resolve_pages`'s own
+/// free-chain walk built: every freed slot's absolute file position
+/// (harvest 5 SS2.1) -- a slot whose start appears there is
+/// [`RecordSlot::Free`], its own forwarding link decoded independently here
+/// (`format::free_slot::decode_link`) rather than reused from the walk;
+/// every other slot is [`RecordSlot::Live`], unchanged from before this
+/// task.
 ///
 /// # Slack is measured, not assumed
 ///
@@ -186,15 +193,50 @@ fn key_descriptors(
 /// no live record. This is why `slack` is stored verbatim rather than
 /// asserted zero -- the general case is zero, but it is not a rule the
 /// format enforces, and 5 real pages disagree with it.
-fn read_data_page(bytes: &[u8], page_start: usize, page_size: usize, physical: usize) -> DataPage {
+///
+/// # Errors
+///
+/// If the free chain names a slot on this page whose `physical` width is
+/// too short to hold the 4-byte forwarding link a free slot must carry
+/// (`format::free_slot::at::LINK_LEN`) -- harvest 5 SS2.1 does not describe
+/// what a free list even means for a record that short, so this crate
+/// refuses rather than guessing.
+fn read_data_page(
+    bytes: &[u8],
+    page_start: usize,
+    page_size: usize,
+    physical: usize,
+    free_slots: &HashSet<u32>,
+) -> Result<DataPage, NotBtrieve> {
     let per_page = (page_size - page::LEN) / physical;
     let mut slots = Vec::with_capacity(per_page);
     for i in 0..per_page {
         let start = page_start + page::LEN + i * physical;
-        slots.push(bytes[start..start + physical].to_vec());
+        let slot = if free_slots.contains(&(start as u32)) {
+            if physical < free_slot::at::LINK_LEN {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "page {page_start:#x}: the free chain names slot {i} \
+                         (position {start:#x}), but this file's \
+                         {physical}-byte physical record is too short to \
+                         hold the 4-byte forwarding link a free slot must \
+                         carry"
+                    ),
+                });
+            }
+            let link: [u8; free_slot::at::LINK_LEN] =
+                bytes[start..start + free_slot::at::LINK_LEN].try_into().expect("4 bytes");
+            RecordSlot::Free {
+                next: free_slot::decode_link(link),
+                fill: bytes[start + free_slot::at::LINK_LEN..start + physical].to_vec(),
+            }
+        } else {
+            RecordSlot::Live(bytes[start..start + physical].to_vec())
+        };
+        slots.push(slot);
     }
     let used = page::LEN + per_page * physical;
-    DataPage { slots, slack: bytes[page_start + used..page_start + page_size].to_vec() }
+    Ok(DataPage { slots, slack: bytes[page_start + used..page_start + page_size].to_vec() })
 }
 
 /// Read an index page's content (harvest 4 SS4): the entry count and the
@@ -949,10 +991,22 @@ fn resolve_pages(
     // ACS page.
     walk_index_trees(bytes, page_size, total_pages, key_descriptors, &mut claim, &mut owner)?;
 
-    // Free: walk the record-slot free chain from FCR 0x10.
+    // Free: walk the record-slot free chain from FCR 0x10, both to claim
+    // the pages it touches (as before) and to remember every freed
+    // position itself (harvest 5 SS2.1) -- `free_slots` is what lets
+    // `read_data_page` tell a free slot from a live one instead of storing
+    // every slot as an opaque blob. `read_data_page` decodes each free
+    // slot's own forwarding link independently
+    // (`format::free_slot::decode_link`), rather than reusing the `next`
+    // this walk computes below to keep walking -- deliberately: this walk's
+    // own `get_long` exists to find every freed *position*, a wholly
+    // different job from the model's own claim about what a free slot's
+    // bytes *mean*, and conflating the two would leave no isolated place
+    // for this task's own decode to be wrong.
     const NOWHERE: u32 = 0xffff_ffff;
     let mut cur = control.free;
     let mut visited: HashSet<u32> = HashSet::new();
+    let mut free_slots: HashSet<u32> = HashSet::new();
     while cur != NOWHERE {
         if !visited.insert(cur) {
             return Err(NotBtrieve {
@@ -995,6 +1049,7 @@ fn resolve_pages(
         } else {
             claim.insert(page_number, PageKind::Free);
         }
+        free_slots.insert(cur);
         cur = get_long(bytes, at);
     }
 
@@ -1114,7 +1169,7 @@ fn resolve_pages(
         // already stores each slot whole and verbatim, so nothing here
         // needs to know a pointer is inside one.
         let content = if data_bit && control.physical != 0 {
-            Some(read_data_page(bytes, at, page_size, control.physical as usize))
+            Some(read_data_page(bytes, at, page_size, control.physical as usize, &free_slots)?)
         } else {
             None
         };
@@ -1470,17 +1525,164 @@ mod tests {
 
         let content = page2.content.as_ref().expect("a data page's content is described");
         assert_eq!(content.slots.len(), 2, "two 252-byte slots fit in a 512-byte page");
-        assert_eq!(content.slots[0].len(), 252);
-        assert_eq!(content.slots[1].len(), 252);
-        assert!(
-            content.slots[0].starts_with(b"Sysop"),
-            "slot 0 at page offset 0x06 is the Sysop record"
-        );
-        assert!(
-            content.slots[1].starts_with(b"Test"),
-            "slot 1 at page offset 0x102 is the Test record"
-        );
+        let RecordSlot::Live(slot0) = &content.slots[0] else {
+            panic!("USRACC.DAT has no deletions -- slot 0 must be live")
+        };
+        let RecordSlot::Live(slot1) = &content.slots[1] else {
+            panic!("USRACC.DAT has no deletions -- slot 1 must be live")
+        };
+        assert_eq!(slot0.len(), 252);
+        assert_eq!(slot1.len(), 252);
+        assert!(slot0.starts_with(b"Sysop"), "slot 0 at page offset 0x06 is the Sysop record");
+        assert!(slot1.starts_with(b"Test"), "slot 1 at page offset 0x102 is the Test record");
         assert_eq!(content.slack, vec![0u8, 0], "the trailing 2 bytes, described and zero here");
+    }
+
+    /// Task 12, step 1: this crate's clean, unambiguous single-deletion
+    /// witness (harvest 5 SS6.2) -- `wccnt7pz/out/wccitem2.vir` (and its
+    /// byte-identical sibling under `wccnt7py`), 1,736 live records plus
+    /// exactly one freed slot, physical page 591 slot 2 (file position
+    /// `0x24f866`). The full corpus file currently refuses for an unrelated
+    /// reason -- physical page 593 is an orphaned B-tree leaf no key's walk
+    /// reaches (Task 11b) -- so this test isolates page 591 alone the same
+    /// way `emit::tests::a_real_files_nonzero_slack_...` isolates page 592:
+    /// a synthetic zero-key control record puts the real page directly
+    /// after page 0, so nothing about the orphan elsewhere can interfere.
+    ///
+    /// This is the model-level claim a byte round trip cannot make on its
+    /// own: not just that the bytes come back, but that this crate knows
+    /// slot 2 is *free*, decodes its forwarding link as `NOWHERE` (this
+    /// file's one deletion was also its first), and that the remaining
+    /// 1,068 bytes are the zero fill the delete left -- structure, not
+    /// bytes that merely happen to round-trip.
+    #[test]
+    fn wccitem2_vir_page_591_decodes_its_one_free_slot_as_free_with_a_nowhere_link() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join("modules/majormud-nt/wccnt7pz/out/wccitem2.vir");
+        let Ok(real) = std::fs::read(&path) else {
+            eprintln!("read: wccitem2.vir not present, nothing verified");
+            return;
+        };
+
+        const PAGE_SIZE: usize = 4096;
+        const PHYSICAL: u16 = 1072;
+        let page_591 = &real[591 * PAGE_SIZE..592 * PAGE_SIZE];
+
+        // The free slot's new absolute position once page 591 becomes this
+        // synthetic file's only page (page number 1): header (6) plus two
+        // live slots ahead of it.
+        let free_at: u32 = (PAGE_SIZE + page::LEN + 2 * PHYSICAL as usize) as u32;
+
+        let mut original = vec![0u8; PAGE_SIZE];
+        original[0x06..0x08].copy_from_slice(&[0, 4]); // version -> V5R4, this file's own generation
+        original[0x08..0x0a].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+        original[0x0c..0x10].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // unknown_0c = NOWHERE
+        original[0x10..0x14].copy_from_slice(&crate::pages::to_long(free_at)); // FREE: high-word-first long
+        original[0x14..0x16].copy_from_slice(&0u16.to_le_bytes()); // keys = 0
+        original[0x16..0x18].copy_from_slice(&PHYSICAL.to_le_bytes()); // reclen
+        original[0x18..0x1a].copy_from_slice(&PHYSICAL.to_le_bytes()); // physical
+        original.extend_from_slice(page_591);
+
+        let model = file(&original).expect("reads: a synthetic zero-key file wrapping page 591");
+        assert_eq!(model.pages.len(), 1);
+        assert_eq!(model.pages[0].kind, PageKind::Free, "one freed slot lives on this page");
+        let content = model.pages[0].content.as_ref().expect("a data page's content is described");
+        assert_eq!(content.slots.len(), 3, "3 whole 1072-byte slots fit in 4096 - 6 bytes");
+
+        assert!(
+            matches!(content.slots[0], RecordSlot::Live(_)),
+            "slot 0 is one of the file's 1,736 live records"
+        );
+        assert!(
+            matches!(content.slots[1], RecordSlot::Live(_)),
+            "slot 1 is one of the file's 1,736 live records"
+        );
+        let RecordSlot::Free { next, fill } = &content.slots[2] else {
+            panic!("slot 2 is this file's one and only freed slot")
+        };
+        assert_eq!(
+            *next, 0xffff_ffff,
+            "harvest 5 SS6.2: this file's one deletion was also its first, so its \
+             forwarding link is NOWHERE, not a real position"
+        );
+        assert_eq!(fill.len(), 1072 - 4);
+        assert!(fill.iter().all(|&b| b == 0), "harvest 5 SS2.1: a fresh delete's zero fill");
+
+        let emitted =
+            crate::emit::file(&model).expect("zero keys leaves nothing undescribed but this page");
+        assert_eq!(
+            emitted.bytes(),
+            original.as_slice(),
+            "the forwarding link and zero fill must come back verbatim"
+        );
+    }
+
+    /// Task 12's harder real-corpus witness: `TTIHORBT.DAT` (harvest 5 SS7's
+    /// own "ambiguous history" file) -- zero live records, a free chain
+    /// threading through every slot the file has, at least 8 hops deep.
+    /// Unlike `wccitem2.vir`, this file's full form already reads and
+    /// round-trips today (no orphaned page elsewhere), so this test reads
+    /// the real file directly rather than isolating one synthetic page.
+    ///
+    /// The forwarding links this asserts (`0x1006 -> 0x147a -> 0x107a ->
+    /// 0x14ee`, measured independently off the file's own raw bytes) are
+    /// **not** byte-order-symmetric -- a plain little-endian misread of
+    /// `0x1006`'s own slot bytes (`00 00 06 10`) would read `0x10060000`, a
+    /// different, still-plausible position. This is the discriminator a
+    /// byte-identical round trip cannot make on its own: decoding every
+    /// link the wrong way, consistently, still reproduces the same bytes
+    /// (see this task's own report for the mutation that proves it) --
+    /// only a model-level assertion of the *decoded value* can tell the two
+    /// apart.
+    #[test]
+    fn ttihorbt_dat_free_chain_decodes_to_the_measured_positions() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path =
+            root.join("modules/isv-file-libraries/ISVTTI - Tessier Technologies/temp/TTIHORBT.DAT");
+        let Ok(original) = std::fs::read(&path) else {
+            eprintln!("read: TTIHORBT.DAT not present, nothing verified");
+            return;
+        };
+
+        let model = file(&original).expect("TTIHORBT.DAT reads: 0 records, a threaded free chain");
+        assert_eq!(model.control.free, 0x1006, "FCR 0x10: the chain's own head, measured");
+        assert_eq!(model.control.physical, 116);
+
+        // Walk the model's own pages to find every free slot's decoded
+        // link, keyed by this slot's own absolute file position -- so the
+        // assertions below read as "position X's link is Y," independent of
+        // which physical page X happens to land on.
+        let mut links: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let page_size = model.id.page_size as usize;
+        for (i, p) in model.pages.iter().enumerate() {
+            let Some(content) = &p.content else { continue };
+            let page_number = i + 1;
+            let mut at = page_number * page_size + page::LEN;
+            for slot in &content.slots {
+                if let RecordSlot::Free { next, .. } = slot {
+                    links.insert(at as u32, *next);
+                }
+                at += match slot {
+                    RecordSlot::Live(b) => b.len(),
+                    RecordSlot::Free { fill, .. } => 4 + fill.len(),
+                };
+            }
+        }
+
+        assert_eq!(links.len() >= 8, true, "at least 8 hops deep (harvest 5 SS7)");
+        assert_eq!(links.get(&0x1006), Some(&0x147a), "the chain's first hop");
+        assert_eq!(links.get(&0x147a), Some(&0x107a), "the chain's second hop");
+        assert_eq!(links.get(&0x107a), Some(&0x14ee), "the chain's third hop");
+        assert_eq!(links.get(&0x14ee), Some(&0x1162), "the chain's fourth hop");
+
+        let emitted = crate::emit::file(&model).expect("TTIHORBT.DAT: nothing undescribed");
+        assert_eq!(emitted.bytes(), original.as_slice(), "the whole threaded chain round-trips");
     }
 
     /// This task's own anchor case: `USRACC.DAT` page 1's index content,
@@ -2183,3 +2385,4 @@ mod tests {
         );
     }
 }
+

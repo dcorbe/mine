@@ -40,11 +40,12 @@ use crate::canvas::{Canvas, Emitted, Fault, Owner};
 use crate::format::acs;
 use crate::format::fcr;
 use crate::format::fcr::key_descriptor;
+use crate::format::free_slot;
 use crate::format::generation::Generation;
 use crate::format::index;
 use crate::format::page;
 use crate::format::variable;
-use crate::model::{File, FragmentSlot};
+use crate::model::{File, FragmentSlot, RecordSlot};
 
 fn owner(field: &'static str) -> Owner {
     Owner { structure: "fcr", field, index: None }
@@ -86,9 +87,13 @@ fn write_page_headers(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 /// still a later task, so those pages' bodies stay unwritten and
 /// `Canvas::finish` reports them as before).
 ///
-/// Slack is written from the model's own stored bytes, never re-derived as
-/// zero -- `read::read_data_page`'s doc measures 5 real corpus pages where
-/// that would be wrong.
+/// A live slot is written from its own stored bytes, whole. A free slot
+/// (harvest 5 SS2.1) is written as its two decoded fields, `link` then
+/// `fill` (`format::free_slot`) -- `fill` is the model's own stored bytes,
+/// never re-zeroed, `DataPage::slack`'s discipline extended to a free
+/// slot's own remainder. Slack past the last slot is written the same way
+/// it always was, never re-derived as zero -- `read::read_data_page`'s doc
+/// measures 5 real corpus pages where that would be wrong.
 ///
 /// # Errors
 ///
@@ -101,8 +106,25 @@ fn write_page_content(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
         let at = page_number * page_size;
         let mut offset = at + page::LEN;
         for slot in &content.slots {
-            canvas.put(offset, slot, page_owner("record", page_number))?;
-            offset += slot.len();
+            match slot {
+                RecordSlot::Live(bytes) => {
+                    canvas.put(offset, bytes, page_owner("record", page_number))?;
+                    offset += bytes.len();
+                }
+                RecordSlot::Free { next, fill } => {
+                    canvas.put(
+                        offset + free_slot::at::LINK,
+                        &free_slot::encode_link(*next),
+                        page_owner("free_link", page_number),
+                    )?;
+                    canvas.put(
+                        offset + free_slot::at::LINK_LEN,
+                        fill,
+                        page_owner("free_fill", page_number),
+                    )?;
+                    offset += free_slot::at::LINK_LEN + fill.len();
+                }
+            }
         }
         canvas.put(offset, &content.slack, page_owner("slack", page_number))?;
     }
