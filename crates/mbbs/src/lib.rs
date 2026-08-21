@@ -1086,6 +1086,26 @@ pub struct Host<A: Abi> {
     /// whatever is running this host.
     ended: Vec<Chan>,
 
+    /// Channels currently sitting at `state == 0`, already reported through
+    /// [`Host::ended`] once.
+    ///
+    /// [`Host::sweep_ended`] runs every turn and reads a *level* -- "is this
+    /// channel's state zero right now?" -- but [`Host::drain_ended`] promises
+    /// an *edge*: "channels handed back since the last call". Without this,
+    /// the two disagree the moment a handback is not cleaned up within one
+    /// turn, and the same channel is re-reported on every turn forever.
+    ///
+    /// That is not hypothetical. The driver answers a report by sending
+    /// `Out::Close` and waiting for the connection task to come back with a
+    /// disconnect; until it does, the channel still reads zero and still
+    /// holds its connection. Measured on a live board, one player pressing
+    /// "[X] Exit Game" produced an unbounded stream of `channel 0 left the
+    /// module; closing` lines -- one per turn, forever -- and a fresh
+    /// `Out::Close` with each. A channel is cleared from here the moment its
+    /// state is non-zero again ([`Host::connect_state`] does that on
+    /// reconnect), so a channel that is handed back twice is reported twice.
+    handed_back: Vec<Chan>,
+
     /// Every module [`Host::load`] has loaded so far in this life, keyed by
     /// its own declared name ([`Abi::module_name`]) -- **not** the same
     /// bookkeeping as [`Host::modules`] above, which is about a module
@@ -1822,6 +1842,7 @@ impl<A: Abi> Host<A> {
             // `inimod()` registers `module00` before any DLL registers itself.
             modules: vec![Registration::AbsentBbs],
             ended: Vec::new(),
+            handed_back: Vec::new(),
             loaded_modules: HashMap::new(),
             agents: Vec::new(),
             textvars: TextVars::default(),
@@ -2425,10 +2446,22 @@ impl<A: Abi> Host<A> {
     pub fn sweep_ended(&mut self, machine: &mut A::Cpu) {
         let chans: Vec<Chan> = self.users().terms().all().collect();
         for chan in chans {
-            if matches!(self.users().state_mem(A::mem(machine), chan), Ok(0))
-                && !self.ended.contains(&chan)
-            {
-                self.ended.push(chan);
+            if !matches!(self.users().state_mem(A::mem(machine), chan), Ok(0)) {
+                // Back in a module (or unreadable, which was never reported
+                // as a handback either). Whatever was reported before is
+                // finished with, so the next handback is a fresh edge.
+                self.handed_back.retain(|held| *held != chan);
+                continue;
+            }
+            // Reported once per handback, not once per turn -- see
+            // `Host::handed_back` for the live-board measurement that says
+            // why. The `ended` test stays as well: `handed_back` survives a
+            // drain and `ended` does not, so neither one subsumes the other.
+            if !self.handed_back.contains(&chan) {
+                self.handed_back.push(chan);
+                if !self.ended.contains(&chan) {
+                    self.ended.push(chan);
+                }
             }
         }
     }
@@ -4025,12 +4058,13 @@ impl<A: Abi> Host<A> {
             // (`status`, `usrnum`/`usrptr`/`usaptr`/`vdaptr`, `margv`/`margn`)
             // is wholesale-overwritten by the next line's own `get_input`
             // and `point_curusr_mem`, never appended to. And the `sttrou`
-            // TRUE/FALSE "did you consume it" contract
-            // (`MAJORBBS.C:2703`, `hdlcri()`) needs no emulation: this host
-            // does not implement it at all (no `go2mnu`, no `substt` reset,
-            // no `hdlcri` equivalent -- see this same function's own R24
-            // comment on the `entry == None` fallback, further down), so
-            // there is nothing for `Handled` to fake.
+            // `sttrou` return-value contract (`hdlcri()`, `MAJORBBS.C:3358`)
+            // needs no emulation here either. It is implemented -- see
+            // [`Host::go2mnu`] and its call site further down -- but what it
+            // means is "the module has finished with this channel", and a
+            // line the module never saw cannot have finished it. A handler
+            // that wants the session over says so by other means; staying in
+            // the module is the only correct answer for a `Handled` line.
             if status == gsbl::Gsbl::CRSTG && self.extension.is_some() {
                 if let extension::Verdict::Handled = self.dispatch_command(machine, module, chan)? {
                     continue;
@@ -4079,24 +4113,102 @@ impl<A: Abi> Host<A> {
                 }
             };
             let Some(entry) = entry else {
-                // R24: `sttrou`'s `ax` is TRUE/FALSE for "did you consume
-                // the input", which the module never answered here -- a
-                // fabricated `Returned { ax: 0, dx: 0 }` would claim a call
-                // that never happened. On the CRSTG path `get_input` above
+                // R24: `sttrou`'s `ax` answers "am I done with this
+                // channel?" -- zero means no, hand it back to the menuing
+                // system (`hdlcri`, `MAJORBBS.C:3358`; it is *not* "did you
+                // consume the input", as this comment used to say). The
+                // module never answered here, and a fabricated
+                // `Returned { lo: 0, hi: 0 }` would claim a call that never
+                // happened -- which now also means it would hang the channel
+                // up, so getting this wrong costs a session, not just a
+                // misleading value. On the CRSTG path `get_input` above
                 // has already taken the line, so a module with no `sttrou`
                 // silently drops every command; not implementing
                 // `module00`'s fallback is in scope, dropping the line
-                // without a word about it is not.
+                // without a word about it is not. `hdlcri`'s *other* half --
+                // acting on the value when there is one -- is implemented:
+                // see [`Host::go2mnu`], below.
                 self.note(format!(
                     "poll: channel {chan} has no entry {entry_index} registered; \
                      status {status} was serviced with no module call"
                 ));
                 continue;
             };
-            return self
-                .run(machine, module, entry, &[], Some(chan))
-                .map(|outcome| Some((outcome, chan)));
+            let outcome = self.run(machine, module, entry, &[], Some(chan))?;
+
+            // `hdlcri()` (`MAJORBBS.C:3358-3383`) reads what `sttrou` just
+            // returned, and this is the half of it a headless host has:
+            //
+            // ```text
+            // if ((i=(*rouptr)()) == 0) {
+            //      usrptr->substt=0;
+            //      ...
+            //      default:
+            //           go2mnu(JSTRET);
+            // }
+            // ```
+            //
+            // `usrcls` picks `rouptr` and picks what a zero return means. Only
+            // `SUPLON` (4) and `SUPLOF` (5) are special -- `MAJORBBS.H:225`;
+            // both are the supplemental logon/logoff walks, which this host
+            // has no machinery for and never enters. Every channel here is in
+            // the `default:` arm, on both sides of the call, so `sttrou` is
+            // the routine and `go2mnu` is the answer.
+            //
+            // Entry 1 only. `susing()` (`:2489`) calls the other one as
+            // `(*(VOIDFUNC *)(module[usrptr->state]->stsrou))()` -- whatever
+            // `stsrou` leaves in `AX` is not a return value, and keying this
+            // on "the module returned zero" instead of "`sttrou` returned
+            // zero" would hang up on most status callbacks.
+            if entry_index == 1
+                && let Outcome::Returned { lo: 0, .. } = outcome
+                && let Err(e) = self.go2mnu(machine, chan)
+            {
+                return self.shim_stop(machine, "go2mnu", e).map(|o| Some((o, chan)));
+            }
+            return Ok(Some((outcome, chan)));
         }
+    }
+
+    /// Hand this channel back to the menuing system: `go2mnu(JSTRET)`.
+    ///
+    /// `MAJORBBS.C:4811`. The real one is three assignments and a repaint:
+    ///
+    /// ```text
+    /// usrptr->usrcls=ACTUSR;
+    /// usrptr->state=0;
+    /// usrptr->substt=substt;
+    /// ... (*(module00.sttrou))();      /* draw the BBS main menu */
+    /// ```
+    ///
+    /// Two of the three are here. `state=0` is the load-bearing one: zero
+    /// names [`Registration::AbsentBbs`], which [`Host::sweep_ended`] already
+    /// watches for and the driver already closes the connection on -- the
+    /// mechanism existed before anything reached it. `substt` is zeroed by
+    /// `hdlcri` itself, just above its `go2mnu` call, and `JSTRET` is `1`;
+    /// zero is written here rather than `JSTRET` because `JSTRET` is a page
+    /// number for a menuing system this host does not have, and leaving a
+    /// live-looking substate on a channel about to be closed would be a lie
+    /// to whoever reads it next (a reused channel, in particular).
+    ///
+    /// `usrcls` is deliberately not written. This host has no `usrcls`
+    /// machinery at all -- nothing reads it, nothing transitions it, and
+    /// `connect_state` zeroes it -- so writing `ACTUSR` would invent a
+    /// vocabulary rather than honour one. See the `usrcls` note at this
+    /// function's one call site.
+    ///
+    /// There is no repaint, because there is no `module00` to repaint. The
+    /// driver hangs the connection up instead, which is the honest headless
+    /// answer -- see [`Host::drain_ended`].
+    fn go2mnu(&mut self, machine: &mut A::Cpu, chan: Chan) -> Result<(), ShimError> {
+        let mem = A::mem(machine);
+        self.users.set_substt_mem(mem, chan, 0)?;
+        self.users.set_state_mem(mem, chan, 0)?;
+        self.note(format!(
+            "go2mnu: channel {chan}'s module returned to the menuing system; \
+             the session is over"
+        ));
+        Ok(())
     }
 
     /// Give the installed extension first look at a `CRSTG` line, before the
@@ -6488,6 +6600,44 @@ mod tests {
         f.machine.write(at, &state.to_le_bytes()).expect("in the segment");
     }
 
+    /// Read `user[chan].state` back, the way the module would.
+    ///
+    /// The mirror of [`set_state`], and through the same layout for the same
+    /// reason: a test that read it through a getter would be agreeing with
+    /// that getter about an offset instead of checking the byte the module
+    /// reads.
+    fn get_state(f: &Fixture, chan: crate::Chan) -> u16 {
+        let slot = f.host.users().slot(chan);
+        let at = FarPtr {
+            offset: slot.offset + users::UserLayout::of::<Wg16>().state.at,
+            selector: slot.selector,
+        };
+        let bytes = f.machine.resolve(at, 2).expect("in the segment");
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    /// Write and read `user[chan].substt`, the module's own substate.
+    ///
+    /// Through the layout, for the same reason [`set_state`] is.
+    fn substt_ptr(f: &Fixture, chan: crate::Chan) -> FarPtr {
+        let slot = f.host.users().slot(chan);
+        FarPtr {
+            offset: slot.offset + users::UserLayout::of::<Wg16>().substt.at,
+            selector: slot.selector,
+        }
+    }
+
+    fn set_substt(f: &mut Fixture, chan: crate::Chan, substt: u16) {
+        let at = substt_ptr(f, chan);
+        f.machine.write(at, &substt.to_le_bytes()).expect("in the segment");
+    }
+
+    fn get_substt(f: &Fixture, chan: crate::Chan) -> u16 {
+        let at = substt_ptr(f, chan);
+        let bytes = f.machine.resolve(at, 2).expect("in the segment");
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
     /// `MAJORBBS.C:2703` is `(*(module[usrptr->state]->sttrou))()`, and this is
     /// the test that says so.
     ///
@@ -6733,11 +6883,14 @@ mod tests {
     /// returning `usrptr->state == 0` -- "did the module let go?". So this
     /// is the documented handback, not an invention here.
     ///
-    /// MajorMUD's own "[X] Exit Game" does *not* use it. Measured on a live
-    /// board, a channel's `state` goes to one at connect and never returns
-    /// to zero, which is why pressing X leaves you sitting at the menu
-    /// instead of disconnected. That is a gap in what this host can detect,
-    /// not a reason for the mechanism to be wrong.
+    /// MajorMUD's own "[X] Exit Game" reaches this the way `hdlcri` says to,
+    /// not by writing `state` itself: it returns zero from `sttrou` and the
+    /// host writes the zero. Measured on a live board -- X returns `AX=0`
+    /// and prints nothing, every other line at that menu returns 1. This
+    /// comment used to say the opposite ("a gap in what this host can
+    /// detect"), which was true only for as long as `poll` threw `sttrou`'s
+    /// return value away. See
+    /// [`an_sttrou_that_returns_zero_hands_the_channel_back_to_the_bbs`].
     #[test]
     fn a_channel_handed_back_to_the_absent_bbs_is_reported_as_ended() {
         let mut f = Fixture::new();
@@ -6761,6 +6914,227 @@ mod tests {
             f.host.drain_ended().is_empty(),
             "draining twice must not report the same channel again"
         );
+    }
+
+    /// A handback is an edge, not a level: one per handback, not one a turn.
+    ///
+    /// [`Host::sweep_ended`] runs every turn and reads `state`, which stays
+    /// zero for as long as the channel sits handed back -- and it does sit
+    /// there, because the driver answers a report by sending `Out::Close`
+    /// and cannot clear the channel until the connection task comes back
+    /// with a disconnect. The test above drains twice between two sweeps and
+    /// so cannot see this; only sweeping twice can.
+    ///
+    /// Measured on a live board before the fix: one "[X] Exit Game" produced
+    /// `channel 0 left the module; closing` once per turn without bound, and
+    /// a fresh `Out::Close` with each. 69 and still climbing when counted.
+    #[test]
+    fn a_channel_that_stays_handed_back_is_reported_once_not_once_a_turn() {
+        let mut f = Fixture::new();
+        let console = f.host.gsbl().terms().chan(0).expect("channel 0");
+
+        set_state(&mut f, console, 1);
+        f.host.sweep_ended(&mut f.machine);
+        assert!(f.host.drain_ended().is_empty(), "in a module, not handed back");
+
+        set_state(&mut f, console, 0);
+        f.host.sweep_ended(&mut f.machine);
+        assert_eq!(f.host.drain_ended(), vec![console], "the handback is reported");
+
+        // The driver has not managed to close it yet, so `state` is still
+        // zero on the next ten turns. None of them is a new handback.
+        for turn in 0..10 {
+            f.host.sweep_ended(&mut f.machine);
+            assert!(
+                f.host.drain_ended().is_empty(),
+                "turn {turn}: a channel that never left zero was not handed back again"
+            );
+        }
+
+        // Reconnecting and handing back again *is* a second edge.
+        set_state(&mut f, console, 1);
+        f.host.sweep_ended(&mut f.machine);
+        assert!(f.host.drain_ended().is_empty(), "back in a module");
+        set_state(&mut f, console, 0);
+        f.host.sweep_ended(&mut f.machine);
+        assert_eq!(
+            f.host.drain_ended(),
+            vec![console],
+            "a second handback must be reported, not swallowed by the first"
+        );
+    }
+
+    /// An `sttrou` that returns zero is the module handing the channel back.
+    ///
+    /// `hdlcri()` (`MAJORBBS.C:3317-3384`) is the whole contract:
+    ///
+    /// ```text
+    /// default:
+    ///      rouptr=module[usrptr->state]->sttrou;
+    /// ...
+    /// if ((i=(*rouptr)()) == 0) {
+    ///      usrptr->substt=0;
+    ///      ...
+    ///      default:
+    ///           go2mnu(JSTRET);
+    /// }
+    /// ```
+    ///
+    /// and `go2mnu` (`:4811`) writes `usrptr->state=0` -- the same zero
+    /// `sweep_ended` already watches for. So "back to the menuing system" is
+    /// the *only* meaning a zero return has ever had; the module never writes
+    /// `state` itself for this.
+    ///
+    /// This is how MajorMUD's "[X] Exit Game" works, measured on a live board
+    /// against the real `WCCMMUD.DLL`: X returns `AX=0` and prints nothing at
+    /// all, while every other line at that menu -- including the Help
+    /// submenu's own `x=exit` and the Sysop menu's "X - Exit to Main Menu" --
+    /// returns 1. Discarding the return value is what left a player sitting
+    /// at a menu that redrew itself forever.
+    #[test]
+    fn an_sttrou_that_returns_zero_hands_the_channel_back_to_the_bbs() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let sttrou = f.machine.code_ptr(0);
+        let stub = returns_stub(0);
+        // After the registration, not before: `Fixture::invoke` -- which
+        // `register_named` goes through -- builds its trampoline at offset
+        // zero of this same scratch segment, and would overwrite a stub
+        // loaded first. Getting this backwards does not fail loudly: the
+        // call faults into `Outcome::Stopped`, which leaves `state`
+        // untouched and so *passes* any test that only asserts the channel
+        // stayed put.
+        let state = register_named(&mut f, "MajorMUD", &[(1, sttrou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+        set_state(&mut f, console, state);
+        set_substt(&mut f, console, 7);
+
+        f.host.gsbl_mut().push_input(console, b"X\r");
+        let outcome = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect("polled")
+            .expect("sttrou was entered");
+        assert_eq!(
+            outcome,
+            Outcome::Returned { lo: 0, hi: 0 },
+            "the stub returns zero, and that is what must reach the caller"
+        );
+
+        assert_eq!(
+            get_state(&f, console),
+            0,
+            "a zero return is go2mnu(JSTRET): state must name the absent BBS"
+        );
+        assert_eq!(
+            get_substt(&f, console),
+            0,
+            "`hdlcri` zeroes substt in the same breath, before go2mnu runs"
+        );
+
+        f.host.sweep_ended(&mut f.machine);
+        assert_eq!(
+            f.host.drain_ended(),
+            vec![console],
+            "the driver must be told to close a channel the module let go of"
+        );
+    }
+
+    /// The other half of the same contract: a non-zero `sttrou` keeps the
+    /// channel exactly where it was.
+    ///
+    /// Without this, "hand the channel back whenever `sttrou` returns" would
+    /// pass the test above and disconnect a player on every command they
+    /// typed. `hdlcri` acts on `i == 0` only (the `i == -1` arm is
+    /// `SUPLOF`-class logoff, a class this host has no machinery for at
+    /// all).
+    #[test]
+    fn a_non_zero_sttrou_leaves_the_channel_in_the_module() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let sttrou = f.machine.code_ptr(0);
+        let stub = returns_stub(1);
+        // After the registration, not before: `Fixture::invoke` -- which
+        // `register_named` goes through -- builds its trampoline at offset
+        // zero of this same scratch segment, and would overwrite a stub
+        // loaded first. Getting this backwards does not fail loudly: the
+        // call faults into `Outcome::Stopped`, which leaves `state`
+        // untouched and so *passes* any test that only asserts the channel
+        // stayed put.
+        let state = register_named(&mut f, "MajorMUD", &[(1, sttrou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+        set_state(&mut f, console, state);
+        set_substt(&mut f, console, 7);
+
+        f.host.gsbl_mut().push_input(console, b"look\r");
+        let outcome = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect("polled")
+            .expect("sttrou was entered");
+        assert_eq!(
+            outcome,
+            Outcome::Returned { lo: 1, hi: 0 },
+            "the stub must actually have run -- a faulted call leaves `state` \
+             untouched too, and would pass every assertion below for free"
+        );
+
+        assert_eq!(get_state(&f, console), state, "a live command keeps the channel in the module");
+        assert_eq!(get_substt(&f, console), 7, "and leaves the module's own substate alone");
+        f.host.sweep_ended(&mut f.machine);
+        assert!(f.host.drain_ended().is_empty(), "nobody was handed back");
+    }
+
+    /// `stsrou` is a `VOIDFUNC`, so whatever it leaves in `AX` means nothing.
+    ///
+    /// `susing()` (`MAJORBBS.C:2489`) calls it as
+    /// `(*(VOIDFUNC *)(module[usrptr->state]->stsrou))()` -- no return value
+    /// is read, and `hdlcri`'s zero test is not on this path at all. A fix
+    /// that keyed on "the module returned zero" instead of "entry 1 returned
+    /// zero" would hang up on every status callback whose stub happens to
+    /// leave `AX` clear, which is most of them.
+    #[test]
+    fn a_zero_from_stsrou_is_not_a_handback() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let stsrou = f.machine.code_ptr(0);
+        let stub = returns_stub(0);
+        // After the registration, not before: `Fixture::invoke` -- which
+        // `register_named` goes through -- builds its trampoline at offset
+        // zero of this same scratch segment, and would overwrite a stub
+        // loaded first. Getting this backwards does not fail loudly: the
+        // call faults into `Outcome::Stopped`, which leaves `state`
+        // untouched and so *passes* any test that only asserts the channel
+        // stayed put.
+        let state = register_named(&mut f, "only", &[(2, stsrou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+        set_state(&mut f, console, state);
+
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
+        let outcome = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect("polled")
+            .expect("stsrou was entered");
+        assert_eq!(
+            outcome,
+            Outcome::Returned { lo: 0, hi: 0 },
+            "the stub must actually have run, and must actually have left AX zero"
+        );
+
+        assert_eq!(
+            get_state(&f, console),
+            state,
+            "stsrou's AX is not a return value; the channel must stay put"
+        );
+        f.host.sweep_ended(&mut f.machine);
+        assert!(f.host.drain_ended().is_empty(), "nobody was handed back");
     }
 
     #[test]
