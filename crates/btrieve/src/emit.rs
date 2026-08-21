@@ -18,17 +18,23 @@
 //! slack -- `crate::model::DataPage`), an `Index` page's own entry array
 //! too: the entry count, the two boundary pointers, every entry -- key,
 //! `head`, the duplicate-only `tail`, and the possibly-omitted `child` --
-//! plus trailing padding (`crate::model::IndexPage`); and now a v5 file's
-//! alternate collating sequence block (`crate::model::AcsBlock`), found by
-//! the page graph on content -- a key's own `ALT_COLLATING` bit -- rather
-//! than trusted from the control record's own (on 2 corpus files, lying)
-//! `0x10a` pointer. `USRACC.DAT` round-trips completely as of an earlier
-//! task -- the first real corpus file to do so. An `IndexChild` page's
-//! content (a B-tree node no key's root names, whose owning key this task
-//! does not resolve) and a variable-length file's fragment-page content are
-//! still later tasks, so [`file`] still faults on any real corpus file that
-//! has one of those -- but the fault names the first byte range *this*
-//! crate still cannot describe.
+//! plus trailing padding (`crate::model::IndexPage`), for **every** index
+//! page a key's own root or its walked descendants resolve to (Task 11b --
+//! an `IndexChild` page writes exactly the same way an `Index` root does,
+//! since both carry the same `IndexPage` content once attributed to a key);
+//! a v5 file's alternate collating sequence block
+//! (`crate::model::AcsBlock`), found by the page graph on content -- a
+//! key's own `ALT_COLLATING` bit -- rather than trusted from the control
+//! record's own (on 2 corpus files, lying) `0x10a` pointer; and a
+//! variable-length file's fragment/overflow pages
+//! (`crate::model::FragmentPage`). `USRACC.DAT` round-trips completely as
+//! of an earlier task -- the first real corpus file to do so; a genuine
+//! multi-page B-tree (`FW_QSQDB.DAT`, `JABTTQST.DAT`, `VARIABLE.DAT`,
+//! `wcctext.nu1`, and 13 more v5 corpus files) now does too. A page no
+//! key's walk reaches, and no other evidence names, is refused by
+//! [`crate::read::file`] before `emit` ever sees it -- so if [`file`] still
+//! faults, the fault names the first byte range this crate genuinely has no
+//! description for yet.
 
 use crate::canvas::{Canvas, Emitted, Fault, Owner};
 use crate::format::acs;
@@ -105,10 +111,9 @@ fn write_page_content(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 
 /// Write every index page's content -- entry count, the two boundary
 /// pointers, every entry, then trailing padding -- for every page whose
-/// model carries one (`Page::index`, `Some` for an `Index` page; `None` for
-/// a `Data`/`Free`/`Acs` page, or an `IndexChild` page whose owning key is
-/// not yet resolved, both a later task, so those pages' bodies stay
-/// unwritten and `Canvas::finish` reports them).
+/// model carries one (`Page::index`, `Some` for an `Index` page **and** for
+/// an `IndexChild` page a key's own walk attributed, Task 11b; `None` only
+/// for a `Data`/`Free`/`Acs` page, which never carries index content).
 ///
 /// Every field is written from the model's own stored value, never
 /// derived -- in particular the last entry's `child` field is written
@@ -433,19 +438,16 @@ fn write_fixed_portion(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 /// record plus its key/segment definitions) is fully described and will
 /// round-trip on its own; every page's six-byte header round-trips too; a
 /// `Data`/`Free` page's slots and slack described (variable-length or not --
-/// harvest 5 SS1.1's slot layout does not change shape); an `Index` page (a
-/// key's own root) has its entry array described too; a v5 file's ACS block
-/// (`Page::acs`) has its tag, name, table and trailing padding described;
-/// and now a variable-length file's fragment/overflow page (`Page::fragments`,
-/// harvest 5 SS3.3) has every fragment, the entry array's boundary member,
-/// and trailing free space described as well. An `IndexChild` page's content
-/// is not, so a real corpus file that has one still leaves the canvas with
-/// unwritten bytes and `Canvas::finish` reports them -- true of every real
-/// variable-length v5 corpus file this task found (see this task's report),
-/// which is why this module's own tests exercise fragment pages against a
-/// synthetic file wrapping a real `VARIABLE.DAT` page rather than the whole
-/// corpus file. A file small enough that every key's whole tree fits on its
-/// own root page (no `IndexChild` pages at all) now round-trips completely.
+/// harvest 5 SS1.1's slot layout does not change shape); every index page --
+/// a key's own root **and** every genuine descendant that key's own walk
+/// attributed it to (Task 11b) -- has its entry array described; a v5
+/// file's ACS block (`Page::acs`) has its tag, name, table and trailing
+/// padding described; and a variable-length file's fragment/overflow page
+/// (`Page::fragments`, harvest 5 SS3.3) has every fragment, the entry
+/// array's boundary member, and trailing free space described as well. A
+/// file this crate could read at all -- `read::file` already refuses any
+/// page no root, ACS claim, free chain, or key's walk reaches -- now
+/// round-trips completely, multi-page B-tree included.
 pub fn file(model: &File) -> Result<Emitted, Fault> {
     let mut canvas = Canvas::new(model.len as usize);
     if model.id.generation.is_v6() {
@@ -491,7 +493,15 @@ mod tests {
     /// one-page file would have).
     #[test]
     fn a_single_page_v5_file_round_trips_completely() {
-        let original = usracc_first_page();
+        // `usracc_first_page` carries the real USRACC.DAT key descriptor's
+        // `root_page` (1) verbatim, but this fixture is deliberately
+        // truncated to page 0 alone -- not a real page 1 for that root to
+        // name. Since Task 11b, `read::file` walks every declared root, so
+        // a genuinely single-page (virgin, no B-tree yet) file must say so
+        // itself: zero the root word here, locally, rather than in the
+        // shared fixture other tests still check against its real value.
+        let mut original = usracc_first_page();
+        original[0x110..0x114].copy_from_slice(&[0, 0, 0, 0]); // root = 0: no B-tree yet
         let model = read::file(&original).expect("reads");
         let emitted = file(&model).expect("page 0 is fully described -- fixed portion plus one key descriptor plus zero_padding");
         assert_eq!(emitted.bytes(), original.as_slice());
@@ -501,26 +511,27 @@ mod tests {
     /// than one repetition, not just the single-definition USRACC.DAT case.
     #[test]
     fn a_single_page_v5_file_with_two_keys_round_trips_completely() {
-        let original = two_key_fixed_portion();
+        // Same adjustment as above: both keys' roots are zeroed locally so
+        // this stays a genuine (if virgin) single-page file under Task
+        // 11b's walk, rather than two dangling pointers into pages the
+        // 512-byte buffer never contains.
+        let mut original = two_key_fixed_portion();
+        original[0x110..0x114].copy_from_slice(&[0, 0, 0, 0]); // key 0's root = 0
+        original[0x12e..0x132].copy_from_slice(&[0, 0, 0, 0]); // key 1's root = 0
         let model = read::file(&original).expect("reads");
         let emitted = file(&model).expect("two key descriptors plus zero_padding tile page 0");
         assert_eq!(emitted.bytes(), original.as_slice());
     }
 
-    /// `file` still faults on a real corpus file that has an `IndexChild`
-    /// page -- a B-tree node no key's root names, whose owning key this
-    /// task does not resolve (`model::Page::index`'s own doc): `USRACC.DAT`
-    /// itself is now fully described (see
-    /// `usracc_dat_round_trips_byte_for_byte` below), so this test uses
-    /// `FW_QSQDB.DA_` instead, the same real file `read`'s own
-    /// `a_real_files_unrooted_btree_nodes_classify_as_index_children` test
-    /// measures: pages 3, 5, 7, 9, 11, 12 are `IndexChild`. Page 0, every
-    /// page's own six-byte header, both `Index` roots' content (pages 1
-    /// and 2), and every `Data` page's content (4, 6, 10) are all described
-    /// now -- so the fault must name the earliest undescribed range, which
-    /// is page 3's content, starting right after its own header.
+    /// Task 11b resolves exactly what this test used to prove `emit` could
+    /// not yet do: `FW_QSQDB.DA_`'s pages 3, 7, 11, and 12 are `IndexChild`
+    /// nodes no key's root names (`read`'s own
+    /// `a_real_files_unrooted_btree_nodes_classify_as_index_children`
+    /// measures this), and are now attributed to whichever of the file's
+    /// three keys' walks actually reaches them -- so the whole file,
+    /// multi-page B-tree included, round-trips byte for byte.
     #[test]
-    fn file_still_faults_on_a_real_files_unresolved_index_child_page() {
+    fn a_real_files_multi_page_btree_round_trips_completely() {
         let Some(root) = crate::corpus::root() else {
             eprintln!("emit: no archive/ on this box, nothing verified");
             return;
@@ -533,17 +544,64 @@ mod tests {
             return;
         };
         let model = read::file(&original).expect("FW_QSQDB.DA_ is a valid v5 file");
-
-        let page_size = model.id.page_size as usize;
-        let page_3_content_start = 3 * page_size + page::LEN;
-
-        let fault = file(&model).expect_err("page 3's IndexChild content is not yet described");
-        let said = fault.to_string();
-        assert!(
-            said.contains(&page_3_content_start.to_string()),
-            "names the range starting right after page 3's header \
-             ({page_3_content_start}): {said}"
+        let emitted = file(&model).expect(
+            "every page is now described -- data, ACS-free, fragment, and \
+             every IndexChild page a key's own walk reached",
         );
+        assert_eq!(emitted.bytes(), original.as_slice());
+    }
+
+    /// The three v5 corpus files that carry **both** a genuine multi-page
+    /// B-tree and a continuing fragment chain -- this task's own
+    /// highest-value targets (Task 11b's brief): each one that round-trips
+    /// proves the walk here *and* gives the previous task's fragment-chain
+    /// work its first real corpus witness, since every such file used to
+    /// fault on an unresolved `IndexChild` page before either byte of a
+    /// fragment was ever compared.
+    #[test]
+    fn the_three_multi_page_fragment_chain_files_round_trip_completely() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("emit: no archive/ on this box, nothing verified");
+            return;
+        };
+        for rel in [
+            "modules/butt-care/DOS Software/BBS/MajorBBS/4EVER/Addons/Farwest Trivia v3.23a/Addons/FW_QSQDB.DAT",
+            "modules/butt-care/DOS Software/BBS/MajorBBS/4EVER/Addons/Jabberwocky Teleconference Trivia v2.2/COPY/JABTTQST.DAT",
+            "tooling/wbtrv32/assets/VARIABLE.DAT",
+        ] {
+            let path = root.join(rel);
+            let Ok(original) = std::fs::read(&path) else {
+                eprintln!("emit: {rel} not present, nothing verified");
+                continue;
+            };
+            let model = read::file(&original).unwrap_or_else(|e| panic!("{rel}: {}", e.why));
+            let emitted =
+                file(&model).unwrap_or_else(|e| panic!("{rel}: emit faulted: {e}"));
+            assert_eq!(emitted.bytes(), original.as_slice(), "{rel} round-trips byte for byte");
+        }
+    }
+
+    /// `wcctext.nu1`: the largest variable-length file in the corpus (5.4
+    /// MB, 2,639 pages, 2,541 records), present at all only because an
+    /// earlier ruling deleted the filename filter that used to hide it
+    /// (`corpus`'s own `the_walk_reaches_the_largest_variable_length_v5_file`
+    /// test). Its one key's B-tree spans 64 pages (measured for this task)
+    /// -- a genuine, if shallow, multi-page tree over the largest
+    /// fragment-chain file this crate reads.
+    #[test]
+    fn wcctext_nu1_round_trips_completely() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("emit: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join("modules/majormud-nt/wccnt7pz/out/wcctext.nu1");
+        let Ok(original) = std::fs::read(&path) else {
+            eprintln!("emit: wcctext.nu1 not present, nothing verified");
+            return;
+        };
+        let model = read::file(&original).expect("wcctext.nu1 is a valid v5 file");
+        let emitted = file(&model).expect("every page -- data, fragment, and every IndexChild page its key's walk reached -- is described");
+        assert_eq!(emitted.bytes(), original.as_slice());
     }
 
     /// Page 1's own six-byte header round-trips byte for byte, checked in
@@ -748,15 +806,18 @@ mod tests {
         assert_eq!(emitted.bytes(), original.as_slice());
     }
 
-    /// This task, step 4/5 end to end: a synthetic v5 file wrapping a real
-    /// `VARIABLE.DAT` page (physical page 15, harvest 5 SS3.5's own named
-    /// best evidence for a multi-hop chain -- fragment 0 continues onto
-    /// another page) round-trips completely. Every real corpus file this
-    /// task found that carries fragment pages also carries at least one
-    /// unresolved `IndexChild` page (see this task's report), so this
-    /// synthetic fixture -- zero keys, nothing else on the page -- is what
-    /// actually proves the fragment-page writer byte for byte, independent
-    /// of that unrelated gap.
+    /// An earlier task's own step 4/5 end to end: a synthetic v5 file
+    /// wrapping a real `VARIABLE.DAT` page (physical page 15, harvest 5
+    /// SS3.5's own named best evidence for a multi-hop chain -- fragment 0
+    /// continues onto another page) round-trips completely. At the time
+    /// every real corpus file carrying fragment pages also carried at least
+    /// one unresolved `IndexChild` page, so this synthetic fixture -- zero
+    /// keys, nothing else on the page -- was what proved the fragment-page
+    /// writer byte for byte, independent of that then-unrelated gap. Task
+    /// 11b closed that gap (`VARIABLE.DAT` itself now round-trips whole,
+    /// see `the_three_multi_page_fragment_chain_files_round_trip_completely`
+    /// above); this fixture stays, since it still isolates the fragment
+    /// writer on its own.
     #[test]
     fn a_real_fragment_page_from_variable_dat_round_trips_byte_for_byte() {
         let original = variable_length_file_with_a_real_fragment_page();

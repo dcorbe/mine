@@ -544,6 +544,276 @@ fn describe_claim(kind: PageKind) -> String {
     }
 }
 
+/// Whether an index page (identified by its own `leftmost` field alone) is a
+/// leaf -- harvest 4's own rule, confirmed against `wccitem2.vir`'s root
+/// (page 118, `leftmost` 117, genuinely interior) and its leaf (page 117,
+/// `leftmost` `NOWHERE`): **zero counts as absent, not as page 0** -- a
+/// virgin root page reads `NOWHERE` at `rightmost` and a literal `0` at
+/// `leftmost`, and reading that zero as a real page sends a walk into the
+/// file control record itself.
+fn is_index_leaf(leftmost: u32) -> bool {
+    leftmost == 0xffff_ffff || leftmost == 0
+}
+
+/// Validate one candidate child pointer and, if it is genuine, claim it for
+/// `key_index`'s tree: bounds (not page 0, not past the file), not already
+/// reached (by this same key's own walk -- a cycle -- or by a different
+/// key's -- ambiguity), not already claimed by something else (the ACS
+/// block, the free chain, or another key's root), and its own header's
+/// `data_bit` clear (a B-tree node, not a page that holds records). Only
+/// once all five hold does this insert the page into `claim` as
+/// [`PageKind::IndexChild`] and into `owner`/`visited` for `key_index`.
+///
+/// # Errors
+///
+/// If any of the five checks above fails -- each arm names the page and the
+/// specific predicate that failed, per Task 11b's own rule that ambiguity is
+/// a refusal, never a guess.
+fn enter_child(
+    candidate: u32,
+    key_index: usize,
+    total_pages: usize,
+    claim: &mut HashMap<u32, PageKind>,
+    owner: &mut HashMap<u32, usize>,
+    visited: &mut HashMap<u32, usize>,
+    bytes: &[u8],
+    page_size: usize,
+) -> Result<u32, NotBtrieve> {
+    if candidate == 0 {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s B-tree names child page 0 -- \
+                 the control record, never a real B-tree node"
+            ),
+        });
+    }
+    if candidate as usize >= total_pages {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s B-tree names child page \
+                 {candidate}, but the file has only {total_pages} pages"
+            ),
+        });
+    }
+    if let Some(&existing_key) = visited.get(&candidate) {
+        return if existing_key == key_index {
+            Err(NotBtrieve {
+                why: format!(
+                    "key_descriptor[{key_index}]'s B-tree revisits page \
+                     {candidate} -- the tree does not terminate cleanly (a \
+                     cycle)"
+                ),
+            })
+        } else {
+            Err(NotBtrieve {
+                why: format!(
+                    "page {candidate} is reached by both \
+                     key_descriptor[{existing_key}]'s and \
+                     key_descriptor[{key_index}]'s B-tree walk -- a page \
+                     cannot belong to two keys' trees"
+                ),
+            })
+        };
+    }
+    if let Some(existing) = claim.get(&candidate).copied() {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s B-tree names page \
+                 {candidate}, which is already {} -- a B-tree node cannot \
+                 also be that",
+                describe_claim(existing)
+            ),
+        });
+    }
+    let child_at = candidate as usize * page_size;
+    let counter = get_u16(bytes, child_at + page::at::COUNTER);
+    if counter & page::DATA_BIT != 0 {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s B-tree names page {candidate} \
+                 as a child, but its own header's data_bit is set -- the \
+                 tree claims a B-tree node, but the page itself says it \
+                 holds records"
+            ),
+        });
+    }
+    visited.insert(candidate, key_index);
+    claim.insert(candidate, PageKind::IndexChild);
+    owner.insert(candidate, key_index);
+    Ok(candidate)
+}
+
+/// Walk one key's B-tree from its own root down through every genuine child
+/// pointer, attributing each page it reaches to `key_index` (via `claim`/
+/// `owner`) -- an explicit stack rather than recursion, leftmost-first, the
+/// same shape `pages::walk_with` uses for the same problem on the live
+/// engine's own page format: descend as far left as a subtree goes, then for
+/// each entry in turn follow the entry itself and (on an interior page) the
+/// child between it and the next, with the very last entry's gap filled by
+/// the page header's own `rightmost` slot rather than the entry's own
+/// (placeholder) `child` field.
+///
+/// The root's own bounds and `data_bit` are checked directly here, before
+/// anything is decoded, using the identical wording `resolve_pages`'s own
+/// per-page loop uses for the same contradiction on an ordinary forward
+/// scan -- so a bogus root cannot be walked into as though its bytes were a
+/// real B-tree node before either check has fired.
+///
+/// # Errors
+///
+/// If the root is out of range or its own `data_bit` is set, if the tree
+/// runs deeper than a generous bound (corruption, not a real B-tree -- no
+/// v5 corpus file this task measured exceeds a handful of levels), if a
+/// non-last entry of an interior page has no stored `child` field at all
+/// (only the last entry of a page may omit it, and only because the page is
+/// full), or if [`enter_child`] refuses any child pointer along the way.
+fn walk_one_key(
+    bytes: &[u8],
+    page_size: usize,
+    total_pages: usize,
+    key_index: usize,
+    d: &KeyDescriptor,
+    claim: &mut HashMap<u32, PageKind>,
+    owner: &mut HashMap<u32, usize>,
+    visited: &mut HashMap<u32, usize>,
+) -> Result<(), NotBtrieve> {
+    const MAX_DEPTH: usize = 64;
+
+    let root = d.root_page;
+    if root == 0 || root as usize >= total_pages {
+        return Err(NotBtrieve {
+            why: format!(
+                "key_descriptor[{key_index}]'s root names page {root}, but \
+                 the file has only {total_pages} pages (page 0 is the \
+                 control record) -- not a real page to walk"
+            ),
+        });
+    }
+    let root_at = root as usize * page_size;
+    if get_u16(bytes, root_at + page::at::COUNTER) & page::DATA_BIT != 0 {
+        return Err(NotBtrieve {
+            why: format!(
+                "page {root} is an index root, but its own header's \
+                 data_bit is set -- a key's root claims it as a B-tree \
+                 node, but the page itself says it holds records"
+            ),
+        });
+    }
+
+    struct Frame {
+        number: u32,
+        page: IndexPage,
+        at: usize,
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut next = Some(root);
+
+    loop {
+        while let Some(number) = next.take() {
+            if stack.len() >= MAX_DEPTH {
+                return Err(NotBtrieve {
+                    why: format!(
+                        "key_descriptor[{key_index}]'s B-tree from root \
+                         {root} is more than {MAX_DEPTH} levels deep -- not \
+                         a real B-tree"
+                    ),
+                });
+            }
+            let child_at = number as usize * page_size;
+            let page = read_index_page(
+                bytes,
+                child_at,
+                page_size,
+                d.key_length as usize,
+                d.entry_size as usize,
+                d.attributes,
+            )?;
+            let leftmost = page.leftmost;
+            stack.push(Frame { number, page, at: 0 });
+            next = if is_index_leaf(leftmost) {
+                None
+            } else {
+                Some(enter_child(
+                    leftmost, key_index, total_pages, claim, owner, visited, bytes, page_size,
+                )?)
+            };
+        }
+
+        let Some(frame) = stack.last_mut() else { return Ok(()) };
+        if frame.at == frame.page.entries.len() {
+            stack.pop();
+            continue;
+        }
+        let is_last = frame.at + 1 == frame.page.entries.len();
+        let entry_child = frame.page.entries[frame.at].child;
+        let leaf = is_index_leaf(frame.page.leftmost);
+        let rightmost = frame.page.rightmost;
+        let frame_number = frame.number;
+        let entry_index = frame.at;
+        frame.at += 1;
+        if !leaf {
+            let candidate = if is_last {
+                rightmost
+            } else {
+                entry_child.ok_or_else(|| NotBtrieve {
+                    why: format!(
+                        "key_descriptor[{key_index}]'s B-tree: page \
+                         {frame_number}'s entry {entry_index} has no stored \
+                         child field at all, but it is not the page's last \
+                         entry -- only the last entry of a page may omit it"
+                    ),
+                })?
+            };
+            next = Some(enter_child(
+                candidate, key_index, total_pages, claim, owner, visited, bytes, page_size,
+            )?);
+        }
+    }
+}
+
+/// Walk every key's own B-tree from its root, attributing each genuine
+/// interior or leaf child page it reaches to that key -- see this task's
+/// (11b) own brief: "every `IndexChild` page is attributed to exactly one
+/// key's B-tree, by walking child pointers from that key's root."
+///
+/// `visited` is seeded with every key's own root page before any walk
+/// starts, so a walk that loops back to its own root, or strays into a
+/// different key's root, is refused the same way straying into a genuine
+/// sibling child is -- there is exactly one predicate (`enter_child`'s
+/// "already reached" check) for every one of these cases, not a separate
+/// special case per source of ambiguity.
+///
+/// Each page is decoded exactly once per key whose tree reaches it (the
+/// `visited` map guarantees no page is ever entered twice, by any key), so
+/// this walk is linear in the number of pages the trees actually occupy,
+/// never quadratic in the file's total page count.
+///
+/// # Errors
+///
+/// See [`walk_one_key`] and [`enter_child`].
+fn walk_index_trees(
+    bytes: &[u8],
+    page_size: usize,
+    total_pages: usize,
+    key_descriptors: &[KeyDescriptor],
+    claim: &mut HashMap<u32, PageKind>,
+    owner: &mut HashMap<u32, usize>,
+) -> Result<(), NotBtrieve> {
+    let mut visited: HashMap<u32, usize> = HashMap::new();
+    for (i, d) in key_descriptors.iter().enumerate() {
+        if d.root_page != 0 {
+            visited.insert(d.root_page, i);
+        }
+    }
+    for (i, d) in key_descriptors.iter().enumerate() {
+        if d.root_page == 0 {
+            continue;
+        }
+        walk_one_key(bytes, page_size, total_pages, i, d, claim, owner, &mut visited)?;
+    }
+    Ok(())
+}
+
 /// Resolve the v5 page graph: what every physical page from 1 to
 /// `total_pages - 1` *is*, derived from **two** independent sources -- the
 /// control record's own pointers, and each page's own header bit -- neither
@@ -604,11 +874,12 @@ fn resolve_pages(
     key_descriptors: &[KeyDescriptor],
 ) -> Result<Vec<Page>, NotBtrieve> {
     let mut claim: HashMap<u32, PageKind> = HashMap::new();
-    // Which key descriptor a root page belongs to -- needed once a page is
-    // known to be `Index`, so its entries can be decoded with the right
-    // `key_length`/`entry_size`/`attributes` (none of which the page itself
-    // carries).
-    let mut root_owner: HashMap<u32, usize> = HashMap::new();
+    // Which key descriptor a page (root **or**, once `walk_index_trees` has
+    // run, a genuine descendant) belongs to -- needed once a page is known
+    // to be `Index`/`IndexChild`, so its entries can be decoded with the
+    // right `key_length`/`entry_size`/`attributes` (none of which the page
+    // itself carries).
+    let mut owner: HashMap<u32, usize> = HashMap::new();
 
     // Index: every key descriptor's own root page (0 means "no root" --
     // either a continuation definition or an as-yet-empty key).
@@ -627,7 +898,7 @@ fn resolve_pages(
             });
         }
         claim.insert(d.root_page, PageKind::Index);
-        root_owner.insert(d.root_page, i);
+        owner.insert(d.root_page, i);
     }
 
     // ACS: gated on content (harvest 4 SS6a), not on FCR 0x10a alone.
@@ -670,6 +941,14 @@ fn resolve_pages(
         });
     }
 
+    // IndexChild: walk every key's own tree from its root, down through
+    // every genuine child pointer, attributing each page it reaches to that
+    // key -- see `walk_index_trees`'s own doc. Ordered before the free-chain
+    // walk below so a free-chain link that reaches a genuine B-tree child is
+    // caught as the same kind of contradiction as one reaching a root or the
+    // ACS page.
+    walk_index_trees(bytes, page_size, total_pages, key_descriptors, &mut claim, &mut owner)?;
+
     // Free: walk the record-slot free chain from FCR 0x10.
     const NOWHERE: u32 = 0xffff_ffff;
     let mut cur = control.free;
@@ -703,7 +982,7 @@ fn resolve_pages(
         }
         let page_number = (at / page_size) as u32;
         if let Some(existing) = claim.get(&page_number).copied() {
-            if matches!(existing, PageKind::Index | PageKind::Acs) {
+            if matches!(existing, PageKind::Index | PageKind::Acs | PageKind::IndexChild) {
                 return Err(NotBtrieve {
                     why: format!(
                         "the free chain from FCR 0x10 reaches page \
@@ -783,9 +1062,13 @@ fn resolve_pages(
                     ),
                 });
             }
-            Some(kind @ (PageKind::Index | PageKind::Acs | PageKind::Free)) => kind,
+            Some(kind @ (PageKind::Index | PageKind::Acs | PageKind::Free | PageKind::IndexChild)) => {
+                kind
+            }
             Some(other) => {
-                unreachable!("claim only ever stores Index, Acs, or Free -- got {other:?}")
+                unreachable!(
+                    "claim only ever stores Index, Acs, Free, or IndexChild -- got {other:?}"
+                )
             }
             None if data_bit => PageKind::Data,
             None if variable && looks_like_fragment_page(bytes, at, page_size) => {
@@ -793,15 +1076,29 @@ fn resolve_pages(
             }
             None => {
                 // Not named by any root, not the ACS block, not on the free
-                // chain, its own header says "not records", and (on a
-                // variable-length file) its own bytes do not match this
-                // format's fragment-page shape either -- a B-tree node no
-                // key's root claims, i.e. a child of some tree. Which tree
-                // is Task 9's business, once index entries are parsed and
-                // child pointers can actually be walked; this task only has
-                // to say honestly that the page is an index page, not that
-                // it knows whose.
-                PageKind::IndexChild
+                // chain, its own header says "not records", not reached by
+                // any key's own B-tree walk (`walk_index_trees`, above --
+                // every genuine child of a real tree is already `claim`ed
+                // by the time this loop runs), and (on a variable-length
+                // file) its own bytes do not match this format's
+                // fragment-page shape either. Task 11b's own rule: a page
+                // reached by no walk is a refusal, not a guess -- this used
+                // to fall through to `PageKind::IndexChild` residually
+                // (exactly the defect an earlier task's `unwrap_or` shipped
+                // elsewhere, mislabelling 9,058 pages), which this crate no
+                // longer does now that a real walk exists to attribute
+                // every genuine child.
+                return Err(NotBtrieve {
+                    why: format!(
+                        "page {page_number} is not named by any key's root, \
+                         not the ACS block, not on the free chain, its own \
+                         header says it holds a B-tree node rather than \
+                         records, and no key's B-tree walk ever reached it \
+                         either -- there is no positive evidence for what \
+                         this page is, so this crate refuses rather than \
+                         guessing"
+                    ),
+                });
             }
         };
 
@@ -823,17 +1120,17 @@ fn resolve_pages(
         };
 
         // An index page's entries, described whenever this page is a key's
-        // own root: its owning key descriptor is known directly (via
-        // `root_owner`), so `key_length`/`entry_size`/`attributes` need no
-        // walking to find. An `IndexChild` page's owning key is not yet
-        // known -- that requires walking child pointers down from a root,
-        // out of this task's scope -- so it stays `None` and `emit` faults
-        // on it honestly, the same way it faults on a variable-length
-        // fragment page today.
-        let index_content = if kind == PageKind::Index {
-            let &n = root_owner
+        // own root **or** a genuine descendant `walk_index_trees` reached:
+        // either way its owning key descriptor is known directly (via
+        // `owner`), so `key_length`/`entry_size`/`attributes` need no
+        // re-deriving here -- they are read a second time from the same key
+        // descriptor the walk itself used, which is what Task 11b's
+        // mutation targets (see `read`'s own
+        // `attributing_every_index_child_to_key_zero_...` test).
+        let index_content = if kind == PageKind::Index || kind == PageKind::IndexChild {
+            let &n = owner
                 .get(&(page_number as u32))
-                .unwrap_or_else(|| panic!("page {page_number} is Index but claims no owner"));
+                .unwrap_or_else(|| panic!("page {page_number} is {kind:?} but claims no owner"));
             let d = &key_descriptors[n];
             Some(read_index_page(
                 bytes,
@@ -1042,10 +1339,19 @@ mod tests {
     /// every other v5 corpus file measured.
     #[test]
     fn usracc_dats_key_descriptor_decodes_root_and_records() {
+        // Calls `key_descriptors` directly rather than going through
+        // `file`: this test is about the key/segment definition array's own
+        // decode, not the page graph, and `usracc_first_page` is
+        // deliberately truncated to page 0 alone -- since Task 11b, `file`
+        // itself refuses that (the descriptor's `root_page` names a page
+        // the buffer does not contain), which is a different, correct
+        // concern this test is not the place to exercise.
         let buf = usracc_first_page();
-        let file = file(&buf).expect("a valid v5 control record");
-        assert_eq!(file.key_descriptors.len(), 1, "USRACC.DAT has exactly one definition");
-        let d = &file.key_descriptors[0];
+        let control = control_record(&buf);
+        let descriptors =
+            key_descriptors(&buf, 512, control.keys).expect("a valid descriptor array");
+        assert_eq!(descriptors.len(), 1, "USRACC.DAT has exactly one definition");
+        let d = &descriptors[0];
         assert_eq!(d.key_number, 0, "unexercised on v5 -- always 0 in the corpus");
         assert_eq!(d.root_page, 1, "root");
         assert_eq!(d.records, 2, "records");
@@ -1071,13 +1377,21 @@ mod tests {
     /// 31-bit mask, key 1's `root_page` reads `0x01000004` instead of `4`.
     #[test]
     fn a_multi_key_files_root_pointers_decode_the_top_byte_and_low_24_bits() {
+        // Calls `key_descriptors` directly, not `file` -- see
+        // `usracc_dats_key_descriptor_decodes_root_and_records`'s own note.
+        // `two_key_fixed_portion` names roots 3 and 4 in a 1-page buffer
+        // purely to exercise the mask on the raw `ROOT` word; neither page
+        // is meant to exist, so a walk (Task 11b) is not this test's
+        // concern.
         let buf = two_key_fixed_portion();
-        let file = file(&buf).expect("a valid v5 control record");
-        assert_eq!(file.key_descriptors.len(), 2);
-        assert_eq!(file.key_descriptors[0].key_number, 0x80);
-        assert_eq!(file.key_descriptors[0].root_page, 3);
-        assert_eq!(file.key_descriptors[1].key_number, 0x81);
-        assert_eq!(file.key_descriptors[1].root_page, 4, "not 0x01000004");
+        let control = control_record(&buf);
+        let descriptors =
+            key_descriptors(&buf, 512, control.keys).expect("a valid descriptor array");
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].key_number, 0x80);
+        assert_eq!(descriptors[0].root_page, 3);
+        assert_eq!(descriptors[1].key_number, 0x81);
+        assert_eq!(descriptors[1].root_page, 4, "not 0x01000004");
     }
 
     /// A segment chain that never closes (every definition sets ANOSEG) runs
@@ -1362,6 +1676,60 @@ mod tests {
         }
     }
 
+    /// Task 11b's own anchor: `FW_QSQDB.DAT` (the real, full-size file --
+    /// 1,775 pages, three keys of three different widths: key 0 is 4 bytes,
+    /// key 1 is 8, key 2 is 80 and permits duplicates) has a genuine
+    /// multi-page tree under every one of its three keys (measured
+    /// independently for this task: 123, 160, and 577 pages respectively).
+    /// Page 734 is a real child reached only by key 1's own walk (its
+    /// root's own `leftmost`); page 1057 only by key 2's. This is the test
+    /// this task's required mutation (Step 6: attribute every `IndexChild`
+    /// to key 0 instead of the key whose walk reached it) must turn red --
+    /// and a byte-level round trip of the whole file cannot, on its own,
+    /// prove that: `read_index_page`/`write_index_pages` are exact
+    /// structural inverses of each other for *any* internally-consistent
+    /// `(key_length, entry_size, duplicates)` triple that does not overrun
+    /// the page, so misattributing page 734 to key 0's *narrower* 4-byte
+    /// shape still reproduces the same bytes (a different partition of the
+    /// identical byte range into "entries" versus "padding") without
+    /// tripping any bounds check. Asserting the *decoded key width* here,
+    /// rather than only the round trip, is what actually catches it.
+    #[test]
+    fn a_real_files_multi_key_btree_children_are_attributed_to_the_right_keys_width() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join(
+            "modules/butt-care/DOS Software/BBS/MajorBBS/4EVER/Addons/Farwest Trivia v3.23a/Addons/FW_QSQDB.DAT",
+        );
+        let Ok(buf) = std::fs::read(&path) else {
+            eprintln!("read: FW_QSQDB.DAT not present, nothing verified");
+            return;
+        };
+        let file = file(&buf).expect("FW_QSQDB.DAT is a valid v5 file");
+
+        let page_734 = &file.pages[734 - 1];
+        assert_eq!(page_734.kind, PageKind::IndexChild, "not a root itself");
+        let idx_734 = page_734.index.as_ref().expect("attributed, so described");
+        assert!(!idx_734.entries.is_empty(), "page 734 holds real entries");
+        assert_eq!(
+            idx_734.entries[0].key.len(),
+            8,
+            "page 734 is a child of key 1 (key_length 8), not key 0 (4)"
+        );
+
+        let page_1057 = &file.pages[1057 - 1];
+        assert_eq!(page_1057.kind, PageKind::IndexChild, "not a root itself");
+        let idx_1057 = page_1057.index.as_ref().expect("attributed, so described");
+        assert!(!idx_1057.entries.is_empty(), "page 1057 holds real entries");
+        assert_eq!(
+            idx_1057.entries[0].key.len(),
+            80,
+            "page 1057 is a child of key 2 (key_length 80), not key 0 (4)"
+        );
+    }
+
     /// Two keys cannot share one root page -- if they did, this crate would
     /// have to guess which key's B-tree actually lives there. No corpus file
     /// does this (0 of 145 v5 files measured for this task), so the fixture
@@ -1502,6 +1870,17 @@ mod tests {
         buf[0x14..0x16].copy_from_slice(&1u16.to_le_bytes()); // keys = 1
         let def0 = 0x110;
         buf[def0..def0 + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]); // root = 1
+        // A real, walkable key -- Task 11b's own walk runs before the free
+        // chain below, so the root must actually decode (key_length 2,
+        // entry_size 10: the unique-key formula) rather than fault on its
+        // own entry_size mismatch before the free-chain conflict this test
+        // means to exercise ever gets a chance to fire.
+        buf[def0 + 0x0a..def0 + 0x0c].copy_from_slice(&2u16.to_le_bytes()); // key_length
+        buf[def0 + 0x0c..def0 + 0x0e].copy_from_slice(&10u16.to_le_bytes()); // entry_size
+        // Page 1 itself: a genuine empty leaf (count 0, both child slots
+        // NOWHERE) so the walk finds nothing further to descend into.
+        buf[512 + 8..512 + 12].copy_from_slice(&[0xff; 4]); // rightmost = NOWHERE
+        buf[512 + 12..512 + 16].copy_from_slice(&[0xff; 4]); // leftmost = NOWHERE
         buf[0x10..0x14].copy_from_slice(&[0x00, 0x00, 0x06, 0x02]); // free = 518 (page 1, offset 6)
         let e = file(&buf).expect_err("the free chain reaches page 1, an index root");
         assert!(e.why.contains("page 1"), "{}", e.why);
