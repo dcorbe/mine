@@ -27,14 +27,15 @@
 //! key's own `ALT_COLLATING` bit -- rather than trusted from the control
 //! record's own (on 2 corpus files, lying) `0x10a` pointer; and a
 //! variable-length file's fragment/overflow pages
-//! (`crate::model::FragmentPage`). `USRACC.DAT` round-trips completely as
-//! of an earlier task -- the first real corpus file to do so; a genuine
-//! multi-page B-tree (`FW_QSQDB.DAT`, `JABTTQST.DAT`, `VARIABLE.DAT`,
-//! `wcctext.nu1`, and 13 more v5 corpus files) now does too. A page no
-//! key's walk reaches, and no other evidence names, is refused by
-//! [`crate::read::file`] before `emit` ever sees it -- so if [`file`] still
-//! faults, the fault names the first byte range this crate genuinely has no
-//! description for yet.
+//! (`crate::model::FragmentPage`); and (Task 13) an abandoned page no key's
+//! walk reaches and no other evidence names (`crate::model::PageKind::Orphan`),
+//! whose whole body is carried back verbatim, undecoded. `USRACC.DAT`
+//! round-trips completely as of an earlier task -- the first real corpus
+//! file to do so; a genuine multi-page B-tree (`FW_QSQDB.DAT`,
+//! `JABTTQST.DAT`, `VARIABLE.DAT`, `wcctext.nu1`, and 13 more v5 corpus
+//! files) now does too; as of Task 13, all 145 v5 corpus files this crate
+//! can identify do. If [`file`] still faults, the fault names the first byte
+//! range this crate genuinely has no description for yet.
 
 use crate::canvas::{Canvas, Emitted, Fault, Owner};
 use crate::format::acs;
@@ -314,6 +315,28 @@ fn write_fragment_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> 
     Ok(())
 }
 
+/// Write every orphan page's whole body back verbatim (`Page::orphan`, Task
+/// 13), for every page whose model carries one (`Some` only for
+/// `PageKind::Orphan`). Written as one opaque block past the header, exactly
+/// as `read::resolve_pages` captured it -- this crate makes no claim about
+/// what, if anything, inside it is still meaningful; see `PageKind::Orphan`'s
+/// own documentation for the evidence that this is abandoned content, not an
+/// unparsed structure.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_orphan_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for (i, p) in model.pages.iter().enumerate() {
+        let Some(body) = &p.orphan else { continue };
+        let page_number = i + 1;
+        let at = page_number * page_size;
+        canvas.put(at + page::LEN, body, page_owner("orphan_body", page_number))?;
+    }
+    Ok(())
+}
+
 /// Write the key/segment definition array (`0x110` onward) and page 0's own
 /// tail (`model.page_zero_tail`) that follows it, out to `page_size`, into
 /// `canvas`. The tail is written verbatim -- it is not always zero, see
@@ -467,10 +490,11 @@ fn write_fixed_portion(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
 /// file's ACS block (`Page::acs`) has its tag, name, table and trailing
 /// padding described; and a variable-length file's fragment/overflow page
 /// (`Page::fragments`, harvest 5 SS3.3) has every fragment, the entry
-/// array's boundary member, and trailing free space described as well. A
-/// file this crate could read at all -- `read::file` already refuses any
-/// page no root, ACS claim, free chain, or key's walk reaches -- now
-/// round-trips completely, multi-page B-tree included.
+/// array's boundary member, and trailing free space described as well. An
+/// orphan page (`Page::orphan`, Task 13 -- a page no root, ACS claim, free
+/// chain, or key's walk reaches) has its whole body written back verbatim,
+/// unparsed. A file this crate could read at all now round-trips
+/// completely, multi-page B-tree and abandoned pages included.
 pub fn file(model: &File) -> Result<Emitted, Fault> {
     let mut canvas = Canvas::new(model.len as usize);
     if model.id.generation.is_v6() {
@@ -483,6 +507,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
     write_index_pages(&mut canvas, model)?;
     write_acs_blocks(&mut canvas, model)?;
     write_fragment_pages(&mut canvas, model)?;
+    write_orphan_pages(&mut canvas, model)?;
     canvas.finish()
 }
 

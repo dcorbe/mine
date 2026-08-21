@@ -583,6 +583,7 @@ fn describe_claim(kind: PageKind) -> String {
         PageKind::IndexChild => "an index page (not a root)".to_string(),
         PageKind::Data => "a data page".to_string(),
         PageKind::Variable => "a variable-length fragment page".to_string(),
+        PageKind::Orphan => "an orphaned page".to_string(),
     }
 }
 
@@ -891,9 +892,14 @@ fn walk_index_trees(
 /// has no page-level free list, so this only records "at least one freed
 /// record slot lives here," never displacing an Index or Acs claim.
 ///
-/// A page no pointer claims is decided by `data_bit` alone: set means
-/// `Data`, clear means [`PageKind::IndexChild`] -- a B-tree node no key's
-/// root names. Measured 281/281 index roots, 15/15 ACS pages, and 22/22
+/// A page no pointer claims is decided by `data_bit` first: set means
+/// `Data`. Clear means a B-tree node no key's root names -- `IndexChild` if
+/// some key's own walk (`walk_index_trees`) reaches it, or, failing that (on
+/// a variable-length file) `Variable` if its content matches that shape, or
+/// else [`PageKind::Orphan`] (Task 13): a page abandoned by every key's
+/// tree, which v5's total absence of a page-level free list (harvest 3 SS4)
+/// makes an expected outcome rather than evidence this crate failed to
+/// attribute it. Measured 281/281 index roots, 15/15 ACS pages, and 22/22
 /// free pages agree with their own `data_bit` across the whole v5 corpus,
 /// so the checks below have never yet fired on real data -- but they are
 /// real checks, not formalities, and a corpus file that ever disagrees is
@@ -1136,24 +1142,17 @@ fn resolve_pages(
                 // every genuine child of a real tree is already `claim`ed
                 // by the time this loop runs), and (on a variable-length
                 // file) its own bytes do not match this format's
-                // fragment-page shape either. Task 11b's own rule: a page
-                // reached by no walk is a refusal, not a guess -- this used
-                // to fall through to `PageKind::IndexChild` residually
-                // (exactly the defect an earlier task's `unwrap_or` shipped
-                // elsewhere, mislabelling 9,058 pages), which this crate no
-                // longer does now that a real walk exists to attribute
-                // every genuine child.
-                return Err(NotBtrieve {
-                    why: format!(
-                        "page {page_number} is not named by any key's root, \
-                         not the ACS block, not on the free chain, its own \
-                         header says it holds a B-tree node rather than \
-                         records, and no key's B-tree walk ever reached it \
-                         either -- there is no positive evidence for what \
-                         this page is, so this crate refuses rather than \
-                         guessing"
-                    ),
-                });
+                // fragment-page shape either. Task 11b's own rule still
+                // holds: this crate never guesses a *structure* for such a
+                // page (this used to fall through to `PageKind::IndexChild`
+                // residually, mislabelling 9,058 pages). Task 13 adds the
+                // one thing it is safe to say instead of refusing: v5 has no
+                // page-level free list (harvest 3 SS4), so a page no walk
+                // reaches is the format's own expected abandoned-page
+                // outcome, not evidence of a parsing gap -- `PageKind::Orphan`
+                // asserts exactly that and nothing more; see its own
+                // documentation for the corpus evidence.
+                PageKind::Orphan
             }
         };
 
@@ -1215,6 +1214,15 @@ fn resolve_pages(
             None
         };
 
+        // An orphan's entire body (Task 13): stored whole and verbatim,
+        // past the 6-byte header, with no attempt to decode it as any other
+        // page shape -- see `PageKind::Orphan`'s own documentation.
+        let orphan_content = if kind == PageKind::Orphan {
+            Some(bytes[at + page::LEN..at + page_size].to_vec())
+        } else {
+            None
+        };
+
         pages.push(Page {
             number,
             data_bit,
@@ -1224,6 +1232,7 @@ fn resolve_pages(
             index: index_content,
             acs: acs_content,
             fragments: fragment_content,
+            orphan: orphan_content,
         });
     }
     Ok(pages)
@@ -2458,6 +2467,78 @@ mod tests {
 
         let emitted = crate::emit::file(&model).expect("wccitems.nu1: nothing undescribed");
         assert_eq!(emitted.bytes(), original.as_slice(), "the whole file round-trips, tail included");
+    }
+
+    /// Task 13, Group B: `TTIHORSS.DAT`'s one orphan, physical page 251 --
+    /// not named by any key's root, not the ACS block, not on the free
+    /// chain, its own header's `data_bit` clear, and unreached by every
+    /// key's own B-tree walk. Before this task `read::file` refused this
+    /// file by name; now it classifies the page `PageKind::Orphan`, carries
+    /// its whole body (past the 6-byte header) verbatim without attempting
+    /// to decode it, and the file round-trips completely.
+    #[test]
+    fn ttihorss_dats_orphan_page_251_is_carried_whole_and_round_trips() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path =
+            root.join("modules/isv-file-libraries/ISVTTI - Tessier Technologies/temp/TTIHORSS.DAT");
+        let Ok(original) = std::fs::read(&path) else {
+            eprintln!("read: TTIHORSS.DAT not present, nothing verified");
+            return;
+        };
+
+        let model = file(&original).expect("an orphan page is no longer a refusal");
+        assert_eq!(model.id.page_size, 1024);
+        let orphan_page = &model.pages[251 - 1];
+        assert_eq!(orphan_page.number, 251, "this page's own header.number field agrees with its position");
+        assert!(!orphan_page.data_bit, "the orphan's own header says B-tree node, not records");
+        assert_eq!(orphan_page.kind, PageKind::Orphan);
+        let body = orphan_page.orphan.as_ref().expect("Orphan carries its whole body");
+        assert_eq!(body.len(), 1024 - page::LEN);
+        assert_eq!(
+            &body[0..6],
+            &[0x00, 0x00, 0xff, 0xff, 0xff, 0xff],
+            "the body is carried verbatim, whatever it contains"
+        );
+
+        let emitted = crate::emit::file(&model).expect("TTIHORSS.DAT: nothing undescribed");
+        assert_eq!(emitted.bytes(), original.as_slice(), "the orphan page round-trips, body included");
+    }
+
+    /// Task 13, Group B's other shape: `wccitem2.vir` under `wccnt7py` has
+    /// its own orphan at physical page 592, and unlike `TTIHORSS.DAT`'s,
+    /// this one's header and leading bytes are a *structurally
+    /// self-consistent* index leaf (a controller review walked this file's
+    /// keys from scratch in Python and confirmed no walk reaches it: real
+    /// root 118, 11 pages visited, maximum 582). This crate does not
+    /// special-case that -- it carries the same whole, undecoded body
+    /// either way, because attributing these bytes to a specific key's
+    /// entry shape without a walk's own evidence is exactly the guess Task
+    /// 7/11b already ruled out.
+    #[test]
+    fn wccitem2_virs_structurally_index_shaped_orphan_is_still_carried_whole_not_decoded() {
+        let Some(root) = crate::corpus::root() else {
+            eprintln!("read: no archive/ on this box, nothing verified");
+            return;
+        };
+        let path = root.join("modules/majormud-nt/wccnt7py/out/wccitem2.vir");
+        let Ok(original) = std::fs::read(&path) else {
+            eprintln!("read: wccitem2.vir not present, nothing verified");
+            return;
+        };
+
+        let model = file(&original).expect("an orphan page is no longer a refusal");
+        assert_eq!(model.id.page_size, 4096);
+        let orphan_page = &model.pages[592 - 1];
+        assert_eq!(orphan_page.kind, PageKind::Orphan);
+        assert!(orphan_page.index.is_none(), "no key attribution exists, so no IndexPage is decoded");
+        let body = orphan_page.orphan.as_ref().expect("Orphan carries its whole body");
+        assert_eq!(body.len(), 4096 - page::LEN);
+
+        let emitted = crate::emit::file(&model).expect("wccitem2.vir: nothing undescribed");
+        assert_eq!(emitted.bytes(), original.as_slice(), "the orphan page round-trips, body included");
     }
 }
 
