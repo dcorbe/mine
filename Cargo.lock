@@ -560,7 +560,6 @@ dependencies = [
  "mbbs",
  "mbbs-lua",
  "mbbs-machine",
- "mud-core",
  "textscreen",
  "tokio",
 ]
@@ -632,6 +631,9 @@ dependencies = [
 [[package]]
 name = "mud-core"
 version = "0.1.0"
+dependencies = [
+ "rusqlite",
+]
 
 [[package]]
 name = "mud-oracle"

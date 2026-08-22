@@ -10,7 +10,6 @@ clap = { version = "4", features = ["derive"] }
 mbbs = { path = "../mbbs" }
 mbbs-lua = { path = "../mbbs-lua" }
 mbbs-machine = { path = "../mbbs-machine" }
-mud-core = { path = "../mud-core" }
 textscreen = { path = "../textscreen" }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"] }
 
