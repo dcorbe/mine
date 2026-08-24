@@ -2158,10 +2158,30 @@ impl<M: Mem> Block<M> {
     /// same session, by creating one file with key attributes `0x0100` and
     /// another with `0x0102` and running the same update against both.
     ///
+    /// # Variable-length records (Task 6)
+    ///
+    /// When `self.geometry.variable`, `bytes` is `reclen` fixed bytes
+    /// followed by the record's whole body -- [`Self::update_inner`] only
+    /// reaches this function once it has confirmed there is one (its
+    /// `has_body` check). The slot's own four-byte pointer, between `reclen`
+    /// and `physical`, is never in `bytes` at all, and must not be
+    /// overwritten by copying `bytes` straight into the slot the way the
+    /// fixed-length case does -- that is the exact corruption
+    /// [`Self::update`]'s own doc comment warns a blanket write here would
+    /// cause. Instead: the pointer is read off the *pre-write* page,
+    /// [`variable::rewrite_fragment_in_place_v6`] rewrites the fragment it
+    /// names (refusing rather than guessing at a chain or a resize -- see
+    /// its own doc comment), the page is re-read fresh because that call
+    /// went through `store` directly, and only then are the marker and the
+    /// `reclen` fixed bytes written -- the pointer itself is never touched,
+    /// because the fragment did not move.
+    ///
     /// # Errors
     ///
     /// If the file cannot be read or written, `position` does not resolve to a
-    /// claimed slot, or [`Self::v6_reindex`] refuses any key.
+    /// claimed slot, [`Self::v6_reindex`] refuses any key, or (variable-length
+    /// only) the fragment is chained onto another page, is not exactly one
+    /// fragment, or is not the same length as the replacement.
     fn update_v6(&mut self, position: u32, bytes: &[u8], layout: pages::Layout) -> Result<(), BtvError> {
         let name = self.name.clone();
         let fail = |why: String| BtvError {
@@ -2187,6 +2207,33 @@ impl<M: Mem> Block<M> {
             .map_err(|why| fail(format!("updating the record in the model: {why}")))?;
 
         let mut content = store.page(physical as usize).map_err(&fail)?.to_vec();
+        let body = within + V6_SLOT_MARKER;
+
+        // Variable-length records: rewrite the fragment first, on the
+        // pre-write pointer, then re-read the slot's own page fresh -- see
+        // this function's own doc comment for why. `fixed_len` is `reclen`
+        // here (the pointer bytes past it are left exactly as they already
+        // are) and `bytes.len()` for a fixed-length record, where there is
+        // no pointer to disturb.
+        let fixed_len = if self.geometry.variable {
+            let reclen = usize::from(self.geometry.reclen);
+            let pointer_at = body + reclen;
+            let pointer = variable::Pointer::decode([
+                content[pointer_at],
+                content[pointer_at + 1],
+                content[pointer_at + 2],
+                content[pointer_at + 3],
+            ]);
+            {
+                let mut fragments = variable::V6Pages::new(&mut store, page_size).map_err(&fail)?;
+                variable::rewrite_fragment_in_place_v6(&mut fragments, pointer, &bytes[reclen..])
+                    .map_err(&fail)?;
+            }
+            content = store.page(physical as usize).map_err(&fail)?.to_vec();
+            reclen
+        } else {
+            bytes.len()
+        };
 
         // The marker counts updates, and zero means free -- so it must never
         // land back on zero. Genuine Btrieve's behaviour at the sixty-five
@@ -2198,8 +2245,7 @@ impl<M: Mem> Block<M> {
         let marker = marker.checked_add(1).filter(|&m| m != 0).unwrap_or(1);
         content[within..within + 2].copy_from_slice(&marker.to_le_bytes());
 
-        let body = within + V6_SLOT_MARKER;
-        content[body..body + bytes.len()].copy_from_slice(bytes);
+        content[body..body + fixed_len].copy_from_slice(&bytes[..fixed_len]);
 
         let fcr = self.v6_live_fcr(&mut store).map_err(&fail)?;
 
@@ -3074,10 +3120,12 @@ impl<M: Mem> Block<M> {
     ///
     /// # Errors
     ///
-    /// If the file holds variable-length records, `bytes` is not exactly
-    /// `reclen` long, the records cannot be read, `position` holds no
-    /// record, the file cannot be written, or (debug builds only) the
-    /// written file fails [`Self::verify_write`].
+    /// If the file holds fixed-length records and `bytes` is not exactly
+    /// `reclen` long, the file holds variable-length records and the write
+    /// is not an in-place, same-length, single-fragment rewrite (see
+    /// [`Self::update_inner`]'s own doc comment), the records cannot be
+    /// read, `position` holds no record, the file cannot be written, or
+    /// (debug builds only) the written file fails [`Self::verify_write`].
     pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
         let result = self.update_inner(position, bytes);
         self.verify_write(result)
@@ -3100,45 +3148,37 @@ impl<M: Mem> Block<M> {
     /// zero-fill the tail of whatever was there. That is a live data-loss
     /// path once `dupdbtv` calls this.
     ///
-    /// **Variable-length files refuse, whatever the buffer's length.** The
-    /// four bytes between `reclen` and `physical` in such a file's slot are
-    /// Btrieve's pointer to the record's first variable fragment, and
-    /// `write_record` pads to `physical`, so any write here unlinks them. An
-    /// earlier version refused only a buffer that was not `reclen` long, which
-    /// misses the case that actually occurs: `Records::read` yields the fixed
-    /// part alone, exactly `reclen` bytes, so a caller that reads a record and
-    /// writes it back went straight through. Genuine Btrieve 6.15 then refused
-    /// the whole of `WCCTEXT.VIR` with status 54 -- see
-    /// [`an_update_of_a_variable_length_file_is_refused_rather_than_unlinking_its_fragments`].
+    /// **Variable-length files rewrite in place, or refuse.** The four bytes
+    /// between `reclen` and `physical` in such a file's slot are Btrieve's
+    /// pointer to the record's first variable fragment, and
+    /// `pages::write_record`/`v6::Map::relocate` both write the *whole*
+    /// slot, so a buffer that does not already carry the right pointer bytes
+    /// in the right place would corrupt or unlink the fragment chain if
+    /// written unconditionally. What actually happens is only ever a call to
+    /// [`Self::rewrite_variable`] (v5) or [`Self::update_v6`]'s
+    /// variable-length branch (v6, Task 6): both read the *existing* pointer
+    /// off disk, rewrite only the fragment content it names, and leave the
+    /// pointer itself untouched -- see their own doc comments for the exact
+    /// shape each one handles (v5: one whole unfragmented fragment, same
+    /// length; v6: the same, decided by the fragment's own leading pointer
+    /// rather than its entry bit) and refuses otherwise. An earlier version
+    /// refused every variable-length update outright, on every version; that
+    /// refusal is what genuine Btrieve 6.15 gave for the one shape this host
+    /// still cannot do -- see
+    /// [`an_update_of_a_variable_length_file_is_refused_rather_than_unlinking_its_fragments`]
+    /// for the case (a buffer with no body past `reclen` at all) this host
+    /// still refuses exactly the same way.
     ///
     /// # Errors
     ///
-    /// If the file holds variable-length records, `bytes` is not exactly
-    /// `reclen` long, the records cannot be read, `position` holds no record,
-    /// or the file cannot be written.
+    /// If the file holds fixed-length records and `bytes` is not exactly
+    /// `reclen` long, the file holds variable-length records and the write
+    /// is not an in-place, same-length, single-fragment rewrite, the records
+    /// cannot be read, `position` holds no record, or the file cannot be
+    /// written.
     fn update_inner(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
         self.records()?;
         let name = self.name.clone();
-
-        // A v6 *variable-length* file refuses before the v5 variable path
-        // below can be entered at all. That path rewrites a fragment through
-        // `variable::rewrite_fragment_in_place`, which addresses pages by
-        // literal offset; on a v6 file every one of those numbers is a
-        // logical id instead, so it would write a real record over whatever
-        // page happens to sit at a logical id's arithmetic. This is the one
-        // half of the old blanket `writable` refusal that is still live.
-        if self.geometry.version == Version::V6 && self.geometry.variable {
-            return Err(BtvError {
-                file: name,
-                why: format!(
-                    "is a v6 file holding variable-length records up to {} bytes: \
-                     a fragment chain's page numbers are logical ids in a v6 file \
-                     and byte offsets in a v5 one, and this host has measured how \
-                     to rewrite one only for v5",
-                    self.geometry.reclen
-                ),
-            });
-        }
 
         if self.geometry.version != Version::V6 {
             self.writable()?;
@@ -3150,10 +3190,10 @@ impl<M: Mem> Block<M> {
             // The one shape this host rewrites: a buffer with a body beyond
             // `reclen` (nothing to rewrite in place otherwise), at a position
             // the model already holds a record at. Everything else -- no
-            // body, an unknown position, or a body
-            // `variable::rewrite_fragment_in_place` itself refuses because the
-            // page it names is not shaped for an in-place rewrite -- keeps
-            // this host's refusal rather than guessing.
+            // body, an unknown position, or a body the version-specific
+            // rewrite itself refuses because the page it names is not shaped
+            // for an in-place rewrite -- keeps this host's refusal rather
+            // than guessing.
             let has_body = bytes.len().checked_sub(reclen).is_some_and(|n| n > 0);
             if has_body {
                 let known = self
@@ -3163,6 +3203,14 @@ impl<M: Mem> Block<M> {
                     .find_physical(position)
                     .is_some();
                 if known {
+                    if self.geometry.version == Version::V6 {
+                        let layout = pages::Layout {
+                            page: self.geometry.page,
+                            physical: self.geometry.physical,
+                            pages: self.geometry.pages,
+                        };
+                        return self.update_v6(position, bytes, layout);
+                    }
                     self.capture_for_journal()?;
                     return match self.rewrite_variable(position, bytes) {
                         Ok(()) => {
@@ -3182,11 +3230,11 @@ impl<M: Mem> Block<M> {
             return Err(BtvError {
                 file: name,
                 why: format!(
-                    "holds variable-length records up to {} bytes, and this host does \
-                     not write them -- writing this {}-byte buffer would pad the slot \
-                     out to its {} physical bytes and zero the pointer to the record's \
-                     variable part, unlinking the fragment chain the rest of the file \
-                     is threaded on",
+                    "holds variable-length records up to {} bytes, and this write has no \
+                     body past reclen (or names a position with no known record) -- \
+                     writing this {}-byte buffer would pad the slot out to its {} \
+                     physical bytes and zero the pointer to the record's variable part, \
+                     unlinking the fragment chain the rest of the file is threaded on",
                     self.geometry.reclen,
                     bytes.len(),
                     self.geometry.physical
@@ -6517,17 +6565,112 @@ mod tests {
         block.verify_writes = true;
         let reclen = usize::from(block.geometry.reclen);
 
-        // `V6DUP.DAT` holds variable-length records, so only insert is a
-        // write this host performs on it at all -- update and delete both
-        // refuse unconditionally for a v6 variable-length file (see
-        // `Self::update_inner`, `Self::delete_inner`). Insert alone is
-        // still a real write through the real v6 path this task wires
-        // verification into, and it is enough to show the healthy case.
+        // `V6DUP.DAT` holds variable-length records. Delete still refuses
+        // unconditionally for a v6 variable-length file (`Self::delete_inner`,
+        // out of this task's scope); update now rewrites an in-place,
+        // same-length, single-fragment record (Task 6,
+        // `a_v6_variable_length_record_rewrites_a_single_fragment_in_place`
+        // exercises it directly) but this fixture's own record shapes are not
+        // chosen for that, so insert alone is what this test uses to show the
+        // healthy case through the real v6 write path verification wires into.
         let mut record = vec![0u8; reclen];
         record[..4].copy_from_slice(&999_999u32.to_le_bytes());
         block.insert(&record).expect("a verified insert");
 
         assert_eq!(crate::verify::written(&path), Ok(()));
+    }
+
+    /// **A v6 variable-length record can be updated.** Task 6: closes the
+    /// refusal `Self::update_inner` used to give unconditionally for every
+    /// v6 file holding variable-length records -- the refusal the design
+    /// doc named as what "crashes a live board", reachable today on
+    /// MajorMUD-NT's own `WCCTEXT2.VIR` (`tmp/plan-3-update-survey.md`
+    /// SS0.B/SS5: any `dfaUpdateDup`/`upvbtv` write to it stopped the
+    /// session outright, `ShimError` being terminal).
+    ///
+    /// # Why this copy, not the 3,467-record one the task brief names
+    ///
+    /// `wccnt8pj`'s copy of `wcctext2.vir` is the 3,467-record file the task
+    /// brief describes, and it is genuinely v6 and genuinely variable -- but
+    /// measured directly (every one of its 3,467 fragment pointers decodes
+    /// to the end-of-chain sentinel, zero real continuations), it carries no
+    /// multi-hop fragment chain at all. Step 6's required mutation --
+    /// emitting the fragment pointer without its byte-order scramble -- is
+    /// only visible on a *real* page number; `0xffffffff`, the sentinel, is
+    /// the one pointer value every byte permutation encodes identically.
+    /// `verify::written` re-emits the *whole* file after this test's update,
+    /// so the mutation is only caught if some record left untouched by this
+    /// update still carries a real chain. `wccnt7pw`'s copy of the same
+    /// file (same MajorMUD text database, a different build snapshot) does:
+    /// measured directly, 170 of its 1,940 records' fragment pointers name a
+    /// real next page rather than the sentinel.
+    ///
+    /// # Why this loop, not one hardcoded position
+    ///
+    /// `Self::update_v6`'s variable-length branch only rewrites a record
+    /// whose own fragment is the whole record on one page -- refusing a
+    /// chain that continues onto another is deliberate scope (see
+    /// `variable::rewrite_fragment_in_place_v6`'s own doc comment: growing
+    /// or splicing a chain needs the allocator and entry-array edits this
+    /// host has not measured against genuine Btrieve 6.15 for v6). Roughly
+    /// 9 in 10 of this file's records are the single-fragment shape (170 of
+    /// 1,940 measured with a real continuation), so this tries records in
+    /// the order the model lists them until one succeeds, rather than
+    /// asserting a specific position that would make this test fragile
+    /// against which record happens to be which shape.
+    #[test]
+    fn a_v6_variable_length_record_rewrites_a_single_fragment_in_place() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../archive/modules/majormud-nt/wccnt7pw/out/wcctext2.vir");
+        if !source.exists() {
+            eprintln!("{}: not present in this checkout, skipping", source.display());
+            return;
+        }
+        let dir = crate::testing::scratch("v6-variable-update-wcctext2");
+        let path = dir.join("wcctext2.vir");
+        std::fs::copy(&source, &path).expect("the corpus file copies into scratch");
+
+        let mut block = block_from_file(path.clone(), "WCCTEXT2.VIR");
+        block.verify_writes = true;
+        assert_eq!(block.geometry.version, Version::V6);
+        assert!(
+            block.geometry.variable,
+            "wcctext2.vir is supposed to hold variable-length records"
+        );
+
+        let positions = block.records().expect("the records read").positions();
+        let mut updated = None;
+        for position in positions {
+            let mut bytes = {
+                let records = block.records().expect("still loaded");
+                let at = records.find_physical(position).expect("just listed");
+                records.physical(at).expect("just found").bytes.clone()
+            };
+            // The body's own last byte -- never a fixed-part byte a key
+            // might be defined over, so this can never trip the
+            // unmodifiable-key rule even where that rule applied here.
+            let last = bytes.len() - 1;
+            bytes[last] = bytes[last].wrapping_add(1);
+            if block.update(position, &bytes).is_ok() {
+                updated = Some((position, bytes));
+                break;
+            }
+        }
+        let (position, bytes) = updated.expect(
+            "wcctext2.vir has at least one single-fragment, unchained variable-length record",
+        );
+
+        assert_eq!(crate::verify::written(&path), Ok(()));
+
+        // Reopened from disk, not trusted from the model the write just
+        // updated -- the same discipline the real-file WCCMP002 tests use.
+        let mut fresh = block_from_file(path.clone(), "WCCTEXT2.VIR");
+        let reread = {
+            let records = fresh.records().expect("the file still reads");
+            let at = records.find_physical(position).expect("record still there");
+            records.physical(at).expect("record").bytes.clone()
+        };
+        assert_eq!(reread, bytes, "the update is visible after a fresh read");
     }
 
     /// **A v6 tree that shrinks on rebuild no longer leaks a claimed page.**

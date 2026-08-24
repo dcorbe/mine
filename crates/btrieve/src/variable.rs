@@ -604,11 +604,13 @@ impl Chain {
 ///
 /// # What is checked, in order
 ///
-/// - **the file is Btrieve 5.** Task 6 taught [`Chain::follow`] to read a v6
-///   fragment chain, but writing one needs the allocator and the free chain
-///   this does not have -- out of scope by the plan's own "Deliberately out
-///   of scope: v6 writing", so this keeps refusing every v6 file rather than
-///   only the v5 rule's read-side justification, which no longer applies.
+/// - **the file is Btrieve 5.** A v6 fragment page is addressed by logical
+///   id through the `"PP"` allocation table rather than a physical byte
+///   offset, and every v6 fragment carries its 4-byte pointer whether or
+///   not the chain continues -- different enough, on both counts, that v6
+///   has its own counterpart, [`rewrite_fragment_in_place_v6`], rather than
+///   a version branch inside this one. This function still refuses a v6
+///   file outright, and stays v5-only.
 /// - **the page `pointer` names says it is that page** ([`Header::read`]).
 /// - **the page holds exactly one fragment.** A page mid-split, or any page
 ///   with more on it than the one fragment this pointer names, is refused
@@ -646,10 +648,11 @@ pub(crate) fn rewrite_fragment_in_place<P: PagesMut>(
 ) -> Result<(), String> {
     if version != Version::V5 {
         return Err(format!(
-            "{version:?} lays out its fragments differently, and rewriting one in place \
-             would need the allocator and the entry array this call does not have \
-             (W32MKDE_decompiled.c:19045) -- v6 writing is out of scope for the plan that \
-             taught the read side (Chain::follow) to handle {version:?}"
+            "{version:?} addresses a fragment page by logical id through the \"PP\" \
+             allocation table, not a physical byte offset, and every one of its \
+             fragments carries a leading pointer whether or not the chain continues \
+             (W32MKDE_decompiled.c:19045) -- see `rewrite_fragment_in_place_v6` for \
+             the {version:?} counterpart"
         ));
     }
 
@@ -688,6 +691,118 @@ pub(crate) fn rewrite_fragment_in_place<P: PagesMut>(
 
     let mut rewritten = page;
     rewritten[found.at..found.at + found.length].copy_from_slice(new_body);
+    pages.write_page(pointer.page, &rewritten)
+}
+
+/// Overwrite a single, whole, unchained, equal-length v6 fragment in place --
+/// the v6 counterpart of [`rewrite_fragment_in_place`].
+///
+/// `pointer.page` is a **logical** id, resolved through `pages`
+/// ([`V6Pages`], backed by the `"PP"` allocation table), not a physical
+/// page number -- the same distinction [`Header::read`]'s own v6 branch
+/// makes.
+///
+/// # Why "not continued" cannot be [`Fragment::continued`] here
+///
+/// Every v6 fragment carries its 4-byte leading pointer whether or not the
+/// chain actually goes on ([`Entry::continued`]'s own doc comment, harvest 5
+/// SS3.4) -- so [`fragment`] always reports `continued: true` for a v6 page,
+/// and that field cannot tell a whole record from one link of a longer
+/// chain. What can is the pointer's own *value*: [`Chain::follow`] decodes
+/// it and asks [`Pointer::is_end`], and this does the identical check on
+/// the same bytes before touching anything, rather than inventing a second
+/// way to ask the same question.
+///
+/// # Why this rewrite does not require the page to hold only one fragment
+///
+/// [`rewrite_fragment_in_place`] (v5) refuses any page with more than one
+/// fragment on it, conservatively, because the one real file it was proven
+/// against (`WCCTEXT.DAT`) never packed more than one. This v6 counterpart
+/// does not need that restriction and does not take it: measured directly
+/// against real MajorMUD-NT data (`wccnt7pw`'s copy of `wcctext2.vir`, whose
+/// short 12-byte-`reclen` records pack many fragments per 4096-byte page --
+/// pages with 9 and 13 live fragments observed), a v6 fragment page routinely
+/// holds several. [`fragment`] already derives *this* fragment's own
+/// `at`/`length` from the entry array regardless of how many neighbours
+/// share the page (that is the whole purpose of the array), and only the
+/// bytes `at..at+length` are ever touched here -- a sibling fragment's own
+/// span is never read or written, so leaving it alone needs no assumption
+/// beyond what [`fragment`] itself already guarantees.
+///
+/// # What is checked, in order
+///
+/// - **the page `pointer` names says it is that logical page**
+///   ([`Header::read`]).
+/// - **that fragment starts at [`FIRST_FRAGMENT`], if it is fragment 0** --
+///   the engine's own status 54 check, reused from [`fragment`].
+/// - **that fragment's own leading pointer is the chain's end-of-chain
+///   sentinel** ([`Pointer::is_end`]). A real next pointer means this
+///   record's body spans more than one page; rewriting that needs the
+///   allocator and the entry-array edits a resize or a chain splice would
+///   take, none of which is measured against genuine Btrieve 6.15 for v6 --
+///   refused rather than guessed, the same standard the v5 function already
+///   holds itself to for exactly this shape.
+/// - **that fragment's existing body length (its span minus the leading
+///   pointer) equals `new_body.len()`.** Anything shorter or longer needs
+///   the free chain, the entry array, or a second page -- unmeasured, and
+///   out of scope for the same reason as the point above.
+///
+/// # What is written
+///
+/// Only `new_body`, into exactly the bytes past the fragment's own leading
+/// pointer -- which is read, checked, and left untouched, not rewritten:
+/// the fragment does not move, so its own pointer does not change.
+///
+/// # Errors
+///
+/// If any of the checks above fails, or the page cannot be read or written
+/// back.
+pub(crate) fn rewrite_fragment_in_place_v6<P: PagesMut>(
+    pages: &mut P,
+    pointer: Pointer,
+    new_body: &[u8],
+) -> Result<(), String> {
+    let page = pages.page(pointer.page)?.to_vec();
+    let header = Header::read(&page, pointer.page, Version::V6)?;
+
+    let found = fragment(&page, pointer.fragment, header, Version::V6)
+        .map_err(|why| format!("logical page {}: {why}", pointer.page))?;
+
+    if found.length < POINTER {
+        return Err(format!(
+            "logical page {}: fragment {} is {} bytes, too short for the \
+             {POINTER}-byte leading pointer every v6 fragment carries",
+            pointer.page, pointer.fragment, found.length
+        ));
+    }
+    let leading: [u8; POINTER] = page[found.at..found.at + POINTER]
+        .try_into()
+        .expect("checked against POINTER above");
+    let next = Pointer::decode(leading);
+    if !next.is_end() {
+        return Err(format!(
+            "logical page {}: fragment {}'s own pointer names page {}, fragment {} -- \
+             this record's body continues onto another page, and rewriting a chain \
+             that spans more than one page is not implemented",
+            pointer.page, pointer.fragment, next.page, next.fragment
+        ));
+    }
+
+    let body_len = found.length - POINTER;
+    if body_len != new_body.len() {
+        return Err(format!(
+            "logical page {}: fragment {} carries a {body_len}-byte body and the new \
+             body is {} -- an in-place rewrite only handles a replacement of the same \
+             length",
+            pointer.page,
+            pointer.fragment,
+            new_body.len()
+        ));
+    }
+
+    let mut rewritten = page;
+    let body_at = found.at + POINTER;
+    rewritten[body_at..body_at + body_len].copy_from_slice(new_body);
     pages.write_page(pointer.page, &rewritten)
 }
 
