@@ -6406,7 +6406,7 @@ mod tests {
     /// [`crate::verify::written`] accepts.
     ///
     /// This is the baseline
-    /// [`a_shrinking_multi_key_v6_reindex_releases_its_surplus_pages`] is
+    /// [`a_shrinking_v6_reindex_releases_its_surplus_pages_on_insert`] is
     /// contrasted against: `verify_writes` does not fail a write that is
     /// actually sound.
     #[test]
@@ -6433,8 +6433,7 @@ mod tests {
         assert_eq!(crate::verify::written(&path), Ok(()));
     }
 
-    /// **A multi-key v6 tree that shrinks on rebuild no longer leaks a
-    /// claimed page.**
+    /// **A v6 tree that shrinks on rebuild no longer leaks a claimed page.**
     ///
     /// Formerly `verify_writes_catches_a_real_defect_in_multi_key_v6_reindex`,
     /// which asserted the opposite of what this now checks -- a defect this
@@ -6442,7 +6441,15 @@ mod tests {
     /// (`v6::Map::unclaim`, wired into `Block::v6_reindex`), and a test
     /// still named "catches a real defect" would be a lie sitting in the
     /// suite once it started asserting the defect's *absence*. Renamed to
-    /// describe the property it guards instead.
+    /// describe the property it guards instead -- and dropped "multi_key"
+    /// specifically: the census in `task-3b-report.md` proved key count is
+    /// irrelevant to the mechanism, so a name built around it would invite
+    /// the exact misreading Task 1's own original inference made. This
+    /// test's own fixture happens to be multi-key; its sibling,
+    /// [`a_shrinking_v6_reindex_releases_its_surplus_pages_on_delete`],
+    /// hits the identical mechanism on a single-key file -- the suffix
+    /// names the *operation* that triggers the shrink, which is the
+    /// property that actually varies between them.
     ///
     /// The scenario is unchanged: `IDXPROBE.DAT` (2 keys, 120 records) is
     /// the smallest committed multi-key v6 fixture this crate has, and one
@@ -6456,7 +6463,7 @@ mod tests {
     /// returns, so the write -- and `verify::written` on the result -- both
     /// succeed, in either build profile.
     #[test]
-    fn a_shrinking_multi_key_v6_reindex_releases_its_surplus_pages() {
+    fn a_shrinking_v6_reindex_releases_its_surplus_pages_on_insert() {
         let dir = crate::testing::scratch("verify-writes-idxprobe-shrink");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/IDXPROBE.DAT");
         let path = dir.join("IDXPROBE.DAT");
@@ -6501,6 +6508,63 @@ mod tests {
     /// refusal. Run once to answer Step 1 of the task-3b brief and left in as
     /// `#[ignore]`d evidence rather than a scratch script that leaves nothing
     /// behind.
+    /// **The single-key shape, default-running -- the dominant real-world
+    /// failure mode, not just the fixture that happened to find it.**
+    ///
+    /// `a_shrinking_v6_reindex_releases_its_surplus_pages_on_insert`'s own
+    /// fixture is multi-key, and the task-3b census found the census's own
+    /// blast radius runs the other way: of 170 real writes driven across the
+    /// `archive/` corpus, 93 hit this defect and every one of them was a
+    /// single-key file (0 of the 2 populated multi-key files ever did). A
+    /// default `cargo test -p btrieve` exercised none of that -- the census
+    /// itself is `#[ignore]`d and the real single-key witness
+    /// (`WCCMP002.DAT`) is env-gated behind `$WCCMP002`. This is a small,
+    /// committed, always-running fixture closing that gap.
+    ///
+    /// `V6SHRINK.DAT`: a genuine v6 file, its empty shell built by the real
+    /// oracle (`tools/btrieve-oracle/crtprobe.exe create`, Pervasive Btrieve
+    /// 6.15 under Wine -- not hand-crafted bytes), one key (STRING, 48
+    /// bytes, unique), reclen 48, page 512. `Shape::capacity` gives this key
+    /// 8 entries per index page ((512-12)/(48+8)), so this crate's own
+    /// `pages::build_index` packs 8 records into a single leaf and 9 into
+    /// three nodes (2 leaves + 1 root) -- the committed fixture holds those
+    /// 9, inserted through this crate's own `Block::insert` after the
+    /// oracle-built shell. `existing.len()=3, index.nodes.len()=1` after
+    /// this test's delete, measured directly (temporary instrumentation,
+    /// removed before commit) -- the identical shrink shape as `WCCMP002.DAT`
+    /// (208 -> 106) and `IDXPROBE.DAT` (6 -> 4), just reached by a delete on
+    /// a single key rather than an insert on two.
+    #[test]
+    fn a_shrinking_v6_reindex_releases_its_surplus_pages_on_delete() {
+        let dir = crate::testing::scratch("verify-writes-v6shrink-delete");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/V6SHRINK.DAT");
+        let path = dir.join("V6SHRINK.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        assert_eq!(
+            crate::verify::written(&path),
+            Ok(()),
+            "the untouched fixture must round-trip, or this test would be \
+             blaming the write for a defect the fixture already had"
+        );
+
+        let mut block = block_from_file(path.clone(), "V6SHRINK.DAT");
+        block.verify_writes = true;
+        let records = block.records().expect("the fixture's records load");
+        assert_eq!(records.len(), 9, "the fixture's own committed record count");
+        let first = records.physical(0).expect("9 records, so index 0 exists").clone();
+
+        block.delete(first.position).expect(
+            "a single-key v6 tree that shrinks on delete must still leave a file this crate \
+             can read back",
+        );
+        assert_eq!(
+            crate::verify::written(&path),
+            Ok(()),
+            "the write must leave a file read::file accepts, independent of whether \
+             verify_writes caught anything already"
+        );
+    }
+
     #[test]
     #[ignore = "drives real writes across every v6 file in archive/; slow, opt-in, needs the archive"]
     fn task3b_v6_shrink_census() {

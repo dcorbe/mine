@@ -2048,4 +2048,111 @@ mod tests {
              only the allocation-table entry makes a claim real"
         );
     }
+
+    /// `Map::unclaim`, `claim`'s inverse -- Task 3b's fix for `v6_reindex`
+    /// leaving a shrunk tree's surplus pages claimed. Mirrors `claim`'s own
+    /// four tests (fresh-add, double-flip, refuse, second-block) rather than
+    /// only being exercised indirectly through `lib.rs`'s two integration
+    /// scenarios -- an inverse operation with no direct test of its own
+    /// refusals is exactly the shape this project keeps finding.
+    ///
+    /// `DUPKEY30.DAT`'s live copy (physical 3) claims logical 1 at physical 9
+    /// and logical 2 at physical 10 -- measured in
+    /// `claim_adds_a_new_logical_page_and_disturbs_nothing_else`'s own
+    /// comment. Releasing logical 2 must clear only its own entry, leave
+    /// logical 1 and every other page byte-for-byte alone, and bump the
+    /// generation the same way `claim` does.
+    #[test]
+    fn unclaim_releases_a_claimed_entry_and_disturbs_nothing_else() {
+        let mut file = fixture("DUPKEY30.DAT");
+        let before = Map::read(&file, 512).expect("resolves before");
+        assert_eq!(before.physical(2), Some(10), "measured baseline");
+        let physical10_before = file[10 * 512..11 * 512].to_vec();
+
+        Map::unclaim(&mut file, 512, 2).expect("logical 2 is claimed");
+
+        let after = Map::read(&file, 512).expect("resolves after");
+        assert_eq!(after.physical(2), None, "logical 2 is no longer claimed");
+        assert_eq!(after.physical(1), Some(9), "logical 1 untouched");
+        assert_eq!(
+            file[10 * 512..11 * 512],
+            physical10_before[..],
+            "unclaim never touches the abandoned page's own bytes -- only \
+             the allocation-table entry"
+        );
+    }
+
+    /// Releasing a logical id nothing claims is refused, not a silent no-op
+    /// -- the same discipline `claim`'s own refusals hold to. Logical 3 is
+    /// `DUPKEY30.DAT`'s first free slot (the same fact
+    /// `claim_adds_a_new_logical_page_and_disturbs_nothing_else` claims into).
+    #[test]
+    fn unclaim_refuses_a_logical_id_nothing_claims() {
+        let mut file = fixture("DUPKEY30.DAT");
+        let e = Map::unclaim(&mut file, 512, 3).unwrap_err();
+        assert!(e.contains("there is nothing to release"), "{e}");
+    }
+
+    /// Unclaiming and reclaiming exercise the shadow flip both ways, the
+    /// same way `claiming_twice_flips_the_shadow_pair_both_ways` does for
+    /// two claims in a row -- and prove the freed slot is genuinely back in
+    /// the free pool, not merely reported empty by `Map::read`.
+    #[test]
+    fn unclaiming_then_claiming_reuses_the_freed_slot() {
+        let mut file = fixture("DUPKEY30.DAT");
+
+        Map::unclaim(&mut file, 512, 2).expect("logical 2 is claimed");
+
+        let mut content = vec![0u8; 512];
+        content[6..10].copy_from_slice(b"NEW!");
+        let logical = Map::claim(&mut file, 512, &content, [0x00, 0x44]).expect("claims");
+        assert_eq!(
+            logical, 2,
+            "the lowest free slot is logical 2's, now that unclaim freed it -- \
+             not logical 3, which was already free before either call"
+        );
+
+        let map = Map::read(&file, 512).expect("resolves");
+        assert_eq!(map.physical(1), Some(9), "logical 1 was never touched");
+        assert_eq!(map.physical(3), None, "logical 3 is still free, as it always was");
+        let physical = map.physical(2).expect("the reclaim resolved");
+        let at = physical as usize * 512;
+        assert_eq!(&file[at + 6..at + 10], b"NEW!", "the reclaim's own content landed");
+    }
+
+    /// A logical id in allocation-table **block 2** releases through block
+    /// 2's own shadow pair alone -- the multi-block correctness
+    /// `relocate`'s own doc comment claims for itself but `unclaim` had no
+    /// direct test of. `PP2BLOCK.DAT`'s logical 127 is block 2's slot 0,
+    /// claimed at physical 128 -- the same fact
+    /// `a_logical_id_in_the_second_block_relocates_through_that_blocks_pair`
+    /// measures.
+    #[test]
+    fn unclaim_in_the_second_block_touches_only_that_blocks_pair() {
+        const PAGE: usize = 512;
+        let mut file = fixture("PP2BLOCK.DAT");
+        let before = Map::read(&file, PAGE as u16).expect("resolves");
+        assert_eq!(before.physical(127), Some(128), "measured baseline");
+        let block1 = file[2 * PAGE..4 * PAGE].to_vec();
+
+        Map::unclaim(&mut file, PAGE as u16, 127).expect("logical 127 is claimed in block 2");
+
+        assert_eq!(
+            file[2 * PAGE..4 * PAGE],
+            block1[..],
+            "block 1's pair is untouched -- the release belonged to block 2"
+        );
+        let after = Map::read(&file, PAGE as u16).expect("still resolves");
+        assert_eq!(after.physical(127), None, "logical 127 is released");
+
+        // Every other id still resolves exactly where it did. A block-2
+        // release that clobbered block 1, or the wrong slot within block 2,
+        // shows up here and nowhere else.
+        for (logical, physical) in before.entries() {
+            if logical == 127 {
+                continue;
+            }
+            assert_eq!(after.physical(logical), Some(physical), "logical {logical} moved");
+        }
+    }
 }
