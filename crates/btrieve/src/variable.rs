@@ -2421,15 +2421,16 @@ mod tests {
         assert_eq!(pages.0[1], before);
     }
 
-    /// Reading a v6 fragment chain is implemented (Task 6) and checked
-    /// byte-for-byte against the engine on four committed fixtures; **writing
-    /// one is not**, and [`rewrite_fragment_in_place`] still refuses it. The
-    /// reason is no longer "there is nothing to check an implementation
-    /// against" -- that was true when this test was written and is not now --
-    /// but that a v6 write needs the allocation-table maintenance the read
-    /// plan puts deliberately out of scope. `Block::writable` refuses every
-    /// v6 write upstream of here for the same reason; this is the same
-    /// refusal at the layer that would do the damage.
+    /// [`rewrite_fragment_in_place`] is the v5-only half of this mechanism
+    /// and still refuses a v6 page -- deliberately, not because v6 writing
+    /// is unimplemented: [`rewrite_fragment_in_place_v6`] above is that
+    /// implementation, used by [`super::Block::update_v6`]. The two exist
+    /// separately because a v6 page's `0x8000` bit means something else
+    /// than it does in v5 (see the assertion below), so a shared function
+    /// would have to branch on version internally rather than let a caller
+    /// pick the right one; this test pins that [`rewrite_fragment_in_place`]
+    /// itself never silently does the wrong thing with a v6 page, whatever
+    /// its v6 counterpart does.
     #[test]
     fn a_btrieve_6_file_is_refused_rather_than_rewritten_by_the_version_5_rule() {
         let mut pages = Held(vec![blank(96), page(1, 96, &[(b"body".as_slice(), false)])]);

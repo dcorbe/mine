@@ -1080,34 +1080,31 @@ impl<M: Mem> Block<M> {
     /// Whether this host will write to the file the v5 way: seeking a
     /// position as a literal byte offset.
     ///
-    /// **No longer the whole v6 gate.** [`Self::insert`] now has its own v6
-    /// path ([`Self::insert_v6`]), with its own narrower scope, called
-    /// *before* this would ever see a v6 file. [`Self::update`] and
-    /// [`Self::delete`] still call this unconditionally and still refuse
-    /// every v6 file, because both of them still assume `pages::write_record`
-    /// /`pages::delete_record`'s literal-byte-offset arithmetic, and neither
-    /// has been made v6-aware -- an update would still land on whatever
-    /// physical page happened to sit at a logical id's arithmetic, or past
-    /// the end of the file, exactly the corruption this refusal was written
-    /// to prevent (Task 13 of
-    /// `docs/plans/2026-08-15-host-api-surface-track-b.md`, "the refusal at
-    /// 754" this doc comment used to describe in full).
+    /// **No longer the v6 gate at all.** [`Self::insert`], [`Self::update`]
+    /// and [`Self::delete`] each now have their own v6 path
+    /// ([`Self::insert_v6`]/[`Self::update_v6`]/[`Self::delete_v6`]),
+    /// called before this could ever see a v6 file -- `pages::write_record`/
+    /// `pages::delete_record`'s literal-byte-offset arithmetic, which this
+    /// exists to guard, is simply never reached for one. This is called
+    /// only on the v5 branch of each of the three, to catch the one case a
+    /// version check alone would not: a v5-declared file whose geometry is
+    /// otherwise malformed. See each caller's own doc comment for what its
+    /// v6 path still refuses -- none of it is "v6 at all."
     ///
     /// # Errors
     ///
-    /// If the file is v6.
+    /// If the file is not v5.
     fn writable(&self) -> Result<(), BtvError> {
         if self.geometry.version != Version::V5 {
             return Err(BtvError {
                 file: self.name.clone(),
                 why: format!(
-                    "is a {:?} file, and this host does not write an update or a \
-                     delete to one -- a v6 record's position names a logical \
-                     page, and `pages::write_record`/`pages::delete_record` seek \
-                     to it as a literal byte offset. `Self::insert` no longer \
-                     shares this refusal (see `Self::insert_v6`), but neither \
-                     rewriting a record in place nor splicing one off the free \
-                     list has been made v6-safe",
+                    "is a {:?} file, and this is the v5-only write path -- \
+                     `pages::write_record`/`pages::delete_record` seek to a \
+                     position as a literal byte offset, which is only ever \
+                     correct for v5. A v6 file never reaches this: \
+                     `Self::insert_v6`/`Self::update_v6`/`Self::delete_v6` \
+                     handle it instead",
                     self.geometry.version
                 ),
             });
@@ -1537,20 +1534,18 @@ impl<M: Mem> Block<M> {
     /// read-modify-append-elsewhere-and-flip-the-shadow-pair operation, not
     /// an in-place edit.
     ///
-    /// # Scope, stated rather than guessed past
+    /// # Scope
     ///
-    /// **Every key must be unique** (no duplicates), **belong to a single
-    /// `"PP"` allocation-table block**, and **have an index that still fits
-    /// one page after this record is added.** Each boundary is a real,
-    /// separate mechanism this host has not measured or implemented: a
-    /// duplicate key's chain is written into the records themselves by
-    /// [`Self::reindex`] (`pages::Shape::duplicates`'s own doc comment),
-    /// which is not v6-aware; a second allocation-table block's placement is
-    /// [`v6::Map`]'s own stated unknown (Evidence 5); and an index that
-    /// outgrows one page needs interior nodes placed on their own claimed,
-    /// relocatable pages, which nothing here does. All three are checked for
-    /// every key **before** anything is written, so a refusal never leaves
-    /// some keys' indexes updated and others not.
+    /// None of the three restrictions this doc used to state here still
+    /// hold: [`Self::v6_reindex`] writes a duplicate-permitting key's chain
+    /// itself ([`Self::v6_write_chains`]), [`v6::Map::claim`] scans every
+    /// existing `"PP"` allocation-table block rather than only the first
+    /// (`v6.rs`'s own `claiming_works_on_a_file_that_has_a_second_block`),
+    /// and an index that outgrows one page claims new interior-node pages on
+    /// demand, the same way any other page is claimed. What is still
+    /// checked, for every key, before anything is written: the key's root
+    /// must carry the v6 marker bit (see Errors below) -- a refusal there
+    /// never leaves some keys' indexes updated and others not.
     ///
     /// # Where the record goes
     ///
@@ -1589,9 +1584,9 @@ impl<M: Mem> Block<M> {
     ///
     /// # Errors
     ///
-    /// If any key permits duplicates, more than one `"PP"` block exists, any
-    /// key's root does not carry the v6 marker bit, any key's rebuilt index
-    /// would need more than one page, or the file cannot be read or written.
+    /// If the record does not fit the physical slot once the two-byte v6
+    /// slot marker is counted, if any key's root does not carry the v6
+    /// marker bit, or if the file cannot be read or written.
     fn insert_v6(&mut self, bytes: Vec<u8>) -> Result<u32, BtvError> {
         let name = self.name.clone();
         let fail = |why: String| BtvError {
@@ -2316,16 +2311,17 @@ impl<M: Mem> Block<M> {
     /// the slot itself get zeroed and linked, exactly as the fixed-length
     /// case above.
     ///
-    /// # What this host leaks, said out loud
+    /// # The freed slot is reused, not leaked
     ///
-    /// The freed slot goes on the free list and [`Self::insert_v6`] does not
-    /// pop it: this host's v6 insert claims a whole fresh page per record and
-    /// leaves the head alone. So a delete-then-insert pair costs a page and
-    /// leaves a slot on the list that only a real Btrieve would ever reuse.
-    /// That is a waste, not a corruption -- the chain this writes is
-    /// well-formed and the slot is genuinely free -- and it is written down
-    /// here rather than quietly tolerated because the two halves *ought* to be
-    /// one mechanism. Making insert pop the head is the next piece of work.
+    /// The freed slot goes on the free list, and [`Self::insert_v6`] pops
+    /// exactly that head before ever claiming a fresh page -- see
+    /// [`Self::v6_pop_free`]. A delete-then-insert pair reuses the freed
+    /// slot rather than costing a page, the other half of the same
+    /// mechanism this function's own doc describes:
+    /// [`a_v6_insert_reuses_the_slot_a_delete_freed`] is the test. An
+    /// earlier version of this host claimed a whole fresh page per insert
+    /// and never touched the head, which this section used to describe as
+    /// a standing leak; that has since been fixed.
     ///
     /// # A freed fragment page rejoins the write-side free-space chain
     ///
@@ -2530,9 +2526,12 @@ impl<M: Mem> Block<M> {
     ///
     /// # Errors
     ///
-    /// If any key permits duplicates, is not among the orders the loaded
-    /// records carry, has a root without the v6 marker bit, or needs more
-    /// than one index page; or if a relocation fails.
+    /// If any key is not among the orders the loaded records carry, has a
+    /// root without the v6 marker bit, or if claiming or releasing an index
+    /// page, or a relocation, fails. A duplicate-permitting key is handled,
+    /// not refused -- see [`Self::v6_write_chains`] -- and an index that
+    /// outgrows one page claims the extra pages it needs rather than
+    /// refusing.
     /// Write the `[prev][next]` pairs that join records sharing a key value,
     /// into the records themselves, **v6-aware**.
     ///
@@ -3768,10 +3767,13 @@ impl<M: Mem> Block<M> {
         // `dfaclose`, after the module had otherwise finished init.
         //
         // So this early return is a genuine no-op, not a gap papered over --
-        // but it is only a no-op **while v6 write is insert-only**. `update`
-        // and `delete` both refuse for v6 today (see their own doc comments).
-        // If either is implemented and defers index work to close time, this
-        // has to become a real v6 reindex instead.
+        // and it stays one now that `update`/`delete` also write v6 files
+        // ([`Self::update_v6`], [`Self::delete_v6`]): both call
+        // [`Self::v6_reindex`] inline, the same discipline `insert_v6`
+        // established, so there is still nothing deferred to close time for
+        // this function to catch up on. If a future v6 write path ever
+        // defers index work to close time instead, this has to become a
+        // real v6 reindex.
         if self.geometry.version == Version::V6 {
             self.dirty = false;
             return Ok(());

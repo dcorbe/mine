@@ -26,10 +26,13 @@
 //! btrieve-oracle/fixtures/DUPKEY30.DAT`, which this same engine built, and
 //! by a fresh `crtprobe create` run during this module's own development --
 //! see the crate's test suite and this file's own doc comments below for
-//! both). [`super::Block::writable`] refuses to write ANY v6 file --
-//! deliberately, v6 writing is out of the scope of the plan that added v6
-//! *reading* -- so a `create` built on what this oracle writes would produce
-//! files nothing else in this crate could then insert into.
+//! both). This module still only ever builds v5 files: `create()` (Btrieve
+//! op 14) never writes a v6 control record from scratch, even though v6
+//! *write* against an existing file is now implemented elsewhere in this
+//! crate ([`super::Block::insert_v6`]/[`super::Block::update_v6`]/
+//! [`super::Block::delete_v6`]) -- so a `create` built on what this oracle
+//! writes would produce files nothing else in this crate could then insert
+//! into.
 //!
 //! **This module writes the v5 format instead** -- four zero bytes at the
 //! start, the format all seventeen of MajorMUD's real fixed-length files use,

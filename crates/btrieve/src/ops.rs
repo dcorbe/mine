@@ -506,7 +506,7 @@ pub enum OpError {
     /// 6.x-or-later engine supports 1019 unconditionally, so the vendor has
     /// never had to document what a concurrency-incapable engine answers.
     /// This is a fact about this host, not about the file or the request,
-    /// the same shape `btrieve.rs:754`'s v6-write refusal is (a `BtvError`,
+    /// the same shape `Self::writable`'s v5-only-write refusal is (a `BtvError`,
     /// not a status code) -- Task 7's marshalling decides what a module
     /// sees; this only says the concurrent half of Begin Transaction cannot
     /// be honoured, which is what a caller needs to know before it can
@@ -1612,7 +1612,7 @@ impl<M: Mem> Block<M> {
     ///   A v6-capable engine given an operation code it does not recognise
     ///   answers status 1 (p. 1); this reproduces that rather than
     ///   inventing a v6-specific Extend behaviour the vendor never
-    ///   documented, the same reasoning `btrieve.rs:754`'s v6 write refusal
+    ///   documented, the same reasoning `Self::writable`'s v5-only-write refusal
     ///   already uses for a different operation.
     /// - **v5 file: succeeds.** Extend's still-current neighbour, status 32
     ///   ("the file cannot be extended... a file which is growing larger
@@ -1784,29 +1784,22 @@ impl<M: Mem> Block<M> {
     ///
     /// Splices `chunks` (each an `(offset, replacement bytes)` pair) into a
     /// copy of the current record and calls [`Block::update`] with the
-    /// result -- which is also where this method inherits **the v6 write
-    /// refusal `btrieve.rs:754` already has**, unconditionally, for every
-    /// file version. That refusal and this method's own [`OpError::
-    /// PreV6Chunk`] gate answer two different questions and are not
-    /// redundant: the chunk gate says "this file's *format* is too old for
-    /// a chunk operation at all" (any pre-v6 file); the write refusal says
-    /// "this *host* cannot yet write a v6 file safely" (Task 13, sequenced
-    /// after this track, still open). The consequence is real and worth
-    /// stating plainly: **every Update Chunk this host is asked to perform
-    /// fails today** -- refused at the version gate on a v5 file, refused
-    /// at the write gate on a v6 file, because a chunk operation is only
-    /// ever meaningful against a v6 file (see [`Self::get_chunks`], which
-    /// has no such second wall, because reading a v6 file already works)
-    /// and v6 write does not exist yet. The splicing logic above the write
-    /// call is real and tested against [`Block::update`] directly; it is
-    /// ready the moment Task 13 lifts that refusal.
+    /// result. This method's own [`OpError::PreV6Chunk`] gate says "this
+    /// file's *format* is too old for a chunk operation at all" (any
+    /// pre-v6 file); past that gate, a v6 file reaches [`Block::update`]
+    /// like any other caller and inherits whatever *that* method still
+    /// refuses -- a variable-length record whose fragment is chained or
+    /// changes length (see [`Block::update_v6`]'s own doc comment) or a key
+    /// root missing the v6 marker bit -- neither of which is specific to
+    /// chunk update. The splicing logic above the write call is tested
+    /// against [`Block::update`] directly.
     ///
     /// # Errors
     ///
     /// [`OpError::PreV6Chunk`] -- status 107. [`OpError::NotPositioned`] if
     /// nothing is positioned. [`OpError::ChunkOffsetTooBig`] -- status 103
     /// -- if a chunk runs past the end of the record. [`OpError::Records`]
-    /// for anything [`Block::update`] itself refuses, v6 write included.
+    /// for anything [`Block::update`] itself refuses.
     pub fn update_chunks(&mut self, chunks: &[(u32, Vec<u8>)]) -> Result<(), OpError> {
         if self.geometry().version != Version::V6 {
             return Err(OpError::PreV6Chunk);
@@ -2424,7 +2417,7 @@ impl<M: Mem> Block<M> {
 /// never had to document what a concurrency-incapable *engine* answers --
 /// only what a well-formed *request* can go wrong. This is a fact about
 /// this host, not about the file or the request, the same shape
-/// `btrieve.rs:754`'s v6-write refusal is: a host-level message
+/// `Self::writable`'s v5-only-write refusal is: a host-level message
 /// (`OpError`, here; `BtvError`, there), not a status code -- assigning the
 /// status a module actually sees is Task 7's marshalling job, same as
 /// every other [`OpError`] in this file.
@@ -2627,6 +2620,58 @@ mod tests {
             // `Block::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
         }
+    }
+
+    /// A genuinely v6 fixture -- `V6EMPTY1KEY.DAT`, engine-built under Wine
+    /// (`tools/btrieve-oracle/`, the same file `lib.rs`'s own `v6_scratch`
+    /// uses), copied fresh into `name`'s own scratch directory and opened
+    /// with its real geometry and keys. Unlike [`fixture_v6`], every byte on
+    /// disk is really v6-shaped: a real `"FC"` control record, a real
+    /// `"PP"` allocation table, and a key root carrying the v6 marker bit --
+    /// so a write that reaches [`Block::update`]'s v6 path here exercises
+    /// that path for real rather than hitting the marker-bit refusal
+    /// [`fixture_v6`]'s synthetic bytes cannot avoid.
+    fn fixture_v6_real(name: &str) -> Block<Flat> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let dir = crate::testing::scratch(&format!("ops-v6-{name}"));
+        let path = dir.join("V6EMPTY1KEY.DAT");
+        std::fs::copy(&fixture, &path).expect("the engine-built fixture copies into scratch");
+
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("a readable v6 file");
+        let fcr = std::fs::read(&path).expect("the copy reads back");
+        let keys = crate::keys::parse("V6EMPTY1KEY.DAT", &fcr, geometry.keys, &[])
+            .expect("its key definitions parse");
+        let maxlen = geometry.reclen;
+
+        Block {
+            id: BlockId::fresh(),
+            name: "V6EMPTY1KEY.DAT".to_owned(),
+            path,
+            geometry,
+            keys,
+            block: FlatPtr::NULL,
+            maxlen,
+            data: FlatPtr::NULL,
+            key: FlatPtr::NULL,
+            records: None,
+            cursor: Cursor::Nowhere,
+            dirty: false,
+            txn_active: false,
+            pre_image: None,
+            // A test-only fixture, not `Block::open` -- see
+            // `Block::verify_writes`'s doc comment for why this stays off.
+            verify_writes: false,
+        }
+    }
+
+    /// A 20-byte record shaped for `V6EMPTY1KEY.DAT`: `key` at bytes 0..4,
+    /// `0xEE` filler for the rest -- the same shape `lib.rs`'s own
+    /// `v6_record` uses on the same fixture.
+    fn v6_real_record(key: &[u8; 4]) -> Vec<u8> {
+        let mut bytes = vec![0xEEu8; 20];
+        bytes[..4].copy_from_slice(key);
+        bytes
     }
 
     fn tag(delivery: &Delivery) -> u8 {
@@ -3598,22 +3643,43 @@ mod tests {
         assert_eq!(err, OpError::PreV6Chunk);
     }
 
+    /// v6 chunk update on a **genuinely** v6 file succeeds.
+    ///
+    /// The predecessor to this test, `update_chunks_on_a_v6_file_passes_
+    /// the_gate_and_reaches_the_still_refused_v6_write`, ran against
+    /// [`fixture_v6`] -- v5 bytes on disk with `geometry.version` force-set
+    /// to `V6` in memory -- and asserted an error, naming it "the pre-
+    /// existing v6-write refusal". That was true of the error but not of
+    /// the reason: v5 bytes have no `"PP"` allocation table and no v6
+    /// marker bit on the key root, so the write it actually hit was
+    /// [`Block::v6_reindex`]'s "root does not carry the v6 marker bit"
+    /// check (`lib.rs`, refusal #7 in `tmp/plan-3-update-survey.md`), which
+    /// is a real refusal but not "v6 write does not exist" -- v6 write was
+    /// implemented in a later task and this test never noticed, because a
+    /// fake-v6 fixture cannot tell the two refusals apart. [`fixture_v6_real`]
+    /// is a genuine engine-built v6 file, so this test exercises the real
+    /// predicate: chunked update on a v6 file reaches [`Block::update`]'s
+    /// v6 path and succeeds.
     #[test]
-    fn update_chunks_on_a_v6_file_passes_the_gate_and_reaches_the_still_refused_v6_write() {
-        let mut b = fixture_v6("update_chunks_on_a_v6_file_passes_the_gate_and_reaches_the_still_refused_v6_write");
-        let mut locks = LockTable::default();
-        b.get(0, Op::Equal, &10u16.to_le_bytes(), 0, &mut locks, RECLEN).unwrap();
-        let err = b
-            .update_chunks(&[(4, vec![9])])
-            .expect_err("v6 write does not exist yet (Task 13)");
-        assert_ne!(
-            err,
-            OpError::PreV6Chunk,
-            "the chunk gate must let a v6 file through -- it fails later, at the write"
-        );
-        assert!(
-            matches!(err, OpError::Records(_)),
-            "the failure is the pre-existing v6-write refusal (btrieve.rs:754), not this task's gate: {err}"
+    fn update_chunks_on_a_genuinely_v6_file_succeeds() {
+        let mut b = fixture_v6_real("update_chunks_on_a_genuinely_v6_file_succeeds");
+        let position = b.insert(&v6_real_record(b"AAAA")).expect("insert into the real v6 fixture");
+        let at = b.records().expect("just inserted").find_physical(position).expect("just inserted");
+        b.seek_to(Cursor::Physical { at });
+
+        // Offset 8 is past the 4-byte key at 0..4, so this chunk cannot
+        // trip `Block::unmodifiable_key_changed` -- the subject here is
+        // whether a v6 chunk update reaches disk at all, not the key rule.
+        b.update_chunks(&[(8, vec![0x42])]).expect("a chunk update on a real v6 file must succeed");
+
+        b.records = None;
+        let reread = b.records().expect("re-reads after the update");
+        let mut want = v6_real_record(b"AAAA");
+        want[8] = 0x42;
+        assert_eq!(
+            reread.physical(reread.find_physical(position).expect("still there")).expect("in range").bytes,
+            want,
+            "the spliced byte reached disk"
         );
     }
 
