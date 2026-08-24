@@ -2293,6 +2293,29 @@ impl<M: Mem> Block<M> {
     ///   Nothing here unclaims a page, and that is the measured behaviour
     ///   rather than a simplification.
     ///
+    /// That whole ladder was measured against a **fixed-length** file
+    /// (`reclen 32`, no variable flag) and this function applies it
+    /// unchanged to a variable-length slot's own bytes -- the forwarding
+    /// link and the fragment pointer never collide (the link goes at the
+    /// slot's first four body bytes; the pointer sits `reclen` bytes in, and
+    /// `reclen` is never zero), so zeroing "everything behind" the link is
+    /// the same write either way.
+    ///
+    /// # Variable-length records (Task 7)
+    ///
+    /// When `self.geometry.variable`, the record's own fragment is freed
+    /// **before** any byte of the slot is touched -- the same ordering
+    /// [`Self::update_v6`] uses and for the same reason: a shape refusal
+    /// there must leave nothing written anywhere. The pointer is read off
+    /// the *pre-write* page (between `reclen` and `physical` in the slot,
+    /// same as [`Self::update_v6`]), [`variable::free_fragment_v6`] frees
+    /// the fragment it names (refusing a chained fragment, or one an oracle
+    /// recording has not settled -- see its own doc comment), and the page
+    /// is re-read fresh afterward because that call went through `store`
+    /// directly and may have relocated an unrelated page. Only then does
+    /// the slot itself get zeroed and linked, exactly as the fixed-length
+    /// case above.
+    ///
     /// # What this host leaks, said out loud
     ///
     /// The freed slot goes on the free list and [`Self::insert_v6`] does not
@@ -2304,10 +2327,26 @@ impl<M: Mem> Block<M> {
     /// here rather than quietly tolerated because the two halves *ought* to be
     /// one mechanism. Making insert pop the head is the next piece of work.
     ///
+    /// # What this host also leaks: a freed fragment page never rejoins the
+    /// write-side free-space chain
+    ///
+    /// [`variable::free_fragment_v6`] reclaims the space *within* the
+    /// fragment page's own entry array, but this function does not thread
+    /// that page onto the write-side free-space chain at `pages::fcr::
+    /// VARIABLE_HEAD` (`write_fcr`'s `None` below, unchanged from before this
+    /// task) the way `variable::Space::reoffer` does for v5 inserts. This is
+    /// not a regression: v6 write-side allocation is refused entirely today
+    /// (no v6 insert consults that chain), so there is nothing yet that
+    /// would read the link this would add. Wiring it is future work, once a
+    /// v6 variable-length insert exists to consume it.
+    ///
     /// # Errors
     ///
     /// If the file cannot be read or written, `position` does not resolve to a
-    /// claimed slot, or [`Self::v6_reindex`] refuses any key.
+    /// claimed slot, [`Self::v6_reindex`] refuses any key, or (variable-length
+    /// only) the record's fragment is chained onto another page, is the only
+    /// fragment on its page, or [`variable::free_fragment_v6`] refuses it for
+    /// any other reason -- see that function's own doc comment.
     fn delete_v6(&mut self, position: u32, layout: pages::Layout) -> Result<(), BtvError> {
         let name = self.name.clone();
         let fail = |why: String| BtvError {
@@ -2334,6 +2373,24 @@ impl<M: Mem> Block<M> {
 
         let fcr = self.v6_live_fcr(&mut store).map_err(&fail)?;
         let free_head = pages::long(&fcr[pages::fcr::FREE_V6..pages::fcr::FREE_V6 + 4]);
+
+        // Variable-length records: free the fragment first, on the
+        // pre-write pointer, before a byte of the slot itself is touched --
+        // see this function's own doc comment for why. `Self::v6_slot`'s
+        // `within` already accounts for the marker.
+        if self.geometry.variable {
+            let reclen = usize::from(self.geometry.reclen);
+            let pre_write = store.page(physical as usize).map_err(&fail)?.to_vec();
+            let pointer_at = within + V6_SLOT_MARKER + reclen;
+            let pointer = variable::Pointer::decode([
+                pre_write[pointer_at],
+                pre_write[pointer_at + 1],
+                pre_write[pointer_at + 2],
+                pre_write[pointer_at + 3],
+            ]);
+            let mut fragments = variable::V6Pages::new(&mut store, page_size).map_err(&fail)?;
+            variable::free_fragment_v6(&mut fragments, pointer).map_err(&fail)?;
+        }
 
         let mut content = store.page(physical as usize).map_err(&fail)?.to_vec();
 
@@ -3410,19 +3467,21 @@ impl<M: Mem> Block<M> {
     /// deleting whatever happens to sit at an unverified offset would erase
     /// bytes that were never a record at all.
     ///
-    /// **Variable-length files refuse, for the same reason [`Self::update`]
-    /// already refuses to write one.** A variable-length record's fragment
-    /// lives on a separate page, reached through the four-byte pointer
-    /// between `reclen` and `physical` in its slot (see [`Self::update`]'s
-    /// doc comment and [`Self::rewrite_variable`]). Deleting the slot without
-    /// also freeing that fragment page would leak it forever; deleting the
-    /// fragment page too is a real feature this host has not measured or
-    /// implemented. Measured (`tools/btrieve-oracle/delprobe.c`,
+    /// **v5 variable-length files still refuse.** A variable-length record's
+    /// fragment lives on a separate page, reached through the four-byte
+    /// pointer between `reclen` and `physical` in its slot (see
+    /// [`Self::update`]'s doc comment and [`Self::rewrite_variable`]).
+    /// Measured (`tools/btrieve-oracle/delprobe.c`,
     /// `docs/delete-oracle-answer.md`): a genuine delete of a variable-length
     /// record succeeds at the API level (status 0) on the real engine, but
-    /// what it does to the fragment chain was not traced byte-for-byte, so
-    /// this host refuses rather than guess -- the identical precedent
-    /// [`Self::update`]'s own doc comment sets for the same shape of file.
+    /// what it does to a v5 fragment chain was not traced byte-for-byte, and
+    /// v5's own write-side allocator (`variable::Space`) has only ever been
+    /// proven for insert, not a delete-side free -- so this host refuses v5
+    /// rather than guess.
+    ///
+    /// **v6 variable-length files delete** (Task 7): see
+    /// [`Self::delete_v6`]'s own doc comment for the shape this closes and
+    /// [`variable::free_fragment_v6`] for what is refused within that.
     ///
     /// Measured against the real engine, on a copy of the real, shipped
     /// `WCCCLASS.DAT` (fixed-length, no confounding shadow-paged or
@@ -3462,16 +3521,16 @@ impl<M: Mem> Block<M> {
         }
         let name = self.name.clone();
 
-        if self.geometry.variable {
+        if self.geometry.variable && self.geometry.version != Version::V6 {
             return Err(BtvError {
                 file: name,
                 why: format!(
                     "holds variable-length records up to {} bytes, and this host does \
-                     not delete them -- a variable-length record's fragment lives on a \
-                     separate page reached through the pointer behind its fixed part, \
-                     and this host has not measured or implemented freeing that page, \
-                     the same reasoning `Self::update` already gives for refusing to \
-                     write this shape of file",
+                     not delete them for Btrieve 5 -- a variable-length record's \
+                     fragment lives on a separate page reached through the pointer \
+                     behind its fixed part, and the write-side allocator this needs \
+                     (`variable::Space`) has only ever been proven for insert, not a \
+                     delete-side free, for v5 (v6 deletes -- see `Self::delete_v6`)",
                     self.geometry.reclen
                 ),
             });
@@ -6671,6 +6730,80 @@ mod tests {
             records.physical(at).expect("record").bytes.clone()
         };
         assert_eq!(reread, bytes, "the update is visible after a fresh read");
+    }
+
+    /// **A v6 variable-length record can be deleted.** Task 7: closes the
+    /// refusal `Self::delete_inner` used to give unconditionally for every
+    /// v6 file holding variable-length records.
+    ///
+    /// # Why this fixture, and this loop
+    ///
+    /// Same reasoning as
+    /// [`a_v6_variable_length_record_rewrites_a_single_fragment_in_place`]
+    /// (Task 6), and the same fixture: `wccnt7pw`'s copy of `wcctext2.vir`
+    /// carries 170 real multi-hop fragment pointers among 1,940 records,
+    /// measured directly, so a delete that corrupted the entry array in a
+    /// way only visible on a real chain has something to be caught by --
+    /// the task brief's own named fixture (`wccnt8pj`'s copy, 3,467
+    /// records) carries none. `Self::delete_v6`'s variable branch refuses a
+    /// chained fragment and the only fragment on a page (see
+    /// [`variable::free_fragment_v6`]'s doc comment), so this tries
+    /// positions in the order the model lists them until one deletes,
+    /// rather than asserting a specific one.
+    ///
+    /// # What "the freed fragments are accounted for" means here
+    ///
+    /// [`crate::verify::written`] re-reads the whole file back into a fresh
+    /// model and re-emits it, byte for byte, from that model -- so it does
+    /// not merely check that the deleted record is gone, it also re-derives
+    /// and re-checks every *other* record still on the touched fragment
+    /// page. `Self::delete_v6`'s interior-compaction path physically moves
+    /// those neighbours' bytes; if that shift or the entry rebase behind it
+    /// were wrong, a neighbour's own fragment would decode to the wrong
+    /// span or the wrong content, and this assertion is what would catch
+    /// that, not a targeted check on the deleted record alone.
+    #[test]
+    fn a_v6_variable_length_record_deletes_a_single_fragment() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../archive/modules/majormud-nt/wccnt7pw/out/wcctext2.vir");
+        if !source.exists() {
+            eprintln!("{}: not present in this checkout, skipping", source.display());
+            return;
+        }
+        let dir = crate::testing::scratch("v6-variable-delete-wcctext2");
+        let path = dir.join("wcctext2.vir");
+        std::fs::copy(&source, &path).expect("the corpus file copies into scratch");
+
+        let mut block = block_from_file(path.clone(), "WCCTEXT2.VIR");
+        block.verify_writes = true;
+        assert_eq!(block.geometry.version, Version::V6);
+        assert!(
+            block.geometry.variable,
+            "wcctext2.vir is supposed to hold variable-length records"
+        );
+
+        let before_count = block.records().expect("the records read").len();
+        let positions = block.records().expect("still loaded").positions();
+        let mut deleted = None;
+        for position in positions {
+            if block.delete(position).is_ok() {
+                deleted = Some(position);
+                break;
+            }
+        }
+        let position = deleted.expect(
+            "wcctext2.vir has at least one deletable record -- an unchained fragment \
+             whose page is not that fragment's only one",
+        );
+
+        assert_eq!(crate::verify::written(&path), Ok(()));
+
+        // Reopened from disk, not trusted from the model the delete just
+        // changed -- the same discipline the update test above uses.
+        let mut fresh = block_from_file(path.clone(), "WCCTEXT2.VIR");
+        let records = fresh.records().expect("the file still reads");
+        assert!(records.find_physical(position).is_none(), "gone after a fresh read too");
+        assert_eq!(records.len(), before_count - 1, "the record count dropped by exactly one");
     }
 
     /// **A v6 tree that shrinks on rebuild no longer leaks a claimed page.**

@@ -806,6 +806,150 @@ pub(crate) fn rewrite_fragment_in_place_v6<P: PagesMut>(
     pages.write_page(pointer.page, &rewritten)
 }
 
+/// Free a single, unchained v6 fragment: the delete-side counterpart of
+/// [`rewrite_fragment_in_place_v6`].
+///
+/// # What genuine Btrieve does, which this follows
+///
+/// **This is the one v6 variable-length mutation this crate has an actual
+/// oracle recording of** -- unlike [`rewrite_fragment_in_place_v6`], which
+/// has none (see its own module's Task 6 report). `varfree.c`'s delete
+/// ladder against a genuine, `B_CREATE`d (therefore v6) file
+/// (`docs/2026-08-17-variable-write-oracle.md`, "Delete frees the entry and
+/// compacts the page") measured deleting the first of three fragments on a
+/// page:
+///
+/// ```text
+/// before  frags 3  entries [0x0c,   0xd8, 0x1a4, 0x1f8]   free 0
+/// after   frags 3  entries [0xffff, 0x0c, 0xd8,  0x12c]   free 204
+/// ```
+///
+/// The freed entry becomes `0xffff` in place; every fragment after it
+/// shifts down by the freed length to close the gap, and every entry after
+/// it (including the boundary) is rebased by the same amount. Fragment
+/// count is unchanged -- the freed slot is interior. That is the **interior**
+/// branch below, applied verbatim.
+///
+/// The same document also measured freeing the *last* live fragment on a
+/// page: "the count drops -- logical 5 went from 3 fragments to 2 ... while
+/// keeping its `0xffff` at entry 0." No exact before/after bytes are given
+/// for that step, so the **trailing** branch below is a derivation, not a
+/// transcription: entry `which`'s own storage address (`entry_at(len,
+/// which)`) is *identical* to what becomes the new boundary's address once
+/// `fragments` decrements by one (`entry_at` depends only on `which`, not on
+/// the page's fragment count) -- and entry `which` already holds exactly the
+/// value the new boundary needs, the freed fragment's own start offset. So
+/// decrementing the count is the *entire* write; no entry bytes change. This
+/// reproduces the documented before/after of the interior case exactly when
+/// checked the same way, and is the simplest change consistent with the
+/// array's own documented invariant (`variable.rs`'s module doc: "the array
+/// has one more entry than the page has fragments").
+///
+/// # What is refused, and why
+///
+/// - **A chained fragment** (this record's body continues onto another
+///   page). Freeing a whole chain needs to walk and free every hop, in an
+///   order and with a page-reclaim rule this host has not measured -- same
+///   standard [`rewrite_fragment_in_place_v6`] already holds itself to.
+/// - **Freeing the only fragment on a page** (`header.fragments == 1`).
+///   The trailing derivation above decrements the count to zero, and
+///   [`Header::read`] refuses any page reporting zero fragments
+///   (`fragments == 0 || fragments > MAX_FRAGMENTS`) -- so writing this
+///   would leave a page this crate's own reader cannot open again. Whether
+///   genuine Btrieve reclaims the whole page, leaves a zero-fragment marker
+///   this host's reader does not understand, or something else, is not in
+///   the oracle ladder above (every page it measured kept at least one
+///   fragment) -- refused rather than guessed. An oracle rig that empties a
+///   page completely (`varfree.c`'s own delete command, driven past the
+///   point every fragment on one page is gone) would settle it.
+/// - **An entry between `which` and the boundary that is already `0xffff`.**
+///   The interior branch rebases every one of those entries by subtracting
+///   the freed length; doing that to an already-`0xffff` entry corrupts the
+///   freed-slot sentinel rather than shifting a real offset. No corpus file
+///   exercises this -- every v6 file here is first-generation, zero real
+///   deletions (harvest 5 SS6.3) -- and neither does the oracle ladder, which
+///   never deletes twice from the same page before the fragments in between
+///   are already gone. Refused rather than guessed at a second-delete rule
+///   nothing has measured.
+///
+/// # What is written
+///
+/// Interior: the content between the freed fragment and the old boundary
+/// shifts down over it (`copy_within`), every entry from `which + 1` through
+/// the boundary is rebased down by the freed length, and entry `which`
+/// itself becomes `0xffff`. Trailing: only the fragment count, by one. The
+/// header, the free chain and every fragment before `which` are read and
+/// never written.
+///
+/// # Errors
+///
+/// If any of the checks above fails, or the page cannot be read or written
+/// back.
+pub(crate) fn free_fragment_v6<P: PagesMut>(pages: &mut P, pointer: Pointer) -> Result<(), String> {
+    let page = pages.page(pointer.page)?.to_vec();
+    let header = Header::read(&page, pointer.page, Version::V6)?;
+
+    let found = fragment(&page, pointer.fragment, header, Version::V6)
+        .map_err(|why| format!("logical page {}: {why}", pointer.page))?;
+
+    if found.length < POINTER {
+        return Err(format!(
+            "logical page {}: fragment {} is {} bytes, too short for the \
+             {POINTER}-byte leading pointer every v6 fragment carries",
+            pointer.page, pointer.fragment, found.length
+        ));
+    }
+    let leading: [u8; POINTER] = page[found.at..found.at + POINTER]
+        .try_into()
+        .expect("checked against POINTER above");
+    let next = Pointer::decode(leading);
+    if !next.is_end() {
+        return Err(format!(
+            "logical page {}: fragment {}'s own pointer names page {}, fragment {} -- \
+             this record's body continues onto another page, and freeing a chain \
+             that spans more than one page is not implemented",
+            pointer.page, pointer.fragment, next.page, next.fragment
+        ));
+    }
+
+    let which = u32::from(pointer.fragment);
+    let fragments = u32::from(header.fragments);
+    let mut rewritten = page;
+
+    if which + 1 == fragments {
+        if fragments == 1 {
+            return Err(format!(
+                "logical page {}: fragment {} is the only one on its page, and \
+                 freeing it would leave the page reporting 0 fragments -- a shape \
+                 `Header::read` refuses and no oracle recording reaches (every \
+                 delete `docs/2026-08-17-variable-write-oracle.md` measured left \
+                 at least one fragment behind)",
+                pointer.page, pointer.fragment
+            ));
+        }
+        set_fragment_count(&mut rewritten, header.fragments - 1);
+    } else {
+        for i in (which + 1)..=fragments {
+            if entry(&rewritten, i)? == UNUSED {
+                return Err(format!(
+                    "logical page {}: entry {i} is already a freed slot -- compacting \
+                     past a pre-existing hole is not measured",
+                    pointer.page
+                ));
+            }
+        }
+        let old_boundary = entry(&rewritten, fragments)? as usize;
+        rewritten.copy_within(found.at + found.length..old_boundary, found.at);
+        for i in (which + 1)..=fragments {
+            let old = entry(&rewritten, i)?;
+            set_entry(&mut rewritten, i, old - found.length as u32)?;
+        }
+        set_entry(&mut rewritten, which, UNUSED)?;
+    }
+
+    pages.write_page(pointer.page, &rewritten)
+}
+
 /// [`PagesMut`] over an actual file on disk, addressed by page number.
 ///
 /// A file handle is opened fresh for each [`Pages::page`] or
@@ -2228,6 +2372,139 @@ mod tests {
             .expect_err("the 0x8000 bit means something else in a v6 file");
         assert!(e.contains("V6") && e.contains("19045"), "{e}");
         assert_eq!(pages.0[1], before, "refused before the page was even asked for");
+    }
+
+    // `free_fragment_v6` -- the delete-side counterpart. Unlike
+    // `rewrite_fragment_in_place_v6` above, this one has an actual oracle
+    // recording (`docs/2026-08-17-variable-write-oracle.md`), so the first
+    // test below reproduces its exact before/after entries rather than an
+    // arbitrary shape.
+
+    /// The oracle ladder's own numbers, reproduced exactly: freeing the
+    /// first of three fragments on a page shifts the two behind it down to
+    /// close the gap, rebases every entry from `which + 1` on, and leaves
+    /// `0xffff` where the freed one was -- fragment count unchanged, because
+    /// the freed slot is interior.
+    #[test]
+    fn freeing_an_interior_v6_fragment_matches_the_oracle_ladder() {
+        let frag0 = [V6_END.as_slice(), &[0xa1u8; 200]].concat();
+        let frag1 = [V6_END.as_slice(), &[0xb1u8; 200]].concat();
+        let frag2 = [V6_END.as_slice(), &[0xc1u8; 80]].concat();
+        assert_eq!(frag0.len(), 204);
+        assert_eq!(frag1.len(), 204);
+        assert_eq!(frag2.len(), 84);
+
+        let five = page_v6(5, 512, &[&frag0, &frag1, &frag2]);
+        // The oracle's own entries before this delete: 0xc, 0xd8, 0x1a4, 0x1f8.
+        assert_eq!(entry(&five, 0), Ok(0x0c));
+        assert_eq!(entry(&five, 1), Ok(0xd8));
+        assert_eq!(entry(&five, 2), Ok(0x1a4));
+        assert_eq!(entry(&five, 3), Ok(0x1f8));
+
+        let mut pages = Held(vec![blank(512), blank(512), blank(512), blank(512), blank(512), five]);
+
+        free_fragment_v6(&mut pages, Pointer { page: 5, fragment: 0 })
+            .expect("an unchained fragment on a page with siblings after it");
+
+        let after = &pages.0[5];
+        assert_eq!(fragment_count(after), 3, "interior free leaves the count alone");
+        assert_eq!(entry(after, 0), Ok(UNUSED), "the freed entry, in place");
+        assert_eq!(entry(after, 1), Ok(0x0c), "0xd8 - 0xcc, the oracle's own number");
+        assert_eq!(entry(after, 2), Ok(0xd8), "0x1a4 - 0xcc");
+        assert_eq!(entry(after, 3), Ok(0x12c), "0x1f8 - 0xcc, matches the ladder's \"free 204\"");
+        assert_eq!(&after[0x0c..0x0c + 204], frag1.as_slice(), "fragment 1's own bytes, shifted down");
+        assert_eq!(&after[0xd8..0xd8 + 84], frag2.as_slice(), "fragment 2's own bytes, shifted down");
+    }
+
+    /// The oracle ladder's second delete, from the same document: freeing
+    /// the *last* live fragment on a page drops the count instead of leaving
+    /// a trailing hole -- derived from the entry array's own invariant (see
+    /// `free_fragment_v6`'s doc comment), not a byte-for-byte transcription,
+    /// because the document does not give exact bytes for this step.
+    #[test]
+    fn freeing_the_last_v6_fragment_shrinks_the_count_instead_of_leaving_a_hole() {
+        let frag0 = [V6_END.as_slice(), &[0xd1u8; 50]].concat();
+        let frag1 = [V6_END.as_slice(), &[0xd2u8; 30]].concat();
+        let seven = page_v6(7, 256, &[&frag0, &frag1]);
+        let mut pages = Held({
+            let mut v = vec![blank(256); 7];
+            v.push(seven);
+            v
+        });
+
+        free_fragment_v6(&mut pages, Pointer { page: 7, fragment: 1 })
+            .expect("the last of two fragments, unchained");
+
+        let after = &pages.0[7];
+        assert_eq!(fragment_count(after), 1, "the trailing slot is dropped, not marked 0xffff");
+        assert_eq!(entry(after, 0), Ok(FIRST_FRAGMENT), "fragment 0's own entry, untouched");
+        assert_eq!(
+            entry(after, 1),
+            Ok(FIRST_FRAGMENT + frag0.len() as u32),
+            "the new boundary is where the freed fragment used to start"
+        );
+        assert_eq!(&after[0x0c..0x0c + frag0.len()], frag0.as_slice(), "the surviving fragment, untouched");
+    }
+
+    /// Freeing the only fragment on a page would leave it reporting 0
+    /// fragments, a shape `Header::read` itself refuses -- so this refuses
+    /// before writing rather than producing a page nothing here can read
+    /// back. No oracle ladder reaches this case either (every delete
+    /// measured left at least one fragment behind).
+    #[test]
+    fn freeing_the_only_fragment_on_a_page_is_refused() {
+        let frag0 = [V6_END.as_slice(), &[0xe1u8; 40]].concat();
+        let nine = page_v6(9, 128, &[&frag0]);
+        let mut pages = Held({
+            let mut v = vec![blank(128); 9];
+            v.push(nine);
+            v
+        });
+        let before = pages.0[9].clone();
+
+        let e = free_fragment_v6(&mut pages, Pointer { page: 9, fragment: 0 })
+            .expect_err("the only fragment on its page");
+        assert!(e.contains("the only one on its page"), "{e}");
+        assert_eq!(pages.0[9], before, "a refused free must not touch the page");
+    }
+
+    /// A chained fragment's own leading bytes name where the record's body
+    /// continues -- freeing it without freeing the rest of the chain would
+    /// leak those pages, and this host has not measured what genuine
+    /// Btrieve does across a multi-hop free. Refused, the same standard
+    /// `rewrite_fragment_in_place_v6` already holds itself to.
+    #[test]
+    fn freeing_a_chained_v6_fragment_is_refused() {
+        let frag0 = [v6_next(3, 2).as_slice(), &[0xf1u8; 10]].concat();
+        let frag1 = [V6_END.as_slice(), &[0xf2u8; 10]].concat();
+        let four = page_v6(4, 128, &[&frag0, &frag1]);
+        let mut pages = Held(vec![blank(128), blank(128), blank(128), blank(128), four]);
+        let before = pages.0[4].clone();
+
+        let e = free_fragment_v6(&mut pages, Pointer { page: 4, fragment: 0 })
+            .expect_err("fragment 0 continues onto page 3");
+        assert!(e.contains("continues onto another page"), "{e}");
+        assert_eq!(pages.0[4], before, "a refused free must not touch the page");
+    }
+
+    /// A second delete on a page that already has an interior hole is
+    /// refused rather than rebasing an already-`0xffff` entry into garbage
+    /// -- no corpus file (first-generation, harvest 5 SS6.3) or oracle rig
+    /// exercises two deletes on the same page.
+    #[test]
+    fn freeing_past_an_already_freed_entry_is_refused() {
+        let frag0 = [V6_END.as_slice(), &[0xa1u8; 40]].concat();
+        let frag1 = [V6_END.as_slice(), &[0xb1u8; 40]].concat();
+        let frag2 = [V6_END.as_slice(), &[0xc1u8; 40]].concat();
+        let mut six = page_v6(6, 256, &[&frag0, &frag1, &frag2]);
+        set_entry(&mut six, 1, UNUSED).expect("entry 1 exists"); // a prior interior free
+        let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), blank(256), six]);
+        let before = pages.0[6].clone();
+
+        let e = free_fragment_v6(&mut pages, Pointer { page: 6, fragment: 0 })
+            .expect_err("entry 1, between fragment 0 and the boundary, is already freed");
+        assert!(e.contains("already a freed slot"), "{e}");
+        assert_eq!(pages.0[6], before, "a refused free must not touch the page");
     }
 
     /// [`FilePages`] is what a real `Block::update` runs against -- every
