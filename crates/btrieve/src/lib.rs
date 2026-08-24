@@ -165,16 +165,15 @@ pub enum Version {
     V6,
 }
 
-/// Where a v6 record physically is, and the file it was found in.
+/// Where a v6 record physically is, and the page store it was found in.
 ///
 /// [`Block::v6_slot`]'s answer: every v6 write needs all four of these and
-/// none of them should be re-derived from another. `file` rides along because
-/// every v6 write is a read-modify-append-elsewhere-and-flip-the-shadow-pair
-/// operation over the whole file, so reading it is the first thing each of
-/// them does anyway and reading it twice would let the two reads disagree.
+/// none of them should be re-derived from another. `store` rides along
+/// because opening it is the first thing each of them does anyway and
+/// opening a second one would let the two disagree about what is dirty.
 struct V6Slot {
-    /// The whole file, as it was before this write.
-    file: Vec<u8>,
+    /// The file's pages, read lazily from here on -- not the whole file.
+    store: v6::Store,
     /// The record's logical page -- what its position names.
     logical: u32,
     /// The physical page currently holding that logical page.
@@ -547,7 +546,7 @@ fn read_head(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
 /// [`read_head`] does not read the whole file: a v6 file's second
 /// control-record copy can start many kilobytes in, and this file can be
 /// tens of megabytes.
-fn read_at(path: &Path, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_at(path: &Path, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
@@ -603,8 +602,12 @@ fn acs_tables(
         // resolver every other page goes through
         // (`W32MKDE_decompiled.c:15381`).
         Version::V6 => {
+            // Open-time only, not `Block::update()`'s hot path -- reads the
+            // whole file, same as before, wrapped in a `Store` only so
+            // `v6::Map::read` stays one implementation.
             let whole = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let map = v6::Map::read(&whole, geometry.page)?;
+            let mut store = v6::Store::from_bytes(&whole, geometry.page)?;
+            let map = v6::Map::read(&mut store, geometry.page)?;
             let mut resolved: Vec<(u32, u32)> = map.entries().collect();
             resolved.sort_unstable();
             for (logical, physical) in resolved {
@@ -1141,25 +1144,16 @@ impl<M: Mem> Block<M> {
         Ok(())
     }
 
-    /// The same snapshot, from bytes the caller already has.
+    /// Build the pre-image. One authority, one way in.
     ///
-    /// Every v6 write path holds the file as it was -- it reads the whole
-    /// thing, mutates a copy, and needs the original again at commit time to
-    /// work out which pages changed. Those are exactly the bytes
-    /// [`Self::capture_for_journal`] would go back to the disk for, so inside
-    /// a transaction it used to read `WCCMP002.DAT`'s 53 MB a second time to
-    /// fetch a buffer already in memory a few frames up.
-    ///
-    /// v5 has no such buffer -- it seeks and writes one record without ever
-    /// holding the file -- which is why the reading entry point stays.
-    fn capture_for_journal_from(&mut self, before: &[u8]) {
-        if !self.txn_active || self.pre_image.is_some() {
-            return;
-        }
-        self.capture_pre_image(before.to_vec());
-    }
-
-    /// Build the pre-image. One authority, two ways in.
+    /// A v6 write used to hold the whole file in memory already (read once,
+    /// mutated into a copy) and had a second entry point,
+    /// `capture_for_journal_from`, that took a pre-image from those bytes
+    /// rather than reading the file a second time. Now that a v6 write
+    /// reads pages lazily through [`v6::Store`] and never holds the whole
+    /// file, that shortcut no longer has anything cheap to shortcut --
+    /// [`Self::capture_for_journal`]'s own disk read is the only way to get
+    /// a transaction's pre-image, the same as v5 always needed one for.
     fn capture_pre_image(&mut self, bytes: Vec<u8>) {
         self.pre_image = Some(PreImage {
             bytes,
@@ -1354,7 +1348,22 @@ impl<M: Mem> Block<M> {
     /// If either image is not a whole number of pages, if the file shrank
     /// (v6 writes only ever grow it), or if any page cannot be written or
     /// flushed.
-    fn write_changed_pages(&self, before: &[u8], after: &[u8]) -> Result<(), BtvError> {
+    ///
+    /// # What changed from a `before`/`after` diff
+    ///
+    /// This used to take two whole-file images (`before: &[u8]`,
+    /// `after: &[u8]`) and diff them page by page to work out both the
+    /// structural pairs and which content pages changed. `store` already
+    /// knows both: [`v6::Store::dirty_pages`] is every page a write actually
+    /// touched, already known rather than rediscovered, and
+    /// [`v6::Store::structural_pairs`] is exactly the shadow pairs a write
+    /// touched -- named by [`v6::Map::claim`], [`v6::Map::relocate`],
+    /// [`v6::Map::unclaim`] and [`v6::write_fcr`] themselves, never
+    /// inferred by scanning for `"PP"` magic. The canonicalisation logic
+    /// below -- one flip per pair, live/stale by generation, a double flip
+    /// collapsed to nothing -- is unchanged; only where the before/after
+    /// bytes come from is.
+    fn write_changed_pages(&self, store: &v6::Store) -> Result<(), BtvError> {
         use std::io::{Seek, SeekFrom, Write};
 
         let fail = |why: String| BtvError {
@@ -1362,37 +1371,23 @@ impl<M: Mem> Block<M> {
             why,
         };
         let page = usize::from(self.geometry.page);
-        if page == 0 || !before.len().is_multiple_of(page) || !after.len().is_multiple_of(page) {
-            return Err(fail(format!(
-                "{} before and {} after is not a whole number of {page}-byte \
-                 pages",
-                before.len(),
-                after.len()
-            )));
-        }
-        if after.len() < before.len() {
-            return Err(fail(format!(
-                "a v6 write shrank the file from {} to {} bytes, which no \
-                 write path does -- refusing rather than truncating",
-                before.len(),
-                after.len()
-            )));
-        }
+        let old_pages = store.original_pages();
 
-        let generation = |image: &[u8], number: usize| -> u16 {
-            let at = number * page + at::GENERATION;
-            u16::from_le_bytes([image[at], image[at + 1]])
+        let generation = |image: &[u8]| -> u16 {
+            u16::from_le_bytes([image[at::GENERATION], image[at::GENERATION + 1]])
         };
-        fn body(image: &[u8], page: usize, number: usize) -> &[u8] {
-            &image[number * page..][..page]
-        }
 
-        // The shadow pairs, control record first -- the order phase 3 flips
-        // them in, and the whole reason that order is written down here
-        // rather than left to whatever `table_pages` happens to return.
-        let mut pairs = vec![(0usize, 1usize)];
-        let table = v6::Map::table_pages(after, self.geometry.page);
-        pairs.extend(table.chunks_exact(2).map(|pair| (pair[0], pair[1])));
+        // The shadow pairs a write actually touched, control record first --
+        // the order phase 3 flips them in. `structural_pairs()` is already
+        // sorted ascending, and physical 0/1 (the control record, always
+        // noted by `v6::write_fcr`) sorts first by construction.
+        let pairs = store.structural_pairs();
+
+        // A pair the file grew into is not a flip at all: neither half
+        // existed before, so nothing of it is live and phase 1 puts both
+        // halves down with everything else new.
+        let flip_pairs: Vec<(usize, usize)> =
+            pairs.iter().copied().filter(|&(_, second)| second < old_pages).collect();
 
         // Phase 2's writes, canonicalised to one flip each: the final image,
         // the half of the pair it goes on, and the generation phase 3 will
@@ -1403,33 +1398,28 @@ impl<M: Mem> Block<M> {
             generation: u16,
         }
         let mut flips: Vec<Flip> = Vec::new();
-        let old_pages = before.len() / page;
 
-        for &(first, second) in &pairs {
-            // A pair the file grew into is not a flip at all: neither half
-            // existed before, so nothing of it is live and phase 1 puts both
-            // halves down with everything else new.
-            if second >= old_pages {
-                continue;
-            }
+        for &(first, second) in &flip_pairs {
+            let before_first = store.original(first).expect("noted structural pairs are read before written");
+            let before_second = store.original(second).expect("noted structural pairs are read before written");
+            let after_first = store.current(first);
+            let after_second = store.current(second);
+
             // A pair neither half of which moved is not part of this write at
             // all. Without this the canonicalisation below "flips" every
             // untouched allocation-table block to its other half with a
             // bumped generation -- the same content, written for nothing. On
             // `WCCMP002.DAT`, whose table runs to fourteen blocks, that was
             // 13 spurious page writes out of 16.
-            if body(before, page, first) == body(after, page, first)
-                && body(before, page, second) == body(after, page, second)
-            {
+            if before_first == after_first && before_second == after_second {
                 continue;
             }
-            let (live_before, stale_before) =
-                if generation(before, first) > generation(before, second) {
-                    (first, second)
-                } else {
-                    (second, first)
-                };
-            let live_after = if generation(after, first) > generation(after, second) {
+            let (live_before, stale_before) = if generation(before_first) > generation(before_second) {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let live_after = if generation(after_first) > generation(after_second) {
                 first
             } else {
                 second
@@ -1439,18 +1429,19 @@ impl<M: Mem> Block<M> {
                 // One flip, or an odd number of them: the winning image is
                 // already on the half that was stale, and its own generation
                 // already beats the half that was live.
-                generation(after, live_after)
+                generation(store.current(live_after))
             } else {
                 // An even number of flips landed the winner back on the half
                 // that started live. Move it across and give it the smallest
                 // generation that still wins, so the live half is never
                 // written.
-                generation(before, live_before).wrapping_add(1)
+                generation(store.original(live_before).expect("read above")).wrapping_add(1)
             };
 
-            let mut image = body(after, page, live_after).to_vec();
+            let mut image = store.current(live_after).to_vec();
             image[at::GENERATION..at::GENERATION + 2].copy_from_slice(&wanted.to_le_bytes());
-            if image == body(before, page, stale_before) {
+            let stale_before_bytes = store.original(stale_before).expect("read above");
+            if image == stale_before_bytes {
                 continue;
             }
             flips.push(Flip {
@@ -1460,19 +1451,27 @@ impl<M: Mem> Block<M> {
             });
         }
 
-        // Everything else that changed. **Both** halves of every shadow pair
-        // are excluded, not just the halves phase 2 writes: canonicalising a
-        // double flip deliberately leaves the old live half alone, so its
-        // bytes differ between `before` and `after` and it must not be
-        // mistaken for content. Leaving it is the point -- it becomes the
-        // pair's stale copy, which is exactly what a stale copy is for.
-        let structural: std::collections::HashSet<usize> = pairs
-            .iter()
-            .flat_map(|&(first, second)| [first, second])
-            .collect();
-        let content: Vec<usize> = (0..old_pages)
-            .filter(|number| !structural.contains(number))
-            .filter(|number| body(before, page, *number) != body(after, page, *number))
+        // Everything else that changed. **Both** halves of every flip-
+        // covered pair are excluded, not just the halves phase 2 writes:
+        // canonicalising a double flip deliberately leaves the old live half
+        // alone, so its bytes still differ from `original` and it must not
+        // be mistaken for content. Leaving it is the point -- it becomes the
+        // pair's stale copy, which is exactly what a stale copy is for. A
+        // pair the file grew into (`second >= old_pages`, excluded from
+        // `flip_pairs` above) is *not* excluded here -- it never went
+        // through canonicalisation, so both its halves fall through to
+        // ordinary content below, exactly like the old tail write handled
+        // them.
+        let flip_covered: std::collections::HashSet<usize> =
+            flip_pairs.iter().flat_map(|&(first, second)| [first, second]).collect();
+        let content: Vec<usize> = store
+            .dirty_pages()
+            .into_iter()
+            .filter(|n| !flip_covered.contains(n))
+            .filter(|&n| match store.original(n) {
+                None => true, // appended this operation -- always new content
+                Some(before) => before != store.current(n),
+            })
             .collect();
 
         let mut out = std::fs::OpenOptions::new()
@@ -1492,12 +1491,10 @@ impl<M: Mem> Block<M> {
                 .map_err(|e| fail(format!("{}: flushing: {e}", self.path.display())))
         };
 
-        // Phase 1 -- content, and the tail the file grew by.
-        for number in &content {
-            put(&mut out, (number * page) as u64, body(after, page, *number))?;
-        }
-        if after.len() > before.len() {
-            put(&mut out, before.len() as u64, &after[before.len()..])?;
+        // Phase 1 -- content, pre-existing or newly appended alike: every
+        // dirty page not covered by a flip goes down whole, unconditionally.
+        for &number in &content {
+            put(&mut out, (number * page) as u64, store.current(number))?;
         }
         flush(&out)?;
         stop_here(Stop::AfterContent).map_err(&fail)?;
@@ -1506,7 +1503,7 @@ impl<M: Mem> Block<M> {
         // that loses to the half currently live.
         for flip in &flips {
             let mut held = flip.image.clone();
-            let losing = generation(before, flip.page);
+            let losing = generation(store.original(flip.page).expect("read above"));
             held[at::GENERATION..at::GENERATION + 2].copy_from_slice(&losing.to_le_bytes());
             put(&mut out, (flip.page * page) as u64, &held)?;
         }
@@ -1618,12 +1615,12 @@ impl<M: Mem> Block<M> {
             )));
         }
 
-        let mut file = std::fs::read(&self.path).map_err(|e| {
-            fail(format!("{}: {e}", self.path.display()))
-        })?;
-        // The file as it was, kept so the commit can write only the pages
-        // that end up different -- see `Self::write_changed_pages`.
-        let before = file.clone();
+        // `Store::open` reads only the file's length -- every page this
+        // write actually touches is read lazily, once, the first time
+        // something below asks for it. See `Store`'s own doc comment for
+        // what this replaced (a `std::fs::read` of the whole file, plus a
+        // full clone of it for `write_changed_pages` to diff against).
+        let mut store = v6::Store::open(&self.path, page_size).map_err(&fail)?;
 
         let layout = pages::Layout {
             page: page_size,
@@ -1631,7 +1628,7 @@ impl<M: Mem> Block<M> {
             pages: self.geometry.pages,
         };
 
-        let fcr = self.v6_live_fcr(&file).map_err(&fail)?;
+        let fcr = self.v6_live_fcr(&mut store).map_err(&fail)?;
         let head = pages::long(&fcr[pages::fcr::FREE_V6..pages::fcr::FREE_V6 + 4]);
 
         // A variable-length record's body goes down **first**, on a variable
@@ -1641,14 +1638,15 @@ impl<M: Mem> Block<M> {
         // Body first because the two writes cannot be made atomic: if placing
         // the body fails there is nothing to unwind, whereas a slot written
         // first and then orphaned leaves a record pointing at fragments that
-        // were never allocated. Note the whole file is still in memory here
-        // and is not written to disk until the very end, so a failure past
-        // this point discards the fragment with everything else.
+        // were never allocated. Note nothing below is written to disk until
+        // the very end, so a failure past this point discards the fragment
+        // with everything else -- still true now that `store` holds pages
+        // one at a time rather than the whole file.
         let (slot, variable_head) = if self.geometry.variable {
             let reclen = usize::from(self.geometry.reclen);
             let was = variable::head_of(&fcr);
             let mut source =
-                variable::V6Pages::new(&mut file, page_size).map_err(&fail)?;
+                variable::V6Pages::new(&mut store, page_size).map_err(&fail)?;
             let mut space = variable::Space::new(&mut source, Version::V6, was);
             let at = space.place(&bytes[reclen..]).map_err(|why| {
                 fail(format!(
@@ -1671,9 +1669,9 @@ impl<M: Mem> Block<M> {
         // page if the list is empty. Both are what genuine 6.15 does; see
         // `Self::v6_pop_free` and `Self::v6_claim_threaded_page`.
         let (new_position, new_head) = if head == records::NOWHERE {
-            self.v6_claim_threaded_page(&mut file, layout, &slot).map_err(&fail)?
+            self.v6_claim_threaded_page(&mut store, layout, &slot).map_err(&fail)?
         } else {
-            self.v6_pop_free(&mut file, layout, head, &slot).map_err(&fail)?
+            self.v6_pop_free(&mut store, layout, head, &slot).map_err(&fail)?
         };
 
         // The model, updated on a copy first: every key's index below is
@@ -1692,13 +1690,13 @@ impl<M: Mem> Block<M> {
             .map_err(|why| fail(format!("adding the new record to the model: {why}")))?;
 
         let key_record_counts = self
-            .v6_reindex(&mut file, &records_clone, &fcr, layout)
+            .v6_reindex(&mut store, &records_clone, &fcr, layout)
             .map_err(&fail)?;
 
         let total_records =
             u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
         v6::write_fcr(
-            &mut file,
+            &mut store,
             page_size,
             total_records,
             &key_record_counts,
@@ -1709,16 +1707,19 @@ impl<M: Mem> Block<M> {
 
         // The last point before this write actually changes anything on
         // disk -- see `Self::capture_for_journal`'s doc comment for why it
-        // is taken here rather than at the top of the function.
-        self.capture_for_journal_from(&before);
+        // is taken here rather than at the top of the function. Reads the
+        // pristine file fresh from disk when a transaction actually needs
+        // it (`Self::capture_for_journal`'s own no-op-unless-active guard);
+        // nothing below this point has written anything yet, so the file on
+        // disk is still exactly the pre-image a rollback would want.
+        self.capture_for_journal()?;
 
-        self.write_changed_pages(&before, &file)?;
+        self.write_changed_pages(&store)?;
 
         self.records = Some(records_clone);
         self.geometry.records = total_records;
-        self.geometry.pages = u32::try_from(file.len())
-            .expect("a Btrieve file under four gigabytes")
-            / u32::from(page_size);
+        self.geometry.pages =
+            u32::try_from(store.total_pages()).expect("a Btrieve file under four gigabytes of pages");
         self.dirty = true;
 
         Ok(new_position)
@@ -1838,33 +1839,29 @@ impl<M: Mem> Block<M> {
     /// cannot be relocated.
     fn v6_pop_free(
         &self,
-        file: &mut Vec<u8>,
+        store: &mut v6::Store,
         layout: pages::Layout,
         head: u32,
         bytes: &[u8],
     ) -> Result<(u32, u32), String> {
         let page_size = self.geometry.page;
-        let page_size_usize = usize::from(page_size);
 
         let (logical, slot) = layout.slot_of(head).ok_or_else(|| {
             format!("the free-list head is {head}, which is not on a slot boundary")
         })?;
-        let physical = v6::Map::read(file, page_size)?.physical(logical).ok_or_else(|| {
+        let physical = v6::Map::read(store, page_size)?.physical(logical).ok_or_else(|| {
             format!(
                 "the free-list head is {head}, on logical page {logical}, which the \
                  allocation table claims no physical page for"
             )
         })?;
 
-        let at = physical as usize * page_size_usize;
-        if at + page_size_usize > file.len() {
-            return Err(format!(
+        let mut content = store.page(physical as usize).map_err(|why| {
+            format!(
                 "the free-list head is {head}, on logical page {logical}, which \
-                 resolves to physical page {physical}, past the end of a {}-byte file",
-                file.len()
-            ));
-        }
-        let mut content = file[at..at + page_size_usize].to_vec();
+                 resolves to physical page {physical}: {why}"
+            )
+        })?.to_vec();
 
         let within = layout.position(0, slot) as usize;
         let marker = u16::from_le_bytes([content[within], content[within + 1]]);
@@ -1882,7 +1879,7 @@ impl<M: Mem> Block<M> {
         content[body..body + usize::from(self.geometry.physical) - V6_SLOT_MARKER].fill(0);
         content[body..body + bytes.len()].copy_from_slice(bytes);
 
-        v6::Map::relocate(file, page_size, logical, &content, [0x00, 0x44])
+        v6::Map::relocate(store, page_size, logical, &content, [0x00, 0x44])
             .map_err(|why| format!("relocating the page the free slot is on: {why}"))?;
 
         Ok((head, next))
@@ -1907,7 +1904,7 @@ impl<M: Mem> Block<M> {
     /// If the page cannot be claimed.
     fn v6_claim_threaded_page(
         &self,
-        file: &mut Vec<u8>,
+        store: &mut v6::Store,
         layout: pages::Layout,
         bytes: &[u8],
     ) -> Result<(u32, u32), String> {
@@ -1931,31 +1928,32 @@ impl<M: Mem> Block<M> {
         // `claim` decides the logical id, and the thread's links are
         // positions that depend on it -- so the page is threaded *after* the
         // claim, in the file, rather than before it in this buffer.
-        let logical = v6::Map::claim(file, page_size, &content, [0x00, 0x44])
+        let logical = v6::Map::claim(store, page_size, &content, [0x00, 0x44])
             .map_err(|why| format!("claiming a page for the new record: {why}"))?;
 
-        let physical = v6::Map::read(file, page_size)?
+        let physical = v6::Map::read(store, page_size)?
             .physical(logical)
-            .ok_or_else(|| format!("logical page {logical} was just claimed and is not claimed"))?;
-        let at = physical as usize * usize::from(page_size);
+            .ok_or_else(|| format!("logical page {logical} was just claimed and is not claimed"))?
+            as usize;
 
         for slot in 0..per_page {
-            let body = at + layout.position(0, slot) as usize + V6_SLOT_MARKER;
+            let body = layout.position(0, slot) as usize + V6_SLOT_MARKER;
             let next = if slot + 1 < per_page {
                 layout.position(logical, slot + 1)
             } else {
                 records::NOWHERE
             };
-            file[body..body + 4].copy_from_slice(&pages::to_long(next));
+            store.page_mut(physical)?[body..body + 4].copy_from_slice(&pages::to_long(next));
         }
 
         // Slot 0 takes the record, so the head is slot 1 -- or nothing, on a
         // page with room for exactly one.
-        let record_at = at + layout.position(0, 0) as usize;
-        file[record_at..record_at + 2].copy_from_slice(&1u16.to_le_bytes());
+        let record_at = layout.position(0, 0) as usize;
+        let page_bytes = store.page_mut(physical)?;
+        page_bytes[record_at..record_at + 2].copy_from_slice(&1u16.to_le_bytes());
         let body = record_at + V6_SLOT_MARKER;
-        file[body..body + usize::from(self.geometry.physical) - V6_SLOT_MARKER].fill(0);
-        file[body..body + bytes.len()].copy_from_slice(bytes);
+        page_bytes[body..body + usize::from(self.geometry.physical) - V6_SLOT_MARKER].fill(0);
+        page_bytes[body..body + bytes.len()].copy_from_slice(bytes);
 
         let head = if per_page > 1 {
             layout.position(logical, 1)
@@ -2090,21 +2088,21 @@ impl<M: Mem> Block<M> {
     ///
     /// The four quantities every v6 write below needs and none of them should
     /// re-derive: the record's logical page, the physical page currently
-    /// holding it, the slot's byte offset within a page, and the whole file
-    /// read into memory. The first three are resolved by
+    /// holding it, the slot's byte offset within a page, and a page store to
+    /// do the rest of the write through. The first three are resolved by
     /// [`Self::v6_resolve_logical`] and pure arithmetic, without loading the
-    /// file -- see that function's own doc comment. The whole file is still
-    /// read here, but for a different reason than locating this one slot:
-    /// every v6 *write* is read-modify-append-elsewhere-and-flip-the-shadow-
-    /// pair, never an in-place edit, so [`Self::update_v6`] and
-    /// [`Self::delete_v6`] need the whole buffer regardless of how cheaply
-    /// this function found the one slot they asked about.
+    /// file -- see that function's own doc comment. [`v6::Store::open`]
+    /// below reads nothing yet either; it only checks the file's length
+    /// against `page_size`, and every page [`Self::update_v6`] or
+    /// [`Self::delete_v6`] actually needs -- this one included -- is read
+    /// lazily as they ask for it, once, from here on.
     ///
     /// # Errors
     ///
-    /// If the file cannot be read, `position` is not on a slot boundary, the
-    /// allocation table cannot be resolved or does not claim the record's
-    /// logical page, or the page it names lies past the end of the file.
+    /// If the file's metadata cannot be read or its length is not a whole
+    /// number of pages, `position` is not on a slot boundary, the allocation
+    /// table cannot be resolved or does not claim the record's logical page,
+    /// or the page it names lies past the end of the file.
     fn v6_slot(&self, position: u32, layout: pages::Layout) -> Result<V6Slot, String> {
         let (logical, slot) = layout.slot_of(position).ok_or_else(|| {
             format!("position {position} is not on a slot boundary of this file's layout")
@@ -2112,23 +2110,20 @@ impl<M: Mem> Block<M> {
 
         let physical = self.v6_resolve_logical(logical)?;
 
-        let file = std::fs::read(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
-
-        let page_size = usize::from(self.geometry.page);
-        let at = page_size * physical as usize;
-        if at + page_size > file.len() {
-            return Err(format!(
-                "logical page {logical} resolves to physical page {physical}, past \
-                 the end of a {}-byte file",
-                file.len()
-            ));
-        }
+        let mut store = v6::Store::open(&self.path, self.geometry.page)?;
+        // Touch the page now, not lazily on first write: a `physical` the
+        // allocation table named but that does not actually exist in the
+        // file is exactly the "past the end" refusal this used to raise
+        // itself, and `Store::page` already raises the same one.
+        store.page(physical as usize).map_err(|why| {
+            format!("logical page {logical} resolves to physical page {physical}: {why}")
+        })?;
 
         // Within a page, a slot's offset is the same whichever page it is on,
         // so `position(0, slot)` asks exactly that -- the same reasoning
         // `records::walk_v6` gives at length for the same expression.
         Ok(V6Slot {
-            file,
+            store,
             logical,
             physical,
             within: layout.position(0, slot) as usize,
@@ -2175,16 +2170,12 @@ impl<M: Mem> Block<M> {
         };
 
         let page_size = self.geometry.page;
-        let page_size_usize = usize::from(page_size);
         let V6Slot {
-            mut file,
+            mut store,
             logical,
             physical,
             within,
         } = self.v6_slot(position, layout).map_err(&fail)?;
-        // See `Self::write_changed_pages`: the commit needs the file as it
-        // was to know which pages it has to put down.
-        let before = file.clone();
 
         let mut records_clone = self
             .records
@@ -2195,8 +2186,7 @@ impl<M: Mem> Block<M> {
             .update(&self.keys, position, bytes.to_vec())
             .map_err(|why| fail(format!("updating the record in the model: {why}")))?;
 
-        let at = page_size_usize * physical as usize;
-        let mut content = file[at..at + page_size_usize].to_vec();
+        let mut content = store.page(physical as usize).map_err(&fail)?.to_vec();
 
         // The marker counts updates, and zero means free -- so it must never
         // land back on zero. Genuine Btrieve's behaviour at the sixty-five
@@ -2211,27 +2201,26 @@ impl<M: Mem> Block<M> {
         let body = within + V6_SLOT_MARKER;
         content[body..body + bytes.len()].copy_from_slice(bytes);
 
-        let fcr = self.v6_live_fcr(&file).map_err(&fail)?;
+        let fcr = self.v6_live_fcr(&mut store).map_err(&fail)?;
 
-        v6::Map::relocate(&mut file, page_size, logical, &content, [0x00, 0x44])
+        v6::Map::relocate(&mut store, page_size, logical, &content, [0x00, 0x44])
             .map_err(|why| fail(format!("relocating the record's page: {why}")))?;
 
         let key_record_counts = self
-            .v6_reindex(&mut file, &records_clone, &fcr, layout)
+            .v6_reindex(&mut store, &records_clone, &fcr, layout)
             .map_err(&fail)?;
 
         let total_records =
             u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
-        v6::write_fcr(&mut file, page_size, total_records, &key_record_counts, None, None)
+        v6::write_fcr(&mut store, page_size, total_records, &key_record_counts, None, None)
             .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
-        self.capture_for_journal_from(&before);
-        self.write_changed_pages(&before, &file)?;
+        self.capture_for_journal()?;
+        self.write_changed_pages(&store)?;
 
         self.records = Some(records_clone);
-        self.geometry.pages = u32::try_from(file.len())
-            .expect("a Btrieve file under four gigabytes")
-            / u32::from(page_size);
+        self.geometry.pages =
+            u32::try_from(store.total_pages()).expect("a Btrieve file under four gigabytes of pages");
         self.dirty = true;
 
         Ok(())
@@ -2281,16 +2270,12 @@ impl<M: Mem> Block<M> {
         };
 
         let page_size = self.geometry.page;
-        let page_size_usize = usize::from(page_size);
         let V6Slot {
-            mut file,
+            mut store,
             logical,
             physical,
             within,
         } = self.v6_slot(position, layout).map_err(&fail)?;
-        // See `Self::write_changed_pages`: the commit needs the file as it
-        // was to know which pages it has to put down.
-        let before = file.clone();
 
         let mut records_clone = self
             .records
@@ -2301,11 +2286,10 @@ impl<M: Mem> Block<M> {
             .delete(&self.keys, position)
             .map_err(|why| fail(format!("removing the record from the model: {why}")))?;
 
-        let fcr = self.v6_live_fcr(&file).map_err(&fail)?;
+        let fcr = self.v6_live_fcr(&mut store).map_err(&fail)?;
         let free_head = pages::long(&fcr[pages::fcr::FREE_V6..pages::fcr::FREE_V6 + 4]);
 
-        let at = page_size_usize * physical as usize;
-        let mut content = file[at..at + page_size_usize].to_vec();
+        let mut content = store.page(physical as usize).map_err(&fail)?.to_vec();
 
         // Zero the whole slot -- marker included -- and then write the
         // forwarding link over the front of the body. Zeroing first rather
@@ -2316,17 +2300,17 @@ impl<M: Mem> Block<M> {
         let body = within + V6_SLOT_MARKER;
         content[body..body + 4].copy_from_slice(&pages::to_long(free_head));
 
-        v6::Map::relocate(&mut file, page_size, logical, &content, [0x00, 0x44])
+        v6::Map::relocate(&mut store, page_size, logical, &content, [0x00, 0x44])
             .map_err(|why| fail(format!("relocating the record's page: {why}")))?;
 
         let key_record_counts = self
-            .v6_reindex(&mut file, &records_clone, &fcr, layout)
+            .v6_reindex(&mut store, &records_clone, &fcr, layout)
             .map_err(&fail)?;
 
         let total_records =
             u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
         v6::write_fcr(
-            &mut file,
+            &mut store,
             page_size,
             total_records,
             &key_record_counts,
@@ -2336,14 +2320,13 @@ impl<M: Mem> Block<M> {
         )
         .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
-        self.capture_for_journal_from(&before);
-        self.write_changed_pages(&before, &file)?;
+        self.capture_for_journal()?;
+        self.write_changed_pages(&store)?;
 
         self.records = Some(records_clone);
         self.geometry.records = total_records;
-        self.geometry.pages = u32::try_from(file.len())
-            .expect("a Btrieve file under four gigabytes")
-            / u32::from(page_size);
+        self.geometry.pages =
+            u32::try_from(store.total_pages()).expect("a Btrieve file under four gigabytes of pages");
         self.dirty = true;
 
         Ok(())
@@ -2360,31 +2343,31 @@ impl<M: Mem> Block<M> {
     /// # Errors
     ///
     /// If the file does not hold two whole pages, or the two generations tie.
-    fn v6_live_fcr(&self, file: &[u8]) -> Result<Vec<u8>, String> {
+    fn v6_live_fcr(&self, store: &mut v6::Store) -> Result<Vec<u8>, String> {
         let page_size = usize::from(self.geometry.page);
-        if file.len() < 2 * page_size {
+        if store.total_pages() < 2 {
             return Err(format!(
                 "{} bytes does not hold two whole {page_size}-byte pages for the \
                  file control record's shadow pair",
-                file.len()
+                store.total_pages() * page_size
             ));
         }
-        let generation = |page: usize| -> u16 {
-            let at = page * page_size + at::GENERATION;
-            u16::from_le_bytes([file[at], file[at + 1]])
+        let generation = |store: &mut v6::Store, page: usize| -> Result<u16, String> {
+            let header = store.header(page)?;
+            Ok(u16::from_le_bytes([header[at::GENERATION], header[at::GENERATION + 1]]))
         };
-        let live = match generation(0).cmp(&generation(1)) {
+        let live = match generation(store, 0)?.cmp(&generation(store, 1)?) {
             std::cmp::Ordering::Greater => 0usize,
             std::cmp::Ordering::Less => 1usize,
             std::cmp::Ordering::Equal => {
                 return Err(format!(
                     "both file-control-record copies claim generation {}, and \
                      there is no rule measured for choosing between them",
-                    generation(0)
+                    generation(store, 0)?
                 ));
             }
         };
-        Ok(file[live * page_size..][..page_size].to_vec())
+        Ok(store.page(live)?.to_vec())
     }
 
     /// Rebuild every key's index from `records`, and relocate each key's root
@@ -2460,7 +2443,7 @@ impl<M: Mem> Block<M> {
     /// (`docs/2026-08-17-v6-duplicate-key-oracle.md`).
     fn v6_write_chains(
         &self,
-        file: &mut Vec<u8>,
+        store: &mut v6::Store,
         layout: pages::Layout,
         chains: &[(usize, Vec<Vec<u32>>)],
     ) -> Result<(), String> {
@@ -2502,12 +2485,12 @@ impl<M: Mem> Block<M> {
         // something -- the same reason [`Self::v6_reindex`]'s loop does:
         // a relocation does rewrite the allocation table, but most passes
         // through this loop no longer relocate at all.
-        let mut map = v6::Map::read(file, page_size)?;
+        let mut map = v6::Map::read(store, page_size)?;
         let mut map_is_stale = false;
 
         for (logical, writes) in per_page {
             if map_is_stale {
-                map = v6::Map::read(file, page_size)?;
+                map = v6::Map::read(store, page_size)?;
                 map_is_stale = false;
             }
             let physical = map
@@ -2518,15 +2501,10 @@ impl<M: Mem> Block<M> {
                          table claims no physical page for"
                     )
                 })?;
-            let at = physical as usize * page_size_usize;
-            let mut content = file
-                .get(at..at + page_size_usize)
-                .ok_or_else(|| {
-                    format!(
-                        "logical page {logical} resolves to physical {physical}, past the \
-                         end of a {}-byte file",
-                        file.len()
-                    )
+            let mut content = store
+                .page(physical as usize)
+                .map_err(|why| {
+                    format!("logical page {logical} resolves to physical {physical}: {why}")
                 })?
                 .to_vec();
 
@@ -2541,11 +2519,11 @@ impl<M: Mem> Block<M> {
             // relocated every data page holding one, for bytes identical to
             // the ones already there. The pages are *data* pages, so each
             // needless relocation also claimed or consumed a shadow twin.
-            if content == file[at..at + page_size_usize] {
+            if content.as_slice() == store.page(physical as usize).map_err(|why| why.to_string())? {
                 continue;
             }
 
-            v6::Map::relocate(file, page_size, logical, &content, [0x00, 0x44])?;
+            v6::Map::relocate(store, page_size, logical, &content, [0x00, 0x44])?;
             map_is_stale = true;
         }
 
@@ -2584,14 +2562,13 @@ impl<M: Mem> Block<M> {
     /// other key's tag byte, if an id the tree names is claimed by nothing, or
     /// if any page of the tree does not decode.
     fn v6_index_logicals(
-        file: &[u8],
+        store: &mut v6::Store,
         page_size: u16,
         root: u32,
         tag: [u8; 2],
         shape: pages::Shape,
     ) -> Result<Vec<u32>, String> {
-        let map = v6::Map::read(file, page_size)?;
-        let page = usize::from(page_size);
+        let map = v6::Map::read(store, page_size)?;
         let walked = pages::walk_with(Self::v6_decorate(root, tag), shape, |number| {
             let top = (number >> 24) as u8;
             if top != tag[1] {
@@ -2604,14 +2581,10 @@ impl<M: Mem> Block<M> {
             let physical = map.physical(logical).ok_or_else(|| {
                 format!("logical page {logical} is claimed by nothing")
             })? as usize;
-            file.get(physical * page..physical * page + page)
+            store
+                .page(physical)
                 .map(<[u8]>::to_vec)
-                .ok_or_else(|| {
-                    format!(
-                        "logical page {logical} resolves to physical {physical}, past                          the end of a {}-byte file",
-                        file.len()
-                    )
-                })
+                .map_err(|why| format!("logical page {logical} resolves to physical {physical}: {why}"))
         })?;
         Ok(walked
             .pages
@@ -2622,7 +2595,7 @@ impl<M: Mem> Block<M> {
 
     fn v6_reindex(
         &self,
-        file: &mut Vec<u8>,
+        store: &mut v6::Store,
         records: &Records,
         fcr: &[u8],
         layout: pages::Layout,
@@ -2759,7 +2732,7 @@ impl<M: Mem> Block<M> {
                 })?;
             let root = raw_root & pages::fcr::ROOT_PAGE;
             let tag = [0x00, tag_high];
-            let existing = Self::v6_index_logicals(file, page_size, root, tag, key.shape())
+            let existing = Self::v6_index_logicals(store, page_size, root, tag, key.shape())
                 .map_err(|why| format!("key {}: walking its current index: {why}", key.number))?;
             built.push(Rebuilt {
                 root,
@@ -2785,7 +2758,7 @@ impl<M: Mem> Block<M> {
         // `claim` or a `relocate` and not otherwise. Lazily, at the point of
         // use, so the last relocate of a write does not pay for a walk whose
         // answer is then thrown away.
-        let mut map = v6::Map::read(file, page_size)?;
+        let mut map = v6::Map::read(store, page_size)?;
         let mut map_is_stale = false;
 
         let mut counts = Vec::with_capacity(built.len());
@@ -2803,7 +2776,7 @@ impl<M: Mem> Block<M> {
                 .collect();
             let blank = vec![0u8; usize::from(page_size)];
             while numbers.len() < rebuilt.index.nodes.len() {
-                let logical = v6::Map::claim(file, page_size, &blank, rebuilt.tag)
+                let logical = v6::Map::claim(store, page_size, &blank, rebuilt.tag)
                     .map_err(|why| format!("claiming an index page: {why}"))?;
                 map_is_stale = true;
                 numbers.push(Self::v6_decorate(logical, rebuilt.tag));
@@ -2829,7 +2802,7 @@ impl<M: Mem> Block<M> {
             // establishes for a page a move leaves behind.
             for decorated in numbers.split_off(rebuilt.index.nodes.len()) {
                 let logical = decorated & pages::fcr::ROOT_PAGE;
-                v6::Map::unclaim(file, page_size, logical).map_err(|why| {
+                v6::Map::unclaim(store, page_size, logical).map_err(|why| {
                     format!(
                         "releasing logical page {logical}, which the rebuilt tree \
                          no longer needs: {why}"
@@ -2846,18 +2819,20 @@ impl<M: Mem> Block<M> {
                 // table, so a map read from before one of those would answer
                 // about the file as it was two nodes ago.
                 if map_is_stale {
-                    map = v6::Map::read(file, page_size)?;
+                    map = v6::Map::read(store, page_size)?;
                     map_is_stale = false;
                 }
                 let body = usize::from(pages::HEADER);
                 if let Some(physical) = map.physical(logical) {
-                    let at = usize::from(page_size) * physical as usize;
-                    if file[at + body..at + usize::from(page_size)] == image[body..] {
+                    let current = store.page(physical as usize).map_err(|why| {
+                        format!("logical page {logical} resolves to physical {physical}: {why}")
+                    })?;
+                    if current[body..] == image[body..] {
                         continue;
                     }
                 }
 
-                v6::Map::relocate(file, page_size, logical, &image, rebuilt.tag)
+                v6::Map::relocate(store, page_size, logical, &image, rebuilt.tag)
                     .map_err(|why| {
                         format!("relocating an index page at logical {logical}: {why}")
                     })?;
@@ -2868,7 +2843,7 @@ impl<M: Mem> Block<M> {
         // Last, and after every index root has been placed: the chains join
         // records on *data* pages, and relocating those is a separate
         // sequence that should not be interleaved with the index's.
-        self.v6_write_chains(file, layout, &chains)?;
+        self.v6_write_chains(store, layout, &chains)?;
 
         Ok(counts)
     }
@@ -5184,7 +5159,7 @@ mod tests {
         // pass the line above and fail here.
         let file = std::fs::read(&path).expect("readable");
         let page_size = block.geometry.page;
-        let map = v6::Map::read(&file, page_size).expect("the allocation table");
+        let map = v6::Map::read(&mut v6::Store::from_bytes(&file, page_size).expect("test fixture"), page_size).expect("the allocation table");
         let key = &block.keys[0];
         let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
         let root_at = definition + pages::fcr::KEY_ROOT;
@@ -5506,7 +5481,7 @@ mod tests {
         // through the allocation table exactly as the writer had to.
         let whole = std::fs::read(&path).expect("the file reads");
         let page_size = geometry.page;
-        let map = v6::Map::read(&whole, page_size).expect("its allocation table reads");
+        let map = v6::Map::read(&mut v6::Store::from_bytes(&whole, page_size).expect("test fixture"), page_size).expect("its allocation table reads");
         let layout = pages::Layout {
             page: page_size,
             physical: geometry.physical,
@@ -5644,14 +5619,16 @@ mod tests {
         let key = &block.keys[0];
         let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
         let raw_root = pages::long(&file[definition + pages::fcr::KEY_ROOT..][..4]);
-        let map = v6::Map::read(file, block.geometry.page).expect("the allocation table");
+        let mut store = v6::Store::from_bytes(file, block.geometry.page).expect("test fixture");
+        let map = v6::Map::read(&mut store, block.geometry.page).expect("the allocation table");
         map.physical(raw_root & pages::fcr::ROOT_PAGE)
             .expect("the key's root is a claimed logical page")
     }
 
     /// The live half of the file control record's shadow pair.
     fn v6_fcr(block: &Block<Flat>, file: &[u8]) -> Vec<u8> {
-        block.v6_live_fcr(file).expect("a live control record")
+        let mut store = v6::Store::from_bytes(file, block.geometry.page).expect("test fixture");
+        block.v6_live_fcr(&mut store).expect("a live control record")
     }
 
     /// An update that changes the value of a key the file declares
@@ -5982,7 +5959,7 @@ mod tests {
             pages: block.geometry.pages,
         };
         let (logical, slot) = layout.slot_of(second).expect("a slot boundary");
-        let physical = v6::Map::read(&after, block.geometry.page)
+        let physical = v6::Map::read(&mut v6::Store::from_bytes(&after, block.geometry.page).expect("test fixture"), block.geometry.page)
             .expect("table")
             .physical(logical)
             .expect("claimed");
@@ -6077,7 +6054,7 @@ mod tests {
 
         let before = std::fs::read(&path).expect("readable");
         let head_before = pages::long(&v6_fcr(&block, &before)[pages::fcr::FREE_V6..][..4]);
-        let claims_before = v6::Map::read(&before, block.geometry.page)
+        let claims_before = v6::Map::read(&mut v6::Store::from_bytes(&before, block.geometry.page).expect("test fixture"), block.geometry.page)
             .expect("table")
             .entries()
             .count();
@@ -6105,7 +6082,7 @@ mod tests {
              for something else"
         );
         assert_eq!(
-            v6::Map::read(&after, block.geometry.page).expect("table").entries().count(),
+            v6::Map::read(&mut v6::Store::from_bytes(&after, block.geometry.page).expect("test fixture"), block.geometry.page).expect("table").entries().count(),
             claims_before,
             "a v6 delete never unclaims a page, even one it just emptied"
         );
@@ -6118,7 +6095,7 @@ mod tests {
             pages: block.geometry.pages,
         };
         let (logical, slot) = layout.slot_of(second).expect("a slot boundary");
-        let physical = v6::Map::read(&after, block.geometry.page)
+        let physical = v6::Map::read(&mut v6::Store::from_bytes(&after, block.geometry.page).expect("test fixture"), block.geometry.page)
             .expect("table")
             .physical(logical)
             .expect("still claimed");
@@ -6172,7 +6149,7 @@ mod tests {
         // straight into the file: marker 1, then the record.
         let mut file = std::fs::read(&path).expect("readable");
         let page_size = usize::from(block.geometry.page);
-        let physical = v6::Map::read(&file, block.geometry.page)
+        let physical = v6::Map::read(&mut v6::Store::from_bytes(&file, block.geometry.page).expect("test fixture"), block.geometry.page)
             .expect("table")
             .physical(logical)
             .expect("claimed") as usize;
@@ -6286,7 +6263,7 @@ mod tests {
         // above already confirmed.
         let file = std::fs::read(&path).expect("readable after the insert");
         let page_size = block.geometry.page;
-        let map = v6::Map::read(&file, page_size).expect("the allocation table");
+        let map = v6::Map::read(&mut v6::Store::from_bytes(&file, page_size).expect("test fixture"), page_size).expect("the allocation table");
         let key = &block.keys[0];
         let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
         let root_at = definition + pages::fcr::KEY_ROOT;
@@ -6390,7 +6367,7 @@ mod tests {
         assert_eq!(second, 0x8100_0003, "key 1's root carries its own number too");
 
         // Both must resolve to a page the file actually has.
-        let map = v6::Map::read(&whole, geometry.page).expect("its allocation table reads");
+        let map = v6::Map::read(&mut v6::Store::from_bytes(&whole, geometry.page).expect("test fixture"), geometry.page).expect("its allocation table reads");
         for (key, raw) in [(&keys[0], first), (&keys[1], second)] {
             let logical = raw & pages::fcr::ROOT_PAGE;
             assert!(
@@ -7051,6 +7028,15 @@ mod tests {
             map_reads < 20,
             "the allocation table was walked {map_reads} times for one update"
         );
+
+        // `read` itself is deliberately not asserted on here: `/proc/self/io`
+        // is process-wide, and this test file has no lock serialising it
+        // against every other `--ignored` test in the same binary the way
+        // `crates/btrieve/tests/write_cost.rs`'s `MEASURE_LOCK` does -- the
+        // `eprintln!` above is honest best-effort reporting, not a gate.
+        // `write_cost.rs`'s `wccmp002_update_cost_today` and `_cold` are
+        // Plan 3 Task 5's actual bound tests for this number, and they do
+        // serialise.
     }
 
     /// Task 4 of the incremental-updates plan: locating a v6 record's
@@ -7477,11 +7463,12 @@ mod tests {
         for key in &block.keys {
             let definition =
                 pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
-            let live = block.v6_live_fcr(&whole).expect("a live control record");
+            let mut store = v6::Store::from_bytes(&whole, block.geometry.page).expect("test fixture");
+            let live = block.v6_live_fcr(&mut store).expect("a live control record");
             let raw = pages::long(&live[definition..definition + 4]);
             let tag = [0x00, 0x80 | key.number as u8];
             let nodes = Block::<Flat>::v6_index_logicals(
-                &whole,
+                &mut store,
                 block.geometry.page,
                 raw & pages::fcr::ROOT_PAGE,
                 tag,
@@ -7497,7 +7484,7 @@ mod tests {
             );
         }
 
-        let claimed_before = v6::Map::read(&whole, block.geometry.page)
+        let claimed_before = v6::Map::read(&mut v6::Store::from_bytes(&whole, block.geometry.page).expect("test fixture"), block.geometry.page)
             .expect("resolves")
             .entries()
             .count();
@@ -7513,7 +7500,7 @@ mod tests {
         assert_eq!(after.len(), before + 1, "the record went in");
 
         let whole = std::fs::read(&path).expect("reads");
-        let claimed_after = v6::Map::read(&whole, block.geometry.page)
+        let claimed_after = v6::Map::read(&mut v6::Store::from_bytes(&whole, block.geometry.page).expect("test fixture"), block.geometry.page)
             .expect("resolves")
             .entries()
             .count();
@@ -7529,11 +7516,12 @@ mod tests {
         for key in &block.keys {
             let definition =
                 pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
-            let live = block.v6_live_fcr(&whole).expect("a live control record");
+            let mut store = v6::Store::from_bytes(&whole, block.geometry.page).expect("test fixture");
+            let live = block.v6_live_fcr(&mut store).expect("a live control record");
             let raw = pages::long(&live[definition..definition + 4]);
             let tag = [0x00, 0x80 | key.number as u8];
             let nodes = Block::<Flat>::v6_index_logicals(
-                &whole,
+                &mut store,
                 block.geometry.page,
                 raw & pages::fcr::ROOT_PAGE,
                 tag,
@@ -7542,7 +7530,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("key {}: the rebuilt tree walks: {e}", key.number));
             assert!(nodes.len() > 1, "key {} still spans several pages", key.number);
 
-            let map = v6::Map::read(&whole, block.geometry.page).expect("resolves");
+            let map = v6::Map::read(&mut store, block.geometry.page).expect("resolves");
             let page = usize::from(block.geometry.page);
             for logical in &nodes {
                 let physical = map.physical(*logical).expect("claimed") as usize;
@@ -7599,8 +7587,9 @@ mod tests {
         // Read the roots back off the file exactly as `v6_reindex` found them.
         let whole = std::fs::read(&path).expect("the file reads");
         let page = usize::from(block.geometry.page);
-        let live = block.v6_live_fcr(&whole).expect("a live control record");
-        let map = v6::Map::read(&whole, block.geometry.page).expect("resolves");
+        let mut store = v6::Store::from_bytes(&whole, block.geometry.page).expect("test fixture");
+        let live = block.v6_live_fcr(&mut store).expect("a live control record");
+        let map = v6::Map::read(&mut store, block.geometry.page).expect("resolves");
 
         for key in &block.keys {
             let definition =

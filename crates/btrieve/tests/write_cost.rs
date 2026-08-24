@@ -88,12 +88,19 @@ unsafe impl GlobalAlloc for Tracking {
 #[global_allocator]
 static ALLOC: Tracking = Tracking;
 
-/// Mark the current heap size as this window's baseline. Every measurement
-/// in this file runs from its own `#[test]` function and this crate's
-/// harness never runs two `#[test]`s from this file at once by default (the
-/// big one is `#[ignore]`d, so a plain `cargo test` never overlaps it with
-/// the small one) -- a concurrent allocation from another test in this
-/// binary would otherwise contaminate the reading.
+/// Serialises every measurement window in this file. `/proc/self/io`'s
+/// counters are process-wide, not per-thread, and the heap tracker above is
+/// process-wide too -- Rust's test harness runs `#[test]`s in parallel
+/// threads of one process by default, so two measurement windows open at
+/// once would each see the other's reads and allocations. A plain
+/// `cargo test` never triggers this (the big tests are `#[ignore]`d and the
+/// small one is alone), but `--ignored` now runs *two* `#[ignore]`d tests
+/// (warm and cold) from this file together, so this is no longer optional.
+/// Every `#[test]` below takes this before its own `reset_peak`/`proc_io`
+/// baseline and holds it for the whole measurement.
+static MEASURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Mark the current heap size as this window's baseline.
 fn reset_peak() {
     let now = CURRENT.load(Ordering::SeqCst);
     BASELINE.store(now, Ordering::SeqCst);
@@ -196,6 +203,71 @@ fn measure_one_update(label: &str, path: &Path) -> Cost {
     }
 }
 
+/// The same measurement as [`measure_one_update`], but *cold*: nothing on
+/// the `Block` under test has called `records()`, `Get`, or `Step` before
+/// `update()` does its own internal `self.records()?` -- the real precondition
+/// the first write after a board's own `Btrieve::open` faces, not the
+/// steady-state one `measure_one_update` deliberately isolates.
+///
+/// A second, throwaway `Btrieve` instance opens `path` first, purely to learn
+/// which position and bytes to hand `update()` -- a real caller already knows
+/// this from an earlier `Get`/`Step` on *some* cursor, but this measurement
+/// must not let *this* `Block` be the one that answered it, or the read
+/// `records()` costs would land outside the timed window and this would
+/// silently become `measure_one_update` again. `/proc/self/io` is
+/// process-wide, not per-`Btrieve`, so the scout's own reads are made to
+/// finish, and its stack drop, before `(r0, w0)` is taken.
+///
+/// # Panics
+///
+/// Same as [`measure_one_update`].
+fn measure_one_update_cold(label: &str, path: &Path) -> Cost {
+    let (position, bytes) = {
+        let mut scout_mem = FlatMem::new(64 * 1024);
+        let mut scout_heap = FlatHeap::new(0x100);
+        let mut scout = Btrieve::<Flat>::default();
+        let geometry = Geometry::read(label, path).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let maxlen = geometry.reclen;
+        let at = scout
+            .open(&mut scout_mem, &mut scout_heap, label, path, geometry, maxlen)
+            .unwrap_or_else(|e| panic!("{label}: scout open: {e}"));
+        let block = scout.block_mut(at).expect("just opened");
+        let records = block.records().unwrap_or_else(|e| panic!("{label}: scout records: {e}"));
+        assert!(!records.is_empty(), "{label}: this file has no records to update");
+        let record = records.physical(0).expect("index 0 of a non-empty Records");
+        let mut bytes = record.bytes.clone();
+        bytes[0] ^= 0xff;
+        (record.position, bytes)
+    };
+
+    let mut mem = FlatMem::new(64 * 1024);
+    let mut heap = FlatHeap::new(0x100);
+    let mut btrieve = Btrieve::<Flat>::default();
+    let geometry = Geometry::read(label, path).unwrap_or_else(|e| panic!("{label}: {e}"));
+    let maxlen = geometry.reclen;
+    let at = btrieve
+        .open(&mut mem, &mut heap, label, path, geometry, maxlen)
+        .unwrap_or_else(|e| panic!("{label}: open: {e}"));
+
+    let (r0, w0) = proc_io();
+    reset_peak();
+    let start = Instant::now();
+    btrieve
+        .block_mut(at)
+        .expect("still open")
+        .update(position, &bytes)
+        .unwrap_or_else(|e| panic!("{label}: update: {e}"));
+    let wall = start.elapsed();
+    let (r1, w1) = proc_io();
+
+    Cost {
+        rchar: r1.saturating_sub(r0),
+        wchar: w1.saturating_sub(w0),
+        peak: peak_growth_since_reset(),
+        wall,
+    }
+}
+
 fn report(label: &str, file_len: u64, cost: &Cost) {
     eprintln!(
         "write_cost[{label}]: file {file_len} bytes -- read {read} bytes, wrote {wrote} \
@@ -221,6 +293,7 @@ fn report(label: &str, file_len: u64, cost: &Cost) {
 /// handle its absence explicitly."
 #[test]
 fn small_v6_fixed_update_cost_today() {
+    let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(archive) = btrieve::corpus::root() else {
         eprintln!("write_cost: no archive/ on this box, nothing measured -- expected on a fresh checkout");
         return;
@@ -248,7 +321,7 @@ fn small_v6_fixed_update_cost_today() {
 
 /// One record update on the exact file the plan's own measured defect #2
 /// names: `WCCMP002.DAT`, 55,734,272 bytes, 13,607 pages, v6, fixed-length,
-/// one key. This is the number Stage B must move.
+/// one key. This is the number Plan 3 Task 5 is judged against.
 ///
 /// Ignored and gated on `$WCCMP002`, exactly like `lib.rs`'s own
 /// `v6_update_writes_only_the_pages_it_changed` and its neighbours: the file
@@ -260,13 +333,27 @@ fn small_v6_fixed_update_cost_today() {
 /// ```
 ///
 /// for the OFF (no-verification) baseline, and the same command without
-/// `--release` for the ON one. Both now produce a clean number: see this
-/// file's own module doc, "A defect this measurement found" -- Task 2 found
-/// the ON run corrupting the file outright, and Task 3b fixed it, so this
-/// assertion is now a regression guard rather than a documented failure.
+/// `--release` for the ON one.
+///
+/// # The bound, and why it is pages, not bytes
+///
+/// Task 5 replaced the whole-file `Vec<u8>` every v6 write used to load with
+/// [`btrieve::v6::Store`] (not exported; see the crate's own module), a
+/// page-at-a-time cache backed by disk reads. What still scales with the
+/// file is [`btrieve::v6::Map::relocate`]'s twin search -- a genuine
+/// `4..pages` scan with no index to shortcut it, see that function's own
+/// doc comment -- but each candidate now costs 8 header bytes, not a whole
+/// 4,096-byte page, and the scan's answer is cached for the rest of the
+/// operation. Measured on this exact file: 991,670 bytes read, against
+/// 55,734,402 before Task 5 -- a ~56x reduction, and closer to `pages *
+/// header_len` (13,607 * 8 = 108,856) plus the few hundred content and
+/// index pages an update actually touches than to the file's own 55.7 MB.
+/// `300 * page_size` gives that headroom without coming anywhere near
+/// asserting the number can never move again.
 #[test]
 #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
 fn wccmp002_update_cost_today() {
+    let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(source) = std::env::var("WCCMP002") else {
         eprintln!("set WCCMP002=/path/to/wccmp002.vir to run this");
         return;
@@ -280,16 +367,76 @@ fn wccmp002_update_cost_today() {
     assert_eq!(big_len, 55_734_272, "this is the exact file the plan measured defect #2 against");
 
     let cost = measure_one_update("WCCMP002.DAT", &big_path);
-    report("WCCMP002.DAT", big_len, &cost);
+    report("WCCMP002.DAT (warm -- records() primed before the window)", big_len, &cost);
 
-    // Not a tight bound -- this is a measurement, and the point is the
-    // number in the report, not a pass/fail gate on it. But a write that
-    // read less than the file itself would mean this test stopped
-    // measuring what it claims to, so that much is asserted.
+    // `verify_writes` (debug builds only) re-reads and re-parses the whole
+    // file on top of the write itself -- Task 1's own cost, not Task 5's to
+    // bound. Asserted only in `--release`, the same way this file's module
+    // doc says every number here must be measured.
+    if cfg!(debug_assertions) {
+        eprintln!("write_cost: verify_writes is on in this build; not bounding its extra read");
+        return;
+    }
+    let page_size = 4096u64;
+    let bound = 300 * page_size;
     assert!(
-        cost.rchar >= big_len,
-        "expected at least one full-file read inside update() on WCCMP002.DAT, got {} bytes \
-         read against a {big_len}-byte file",
+        cost.rchar <= bound,
+        "update() on a warm WCCMP002.DAT read {} bytes -- expected at most {bound} \
+         ({bound} = 300 pages of {page_size}), a small multiple of the page size, not \
+         something that scales with the file's {big_len} bytes",
+        cost.rchar
+    );
+}
+
+/// The same file, the same one-record update, but *cold*: nothing has
+/// called `records()`, `Get`, or `Step` on the `Block` under test before
+/// `update()` makes its own internal call. This is the number a board's
+/// very first update after `Btrieve::open` actually pays -- the baseline
+/// doc's own Part 3 excluded it by priming `records()` first, and said so:
+/// "the real cold-cache cost is higher than 55.7 MB -- a board's first
+/// update after open reads the file twice."
+///
+/// [`records::walk_v6`] (not exported; the crate's own `records` module)
+/// is not part of Task 5's scope -- see this crate's `docs/` for why: it
+/// must visit very nearly every claimed page to enumerate a densely packed
+/// fixed-length file's records, which is not a read-path inefficiency but
+/// what building the in-memory model this host's `Records::ordered_len`/
+/// `ordered` needs actually costs. So this test's own bound is **not**
+/// `300 * page_size` -- it is `file_len + 300 * page_size`, the warm bound
+/// plus one full read of the file for `records()` to prime from. What Task
+/// 5 changed is that this now costs the file **once**, not twice: before
+/// this task, `update()`'s own internal whole-file read added a *second*
+/// full pass on top of `records()`'s.
+#[test]
+#[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+fn wccmp002_update_cost_today_cold() {
+    let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(source) = std::env::var("WCCMP002") else {
+        eprintln!("set WCCMP002=/path/to/wccmp002.vir to run this");
+        return;
+    };
+
+    let big_dir = scratch("write-cost-big-cold");
+    let big_path = big_dir.join("WCCMP002.DAT");
+    std::fs::copy(&source, &big_path).unwrap_or_else(|e| panic!("copying {source}: {e}"));
+    make_keys_modifiable(&big_path);
+    let big_len = std::fs::metadata(&big_path).expect("metadata").len();
+    assert_eq!(big_len, 55_734_272, "this is the exact file the plan measured defect #2 against");
+
+    let cost = measure_one_update_cold("WCCMP002.DAT", &big_path);
+    report("WCCMP002.DAT (cold -- update() primes records() itself)", big_len, &cost);
+
+    if cfg!(debug_assertions) {
+        eprintln!("write_cost: verify_writes is on in this build; not bounding its extra read");
+        return;
+    }
+    let page_size = 4096u64;
+    let bound = big_len + 300 * page_size;
+    assert!(
+        cost.rchar <= bound,
+        "a cold update() on WCCMP002.DAT read {} bytes -- expected at most {bound} \
+         (one full-file read for records() to prime from, plus the warm update's own \
+         bounded read), not something that scales with a second full-file read on top",
         cost.rchar
     );
 }

@@ -842,11 +842,19 @@ fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
         ));
     }
 
+    // This walk genuinely needs almost every claimed page -- a fixed-length
+    // v6 file packs records densely, so enumerating them all touches nearly
+    // every page the allocation table names. One bulk read is still the
+    // right tool here (see `Store`'s own doc comment on what did and did not
+    // shrink): the saving Stage B makes elsewhere is that a *write* no
+    // longer pays this cost too, not that this walk can avoid it. Wrapped in
+    // a `Store` only so `v6::Map::read` has one implementation, not two.
     let file = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let size = u32::try_from(file.len())
         .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
 
-    let map = super::v6::Map::read(&file, geometry.page)?;
+    let mut store = super::v6::Store::from_bytes(&file, geometry.page)?;
+    let map = super::v6::Map::read(&mut store, geometry.page)?;
 
     let layout = super::pages::Layout {
         page: geometry.page,

@@ -793,8 +793,11 @@ pub(crate) trait PageSource: PagesMut {
 /// A v6 file's pages, resolved and written through its `"PP"` allocation
 /// table.
 ///
-/// Holds the whole file, which is the shape `Block::insert_v6` already works
-/// in: it reads the file to a `Vec`, mutates it, and writes it back.
+/// Backed by a [`super::v6::Store`] -- the same lazy, page-at-a-time cache
+/// `Block::insert_v6` now works through, not a whole-file `Vec` read
+/// upfront. A variable-length record's own placement touches only its own
+/// pages plus the allocation table, and `Store` is what makes that bounded
+/// rather than incidental.
 ///
 /// **The map is re-read after every claim and every write**, because both
 /// move pages: `relocate` writes a logical page to its *other* physical twin
@@ -802,20 +805,18 @@ pub(crate) trait PageSource: PagesMut {
 /// resolves to the stale twin afterwards. Re-reading costs a pass over the
 /// table per page written and is what makes the alternative -- caching a map
 /// and hoping -- not worth reasoning about.
-#[allow(dead_code, reason = "consumed by `Block::insert`; landed with `Space` first")]
 pub(crate) struct V6Pages<'a> {
-    file: &'a mut Vec<u8>,
+    store: &'a mut super::v6::Store,
     page_size: u16,
     map: super::v6::Map,
 }
 
 impl<'a> V6Pages<'a> {
-    /// Read the allocation table and take the file.
-    #[allow(dead_code, reason = "consumed by `Block::insert`; landed with `Space` first")]
-    pub(crate) fn new(file: &'a mut Vec<u8>, page_size: u16) -> Result<Self, String> {
-        let map = super::v6::Map::read(file, page_size)?;
+    /// Read the allocation table and take the store.
+    pub(crate) fn new(store: &'a mut super::v6::Store, page_size: u16) -> Result<Self, String> {
+        let map = super::v6::Map::read(store, page_size)?;
         Ok(Self {
-            file,
+            store,
             page_size,
             map,
         })
@@ -830,30 +831,22 @@ impl Pages for V6Pages<'_> {
                  page for it"
             )
         })?;
-        let at = usize::from(self.page_size) * physical as usize;
-        let end = at + usize::from(self.page_size);
-        self.file.get(at..end).ok_or_else(|| {
-            format!(
-                "logical page {number} resolves to physical {physical}, past the end of a \
-                 {}-byte file",
-                self.file.len()
-            )
-        })
+        self.store.page(physical as usize)
     }
 }
 
 impl PagesMut for V6Pages<'_> {
     fn write_page(&mut self, number: u32, page: &[u8]) -> Result<(), String> {
-        super::v6::Map::relocate(self.file, self.page_size, number, page, V_TAG)?;
-        self.map = super::v6::Map::read(self.file, self.page_size)?;
+        super::v6::Map::relocate(self.store, self.page_size, number, page, V_TAG)?;
+        self.map = super::v6::Map::read(self.store, self.page_size)?;
         Ok(())
     }
 }
 
 impl PageSource for V6Pages<'_> {
     fn claim(&mut self, content: &[u8]) -> Result<u32, String> {
-        let logical = super::v6::Map::claim(self.file, self.page_size, content, V_TAG)?;
-        self.map = super::v6::Map::read(self.file, self.page_size)?;
+        let logical = super::v6::Map::claim(self.store, self.page_size, content, V_TAG)?;
+        self.map = super::v6::Map::read(self.store, self.page_size)?;
         Ok(logical)
     }
 

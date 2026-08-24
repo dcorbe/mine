@@ -149,6 +149,421 @@ const ENTRY: usize = 4;
 /// little-endian).
 const LOGICAL: usize = 0x02;
 
+/// How many leading bytes of a page carry everything a *resolving* scan ever
+/// asks about: the two-byte tag/magic at `0x00`, the two-byte logical id or
+/// allocation-table block index at `0x02` (the same offset serves both,
+/// [`LOGICAL`] and [`BLOCK`]), and the two-byte generation at `0x04`. Two
+/// bytes of padding round it to a `usize`-friendly width; nothing reads them.
+///
+/// This is the whole of what turns [`Map::relocate`]'s twin search from a
+/// per-operation full-file read into one bounded by page *count*, not page
+/// *size*: a candidate that is not the twin costs 8 bytes to rule out, not
+/// 4,096.
+const HEADER_LEN: usize = 8;
+
+/// One page's content as [`Store`] holds it while a v6 write is in
+/// progress: the bytes as they stood when this page was first read (`None`
+/// if the page did not exist yet -- it was appended during this operation),
+/// the bytes as they stand now, and whether the two differ.
+///
+/// `dirty` is kept as its own bit rather than computed by comparing
+/// `original` and `current` on demand, because [`Store::page_mut`] cannot
+/// know in advance whether its caller's edit will end up a no-op -- v6's own
+/// write paths routinely copy a page over unchanged fields, see whether it
+/// still reads the same, and skip the disk write if it does. That decision
+/// belongs to the caller, not to this type; `dirty` just remembers that
+/// mutable access was requested at all, and [`Store::write_page`] can still
+/// leave a page marked dirty over bytes that end up identical to
+/// `original` -- [`super::lib::write_changed_pages`]'s own before/after
+/// comparison is what filters those back out before anything is written.
+struct Entry {
+    original: Option<Vec<u8>>,
+    current: Vec<u8>,
+    dirty: bool,
+}
+
+/// A v6 file's pages, read from disk one at a time and cached only for the
+/// duration of a single write.
+///
+/// # What this replaces
+///
+/// Every v6 write used to open with `std::fs::read(&self.path)` -- the
+/// *entire* file, unconditionally, because [`Map::read`], [`Map::claim`],
+/// [`Map::relocate`] and [`super::lib::Block::v6_reindex`] all indexed a
+/// shared `Vec<u8>` by absolute physical offset and had no other way to ask
+/// for "physical page N". On `WCCMP002.DAT` (13,607 pages) that was 55.7 MB
+/// read for a one-record, one-byte update, and the peak heap paid for it
+/// twice over: `insert_v6`/`update_v6`/`delete_v6` each cloned that buffer
+/// again before touching it, to have something to diff the finished write
+/// against.
+///
+/// Every one of those call sites, measured, touches a *bounded* set of
+/// pages -- the allocation table's own blocks (found by formula, never a
+/// scan, see [`Map::read`]'s doc comment), the record's own data page, and
+/// whichever index nodes a key's rebuilt tree actually relocates. None of
+/// them needed the *whole* file resident; they needed `file[a..b]` to be
+/// answerable for the handful of pages they actually touch, and a `Vec<u8>`
+/// eagerly loaded to the file's full length was the only way this crate
+/// had to answer that.
+///
+/// # What did not shrink, and had to be fixed a different way
+///
+/// [`Map::relocate`]'s twin search is a genuine `4..pages` scan -- it has to
+/// rule out every physical page that is not this logical id's abandoned
+/// twin, and the format gives no index to shortcut that with. Caching whole
+/// pages would have made this store degenerate into loading the entire file
+/// on the *first* relocation of any write that touches a never-before-moved
+/// page (measured: on a fresh `WCCMP002.DAT`, 107 of 108 relocations in one
+/// update find no twin and scan every candidate). [`Self::header`] is the
+/// fix that measurement demanded: a twin search only ever needs to read
+/// [`HEADER_LEN`] bytes of a candidate to rule it out, not the 4,096-byte
+/// page a naive per-page cache would have fetched. The scan is still
+/// O(pages), and said so plainly rather than mis-sold as bounded -- see
+/// [`Map::relocate`]'s own doc comment -- but its *constant* dropped from
+/// one page to eight bytes, and every relocation after the first within one
+/// operation answers from this cache rather than touching disk again.
+///
+/// # Dirty tracking, replacing whole-buffer diffing
+///
+/// [`super::lib::Block::write_changed_pages`] used to diff an entire
+/// `before: Vec<u8>` against an entire `after: Vec<u8>` to work out which
+/// pages actually changed. This store already knows, because every write
+/// went through [`Self::page_mut`], [`Self::write_page`] or
+/// [`Self::append_page`] -- [`Self::dirty_pages`] is that list, already
+/// known rather than rediscovered, and [`Self::original`] is the one
+/// pre-image `write_changed_pages` needs per dirty page, not the whole
+/// file's.
+pub(crate) struct Store {
+    path: std::path::PathBuf,
+    page_size: usize,
+    original_pages: usize,
+    total_pages: usize,
+    pages: HashMap<usize, Entry>,
+    headers: HashMap<usize, [u8; HEADER_LEN]>,
+    structural_pairs: std::collections::BTreeSet<(usize, usize)>,
+}
+
+impl Store {
+    /// Open `path` for a page-at-a-time write. Nothing is read yet -- only
+    /// the file's length, to know how many pages it starts with.
+    ///
+    /// # Errors
+    ///
+    /// If the file's metadata cannot be read, or its length is not a whole
+    /// number of `page_size`-byte pages.
+    pub(crate) fn open(path: &std::path::Path, page_size: u16) -> Result<Self, String> {
+        let page_size_usize = usize::from(page_size);
+        if page_size_usize == 0 {
+            return Err("a v6 file's page size cannot be zero".to_owned());
+        }
+        let len = std::fs::metadata(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        let len = usize::try_from(len)
+            .map_err(|_| format!("{}: {len} bytes does not fit this host's usize", path.display()))?;
+        if !len.is_multiple_of(page_size_usize) {
+            return Err(format!(
+                "{} bytes is not a whole number of {page_size}-byte pages",
+                len
+            ));
+        }
+        let pages = len / page_size_usize;
+        Ok(Self {
+            path: path.to_path_buf(),
+            page_size: page_size_usize,
+            original_pages: pages,
+            total_pages: pages,
+            pages: HashMap::new(),
+            headers: HashMap::new(),
+            structural_pairs: std::collections::BTreeSet::new(),
+        })
+    }
+
+    /// Wrap bytes already in memory as a `Store`, instead of opening a file.
+    ///
+    /// For the handful of callers that legitimately have (or need) the whole
+    /// file already -- [`super::records::walk_v6`], which must visit nearly
+    /// every claimed page to enumerate a fixed-length file's records, and
+    /// this crate's own tests, which build small synthetic fixtures by hand
+    /// -- so they can still reach [`Map::read`]/[`Map::claim`]/etc. without
+    /// this module keeping a second, byte-slice-based copy of that logic.
+    ///
+    /// Every page is pre-loaded and marked clean, so [`Self::ensure_loaded`]
+    /// never falls back to disk for a `Store` built this way; `path` is a
+    /// placeholder never read for that reason.
+    ///
+    /// # Errors
+    ///
+    /// If `bytes` is not a whole number of `page_size`-byte pages.
+    pub(crate) fn from_bytes(bytes: &[u8], page_size: u16) -> Result<Self, String> {
+        let page_size_usize = usize::from(page_size);
+        if page_size_usize == 0 {
+            return Err("a v6 file's page size cannot be zero".to_owned());
+        }
+        if !bytes.len().is_multiple_of(page_size_usize) {
+            return Err(format!(
+                "{} bytes is not a whole number of {page_size}-byte pages",
+                bytes.len()
+            ));
+        }
+        let total = bytes.len() / page_size_usize;
+        let mut pages = HashMap::with_capacity(total);
+        for n in 0..total {
+            let content = bytes[n * page_size_usize..][..page_size_usize].to_vec();
+            pages.insert(
+                n,
+                Entry {
+                    original: Some(content.clone()),
+                    current: content,
+                    dirty: false,
+                },
+            );
+        }
+        Ok(Self {
+            path: std::path::PathBuf::new(),
+            page_size: page_size_usize,
+            original_pages: total,
+            total_pages: total,
+            pages,
+            headers: HashMap::new(),
+            structural_pairs: std::collections::BTreeSet::new(),
+        })
+    }
+
+    /// Reassemble every page, in order, into one contiguous buffer -- the
+    /// inverse of [`Self::from_bytes`], for tests and inspection code that
+    /// still want to assert against raw file bytes.
+    ///
+    /// Panics if any page from `0` to [`Self::total_pages`] was never read
+    /// or written this operation -- the same "never guess" rule every other
+    /// accessor here follows; a caller wanting the whole image back has to
+    /// have touched the whole image.
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.total_pages * self.page_size);
+        for n in 0..self.total_pages {
+            let entry = self
+                .pages
+                .get(&n)
+                .unwrap_or_else(|| panic!("physical page {n} was never read or written this operation"));
+            out.extend_from_slice(&entry.current);
+        }
+        out
+    }
+
+    /// How many pages this file has *now*, original plus every page
+    /// appended during this write.
+    pub(crate) fn total_pages(&self) -> usize {
+        self.total_pages
+    }
+
+    /// How many pages this file had when [`Self::open`] was called. A page
+    /// numbered at or past this existed nowhere before this write and so has
+    /// no `before` image -- see [`Self::original`].
+    pub(crate) fn original_pages(&self) -> usize {
+        self.original_pages
+    }
+
+    fn read_disk(&self, page: usize, len: usize) -> Result<Vec<u8>, String> {
+        let bytes = super::read_at(&self.path, page * self.page_size, len)
+            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        if bytes.len() != len {
+            return Err(format!(
+                "physical page {page} is only {} of {len} bytes -- past the end \
+                 of the file",
+                bytes.len()
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// The first [`HEADER_LEN`] bytes of a page -- tag, logical/block id,
+    /// generation -- without paying to read the rest of it.
+    ///
+    /// Answered from whichever cache already has this page, full or
+    /// header-only; a page neither cache has yet costs [`HEADER_LEN`] bytes
+    /// of disk, not [`Self::page_size`].
+    ///
+    /// # Errors
+    ///
+    /// If `n` is at or past [`Self::total_pages`], or the file is shorter
+    /// than this page claims.
+    pub(crate) fn header(&mut self, n: usize) -> Result<[u8; HEADER_LEN], String> {
+        if let Some(entry) = self.pages.get(&n) {
+            let mut out = [0u8; HEADER_LEN];
+            out.copy_from_slice(&entry.current[..HEADER_LEN]);
+            return Ok(out);
+        }
+        if let Some(&out) = self.headers.get(&n) {
+            return Ok(out);
+        }
+        if n >= self.total_pages {
+            return Err(format!("physical page {n}, and the file is {} pages", self.total_pages));
+        }
+        let bytes = self.read_disk(n, HEADER_LEN)?;
+        let mut out = [0u8; HEADER_LEN];
+        out.copy_from_slice(&bytes);
+        self.headers.insert(n, out);
+        Ok(out)
+    }
+
+    fn ensure_loaded(&mut self, n: usize) -> Result<(), String> {
+        if self.pages.contains_key(&n) {
+            return Ok(());
+        }
+        if n >= self.total_pages {
+            return Err(format!("physical page {n}, and the file is {} pages", self.total_pages));
+        }
+        let bytes = self.read_disk(n, self.page_size)?;
+        self.pages.insert(
+            n,
+            Entry {
+                original: Some(bytes.clone()),
+                current: bytes,
+                dirty: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// A page's whole current content -- its original bytes if nothing has
+    /// written to it yet this operation, or whatever the last write left.
+    ///
+    /// # Errors
+    ///
+    /// If `n` is at or past [`Self::total_pages`], or the file is shorter
+    /// than this page claims.
+    pub(crate) fn page(&mut self, n: usize) -> Result<&[u8], String> {
+        self.ensure_loaded(n)?;
+        Ok(&self.pages[&n].current)
+    }
+
+    /// A page's whole current content, mutably -- read-through the same as
+    /// [`Self::page`], then marked dirty because a caller asking for `&mut`
+    /// means to change it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::page`].
+    pub(crate) fn page_mut(&mut self, n: usize) -> Result<&mut [u8], String> {
+        self.ensure_loaded(n)?;
+        let entry = self.pages.get_mut(&n).expect("just loaded");
+        entry.dirty = true;
+        self.headers.remove(&n);
+        Ok(&mut entry.current)
+    }
+
+    /// Replace a page's entire content in one call, the shape every
+    /// copy-on-write flip in this module already wants: "this page's stale
+    /// half becomes the live half's bytes, then a few fields change."
+    ///
+    /// # Errors
+    ///
+    /// If `content` is not exactly [`Self::page_size`] bytes, or `n` is at
+    /// or past [`Self::total_pages`].
+    pub(crate) fn write_page(&mut self, n: usize, content: &[u8]) -> Result<(), String> {
+        if content.len() != self.page_size {
+            return Err(format!(
+                "a {}-byte page for a {}-byte page slot",
+                content.len(),
+                self.page_size
+            ));
+        }
+        self.ensure_loaded(n)?;
+        let entry = self.pages.get_mut(&n).expect("just loaded");
+        entry.current.copy_from_slice(content);
+        entry.dirty = true;
+        self.headers.remove(&n);
+        Ok(())
+    }
+
+    /// Bring a brand-new page into the file, numbered one past whatever
+    /// [`Self::total_pages`] answered before this call. Has no `before`
+    /// image -- see [`Self::original`] -- because nothing was there.
+    ///
+    /// # Errors
+    ///
+    /// If `content` is not exactly [`Self::page_size`] bytes.
+    pub(crate) fn append_page(&mut self, content: &[u8]) -> Result<usize, String> {
+        if content.len() != self.page_size {
+            return Err(format!(
+                "a {}-byte page for a {}-byte page slot",
+                content.len(),
+                self.page_size
+            ));
+        }
+        let n = self.total_pages;
+        self.pages.insert(
+            n,
+            Entry {
+                original: None,
+                current: content.to_vec(),
+                dirty: true,
+            },
+        );
+        self.total_pages += 1;
+        Ok(n)
+    }
+
+    /// Record that physical pages `first` and `second` are one shadow pair
+    /// of structure -- the file control record or one allocation-table
+    /// block -- so [`super::lib::Block::write_changed_pages`] knows to run
+    /// its flip-canonicalisation over them instead of treating either half
+    /// as ordinary content.
+    ///
+    /// Called by every function in this module that writes to a shadow
+    /// pair ([`Map::claim`], [`Map::relocate`], [`Map::unclaim`],
+    /// [`write_fcr`]), naming the exact pair it just touched -- never
+    /// inferred after the fact by scanning for `"PP"` magic, for the same
+    /// reason [`Map::read`] no longer scans for it either.
+    pub(crate) fn note_structural_pair(&mut self, first: usize, second: usize) {
+        self.structural_pairs.insert((first.min(second), first.max(second)));
+    }
+
+    /// Every shadow pair a write touched this operation, ascending.
+    pub(crate) fn structural_pairs(&self) -> Vec<(usize, usize)> {
+        self.structural_pairs.iter().copied().collect()
+    }
+
+    /// Every page number a write actually changed, ascending -- the whole
+    /// answer to "what does this commit have to put down", without diffing
+    /// anything.
+    pub(crate) fn dirty_pages(&self) -> Vec<usize> {
+        let mut out: Vec<usize> =
+            self.pages.iter().filter(|(_, entry)| entry.dirty).map(|(&n, _)| n).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// A dirty page's pre-image, or `None` if it was appended during this
+    /// operation and so never had one.
+    ///
+    /// Panics if `n` was never touched this operation -- a caller asking
+    /// for a page's `before` state has to have gone through [`Self::page`]
+    /// or a write method first, the same way every other accessor here
+    /// refuses rather than guesses.
+    pub(crate) fn original(&self, n: usize) -> Option<&[u8]> {
+        self.pages
+            .get(&n)
+            .unwrap_or_else(|| panic!("physical page {n} was never read or written this operation"))
+            .original
+            .as_deref()
+    }
+
+    /// A page's current content, without the `&mut self` [`Self::page`]
+    /// needs for its read-through cache -- for commit-time code that only
+    /// ever asks about pages already known to be resident.
+    ///
+    /// Panics if `n` was never touched this operation, same as
+    /// [`Self::original`].
+    pub(crate) fn current(&self, n: usize) -> &[u8] {
+        &self
+            .pages
+            .get(&n)
+            .unwrap_or_else(|| panic!("physical page {n} was never read or written this operation"))
+            .current
+    }
+}
+
 /// A v6 file's logical page numbers, resolved to the physical pages that
 /// currently hold them.
 #[derive(Debug, Clone, Default)]
@@ -203,36 +618,33 @@ impl Map {
     ///   same logical id -- a shape this design says cannot happen (Evidence
     ///   3a measured zero of these across all eight committed fixtures), so
     ///   a wrong pick would be worse than stopping.
-    pub fn read(file: &[u8], page_size: u16) -> Result<Self, String> {
+    pub fn read(store: &mut Store, page_size: u16) -> Result<Self, String> {
         #[cfg(test)]
         READS.with(|reads| reads.set(reads.get() + 1));
-        let page_size = usize::from(page_size);
+        let page_size_usize = usize::from(page_size);
         // `ENTRIES + ENTRY`, not `ENTRIES`: a page long enough to reach the
         // entry array but too short to hold one whole entry would divide out
         // to zero entries and return an empty map, reporting success for a
         // file nothing was read from.
-        if page_size < ENTRIES + ENTRY {
+        if page_size_usize < ENTRIES + ENTRY {
             return Err(format!(
-                "{page_size}-byte pages have no room for an allocation-table \
+                "{page_size_usize}-byte pages have no room for an allocation-table \
                  entry: the array starts at {ENTRIES:#x} and an entry is \
                  {ENTRY} bytes"
             ));
         }
-        if file.is_empty() || !file.len().is_multiple_of(page_size) {
-            return Err(format!(
-                "{} bytes is not a whole number of {page_size}-byte pages",
-                file.len()
-            ));
-        }
-        let pages = file.len() / page_size;
+        let pages = store.total_pages();
 
-        let word = |page: usize, offset: usize| -> u16 {
-            let at = page * page_size + offset;
-            u16::from_le_bytes([file[at], file[at + 1]])
+        // Header-only reads: every question this loop asks (magic, block
+        // index, generation) lives in a page's first `HEADER_LEN` bytes, so
+        // resolving the table never costs more than `HEADER_LEN` bytes per
+        // page it actually looks at -- see [`Store`]'s own doc comment.
+        let word = |store: &mut Store, page: usize, offset: usize| -> Result<u16, String> {
+            let header = store.header(page)?;
+            Ok(u16::from_le_bytes([header[offset], header[offset + 1]]))
         };
-        let magic = |page: usize| -> bool {
-            let at = page * page_size;
-            &file[at..at + 2] == MAGIC
+        let magic = |store: &mut Store, page: usize| -> Result<bool, String> {
+            Ok(store.header(page)?[..2] == *MAGIC)
         };
 
         // Block 1's allocation table is always shadowed across physical
@@ -240,7 +652,7 @@ impl Map {
         // something this scans for. Checked directly, ahead of the general
         // scan below, so this exact refusal fires even if some other page
         // elsewhere happens to carry a stray "PP" tagged block 1.
-        if pages < 4 || !(magic(2) || magic(3)) {
+        if pages < 4 || !(magic(store, 2)? || magic(store, 3)?) {
             return Err(
                 "neither physical page 2 nor 3 carries the \"PP\" allocation-\
                  table magic -- there is no block 1 where one is always \
@@ -283,29 +695,30 @@ impl Map {
         // 20/21, `wccnt7pv/wccmp002.vir` at 10056/10057, and so on), always
         // near the end of the file and never at a position this formula names.
         // The engine cannot see them, and neither can this now.
-        let entries_per_page = Self::entries_per_block(page_size);
+        let entries_per_page = Self::entries_per_block(page_size_usize);
         let mut blocks: HashMap<u16, Vec<(usize, u16)>> = HashMap::new();
         for index in 1u16.. {
-            let (first, second) = Self::pair_position(page_size, usize::from(index));
+            let (first, second) = Self::pair_position(page_size_usize, usize::from(index));
             if second >= pages {
                 break;
             }
-            let copies: Vec<(usize, u16)> = [first, second]
-                .into_iter()
-                .filter(|&page| magic(page))
-                .map(|page| (page, word(page, GENERATION)))
-                .collect();
+            let mut copies: Vec<(usize, u16)> = Vec::new();
+            for page in [first, second] {
+                if magic(store, page)? {
+                    copies.push((page, word(store, page, GENERATION)?));
+                }
+            }
             if copies.is_empty() {
                 break;
             }
             // Position is what identifies a block, so the index stored there has
             // to agree -- the same check physical 2 and 3 already get below.
             for &(page, _) in &copies {
-                if word(page, BLOCK) != index {
+                let stored = word(store, page, BLOCK)?;
+                if stored != index {
                     return Err(format!(
                         "physical page {page} is where allocation-table block \
-                         {index} lives, but it calls itself block {}",
-                        word(page, BLOCK)
+                         {index} lives, but it calls itself block {stored}"
                     ));
                 }
             }
@@ -346,10 +759,16 @@ impl Map {
             // id a given slot answers for, and that is the only place a logical
             // id comes from.
             let first = u32::from(block - 1) * entries_per_page as u32;
+            // The entry array starts at `ENTRIES` (0x08), past `HEADER_LEN`
+            // -- this is the one place `Self::read` needs a page's *whole*
+            // content rather than just its header, so it costs one full
+            // page per block's live copy (bounded, at most one block per
+            // stride of logical ids -- fourteen for `WCCMP002.DAT`).
+            let page_bytes = store.page(live)?;
             for entry in 0..entries_per_page {
-                let at = live * page_size + ENTRIES + entry * ENTRY;
-                let marker = u16::from_le_bytes([file[at], file[at + 1]]);
-                let claimed_page = u16::from_le_bytes([file[at + 2], file[at + 3]]);
+                let at = ENTRIES + entry * ENTRY;
+                let marker = u16::from_le_bytes([page_bytes[at], page_bytes[at + 1]]);
+                let claimed_page = u16::from_le_bytes([page_bytes[at + 2], page_bytes[at + 3]]);
                 // The engine's own "was this ever allocated" test is the entry's
                 // *type* byte -- `(entry >> 8) & 0xff` over the whole 4-byte
                 // entry read little-endian (`:14283`, `:14286`), which is the
@@ -517,6 +936,17 @@ impl Map {
     /// Walking stops at the first position where neither copy carries the
     /// magic -- the rule [`Self::read`] already stops by, so the two agree on
     /// how many blocks a file has.
+    ///
+    /// # Test-only since Plan 3 Task 5
+    ///
+    /// `Block::write_changed_pages` used to call this against a whole-file
+    /// `after: &[u8]` image to work out which pages were structure, before
+    /// diffing every other page to find content. It no longer needs to:
+    /// [`Store::structural_pairs`] already knows, named directly by every
+    /// write that touches a pair, so nothing in the production write path
+    /// calls this any more. Kept, still byte-slice based rather than
+    /// `Store`-based, because tests want a cheap way to inspect a small
+    /// synthetic fixture's table layout without opening a `Store` for it.
     pub(crate) fn table_pages(file: &[u8], page_size: u16) -> Vec<usize> {
         let page_size = usize::from(page_size);
         if page_size == 0 || file.len() < page_size {
@@ -540,12 +970,11 @@ impl Map {
         found
     }
 
-    fn pair_of(
-        file: &[u8],
-        page_size: usize,
-        index: usize,
-    ) -> Result<(usize, usize), String> {
-        let pages = file.len() / page_size;
+    /// Header-only version of [`Self::pair_of`] -- `HEADER_LEN` bytes per
+    /// candidate page instead of a whole one, for the same reason
+    /// [`Self::read`] reads headers rather than pages.
+    fn pair_of(store: &mut Store, page_size: usize, index: usize) -> Result<(usize, usize), String> {
+        let pages = store.total_pages();
         let (first, _) = Self::pair_position(page_size, index);
         if first + 1 >= pages {
             return Err(format!(
@@ -554,13 +983,15 @@ impl Map {
                 first + 1
             ));
         }
-        let word = |page: usize, offset: usize| -> u16 {
-            let at = page * page_size + offset;
-            u16::from_le_bytes([file[at], file[at + 1]])
+        let word = |store: &mut Store, page: usize, offset: usize| -> Result<u16, String> {
+            let header = store.header(page)?;
+            Ok(u16::from_le_bytes([header[offset], header[offset + 1]]))
         };
-        let magic = |page: usize| -> bool { file[page * page_size..][..2] == *MAGIC };
+        let magic = |store: &mut Store, page: usize| -> Result<bool, String> {
+            Ok(store.header(page)?[..2] == *MAGIC)
+        };
 
-        if !(magic(first) || magic(first + 1)) {
+        if !(magic(store, first)? || magic(store, first + 1)?) {
             return Err(format!(
                 "neither physical page {first} nor {} carries the \"PP\" \
                  allocation-table magic -- there is no block {index} there",
@@ -568,27 +999,29 @@ impl Map {
             ));
         }
         for page in [first, first + 1] {
-            if magic(page) && usize::from(word(page, BLOCK)) != index {
-                return Err(format!(
-                    "physical page {page} is where allocation-table block \
-                     {index} lives, but it calls itself block {}",
-                    word(page, BLOCK)
-                ));
+            if magic(store, page)? {
+                let stored = word(store, page, BLOCK)?;
+                if usize::from(stored) != index {
+                    return Err(format!(
+                        "physical page {page} is where allocation-table block \
+                         {index} lives, but it calls itself block {stored}"
+                    ));
+                }
             }
         }
-        match word(first, GENERATION).cmp(&word(first + 1, GENERATION)) {
+        match word(store, first, GENERATION)?.cmp(&word(store, first + 1, GENERATION)?) {
             std::cmp::Ordering::Greater => Ok((first + 1, first)),
             std::cmp::Ordering::Less => Ok((first, first + 1)),
             std::cmp::Ordering::Equal => Err(format!(
                 "both copies of block {index} claim generation {}, and there is \
                  no rule measured for choosing between them",
-                word(first, GENERATION)
+                word(store, first, GENERATION)?
             )),
         }
     }
 
     pub(crate) fn claim(
-        file: &mut Vec<u8>,
+        store: &mut Store,
         page_size: u16,
         content: &[u8],
         tag: [u8; 2],
@@ -600,22 +1033,13 @@ impl Map {
                 content.len()
             ));
         }
-        if file.is_empty() || !file.len().is_multiple_of(page_size_usize) {
-            return Err(format!(
-                "{} bytes is not a whole number of {page_size}-byte pages",
-                file.len()
-            ));
-        }
-        let pages = file.len() / page_size_usize;
+        let pages = store.total_pages();
 
-        let word = |page: usize, offset: usize| -> u16 {
-            let at = page * page_size_usize + offset;
-            u16::from_le_bytes([file[at], file[at + 1]])
+        let magic = |store: &mut Store, page: usize| -> Result<bool, String> {
+            Ok(store.header(page)?[..2] == *MAGIC)
         };
-        let magic =
-            |page: usize| -> bool { file[page * page_size_usize..][..2] == *MAGIC };
 
-        if pages < 4 || !(magic(2) || magic(3)) {
+        if pages < 4 || !(magic(store, 2)? || magic(store, 3)?) {
             return Err(
                 "neither physical page 2 nor 3 carries the \"PP\" allocation-\
                  table magic -- there is no block 1 to claim a page in"
@@ -624,7 +1048,6 @@ impl Map {
         }
 
         let entries_per_page = Self::entries_per_block(page_size_usize);
-        let entry_at = |page: usize, entry: usize| page * page_size_usize + ENTRIES + entry * ENTRY;
 
         // The first free slot, and that is the whole answer: a slot's position
         // within block 1 *is* the logical id it answers for, so the new page's
@@ -644,15 +1067,19 @@ impl Map {
         //
         // The scan stops at the first block whose pair is not there, rather
         // than at block 1: `pair_of` refuses a block past the end of the file,
-        // and that refusal is the end of the table, not an error.
+        // and that refusal is the end of the table, not an error. Each
+        // candidate block costs one whole-page read of its live copy (the
+        // entry array starts past `HEADER_LEN`) -- bounded by how many
+        // blocks the file has, not by its page count.
         let mut found: Option<(usize, usize, usize, usize)> = None;
         for block in 1usize.. {
-            let Ok((stale, live)) = Self::pair_of(file, page_size_usize, block) else {
+            let Ok((stale, live)) = Self::pair_of(store, page_size_usize, block) else {
                 break;
             };
+            let live_bytes = store.page(live)?;
             let free = (0..entries_per_page).find(|&entry| {
-                let at = entry_at(live, entry);
-                u16::from_le_bytes([file[at], file[at + 1]]) >> 8 == 0
+                let at = ENTRIES + entry * ENTRY;
+                u16::from_le_bytes([live_bytes[at], live_bytes[at + 1]]) >> 8 == 0
             });
             if let Some(entry) = free {
                 found = Some((block, entry, stale, live));
@@ -670,9 +1097,11 @@ impl Map {
         let new_logical16 = u16::try_from(new_logical)
             .map_err(|_| format!("logical id {new_logical} does not fit in this format's u16"))?;
 
-        // Read before any mutation below: `word` borrows `file` immutably,
-        // and every write past this point needs it mutably.
-        let new_generation = word(live, GENERATION).wrapping_add(1);
+        let generation_at = |store: &mut Store, page: usize| -> Result<u16, String> {
+            let header = store.header(page)?;
+            Ok(u16::from_le_bytes([header[GENERATION], header[GENERATION + 1]]))
+        };
+        let new_generation = generation_at(store, live)?.wrapping_add(1);
 
         // Append the new physical page whole -- header, then the caller's
         // content -- before the allocation table is touched, so a failure
@@ -684,23 +1113,22 @@ impl Map {
         let mut page = content.to_vec();
         page[..2].copy_from_slice(&tag);
         page[LOGICAL..LOGICAL + 2].copy_from_slice(&new_logical16.to_le_bytes());
-        file.extend_from_slice(&page);
+        store.append_page(&page)?;
 
         // Copy-on-write, the same shape the file control record's own shadow
         // pair already uses (Task 1): the stale copy becomes a full copy of
         // the live one, plus this one new entry, plus a higher generation --
         // never a partial edit of whichever copy happened to be live.
-        let live_page = file[live * page_size_usize..][..page_size_usize].to_vec();
-        let stale_at = stale * page_size_usize;
-        file[stale_at..stale_at + page_size_usize].copy_from_slice(&live_page);
+        store.note_structural_pair(stale, live);
+        let live_page = store.page(live)?.to_vec();
+        store.write_page(stale, &live_page)?;
 
-        let entry_at_new = stale_at + ENTRIES + free_entry * ENTRY;
+        let stale_bytes = store.page_mut(stale)?;
+        let entry_at_new = ENTRIES + free_entry * ENTRY;
         let marker = u16::from_le_bytes([tag[0], tag[1]]);
-        file[entry_at_new..entry_at_new + 2].copy_from_slice(&marker.to_le_bytes());
-        file[entry_at_new + 2..entry_at_new + 4].copy_from_slice(&new_physical16.to_le_bytes());
-
-        file[stale_at + GENERATION..stale_at + GENERATION + 2]
-            .copy_from_slice(&new_generation.to_le_bytes());
+        stale_bytes[entry_at_new..entry_at_new + 2].copy_from_slice(&marker.to_le_bytes());
+        stale_bytes[entry_at_new + 2..entry_at_new + 4].copy_from_slice(&new_physical16.to_le_bytes());
+        stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
         Ok(new_logical)
     }
@@ -739,48 +1167,35 @@ impl Map {
     /// block `logical` belongs to has no live pair, or if `logical`'s own
     /// slot is not claimed in that block's live copy -- there is nothing to
     /// release.
-    pub(crate) fn unclaim(file: &mut Vec<u8>, page_size: u16, logical: u32) -> Result<(), String> {
+    pub(crate) fn unclaim(store: &mut Store, page_size: u16, logical: u32) -> Result<(), String> {
         let page_size_usize = usize::from(page_size);
-        if file.is_empty() || !file.len().is_multiple_of(page_size_usize) {
-            return Err(format!(
-                "{} bytes is not a whole number of {page_size}-byte pages",
-                file.len()
-            ));
-        }
 
         let (block, entry) = Self::block_of(logical, page_size_usize)?;
-        let (stale, live) = Self::pair_of(file, page_size_usize, block)?;
+        let (stale, live) = Self::pair_of(store, page_size_usize, block)?;
 
-        let entry_at = |page: usize, entry: usize| page * page_size_usize + ENTRIES + entry * ENTRY;
-        let word = |page: usize, offset: usize| -> u16 {
-            let at = page * page_size_usize + offset;
-            u16::from_le_bytes([file[at], file[at + 1]])
-        };
-
-        let at = entry_at(live, entry);
-        let marker = u16::from_le_bytes([file[at], file[at + 1]]);
+        let at = ENTRIES + entry * ENTRY;
+        let live_bytes = store.page(live)?;
+        let marker = u16::from_le_bytes([live_bytes[at], live_bytes[at + 1]]);
         if marker >> 8 == 0 {
             return Err(format!(
                 "logical id {logical} is not claimed in block {block}'s live copy -- \
                  there is nothing to release"
             ));
         }
-
-        // Read before any mutation: `word` borrows `file` immutably.
-        let new_generation = word(live, GENERATION).wrapping_add(1);
+        let header = store.header(live)?;
+        let new_generation = u16::from_le_bytes([header[GENERATION], header[GENERATION + 1]]).wrapping_add(1);
 
         // Copy-on-write into the stale copy, the same shape `Self::claim`
         // and `Self::relocate` both use: the live copy's own bytes, plus
         // this one change, plus a higher generation.
-        let live_page = file[live * page_size_usize..][..page_size_usize].to_vec();
-        let stale_at = stale * page_size_usize;
-        file[stale_at..stale_at + page_size_usize].copy_from_slice(&live_page);
+        store.note_structural_pair(stale, live);
+        let live_page = store.page(live)?.to_vec();
+        store.write_page(stale, &live_page)?;
 
-        let repoint = stale_at + ENTRIES + entry * ENTRY;
-        file[repoint..repoint + ENTRY].fill(0);
-
-        file[stale_at + GENERATION..stale_at + GENERATION + 2]
-            .copy_from_slice(&new_generation.to_le_bytes());
+        let stale_bytes = store.page_mut(stale)?;
+        let repoint = ENTRIES + entry * ENTRY;
+        stale_bytes[repoint..repoint + ENTRY].fill(0);
+        stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
         Ok(())
     }
@@ -839,7 +1254,7 @@ impl Map {
     /// exactly `page_size` bytes, or if `logical`'s own slot is not claimed
     /// in block 1's live copy.
     pub(crate) fn relocate(
-        file: &mut Vec<u8>,
+        store: &mut Store,
         page_size: u16,
         logical: u32,
         content: &[u8],
@@ -852,28 +1267,13 @@ impl Map {
                 content.len()
             ));
         }
-        if file.is_empty() || !file.len().is_multiple_of(page_size_usize) {
-            return Err(format!(
-                "{} bytes is not a whole number of {page_size}-byte pages",
-                file.len()
-            ));
-        }
-        let pages = file.len() / page_size_usize;
-
-        let word = |page: usize, offset: usize| -> u16 {
-            let at = page * page_size_usize + offset;
-            u16::from_le_bytes([file[at], file[at + 1]])
-        };
-        let magic =
-            |page: usize| -> bool { file[page * page_size_usize..][..2] == *MAGIC };
+        let pages = store.total_pages();
 
         // Which block answers for this logical id, and which half of that
         // block's pair is live. Both by formula -- see [`Self::pair_of`].
         let (block, entry) = Self::block_of(logical, page_size_usize)?;
-        let (stale, live) = Self::pair_of(file, page_size_usize, block)?;
+        let (stale, live) = Self::pair_of(store, page_size_usize, block)?;
 
-        let entries_per_page = Self::entries_per_block(page_size_usize);
-        let entry_at = |page: usize, entry: usize| page * page_size_usize + ENTRIES + entry * ENTRY;
         let logical16 = u16::try_from(logical)
             .map_err(|_| format!("logical id {logical} does not fit in this format's u16"))?;
 
@@ -884,17 +1284,19 @@ impl Map {
         // outright. The old search read each claimed page's own header looking
         // for a match, which is the inverted resolution `Self::read` no longer
         // performs either.
-        let at = entry_at(live, entry);
-        let marker = u16::from_le_bytes([file[at], file[at + 1]]);
+        let at = ENTRIES + entry * ENTRY;
+        let live_bytes = store.page(live)?;
+        let marker = u16::from_le_bytes([live_bytes[at], live_bytes[at + 1]]);
         if marker >> 8 == 0 {
             return Err(format!(
                 "logical id {logical} is not claimed in block 1's live copy -- \
                  there is nothing to relocate"
             ));
         }
+        let claimed_physical = usize::from(u16::from_le_bytes([live_bytes[at + 2], live_bytes[at + 3]]));
 
-        // Read before any mutation: `word` borrows `file` immutably.
-        let new_generation = word(live, GENERATION).wrapping_add(1);
+        let header = store.header(live)?;
+        let new_generation = u16::from_le_bytes([header[GENERATION], header[GENERATION + 1]]).wrapping_add(1);
 
         // Where the new copy goes: this logical page's **own stale twin** if
         // it has one, and a page appended to the file if it does not.
@@ -918,8 +1320,7 @@ impl Map {
         // nothing. Any other unclaimed page is some other logical id's stale
         // twin, and overwriting one of those would throw away a shadow copy
         // that is not this call's to spend.
-        let claimed_physical = usize::from(u16::from_le_bytes([file[at + 2], file[at + 3]]));
-
+        //
         // Claimed by **any** block, not just this one. Read through
         // [`Self::read`], which resolves every block's live copy by the same
         // formula [`Self::pair_of`] uses -- one authority for "what does this
@@ -928,18 +1329,39 @@ impl Map {
         // multi-block file the difference is a live page belonging to another
         // block being picked as this id's twin and written over.
         let mut claimed = vec![false; pages];
-        for (_, page) in Self::read(file, page_size)?.entries() {
+        for (_, page) in Self::read(store, page_size)?.entries() {
             let page = page as usize;
             if page < pages {
                 claimed[page] = true;
             }
         }
-        let twin = (4..pages).find(|&page| {
-            page != claimed_physical
-                && !claimed[page]
-                && !magic(page)
-                && word(page, LOGICAL) == logical16
-        });
+        // **Still an O(pages) scan** -- the format gives no index from a
+        // logical id to its abandoned twin, so ruling out every candidate is
+        // the only way to answer "does one exist". What changed is the
+        // *cost per candidate*: [`Store::header`] reads [`HEADER_LEN`] bytes,
+        // not a whole page, and every page this scan touches stays cached in
+        // `store` for the rest of the operation -- so a write that relocates
+        // many pages (`WCCMP002.DAT`'s first touch relocates 107) pays this
+        // scan's full cost once, on its first relocation, and every
+        // relocation after that answers from cache. Measured: 13,603
+        // candidates at 8 bytes each is 109 KB, against the 55.7 MB a
+        // whole-page scan (let alone a whole-file read) would have cost --
+        // and that 109 KB is paid at most once per `Block::update()` call,
+        // not once per relocation within it.
+        let mut twin = None;
+        for page in 4..pages {
+            if page == claimed_physical || claimed[page] {
+                continue;
+            }
+            let header = store.header(page)?;
+            if header[..2] == *MAGIC {
+                continue;
+            }
+            if u16::from_le_bytes([header[LOGICAL], header[LOGICAL + 1]]) == logical16 {
+                twin = Some(page);
+                break;
+            }
+        }
 
         let new_physical16 = u16::try_from(twin.unwrap_or(pages))
             .map_err(|_| format!("physical page {pages} does not fit in this format's u16"))?;
@@ -947,25 +1369,23 @@ impl Map {
         page[..2].copy_from_slice(&tag);
         page[LOGICAL..LOGICAL + 2].copy_from_slice(&logical16.to_le_bytes());
         match twin {
-            Some(at) => {
-                let at = at * page_size_usize;
-                file[at..at + page_size_usize].copy_from_slice(&page);
+            Some(at) => store.write_page(at, &page)?,
+            None => {
+                store.append_page(&page)?;
             }
-            None => file.extend_from_slice(&page),
         }
 
         // Copy-on-write into the stale copy, exactly `Self::claim`'s shape:
         // the live copy's own bytes, plus this one change, plus a higher
         // generation.
-        let live_page = file[live * page_size_usize..][..page_size_usize].to_vec();
-        let stale_at = stale * page_size_usize;
-        file[stale_at..stale_at + page_size_usize].copy_from_slice(&live_page);
+        store.note_structural_pair(stale, live);
+        let live_page = store.page(live)?.to_vec();
+        store.write_page(stale, &live_page)?;
 
-        let repoint = stale_at + ENTRIES + entry * ENTRY;
-        file[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
-
-        file[stale_at + GENERATION..stale_at + GENERATION + 2]
-            .copy_from_slice(&new_generation.to_le_bytes());
+        let stale_bytes = store.page_mut(stale)?;
+        let repoint = ENTRIES + entry * ENTRY;
+        stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
+        stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
         Ok(u32::from(new_physical16))
     }
@@ -1004,7 +1424,7 @@ impl Map {
 /// shadow pair's two generations tie, or if a `key_record_counts` offset
 /// does not leave room for its four bytes.
 pub(crate) fn write_fcr(
-    file: &mut Vec<u8>,
+    store: &mut Store,
     page_size: u16,
     records: u32,
     key_record_counts: &[(usize, u32)],
@@ -1012,46 +1432,47 @@ pub(crate) fn write_fcr(
     variable_head: Option<Option<u32>>,
 ) -> Result<(), String> {
     let page_size_usize = usize::from(page_size);
-    if file.len() < 2 * page_size_usize || !file.len().is_multiple_of(page_size_usize) {
+    if store.total_pages() < 2 {
         return Err(format!(
             "{} bytes does not hold two whole {page_size}-byte pages for the \
              file control record's shadow pair",
-            file.len()
+            store.total_pages() * page_size_usize
         ));
     }
 
-    let word = |page: usize, offset: usize| -> u16 {
-        let at = page * page_size_usize + offset;
-        u16::from_le_bytes([file[at], file[at + 1]])
+    let generation_of = |store: &mut Store, page: usize| -> Result<u16, String> {
+        let header = store.header(page)?;
+        Ok(u16::from_le_bytes([header[GENERATION], header[GENERATION + 1]]))
     };
 
-    let (stale, live) = match word(0, GENERATION).cmp(&word(1, GENERATION)) {
+    let (stale, live) = match generation_of(store, 0)?.cmp(&generation_of(store, 1)?) {
         std::cmp::Ordering::Greater => (1usize, 0usize),
         std::cmp::Ordering::Less => (0usize, 1usize),
         std::cmp::Ordering::Equal => {
             return Err(format!(
                 "both control-record copies claim generation {}, and there is \
                  no rule measured for choosing between them",
-                word(0, GENERATION)
+                generation_of(store, 0)?
             ));
         }
     };
-    let new_generation = word(live, GENERATION).wrapping_add(1);
+    let new_generation = generation_of(store, live)?.wrapping_add(1);
 
-    let live_page = file[live * page_size_usize..][..page_size_usize].to_vec();
-    let stale_at = stale * page_size_usize;
-    file[stale_at..stale_at + page_size_usize].copy_from_slice(&live_page);
+    store.note_structural_pair(0, 1);
+    let live_page = store.page(live)?.to_vec();
+    store.write_page(stale, &live_page)?;
 
-    let records_at = stale_at + super::pages::fcr::RECORDS_HIGH;
-    file[records_at..records_at + 4].copy_from_slice(&super::pages::to_long(records));
+    let stale_bytes = store.page_mut(stale)?;
+    let records_at = super::pages::fcr::RECORDS_HIGH;
+    stale_bytes[records_at..records_at + 4].copy_from_slice(&super::pages::to_long(records));
 
     // `None` leaves whatever the live copy had, which is right for every
     // caller that did not move a slot on or off the free list -- the whole
     // live page was copied over the stale one above, so "leave it alone"
     // costs nothing and says nothing.
     if let Some(free) = free_head {
-        let free_at = stale_at + super::pages::fcr::FREE_V6;
-        file[free_at..free_at + 4].copy_from_slice(&super::pages::to_long(free));
+        let free_at = super::pages::fcr::FREE_V6;
+        stale_bytes[free_at..free_at + 4].copy_from_slice(&super::pages::to_long(free));
     }
 
     // The *variable* free-space chain's head, which is a different list from
@@ -1061,24 +1482,22 @@ pub(crate) fn write_fcr(
     // "the chain is now empty", which are different instructions and would be
     // indistinguishable through one layer.
     if let Some(head) = variable_head {
-        let at = stale_at + super::pages::fcr::VARIABLE_HEAD;
+        let at = super::pages::fcr::VARIABLE_HEAD;
         let value = head.unwrap_or(super::pages::fcr::NO_VARIABLE_HEAD);
-        file[at..at + 4].copy_from_slice(&super::pages::to_long(value));
+        stale_bytes[at..at + 4].copy_from_slice(&super::pages::to_long(value));
     }
 
     for &(offset, count) in key_record_counts {
-        let at = stale_at + offset;
-        if at + 4 > stale_at + page_size_usize {
+        if offset + 4 > page_size_usize {
             return Err(format!(
                 "a key-records offset of {offset} does not leave room for its \
                  four bytes in a {page_size}-byte page"
             ));
         }
-        file[at..at + 4].copy_from_slice(&super::pages::to_long(count));
+        stale_bytes[offset..offset + 4].copy_from_slice(&super::pages::to_long(count));
     }
 
-    file[stale_at + GENERATION..stale_at + GENERATION + 2]
-        .copy_from_slice(&new_generation.to_le_bytes());
+    stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
     Ok(())
 }
@@ -1097,6 +1516,26 @@ mod tests {
             .join("../../tools/btrieve-oracle/fixtures")
             .join(name);
         std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// Round-trip a synthetic `Vec<u8>` fixture through a [`Store`] for one
+    /// call, and write the result back into `file` -- test-only sugar so a
+    /// fixture built as a flat buffer (every test above and below this one
+    /// predates `Store`) does not have to be restructured around holding a
+    /// `Store` for its whole body just to call the production API, which now
+    /// takes one. `Store::from_bytes`/`Self::into_bytes` never touch disk, so
+    /// this costs nothing beyond the copy the old in-place `&mut Vec<u8>`
+    /// calls never needed -- acceptable here because it is test weight, not
+    /// the write path Stage B measures.
+    fn via_store<T>(
+        file: &mut Vec<u8>,
+        page_size: u16,
+        f: impl FnOnce(&mut Store) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut store = Store::from_bytes(file, page_size).expect("a whole number of pages");
+        let result = f(&mut store);
+        *file = store.into_bytes();
+        result
     }
 
     /// Eight 512-byte pages: an allocation-table pair at 2/3 whose live copy
@@ -1215,7 +1654,7 @@ mod tests {
 
         let mut content = vec![0u8; PAGE];
         content[32..40].fill(0xCC);
-        let to = Map::relocate(&mut file, PAGE as u16, 1, &content, [0x00, 0x44])
+        let to = via_store(&mut file, PAGE as u16, |s| Map::relocate(s, PAGE as u16, 1, &content, [0x00, 0x44]))
             .expect("logical 1 is claimed, so it can be relocated");
 
         assert_eq!(to, 6, "the unclaimed twin is the only legitimate destination");
@@ -1243,16 +1682,16 @@ mod tests {
     fn claiming_works_on_a_file_that_has_a_second_block() {
         const PAGE: usize = 512;
         let mut file = fixture("PP2BLOCK.DAT");
-        let before = Map::read(&file, PAGE as u16).expect("resolves");
+        let before = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16).expect("resolves");
         let was = file.len() / PAGE;
 
         let mut content = vec![0u8; PAGE];
         content[32..40].fill(0xDD);
-        let logical = Map::claim(&mut file, PAGE as u16, &content, [0x00, 0x44])
+        let logical = via_store(&mut file, PAGE as u16, |s| Map::claim(s, PAGE as u16, &content, [0x00, 0x44]))
             .expect("a two-block file can still be claimed in");
 
         assert_eq!(before.physical(logical), None, "the id claimed was free before");
-        let after = Map::read(&file, PAGE as u16).expect("still resolves");
+        let after = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16).expect("still resolves");
         assert_eq!(
             after.physical(logical),
             Some(was as u32),
@@ -1325,7 +1764,7 @@ mod tests {
 
         let mut content = vec![0u8; page_size];
         content[8..12].fill(0xCC);
-        let to = Map::relocate(&mut file, page_size as u16, 2, &content, [0x00, 0x44])
+        let to = via_store(&mut file, page_size as u16, |s| Map::relocate(s, page_size as u16, 2, &content, [0x00, 0x44]))
             .expect("logical 2 is claimed in block 2");
 
         assert_eq!(to, 8, "the only twin no block claims");
@@ -1334,7 +1773,7 @@ mod tests {
             block1_page[..],
             "physical 4 is block 1's live page and must not be written over"
         );
-        let map = Map::read(&file, page_size as u16).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, page_size as u16).expect("test fixture"), page_size as u16).expect("resolves");
         assert_eq!(map.physical(1), Some(4), "block 1 still resolves to its page");
         assert_eq!(map.physical(2), Some(8), "logical 2 moved to the free twin");
     }
@@ -1377,11 +1816,11 @@ mod tests {
         file[at(4) + LOGICAL..at(4) + LOGICAL + 2].copy_from_slice(&1u16.to_le_bytes());
 
         let content = vec![0u8; page_size];
-        let logical = Map::claim(&mut file, page_size as u16, &content, [0x00, 0x44])
+        let logical = via_store(&mut file, page_size as u16, |s| Map::claim(s, page_size as u16, &content, [0x00, 0x44]))
             .expect("block 1 is full, so the claim belongs to block 2");
 
         assert_eq!(logical, 2, "block 2 slot 0 is logical entries_per_block + 1");
-        let map = Map::read(&file, page_size as u16).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, page_size as u16).expect("test fixture"), page_size as u16).expect("resolves");
         assert_eq!(map.physical(2), Some(8), "the appended page, claimed by block 2");
         assert_eq!(map.physical(1), Some(4), "block 1's claim is untouched");
     }
@@ -1410,7 +1849,7 @@ mod tests {
     fn a_logical_id_in_the_second_block_relocates_through_that_blocks_pair() {
         const PAGE: usize = 512;
         let mut file = fixture("PP2BLOCK.DAT");
-        let before = Map::read(&file, PAGE as u16).expect("resolves");
+        let before = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16).expect("resolves");
         assert_eq!(
             before.physical(127),
             Some(128),
@@ -1420,7 +1859,7 @@ mod tests {
 
         let mut content = vec![0u8; PAGE];
         content[32..40].fill(0xCC);
-        let to = Map::relocate(&mut file, PAGE as u16, 127, &content, [0x00, 0x44])
+        let to = via_store(&mut file, PAGE as u16, |s| Map::relocate(s, PAGE as u16, 127, &content, [0x00, 0x44]))
             .expect("logical 127 is claimed in block 2, so it can be relocated");
 
         assert_ne!(to, 128, "a relocation never writes the page it supersedes");
@@ -1430,7 +1869,7 @@ mod tests {
             "the new content landed on the page the call named"
         );
 
-        let after = Map::read(&file, PAGE as u16).expect("still resolves");
+        let after = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16).expect("still resolves");
         assert_eq!(
             after.physical(127),
             Some(to),
@@ -1517,7 +1956,7 @@ mod tests {
         set_header(&mut file, 6, 0x4400, 1);
         set_header(&mut file, 7, 0x4400, 1);
 
-        let map = Map::read(&file, 512).expect("no collision exists to find");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("no collision exists to find");
         assert_eq!(map.physical(1), Some(6), "the table decides, not the header");
         assert_eq!(
             map.physical(4),
@@ -1539,7 +1978,7 @@ mod tests {
         for page in [5usize, 8] {
             set_header(&mut file, page, 0x4400, 2);
         }
-        let map = Map::read(&file, 512).expect("the table names exactly one");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("the table names exactly one");
         assert_eq!(map.physical(2), Some(5));
         assert_eq!(map.physical(6), Some(8));
     }
@@ -1552,7 +1991,7 @@ mod tests {
         let mut file = indexed_fixture();
         set_entry_raw(&mut file, 3, 0x0050, 9);
         set_header(&mut file, 9, 0x4400, 3);
-        let map = Map::read(&file, 512).expect("an unallocated slot is not an error");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("an unallocated slot is not an error");
         assert_eq!(
             map.physical(3),
             None,
@@ -1568,7 +2007,7 @@ mod tests {
     fn the_first_slot_answers_for_logical_one() {
         let mut file = indexed_fixture();
         set_entry(&mut file, 1, 4);
-        let map = Map::read(&file, 512).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves");
         assert_eq!(map.physical(1), Some(4));
         // And that physical half sits exactly where `OVERFLOW` used to be read.
         assert_eq!(
@@ -1604,7 +2043,7 @@ mod tests {
     #[test]
     fn a_freed_page_keeps_its_logical_id_and_the_allocation_table_settles_it() {
         let file = fixture("NONMONO2.DAT");
-        let map = Map::read(&file, 512).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves");
         assert_eq!(map.physical(11), Some(7));
         assert_eq!(map.physical(14), Some(17));
         assert_eq!(map.physical(26), Some(36));
@@ -1626,7 +2065,7 @@ mod tests {
     #[test]
     fn nonmono1_the_control_before_the_delete_has_no_duplicates() {
         let file = fixture("NONMONO1.DAT");
-        let map = Map::read(&file, 512).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves");
         assert_map(
             &map,
             &[
@@ -1648,7 +2087,7 @@ mod tests {
     #[test]
     fn dupkey30_only_two_logical_ids_have_a_live_claimant() {
         let file = fixture("DUPKEY30.DAT");
-        let map = Map::read(&file, 512).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves");
         // Logical 1 resolves too, from block 1's slot 0 -- physical 9, an
         // empty `0x8000` template. It reads no differently than any other
         // logical id: `records::walk_v6` skips it by its tag, same as it always
@@ -1665,7 +2104,7 @@ mod tests {
     #[test]
     fn pp2048_a_2048_byte_page_still_finds_its_one_live_id() {
         let file = fixture("PP2048.DAT");
-        let map = Map::read(&file, 2048).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 2048).expect("test fixture"), 2048).expect("resolves");
         // Logical 1 -> physical 9: block 1's slot 0, same as every other
         // fixture in this file, at whatever page size.
         assert_map(&map, &[(1, 9), (2, 8)]);
@@ -1683,7 +2122,7 @@ mod tests {
     #[test]
     fn pp2block_a_second_allocation_table_block_is_found_by_scanning() {
         let file = fixture("PP2BLOCK.DAT");
-        let map = Map::read(&file, 512).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves");
         assert_map(
             &map,
             &[
@@ -1731,7 +2170,7 @@ mod tests {
     #[test]
     fn a_file_with_no_pp_table_at_physical_two_or_three_is_refused() {
         let file = vec![0u8; 512 * 4];
-        let e = Map::read(&file, 512).unwrap_err();
+        let e = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).unwrap_err();
         assert!(e.contains("physical page 2 nor 3"), "{e}");
     }
 
@@ -1748,7 +2187,7 @@ mod tests {
             file[at + BLOCK..at + BLOCK + 2].copy_from_slice(&1u16.to_le_bytes());
             file[at + GENERATION..at + GENERATION + 2].copy_from_slice(&5u16.to_le_bytes());
         }
-        let e = Map::read(&file, 512).unwrap_err();
+        let e = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).unwrap_err();
         assert!(e.contains("generation 5"), "{e}");
     }
 
@@ -1781,7 +2220,7 @@ mod tests {
         file[at(4) + LOGICAL..at(4) + LOGICAL + 2].copy_from_slice(&7u16.to_le_bytes());
         file[at(5) + LOGICAL..at(5) + LOGICAL + 2].copy_from_slice(&7u16.to_le_bytes());
 
-        let map = Map::read(&file, 512).expect("no contradiction exists here");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("no contradiction exists here");
         assert_eq!(map.physical(1), Some(4), "slot 0 answers for logical 1");
         assert_eq!(map.physical(2), Some(5), "slot 1 answers for logical 2");
         assert_eq!(map.physical(7), None, "nothing claims logical 7 at all");
@@ -1812,7 +2251,7 @@ mod tests {
         file[entry..entry + 2].copy_from_slice(&0x4400u16.to_le_bytes()); // marker
         file[entry + 2..entry + 4].copy_from_slice(&0u16.to_le_bytes()); // physical page 0
 
-        let e = Map::read(&file, 512).unwrap_err();
+        let e = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).unwrap_err();
         assert!(e.contains("physical page 0"), "{e}");
         assert!(e.contains("control record"), "{e}");
     }
@@ -1824,9 +2263,13 @@ mod tests {
     /// map, and no reason".
     #[test]
     fn a_page_too_short_for_one_whole_entry_is_refused_not_answered_empty() {
-        let file = vec![0u8; 14 * 4];
+        // One page, sized to whatever `size` is this iteration -- `Store`
+        // itself only asks for a whole number of pages, so the point being
+        // tested (`Map::read`'s own too-small-for-an-entry refusal) has to
+        // reach it via a buffer that clears that unrelated bar.
         for size in [ENTRIES + 1, ENTRIES + ENTRY - 1] {
-            let e = Map::read(&file, size as u16).unwrap_err();
+            let file = vec![0u8; size];
+            let e = Map::read(&mut Store::from_bytes(&file, size as u16).expect("test fixture"), size as u16).unwrap_err();
             assert!(e.contains("no room for an allocation-table entry"), "{e}");
         }
     }
@@ -1844,7 +2287,7 @@ mod tests {
         file[at(2) + BLOCK..at(2) + BLOCK + 2].copy_from_slice(&7u16.to_le_bytes());
         file[at(2) + GENERATION..at(2) + GENERATION + 2].copy_from_slice(&5u16.to_le_bytes());
 
-        let e = Map::read(&file, 512).unwrap_err();
+        let e = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).unwrap_err();
         assert!(e.contains("block 7"), "{e}");
     }
 
@@ -1855,11 +2298,11 @@ mod tests {
     #[test]
     fn claim_adds_a_new_logical_page_and_disturbs_nothing_else() {
         let mut file = fixture("DUPKEY30.DAT");
-        let before = Map::read(&file, 512).expect("resolves before");
+        let before = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves before");
 
         let mut content = vec![0u8; 512];
         content[6..10].copy_from_slice(b"NEW!");
-        let logical = Map::claim(&mut file, 512, &content, [0x00, 0x44]).expect("claims");
+        let logical = via_store(&mut file, 512, |s| Map::claim(s, 512, &content, [0x00, 0x44])).expect("claims");
 
         // A slot's position within block 1 *is* the logical id it answers for,
         // so the new page's id is the first free slot rather than one past the
@@ -1873,7 +2316,7 @@ mod tests {
         // 4 permanently unreachable while numbering a fourth page 6.
         assert_eq!(logical, 3);
 
-        let after = Map::read(&file, 512).expect("resolves after");
+        let after = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves after");
         for (l, p) in before.entries() {
             assert_eq!(after.physical(l), Some(p), "logical {l} moved");
         }
@@ -1893,7 +2336,7 @@ mod tests {
         let mut file = fixture("DUPKEY30.DAT");
         let content = vec![0u8; 512];
 
-        let first = Map::claim(&mut file, 512, &content, [0x00, 0x44]).expect("first claim");
+        let first = via_store(&mut file, 512, |s| Map::claim(s, 512, &content, [0x00, 0x44])).expect("first claim");
         let gen_after_first = u16::from_le_bytes([
             file[2 * 512 + GENERATION],
             file[2 * 512 + GENERATION + 1],
@@ -1903,10 +2346,10 @@ mod tests {
             file[3 * 512 + GENERATION + 1],
         ]));
 
-        let second = Map::claim(&mut file, 512, &content, [0x00, 0x44]).expect("second claim");
+        let second = via_store(&mut file, 512, |s| Map::claim(s, 512, &content, [0x00, 0x44])).expect("second claim");
         assert_eq!(second, first + 1);
 
-        let map = Map::read(&file, 512).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves");
         assert!(map.physical(first).is_some());
         assert!(map.physical(second).is_some());
         assert_ne!(
@@ -1937,7 +2380,7 @@ mod tests {
     fn without_the_generation_bump_the_new_claim_is_invisible() {
         let mut file = fixture("DUPKEY30.DAT");
         let content = vec![0u8; 512];
-        let logical = Map::claim(&mut file, 512, &content, [0x00, 0x44]).expect("claims");
+        let logical = via_store(&mut file, 512, |s| Map::claim(s, 512, &content, [0x00, 0x44])).expect("claims");
 
         // Whichever of 2/3 is now live, roll its generation down below the
         // *other* copy's -- undoing only the bump, leaving the new entry's
@@ -1955,7 +2398,7 @@ mod tests {
         let at = live * 512 + GENERATION;
         file[at..at + 2].copy_from_slice(&0u16.to_le_bytes());
 
-        let map = Map::read(&file, 512).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves");
         assert_eq!(
             map.physical(logical),
             None,
@@ -1996,7 +2439,7 @@ mod tests {
         file[at(4) + LOGICAL..at(4) + LOGICAL + 2].copy_from_slice(&2u16.to_le_bytes());
 
         let content = vec![0u8; page_size];
-        let e = Map::claim(&mut file, page_size as u16, &content, [0x00, 0x44]).unwrap_err();
+        let e = via_store(&mut file, page_size as u16, |s| Map::claim(s, page_size as u16, &content, [0x00, 0x44])).unwrap_err();
         assert!(e.contains("already claims all"), "{e}");
     }
 
@@ -2011,11 +2454,11 @@ mod tests {
         let mut file = fixture("DUPKEY30.DAT");
         let mut content = vec![0u8; 512];
         content[6..10].copy_from_slice(b"LOST");
-        let logical = Map::claim(&mut file, 512, &content, [0x00, 0x44]).expect("claims");
+        let logical = via_store(&mut file, 512, |s| Map::claim(s, 512, &content, [0x00, 0x44])).expect("claims");
 
         // Undo only the entry this claim wrote, leaving the new page's own
         // bytes -- header and content both -- exactly as `claim` left them.
-        let physical = Map::read(&file, 512)
+        let physical = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512)
             .expect("resolves")
             .physical(logical)
             .expect("the claim resolved a moment ago");
@@ -2040,7 +2483,7 @@ mod tests {
         }
         assert!(cleared, "the entry `claim` wrote has to exist to clear it");
 
-        let map = Map::read(&file, 512).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves");
         assert_eq!(
             map.physical(logical),
             None,
@@ -2065,13 +2508,13 @@ mod tests {
     #[test]
     fn unclaim_releases_a_claimed_entry_and_disturbs_nothing_else() {
         let mut file = fixture("DUPKEY30.DAT");
-        let before = Map::read(&file, 512).expect("resolves before");
+        let before = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves before");
         assert_eq!(before.physical(2), Some(10), "measured baseline");
         let physical10_before = file[10 * 512..11 * 512].to_vec();
 
-        Map::unclaim(&mut file, 512, 2).expect("logical 2 is claimed");
+        via_store(&mut file, 512, |s| Map::unclaim(s, 512, 2)).expect("logical 2 is claimed");
 
-        let after = Map::read(&file, 512).expect("resolves after");
+        let after = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves after");
         assert_eq!(after.physical(2), None, "logical 2 is no longer claimed");
         assert_eq!(after.physical(1), Some(9), "logical 1 untouched");
         assert_eq!(
@@ -2089,7 +2532,7 @@ mod tests {
     #[test]
     fn unclaim_refuses_a_logical_id_nothing_claims() {
         let mut file = fixture("DUPKEY30.DAT");
-        let e = Map::unclaim(&mut file, 512, 3).unwrap_err();
+        let e = via_store(&mut file, 512, |s| Map::unclaim(s, 512, 3)).unwrap_err();
         assert!(e.contains("there is nothing to release"), "{e}");
     }
 
@@ -2101,18 +2544,18 @@ mod tests {
     fn unclaiming_then_claiming_reuses_the_freed_slot() {
         let mut file = fixture("DUPKEY30.DAT");
 
-        Map::unclaim(&mut file, 512, 2).expect("logical 2 is claimed");
+        via_store(&mut file, 512, |s| Map::unclaim(s, 512, 2)).expect("logical 2 is claimed");
 
         let mut content = vec![0u8; 512];
         content[6..10].copy_from_slice(b"NEW!");
-        let logical = Map::claim(&mut file, 512, &content, [0x00, 0x44]).expect("claims");
+        let logical = via_store(&mut file, 512, |s| Map::claim(s, 512, &content, [0x00, 0x44])).expect("claims");
         assert_eq!(
             logical, 2,
             "the lowest free slot is logical 2's, now that unclaim freed it -- \
              not logical 3, which was already free before either call"
         );
 
-        let map = Map::read(&file, 512).expect("resolves");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).expect("resolves");
         assert_eq!(map.physical(1), Some(9), "logical 1 was never touched");
         assert_eq!(map.physical(3), None, "logical 3 is still free, as it always was");
         let physical = map.physical(2).expect("the reclaim resolved");
@@ -2131,18 +2574,18 @@ mod tests {
     fn unclaim_in_the_second_block_touches_only_that_blocks_pair() {
         const PAGE: usize = 512;
         let mut file = fixture("PP2BLOCK.DAT");
-        let before = Map::read(&file, PAGE as u16).expect("resolves");
+        let before = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16).expect("resolves");
         assert_eq!(before.physical(127), Some(128), "measured baseline");
         let block1 = file[2 * PAGE..4 * PAGE].to_vec();
 
-        Map::unclaim(&mut file, PAGE as u16, 127).expect("logical 127 is claimed in block 2");
+        via_store(&mut file, PAGE as u16, |s| Map::unclaim(s, PAGE as u16, 127)).expect("logical 127 is claimed in block 2");
 
         assert_eq!(
             file[2 * PAGE..4 * PAGE],
             block1[..],
             "block 1's pair is untouched -- the release belonged to block 2"
         );
-        let after = Map::read(&file, PAGE as u16).expect("still resolves");
+        let after = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16).expect("still resolves");
         assert_eq!(after.physical(127), None, "logical 127 is released");
 
         // Every other id still resolves exactly where it did. A block-2
