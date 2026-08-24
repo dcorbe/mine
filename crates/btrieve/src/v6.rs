@@ -1301,7 +1301,7 @@ impl Map {
         let marker = u16::from_le_bytes([live_bytes[at], live_bytes[at + 1]]);
         if marker >> 8 == 0 {
             return Err(format!(
-                "logical id {logical} is not claimed in block 1's live copy -- \
+                "logical id {logical} is not claimed in block {block}'s live copy -- \
                  there is nothing to relocate"
             ));
         }
@@ -1906,6 +1906,51 @@ mod tests {
                 "logical {logical} moved, and only 127 was relocated"
             );
         }
+    }
+
+    /// A relocation refusal names the block that actually refused, not
+    /// block 1 unconditionally.
+    ///
+    /// `Self::relocate`'s "not claimed" refusal used to hardcode `"block
+    /// 1's live copy"` in its message regardless of which block `logical`
+    /// resolved to -- a leftover from before the function was generalised
+    /// to address any block, the same generalisation
+    /// [`a_logical_id_in_the_second_block_relocates_through_that_blocks_
+    /// pair`] proves for the successful path. `Self::unclaim`'s equivalent
+    /// message already names the real block; this fixture drives the
+    /// identical refusal through `relocate` on a logical id that resolves
+    /// into **block 2**, so a hardcoded `"block 1"` would make this test
+    /// fail on the wrong text rather than pass by accident.
+    ///
+    /// `PP2BLOCK.DAT`'s block 2 covers logical 127..252 (126 entries per
+    /// block on this fixture's 512-byte pages) and does not claim every id
+    /// in that range contiguously -- 133 and 134 are both gaps between
+    /// claimed neighbours (132 and 135), confirmed by reading
+    /// [`Map::read`]'s own resolved entries for this fixture before
+    /// relying on it here. Relocating 133 must resolve to block 2 (the
+    /// pair at physical 2/3 only ever answers for block 1) and refuse
+    /// because nothing claims it.
+    #[test]
+    fn relocating_an_unclaimed_id_in_the_second_block_names_that_block() {
+        const PAGE: usize = 512;
+        let mut file = fixture("PP2BLOCK.DAT");
+        let map = Map::read(
+            &mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"),
+            PAGE as u16,
+        )
+        .expect("resolves");
+        assert_eq!(map.physical(133), None, "133 must be the gap this test relies on");
+
+        let content = vec![0u8; PAGE];
+        let e = via_store(&mut file, PAGE as u16, |s| {
+            Map::relocate(s, PAGE as u16, 133, &content, [0x00, 0x44])
+        })
+        .expect_err("logical 133 is not claimed anywhere");
+
+        assert!(
+            e.contains("not claimed in block 2's live copy"),
+            "the refusal must name block 2, the block 133 actually resolves to, not              a hardcoded block 1: {e}"
+        );
     }
 
     /// Ten 512-byte pages with an allocation-table pair at 2/3, copy 3 live
