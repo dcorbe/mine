@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use mbbs_machine::m16::{Exit, FarPtr, Machine, Ret};
 
 use crate::Host;
-use crate::abi::{self, Call, Wg16};
+use crate::abi::{self, Abi, Call, Wg16, Wg32, Wg32Cpu};
 use crate::shims::ShimError;
 
 /// Both of these moved into the `btrieve` crate with the engine, because that
@@ -20,9 +20,41 @@ use crate::shims::ShimError;
 /// always did.
 pub use ::btrieve::testing::{make_keys_modifiable, scratch};
 
-pub struct Fixture {
-    pub machine: Machine,
-    pub host: Host<Wg16>,
+/// A machine stopped at a host call, generic over which ABI it stopped
+/// under.
+///
+/// `A` defaults to [`Wg16`], so every one of this crate's existing call
+/// sites -- `Fixture::new()`, `let f: Fixture = ...`, `f.machine`, `f.host`
+/// -- keeps meaning exactly what it meant before this type gained a
+/// parameter: none of them spell a generic argument, so all of them get the
+/// default. `impl Fixture<Wg16>` below is the same inherent block this type
+/// always had, under a name that says which ABI it is; not one of its
+/// methods changed shape.
+///
+/// `Fixture<Wg32>` is a second, independent inherent block, added once this
+/// task needed one. It does not extend the block above -- a real
+/// `Wg32Cpu` needs a real `mbbs_machine::m32::Machine`, which arms this
+/// thread's fault recovery, and every existing convention in this crate
+/// (`crates/mbbs/tests/wg32_abi.rs`'s own module doc comment, `heap.rs`'s
+/// test module) keeps that construction out of `cargo test -p mbbs --lib`
+/// entirely. `crates/mbbs/src/testing.rs` compiles into that binary, so
+/// `Fixture::<Wg32>`'s own constructors are *defined* here (which costs
+/// nothing -- a function body does not run until called) but must only ever
+/// be *called* from a `crates/mbbs/tests/*.rs` integration binary, never
+/// from a `#[cfg(test)]` module inside `src/`. See that new file's own
+/// module doc comment for the isolation this preserves.
+///
+/// Every `Fixture<Wg32>` method carries a `_wg32` suffix -- `new_wg32`,
+/// `rooted_wg32`, `bytes_wg32`, `text_wg32`, `invoke_wg32` -- rather than
+/// reusing the `Wg16` block's names. See [`Fixture::new_wg32`]'s own doc
+/// comment for the measured reason: two concrete inherent impls sharing a
+/// method name is an ambiguity Rust's default type parameter does not
+/// resolve, and same-named methods on both blocks broke all 1,155 existing
+/// bare `Fixture::new()`/`Fixture::rooted()` call sites the first time this
+/// task tried it.
+pub struct Fixture<A: Abi = Wg16> {
+    pub machine: A::Cpu,
+    pub host: Host<A>,
     scratch: u16,
     next: u16,
 }
@@ -44,7 +76,7 @@ pub fn scratch_with(name: &str, files: &[&str]) -> PathBuf {
     at
 }
 
-impl Fixture {
+impl Fixture<Wg16> {
     /// A host over the checked-in sample files.
     pub fn new() -> Self {
         Self::rooted(data())
@@ -274,6 +306,172 @@ impl Fixture {
         self.host
             .load(&mut self.machine, &minimal_module_bytes())
             .expect("a minimal module loads")
+    }
+}
+
+/// An inert one-section PE32 image, just parseable enough for
+/// [`mbbs_machine::m32::Image::load`]/[`mbbs_machine::m32::Memory::new`] to
+/// accept it.
+///
+/// Byte-for-byte the same skeleton `crates/mbbs/tests/wg32_abi.rs`'s
+/// `minimal_with_one_section` and `crates/mbbs/tests/wg32_round_trip.rs`'s
+/// `skeleton` build -- duplicated rather than shared, per this crate
+/// family's own convention for this exact fixture (see `heap.rs`'s test
+/// module doc comment, which cites the same two files for the same reason).
+/// Nothing a `Fixture<Wg32>` shim test does ever executes this image's code
+/// or walks an import directory -- every test calls a shim function
+/// directly through [`Fixture::invoke`](Fixture::invoke) rather than
+/// entering the module -- so the section holds no bytes at all; it exists
+/// only so `PeImage::parse`/`Image::load` have a real header and one real
+/// section to walk.
+fn wg32_skeleton() -> Vec<u8> {
+    const SIZE_OF_IMAGE: u32 = 0x0000_2000;
+
+    let mut v = vec![0u8; 0x200];
+    v[0..2].copy_from_slice(b"MZ");
+    v[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    v[0x80..0x84].copy_from_slice(b"PE\0\0");
+    v[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes()); // machine = i386
+    v[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+    v[0x94..0x96].copy_from_slice(&0xe0u16.to_le_bytes()); // SizeOfOptionalHeader
+    v[0x96..0x98].copy_from_slice(&0x010eu16.to_le_bytes()); // characteristics
+    v[0x98..0x9a].copy_from_slice(&0x010bu16.to_le_bytes()); // PE32 magic
+
+    let opt = 0x98;
+    v[opt + 16..opt + 20].copy_from_slice(&0x0000_1000u32.to_le_bytes()); // entry rva
+    v[opt + 28..opt + 32].copy_from_slice(&0x2222_0000u32.to_le_bytes()); // image base
+    v[opt + 32..opt + 36].copy_from_slice(&0x0000_1000u32.to_le_bytes()); // section align
+    v[opt + 36..opt + 40].copy_from_slice(&0x0000_0400u32.to_le_bytes()); // file align
+    v[opt + 56..opt + 60].copy_from_slice(&SIZE_OF_IMAGE.to_le_bytes());
+
+    let sec = opt + 0xe0;
+    v.resize(sec + 40 + 0x400, 0);
+    v[sec..sec + 8].copy_from_slice(b"CODE\0\0\0\0");
+    v[sec + 8..sec + 12].copy_from_slice(&0x400u32.to_le_bytes()); // VirtualSize
+    v[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
+    v[sec + 16..sec + 20].copy_from_slice(&0x400u32.to_le_bytes()); // SizeOfRawData
+    v[sec + 20..sec + 24].copy_from_slice(&((sec + 40) as u32).to_le_bytes());
+    v[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE|EXEC|READ|WRITE
+    v
+}
+
+/// Enough arena for [`Host::<Wg32>::new`]'s own placements (measured at
+/// 13,216 bytes by `crates/mbbs/tests/wg32_abi.rs`'s own
+/// `alcmem_and_alczer_still_pack_ordinary_wg32_sizes`) plus whatever a dfa
+/// shim test opens and writes -- `Heap::reserve` maps a full 65,535-byte
+/// `SEGMENT` the first time anything asks it for room, regardless of how
+/// small that first request is, so even one small `dfaOpen` needs far more
+/// arena behind it than the file it opens.
+const WG32_ARENA: usize = 512 * 1024;
+
+impl Fixture<Wg32> {
+    /// A `Wg32` host over the checked-in sample files.
+    ///
+    /// Named `new_wg32`, not `new` -- `impl Fixture<Wg16>` already has a
+    /// same-named `new()`, and unlike a bare unparameterised type, two
+    /// *concrete* inherent impls (`Fixture<Wg16>`, `Fixture<Wg32>`) sharing a
+    /// method name is a hard ambiguity error at every call site that writes
+    /// bare `Fixture::new()`: Rust's default type parameter (`A: Abi =
+    /// Wg16`) is not consulted to break the tie, because inherent method
+    /// lookup collects every impl whose `Self` *could* unify before it ever
+    /// gets to defaults. Measured, not assumed: giving both blocks `new()`
+    /// produced `E0034: multiple applicable items in scope` at all 1,155
+    /// existing `Fixture::new()`/`Fixture::rooted()` call sites across this
+    /// crate the first time this task tried it. Distinct names for every
+    /// `Wg32` method is what keeps every `Wg16` call site compiling
+    /// unchanged -- the actual requirement, not the mechanism this task
+    /// first reached for.
+    ///
+    /// **Must only be called from a `crates/mbbs/tests/*.rs` integration
+    /// binary** -- see this module's own doc comment on [`Fixture`] for why.
+    pub fn new_wg32() -> Self {
+        Self::rooted_wg32(data())
+    }
+
+    /// A `Wg32` host over a directory of the test's choosing.
+    ///
+    /// Builds a real `mbbs_machine::m32::Machine` (thunk table, TIB, fault
+    /// recovery armed) over an inert placeholder image -- [`wg32_skeleton`]
+    /// -- the same construction `crates/mbbs/tests/wg32_abi.rs`'s own `cpu()`
+    /// and `crates/mbbs/tests/wg32_round_trip.rs`'s `machine_and_placeholder`
+    /// use. No module is ever loaded through it: every
+    /// [`Fixture::invoke_wg32`](Fixture::invoke_wg32) call here reaches a
+    /// shim directly, through a hand-built [`Call`], never through
+    /// `Host::run`'s dispatch -- so the placeholder image is never entered
+    /// and never needs to be anything but parseable.
+    pub fn rooted_wg32(root: PathBuf) -> Self {
+        let file = wg32_skeleton();
+        let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture PE parses");
+        let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture PE loads");
+        let mem = mbbs_machine::m32::Memory::new(image, WG32_ARENA).expect("arena mapping");
+        let machine = mbbs_machine::m32::Machine::new().expect("32-bit machine");
+        let mut cpu = Wg32Cpu::new(machine, mem);
+        let mut host =
+            Host::<Wg32>::new(&mut cpu, root, crate::Terms::new(crate::globals::NTERMS))
+                .expect("host");
+        host.finish_init(&mut cpu).expect("finished starting up");
+        Self {
+            machine: cpu,
+            host,
+            scratch: 0,
+            next: 0,
+        }
+    }
+
+    /// Raw bytes, written into a fresh region of this fixture's arena.
+    ///
+    /// The `Wg32` sibling of [`Fixture::<Wg16>::bytes`](Fixture::bytes),
+    /// under its own name for the same reason [`Fixture::new_wg32`]'s doc
+    /// comment gives: there, scratch memory is a hand-picked segment this
+    /// type owns outright; here, it is
+    /// [`crate::abi::ModuleMem::alloc_region`] against the same flat arena
+    /// `Host::new` and every shim already share -- there being no separate
+    /// "scratch segment" concept once near and far collapse to one address
+    /// space (the same collapse `Abi::data_ptr`'s own doc comment
+    /// describes).
+    pub fn bytes_wg32(&mut self, bytes: &[u8]) -> mbbs_machine::m32::Flat32Ptr {
+        let mem = <Wg32 as Abi>::mem(&mut self.machine);
+        let ptr = <mbbs_machine::m32::Memory as abi::ModuleMem>::alloc_region(mem, bytes.len())
+            .expect("arena has room");
+        mbbs_machine::ptr::ModulePtr::write(&ptr, mem, bytes).expect("just allocated, so writable");
+        ptr
+    }
+
+    /// A NUL-terminated string, written into this fixture's arena.
+    pub fn text_wg32(&mut self, s: &str) -> mbbs_machine::m32::Flat32Ptr {
+        let mut out = s.as_bytes().to_vec();
+        out.push(0);
+        self.bytes_wg32(&out)
+    }
+
+    /// Run `shim` directly against a hand-built [`Call<Wg32>`], skipping
+    /// real CPU execution entirely.
+    ///
+    /// `args` is one `u32` per argument, in declaration order -- the `Wg32`
+    /// analogue of [`Fixture::<Wg16>::invoke`](Fixture::invoke)'s one `u16`
+    /// per argument, and just as symmetric: every argument this ABI's
+    /// argument frame holds, pointer or `int` alike, is exactly four bytes
+    /// (`Abi::PTR_WIDTH == Abi::INT_WIDTH == 4` for `Wg32`), so one `u32`
+    /// always means one argument.
+    ///
+    /// Not built by assembling and running real x86 the way
+    /// [`Fixture::<Wg16>::call`](Fixture::call) does: this crate's own
+    /// `crates/mbbs/tests/wg32_abi.rs` (`alcmem_and_alczer_...`,
+    /// `alcblok32_...`) already established the precedent that a shim can be
+    /// proven directly against a hand-built [`Call`], with the *real* module
+    /// round trip (execution, thunk binding, dispatch) covered separately by
+    /// `crates/mbbs/tests/wg32_round_trip.rs`. A dfa shim test needs the
+    /// former, not the latter: what is missing is coverage of the shim
+    /// itself under `Wg32`, not a second proof that `Host::run`'s dispatch
+    /// works.
+    pub fn invoke_wg32(
+        &mut self,
+        shim: crate::shims::Shim<Wg32>,
+        args: &[u32],
+    ) -> Result<abi::Ret<Wg32>, ShimError> {
+        let frame: Vec<u8> = args.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let mut call = Call::<Wg32>::new(&mut self.machine, &frame);
+        shim(&mut call, &mut self.host)
     }
 }
 
