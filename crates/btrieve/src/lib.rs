@@ -3029,8 +3029,11 @@ impl<M: Mem> Block<M> {
     /// # Errors
     ///
     /// If the records cannot be read, the file holds variable-length
-    /// records, the file cannot be written, or (debug builds only) the
-    /// written file fails [`Self::verify_write`].
+    /// records and `bytes` is shorter than the fixed part every record has,
+    /// the file holds variable-length records and is version 5 (see
+    /// [`Self::insert_v6`]'s own doc comment for what a version 6
+    /// variable-length file still refuses), the file cannot be written, or
+    /// (debug builds only) the written file fails [`Self::verify_write`].
     pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
         let result = self.insert_inner(bytes);
         self.verify_write(result)
@@ -3055,11 +3058,17 @@ impl<M: Mem> Block<M> {
     /// `geometry.reclen` bytes, and the two would disagree the moment the
     /// cache is dropped and the file is read again.
     ///
-    /// **Variable-length files refuse instead.** Normalising is right when
-    /// `reclen` really is the length of every record; on a variable-length
-    /// file it is not, and cutting a real record down to it is the same
-    /// silent truncation [`Self::update`] already refuses for exactly this
-    /// reason. See [`Self::update`]'s doc comment.
+    /// **A variable-length file is not normalised, and a version 5 one
+    /// still refuses outright.** Normalising is right when `reclen` really
+    /// is the length of every record; on a variable-length file it is not,
+    /// and cutting a real record down to it is the same silent truncation
+    /// [`Self::update`] already refuses for exactly this reason. A version
+    /// 6 variable-length file does not refuse -- it diverges to
+    /// [`Self::insert_v6`] below, which places the body on a variable page;
+    /// only a version 5 one still has no proven write-side allocator for
+    /// this shape and refuses (see the refusal a few lines down). See
+    /// [`Self::update`]'s doc comment for the normalising rule this
+    /// mirrors.
     ///
     /// `self.geometry` is updated last: `records` always grows by one, and
     /// `pages` grows by one only when the slot was a new page. Both fields are
@@ -3071,7 +3080,9 @@ impl<M: Mem> Block<M> {
     /// # Errors
     ///
     /// If the records cannot be read, the file holds variable-length
-    /// records, or the file cannot be written.
+    /// records and `bytes` is shorter than the fixed part every record has,
+    /// the file holds variable-length records and is version 5, or the file
+    /// cannot be written.
     fn insert_inner(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
         self.records()?;
         let name = self.name.clone();
@@ -3468,8 +3479,10 @@ impl<M: Mem> Block<M> {
     /// # Errors
     ///
     /// If the records cannot be read, the file holds variable-length
-    /// records, `position` holds no record, the file cannot be written, or
-    /// (debug builds only) the written file fails [`Self::verify_write`].
+    /// records and is version 5 (see [`Self::delete_v6`]'s own doc comment
+    /// for what a version 6 variable-length file still refuses),
+    /// `position` holds no record, the file cannot be written, or (debug
+    /// builds only) the written file fails [`Self::verify_write`].
     pub fn delete(&mut self, position: u32) -> Result<(), BtvError> {
         let result = self.delete_inner(position);
         self.verify_write(result)
@@ -3531,7 +3544,8 @@ impl<M: Mem> Block<M> {
     /// # Errors
     ///
     /// If the records cannot be read, the file holds variable-length
-    /// records, `position` holds no record, or the file cannot be written.
+    /// records and is version 5, `position` holds no record, or the file
+    /// cannot be written.
     fn delete_inner(&mut self, position: u32) -> Result<(), BtvError> {
         self.records()?;
         if self.geometry.version != Version::V6 {
