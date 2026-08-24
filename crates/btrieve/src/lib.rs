@@ -67,6 +67,7 @@ pub mod read;
 pub mod records;
 mod stat;
 pub mod testing;
+pub mod verify;
 mod variable;
 pub(crate) mod v6;
 
@@ -857,6 +858,24 @@ pub struct Block<M: Mem> {
     /// leaves the *pre-transaction* image standing, not the first write's
     /// result.
     pre_image: Option<PreImage>,
+
+    /// Whether [`Self::insert`], [`Self::update`] and [`Self::delete`]
+    /// should run [`Self::verify_write`] after a successful write.
+    ///
+    /// Explicit opt-in, not a blanket `#[cfg(debug_assertions)]`, and
+    /// deliberately so: this crate's own unit tests build `Block` directly,
+    /// bypassing [`Self::open`], with synthetic geometries far smaller than
+    /// [`crate::format::generation::FCR_MIN`] -- real enough to exercise one
+    /// piece of write-path logic (a free-list splice, a reindex) in
+    /// isolation, but not shaped like a file [`crate::read::file`] was ever
+    /// meant to parse. Measured directly: gating verification on
+    /// `debug_assertions` alone, with no opt-in, turned 37 of those tests
+    /// red -- every one of them a `NotBtrieve` refusal of a fixture that was
+    /// never trying to be a complete file. [`Self::open`] -- the one path a
+    /// real module's `opnbtv` reaches -- sets this to `cfg!(debug_assertions)`;
+    /// every test-only `Block` literal in this crate leaves it `false` unless
+    /// a test is deliberately exercising verification itself.
+    verify_writes: bool,
 }
 
 /// One block's state as it was the moment a transaction first wrote to it --
@@ -2710,6 +2729,73 @@ impl<M: Mem> Block<M> {
         Ok(counts)
     }
 
+    /// Check a write's own output by rebuilding it and comparing, but only
+    /// when [`Self::verify_writes`] says to, and never at all in a release
+    /// build.
+    ///
+    /// # LOAD-BEARING NAME -- do not rename or remove this hook
+    ///
+    /// `verify_write` is Plan 3 Task 1's net, and every later task in that
+    /// plan is written against its presence. Stage B (tasks 4 and 5)
+    /// rewrites `insert_v6`/`update_v6`/`delete_v6` and `write_changed_pages`
+    /// underneath the three callers below -- that rewrite must still leave
+    /// every successful call to [`Self::insert`], [`Self::update`] and
+    /// [`Self::delete`] passing back through this function before it returns
+    /// to its caller. Those tasks' own reviews check for this by name.
+    ///
+    /// **Plan 3 Task 2's cost measurement must be taken with this hook
+    /// off** -- either build `--release` (which strips the mechanism
+    /// entirely, see below) or open the block under test with
+    /// [`Self::verify_writes`] left `false`, or the numbers measured are
+    /// this function's read and re-emit, not the write being measured.
+    ///
+    /// # What this actually does
+    ///
+    /// If `result` is `Err`, it is returned unchanged -- a write that never
+    /// happened has nothing on disk to check. Otherwise, only when compiled
+    /// with `debug_assertions` (never in `--release`) **and** only when
+    /// `self.verify_writes` is `true`, [`verify::written`] is run against
+    /// `self.path`; its failure replaces `result` with an `Err` naming the
+    /// offset and field it found wrong, exactly as [`verify::written`]'s own
+    /// doc comment describes.
+    ///
+    /// Two gates, not one, because they answer different questions.
+    /// `debug_assertions` is what makes the cost -- a full read plus a full
+    /// re-emit, see [`verify::written`]'s doc comment -- paid in precisely
+    /// zero of the builds a board actually runs, the same way `debug_assert!`
+    /// does. `verify_writes` is what keeps that check from running at all
+    /// against a `Block` this crate's own tests built directly, with a
+    /// synthetic geometry [`crate::read::file`] was never meant to parse --
+    /// see [`Self::verify_writes`]'s own doc comment for the 37 tests that
+    /// went red the one time this was tried without it.
+    fn verify_write<T>(&self, result: Result<T, BtvError>) -> Result<T, BtvError> {
+        let value = result?;
+        #[cfg(debug_assertions)]
+        if self.verify_writes {
+            if let Err(why) = crate::verify::written(&self.path) {
+                return Err(BtvError {
+                    file: self.name.clone(),
+                    why,
+                });
+            }
+        }
+        Ok(value)
+    }
+
+    /// Add a record, choosing its slot and writing it. See
+    /// [`Self::insert_inner`] for the algorithm; this wrapper only adds the
+    /// post-write verification described on [`Self::verify_write`].
+    ///
+    /// # Errors
+    ///
+    /// If the records cannot be read, the file holds variable-length
+    /// records, the file cannot be written, or (debug builds only) the
+    /// written file fails [`Self::verify_write`].
+    pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
+        let result = self.insert_inner(bytes);
+        self.verify_write(result)
+    }
+
     /// Add a record, choosing its slot and writing it.
     ///
     /// Returns the file position it went to, which is what `absbtv` would
@@ -2746,7 +2832,7 @@ impl<M: Mem> Block<M> {
     ///
     /// If the records cannot be read, the file holds variable-length
     /// records, or the file cannot be written.
-    pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
+    fn insert_inner(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
         self.records()?;
         let name = self.name.clone();
 
@@ -2863,6 +2949,21 @@ impl<M: Mem> Block<M> {
         Ok(position)
     }
 
+    /// Replace the record at `position`. See [`Self::update_inner`] for the
+    /// algorithm; this wrapper only adds the post-write verification
+    /// described on [`Self::verify_write`].
+    ///
+    /// # Errors
+    ///
+    /// If the file holds variable-length records, `bytes` is not exactly
+    /// `reclen` long, the records cannot be read, `position` holds no
+    /// record, the file cannot be written, or (debug builds only) the
+    /// written file fails [`Self::verify_write`].
+    pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
+        let result = self.update_inner(position, bytes);
+        self.verify_write(result)
+    }
+
     /// Replace the record at `position`.
     ///
     /// An update is in place: it neither adds a slot nor a page, so
@@ -2896,7 +2997,7 @@ impl<M: Mem> Block<M> {
     /// If the file holds variable-length records, `bytes` is not exactly
     /// `reclen` long, the records cannot be read, `position` holds no record,
     /// or the file cannot be written.
-    pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
+    fn update_inner(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
         self.records()?;
         let name = self.name.clone();
 
@@ -3118,6 +3219,20 @@ impl<M: Mem> Block<M> {
         pages::write_record(&self.path, layout, pages::Slot::Existing(position), &slot, count)
     }
 
+    /// Remove the record at `position`. See [`Self::delete_inner`] for the
+    /// algorithm; this wrapper only adds the post-write verification
+    /// described on [`Self::verify_write`].
+    ///
+    /// # Errors
+    ///
+    /// If the records cannot be read, the file holds variable-length
+    /// records, `position` holds no record, the file cannot be written, or
+    /// (debug builds only) the written file fails [`Self::verify_write`].
+    pub fn delete(&mut self, position: u32) -> Result<(), BtvError> {
+        let result = self.delete_inner(position);
+        self.verify_write(result)
+    }
+
     /// Remove the record at `position`, as `delbtv` (Btrieve operation 4)
     /// does: take it out of the in-memory model and splice its slot onto the
     /// head of the file's own free list on disk.
@@ -3173,7 +3288,7 @@ impl<M: Mem> Block<M> {
     ///
     /// If the records cannot be read, the file holds variable-length
     /// records, `position` holds no record, or the file cannot be written.
-    pub fn delete(&mut self, position: u32) -> Result<(), BtvError> {
+    fn delete_inner(&mut self, position: u32) -> Result<(), BtvError> {
         self.records()?;
         if self.geometry.version != Version::V6 {
             self.writable()?;
@@ -3883,6 +3998,10 @@ impl<M: Mem> Btrieve<M> {
             // rolled back on abort the same as one opened before `begin`.
             txn_active: self.transaction,
             pre_image: None,
+            // A real module's `opnbtv` reached this constructor -- the only
+            // one that did -- so this is the one place verification is worth
+            // its cost, and only in a debug build; see `Self::verify_write`.
+            verify_writes: cfg!(debug_assertions),
         });
         Ok(block)
     }
@@ -5084,6 +5203,9 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            // A test-only fixture, not `Self::open` -- see
+            // `Self::verify_writes`'s doc comment for why this stays off.
+            verify_writes: false,
         }
     }
 
@@ -6191,6 +6313,9 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            // A test-only fixture, not `Self::open` -- see
+            // `Self::verify_writes`'s doc comment for why this stays off.
+            verify_writes: false,
         }
     }
 
@@ -6248,6 +6373,123 @@ mod tests {
                 .unwrap_or_else(|e| panic!("round {round}: the file no longer reads: {e}"))
                 .len();
             assert_eq!(count, expected, "round {round}: record count on disk");
+        }
+    }
+
+    /// The healthy path: insert, update and delete against a real,
+    /// committed, single-key v6 fixture (`V6DUP.DAT`), opened with
+    /// [`Block::verify_writes`] turned on, all succeed and leave a file
+    /// [`crate::verify::written`] accepts.
+    ///
+    /// This is the baseline
+    /// [`verify_writes_catches_a_real_defect_in_multi_key_v6_reindex`] is
+    /// contrasted against: `verify_writes` does not fail a write that is
+    /// actually sound.
+    #[test]
+    fn verify_writes_passes_on_the_healthy_path() {
+        let dir = crate::testing::scratch("verify-writes-v6dup");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/V6DUP.DAT");
+        let path = dir.join("V6DUP.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+
+        let mut block = block_from_file(path.clone(), "V6DUP.DAT");
+        block.verify_writes = true;
+        let reclen = usize::from(block.geometry.reclen);
+
+        // `V6DUP.DAT` holds variable-length records, so only insert is a
+        // write this host performs on it at all -- update and delete both
+        // refuse unconditionally for a v6 variable-length file (see
+        // `Self::update_inner`, `Self::delete_inner`). Insert alone is
+        // still a real write through the real v6 path this task wires
+        // verification into, and it is enough to show the healthy case.
+        let mut record = vec![0u8; reclen];
+        record[..4].copy_from_slice(&999_999u32.to_le_bytes());
+        block.insert(&record).expect("a verified insert");
+
+        assert_eq!(crate::verify::written(&path), Ok(()));
+    }
+
+    /// **The real defect this task's Step 5 asked for -- found, not forced.**
+    ///
+    /// No bug had to be reintroduced: wiring `verify_writes` into a real
+    /// `Block` and pointing it at the smallest committed multi-key v6
+    /// fixture this crate has (`IDXPROBE.DAT`, 2 keys, 120 records) and
+    /// calling a single ordinary `insert` was enough. `IDXPROBE.DAT` itself
+    /// round-trips byte-identically before this test touches it
+    /// (`roundtrip.rs`'s corpus sweep does not cover `tests/data/`, but the
+    /// same `read::file`/`emit::file` pair agrees on it directly). After one
+    /// insert, `read::file` refuses the result outright: physical page 12
+    /// (logical 2) is still claimed by the v6 allocation table, but no
+    /// key's B-tree walk reaches it any more and its tag is neither
+    /// `TAG_ACS`, `TAG_DATA`, nor `TAG_VARIABLE` -- exactly the "claimed but
+    /// unreachable" shape `read::file`'s own doc comment says it refuses
+    /// rather than guesses at.
+    ///
+    /// The record data this insert wrote is not lost -- the *shape* of the
+    /// engine's own write is what is at fault, not the record. Measured
+    /// separately (not asserted by this test): the identical operation on
+    /// this crate's two committed *single*-key v6 fixtures (`V6DUP.DAT`,
+    /// `V6VAR.DAT`) round-trips cleanly, so this is specific to `v6_reindex`
+    /// rebuilding a **second** key's tree, not a defect in v6 writing
+    /// generally. Fixing that is Stage C's concern (or later), not this
+    /// task's -- Task 1 only had to build the net and show it catches
+    /// something, and this is what it caught on the very first real file
+    /// it was pointed at.
+    #[test]
+    fn verify_writes_catches_a_real_defect_in_multi_key_v6_reindex() {
+        let dir = crate::testing::scratch("verify-writes-idxprobe-defect");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/IDXPROBE.DAT");
+        let path = dir.join("IDXPROBE.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        assert_eq!(
+            crate::verify::written(&path),
+            Ok(()),
+            "the untouched fixture must round-trip, or this test would be \
+             blaming the write for a defect the fixture already had"
+        );
+
+        let mut block = block_from_file(path.clone(), "IDXPROBE.DAT");
+        block.verify_writes = true;
+        let reclen = usize::from(block.geometry.reclen);
+        let mut record = vec![0u8; reclen];
+        record[..4].copy_from_slice(&999_999u32.to_le_bytes());
+
+        if cfg!(debug_assertions) {
+            // `Self::verify_write` runs in this build, so the defect
+            // surfaces exactly where a real debug-mode board would meet it:
+            // as this `insert` call's own `Err`.
+            let err = block.insert(&record).expect_err(
+                "this insert's own write is structurally unsound, and verify_writes must say \
+                 so rather than let it through",
+            );
+            assert!(
+                err.why.contains("cannot even parse back"),
+                "a file the crate cannot even read back is refused as such, distinctly from a \
+                 byte mismatch: {}",
+                err.why
+            );
+            assert!(
+                err.why.contains(
+                    "claimed by the allocation table but attributed to no key's B-tree"
+                ),
+                "names the specific structural predicate that failed, not just \"bytes differ\": {}",
+                err.why
+            );
+        } else {
+            // A `--release` build compiles `Self::verify_write`'s check
+            // out entirely (see `verify::written`'s doc comment for why),
+            // so the insert itself reports success here -- and the defect
+            // is still real, just uncaught by this build. Checking
+            // `verify::written` directly, the way `verify_writes` would
+            // have, is what still proves the defect exists in this profile.
+            block.insert(&record).expect("the write itself still succeeds in release");
+            let err = crate::verify::written(&path)
+                .expect_err("the defect is real regardless of build profile");
+            assert!(err.contains("cannot even parse back"), "{err}");
+            assert!(
+                err.contains("claimed by the allocation table but attributed to no key's B-tree"),
+                "{err}"
+            );
         }
     }
 
@@ -7443,6 +7685,9 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            // A test-only fixture, not `Self::open` -- see
+            // `Self::verify_writes`'s doc comment for why this stays off.
+            verify_writes: false,
         }
     }
 
@@ -7692,6 +7937,9 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            // A test-only fixture, not `Self::open` -- see
+            // `Self::verify_writes`'s doc comment for why this stays off.
+            verify_writes: false,
         }
     }
 
@@ -8190,6 +8438,9 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            // A test-only fixture, not `Self::open` -- see
+            // `Self::verify_writes`'s doc comment for why this stays off.
+            verify_writes: false,
         }
     }
 
