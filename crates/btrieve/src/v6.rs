@@ -705,6 +705,86 @@ impl Map {
         Ok(new_logical)
     }
 
+    /// Release an already-claimed logical id back to the allocation table's
+    /// free pool, [`Self::claim`]'s inverse.
+    ///
+    /// Only the allocation-table *entry* is touched -- both halves zeroed,
+    /// so the slot reads exactly as an entry that was never allocated
+    /// (`entry`'s own doc comment: "a marker whose high byte is zero is a
+    /// slot that was never allocated"). The physical page `logical` used to
+    /// name is left as it stands, untouched and unzeroed: this module's own
+    /// doc comment already establishes that an abandoned physical page's
+    /// bytes are decorative once nothing claims it (`Self::read` never
+    /// consults a page's self-stamped header to resolve it), and
+    /// [`Self::relocate`] already leaves an old physical home exactly this
+    /// way on every move. Releasing the claim is what turns the page into
+    /// that same ordinary litter, one call earlier than relocate reaches it.
+    ///
+    /// # Why this exists
+    ///
+    /// `Block::v6_reindex`'s bulk rebuild can need *fewer* index nodes than
+    /// a key's tree currently occupies -- this crate packs a fresh rebuild
+    /// as full as the format allows, genuine Btrieve 6.15 does not (measured
+    /// 50-77% full, this module's own doc comment) -- and the nodes it no
+    /// longer needs must stop being claimed, or the allocation table still
+    /// names a page no key's walk reaches, which `read::file` refuses as
+    /// "claimed but attributed to no key's B-tree". This is the mechanism
+    /// that turns "the tree shrank" into a file this crate can still read
+    /// back, the same way an ordinary v5 rebuild's surplus pages were never
+    /// a problem: v5 has no allocation table to leave a stale claim in.
+    ///
+    /// # Errors
+    ///
+    /// If the file is not a whole number of `page_size`-byte pages, if the
+    /// block `logical` belongs to has no live pair, or if `logical`'s own
+    /// slot is not claimed in that block's live copy -- there is nothing to
+    /// release.
+    pub(crate) fn unclaim(file: &mut Vec<u8>, page_size: u16, logical: u32) -> Result<(), String> {
+        let page_size_usize = usize::from(page_size);
+        if file.is_empty() || !file.len().is_multiple_of(page_size_usize) {
+            return Err(format!(
+                "{} bytes is not a whole number of {page_size}-byte pages",
+                file.len()
+            ));
+        }
+
+        let (block, entry) = Self::block_of(logical, page_size_usize)?;
+        let (stale, live) = Self::pair_of(file, page_size_usize, block)?;
+
+        let entry_at = |page: usize, entry: usize| page * page_size_usize + ENTRIES + entry * ENTRY;
+        let word = |page: usize, offset: usize| -> u16 {
+            let at = page * page_size_usize + offset;
+            u16::from_le_bytes([file[at], file[at + 1]])
+        };
+
+        let at = entry_at(live, entry);
+        let marker = u16::from_le_bytes([file[at], file[at + 1]]);
+        if marker >> 8 == 0 {
+            return Err(format!(
+                "logical id {logical} is not claimed in block {block}'s live copy -- \
+                 there is nothing to release"
+            ));
+        }
+
+        // Read before any mutation: `word` borrows `file` immutably.
+        let new_generation = word(live, GENERATION).wrapping_add(1);
+
+        // Copy-on-write into the stale copy, the same shape `Self::claim`
+        // and `Self::relocate` both use: the live copy's own bytes, plus
+        // this one change, plus a higher generation.
+        let live_page = file[live * page_size_usize..][..page_size_usize].to_vec();
+        let stale_at = stale * page_size_usize;
+        file[stale_at..stale_at + page_size_usize].copy_from_slice(&live_page);
+
+        let repoint = stale_at + ENTRIES + entry * ENTRY;
+        file[repoint..repoint + ENTRY].fill(0);
+
+        file[stale_at + GENERATION..stale_at + GENERATION + 2]
+            .copy_from_slice(&new_generation.to_le_bytes());
+
+        Ok(())
+    }
+
     /// Change what physical page an **already-claimed** logical id resolves
     /// to, writing `content` fresh and repointing the existing
     /// allocation-table claim at it -- [`Self::claim`]'s sibling for a page

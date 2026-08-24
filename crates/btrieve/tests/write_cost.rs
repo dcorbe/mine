@@ -31,20 +31,27 @@
 //! `Btrieve::open` is the one path a real module's `opnbtv` reaches, and
 //! measuring through it (rather than through `lib.rs`'s own test-only
 //! `block_from_file`, which hardcodes `verify_writes: false` -- see that
-//! function's own comment) is what surfaces this: **updating any record of a
-//! genuine `WCCMP002.DAT` leaves the file unparseable.** `verify::written`
-//! reports physical page 7024 claimed by the allocation table but attributed
-//! to no key's B-tree, tagged neither `TAG_ACS`, `TAG_DATA` nor
+//! function's own comment) is what surfaced this: **updating any record of a
+//! genuine `WCCMP002.DAT` left the file unparseable.** `verify::written`
+//! reported physical page 7024 claimed by the allocation table but
+//! attributed to no key's B-tree, tagged neither `TAG_ACS`, `TAG_DATA` nor
 //! `TAG_VARIABLE`. Confirmed independently: the pristine, unmodified file
-//! parses cleanly (`verify::written` `Ok`), and the corruption reproduces
-//! identically regardless of which record is updated or which byte within it
-//! changes -- so this is not about a particular record choice. Every
+//! parsed cleanly (`verify::written` `Ok`), and the corruption reproduced
+//! identically regardless of which record was updated or which byte within
+//! it changed -- so this was not about a particular record choice. Every
 //! existing `$WCCMP002`-gated test in `lib.rs` builds its `Block` with
 //! `verify_writes: false` and only checks record count or page-diff counts,
-//! neither of which a page mistagged this way would ever fail. The
-//! `wccmp002_update_cost_today` test below reproduces this and is expected to
-//! fail until it is fixed -- that is Stage B/C's problem, not this task's;
-//! this file changes no engine behaviour.
+//! neither of which a page mistagged this way would ever fail.
+//!
+//! **Fixed** by Plan 3 Task 3b, same root cause as `lib.rs`'s
+//! `a_shrinking_multi_key_v6_reindex_releases_its_surplus_pages`:
+//! `Block::v6_reindex`'s bulk rebuild packs a key's tree denser than genuine
+//! Btrieve 6.15 ever wrote, so an ordinary update can need fewer index nodes
+//! than the file's own tree occupies (208 nodes to 106, measured on this
+//! exact file), and the surplus used to stay claimed with nothing pointing
+//! at it. `v6::Map::unclaim` now releases those pages before the write
+//! returns. `wccmp002_update_cost_today` below asserts the write succeeds in
+//! both build profiles now, not just `--release`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
@@ -253,11 +260,10 @@ fn small_v6_fixed_update_cost_today() {
 /// ```
 ///
 /// for the OFF (no-verification) baseline, and the same command without
-/// `--release` for the ON one -- which, today, does not produce a clean
-/// number at all: see this file's own module doc, "A defect this
-/// measurement found". `--release` succeeds and reports real numbers; a
-/// plain debug build fails with `verify::written`'s own diagnostic, which is
-/// itself part of what Task 2 is reporting.
+/// `--release` for the ON one. Both now produce a clean number: see this
+/// file's own module doc, "A defect this measurement found" -- Task 2 found
+/// the ON run corrupting the file outright, and Task 3b fixed it, so this
+/// assertion is now a regression guard rather than a documented failure.
 #[test]
 #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
 fn wccmp002_update_cost_today() {

@@ -2676,11 +2676,6 @@ impl<M: Mem> Block<M> {
             // key's number the way every v6 child pointer is. `existing` covers
             // the nodes the tree already had; anything beyond that is a node
             // this rebuild added and needs an allocation-table slot of its own.
-            //
-            // A tree that *shrank* leaves its surplus pages claimed and
-            // unreferenced, exactly as v5's `Block::reindex` does -- reclaiming
-            // them needs the v6 free-list representation `records::walk_v6`'s
-            // doc comment still lists as unestablished.
             let mut numbers: Vec<u32> = rebuilt
                 .existing
                 .iter()
@@ -2692,6 +2687,35 @@ impl<M: Mem> Block<M> {
                     .map_err(|why| format!("claiming an index page: {why}"))?;
                 map_is_stale = true;
                 numbers.push(Self::v6_decorate(logical, rebuilt.tag));
+            }
+
+            // A tree that *shrank* no longer needs every page `existing`
+            // named -- this crate packs a fresh rebuild denser than genuine
+            // Btrieve 6.15 ever wrote (measured 50-77% full,
+            // `v6::Map`'s own module doc), so an ordinary insert or update
+            // can leave a key's tree smaller than it was. `number_pages`
+            // below only consumes the first `rebuilt.index.nodes.len()`
+            // entries of `numbers`; anything past that must be released
+            // here, or the allocation table keeps a claim on a page no
+            // key's walk reaches any more -- exactly what `read::file`
+            // refuses as "claimed but attributed to no key's B-tree".
+            // Measured, not assumed: a real `IDXPROBE.DAT` insert shrinks
+            // *both* of its keys' trees (6 nodes to 4), and a real
+            // `WCCMP002.DAT` update shrinks its one key's tree (208 nodes to
+            // 106) -- one mechanism, not two (`task-3b-report.md`'s
+            // census). `v6::Map::unclaim` only forgets the claim; the
+            // abandoned physical page is left as ordinary litter, the same
+            // shape `v6::Map::relocate`'s own doc comment already
+            // establishes for a page a move leaves behind.
+            for decorated in numbers.split_off(rebuilt.index.nodes.len()) {
+                let logical = decorated & pages::fcr::ROOT_PAGE;
+                v6::Map::unclaim(file, page_size, logical).map_err(|why| {
+                    format!(
+                        "releasing logical page {logical}, which the rebuilt tree \
+                         no longer needs: {why}"
+                    )
+                })?;
+                map_is_stale = true;
             }
 
             let placed = pages::number_pages(&rebuilt.index, &numbers)?;
@@ -6382,7 +6406,7 @@ mod tests {
     /// [`crate::verify::written`] accepts.
     ///
     /// This is the baseline
-    /// [`verify_writes_catches_a_real_defect_in_multi_key_v6_reindex`] is
+    /// [`a_shrinking_multi_key_v6_reindex_releases_its_surplus_pages`] is
     /// contrasted against: `verify_writes` does not fail a write that is
     /// actually sound.
     #[test]
@@ -6409,35 +6433,31 @@ mod tests {
         assert_eq!(crate::verify::written(&path), Ok(()));
     }
 
-    /// **The real defect this task's Step 5 asked for -- found, not forced.**
+    /// **A multi-key v6 tree that shrinks on rebuild no longer leaks a
+    /// claimed page.**
     ///
-    /// No bug had to be reintroduced: wiring `verify_writes` into a real
-    /// `Block` and pointing it at the smallest committed multi-key v6
-    /// fixture this crate has (`IDXPROBE.DAT`, 2 keys, 120 records) and
-    /// calling a single ordinary `insert` was enough. `IDXPROBE.DAT` itself
-    /// round-trips byte-identically before this test touches it
-    /// (`roundtrip.rs`'s corpus sweep does not cover `tests/data/`, but the
-    /// same `read::file`/`emit::file` pair agrees on it directly). After one
-    /// insert, `read::file` refuses the result outright: physical page 12
-    /// (logical 2) is still claimed by the v6 allocation table, but no
-    /// key's B-tree walk reaches it any more and its tag is neither
-    /// `TAG_ACS`, `TAG_DATA`, nor `TAG_VARIABLE` -- exactly the "claimed but
-    /// unreachable" shape `read::file`'s own doc comment says it refuses
-    /// rather than guesses at.
+    /// Formerly `verify_writes_catches_a_real_defect_in_multi_key_v6_reindex`,
+    /// which asserted the opposite of what this now checks -- a defect this
+    /// test itself once demonstrated has since been fixed
+    /// (`v6::Map::unclaim`, wired into `Block::v6_reindex`), and a test
+    /// still named "catches a real defect" would be a lie sitting in the
+    /// suite once it started asserting the defect's *absence*. Renamed to
+    /// describe the property it guards instead.
     ///
-    /// The record data this insert wrote is not lost -- the *shape* of the
-    /// engine's own write is what is at fault, not the record. Measured
-    /// separately (not asserted by this test): the identical operation on
-    /// this crate's two committed *single*-key v6 fixtures (`V6DUP.DAT`,
-    /// `V6VAR.DAT`) round-trips cleanly, so this is specific to `v6_reindex`
-    /// rebuilding a **second** key's tree, not a defect in v6 writing
-    /// generally. Fixing that is Stage C's concern (or later), not this
-    /// task's -- Task 1 only had to build the net and show it catches
-    /// something, and this is what it caught on the very first real file
-    /// it was pointed at.
+    /// The scenario is unchanged: `IDXPROBE.DAT` (2 keys, 120 records) is
+    /// the smallest committed multi-key v6 fixture this crate has, and one
+    /// ordinary `insert` on it is what originally surfaced the leak --
+    /// rebuilding both keys' trees from scratch needs only 4 nodes each
+    /// where the file's own (genuine-Btrieve-packed) trees occupy 6, and the
+    /// 2 surplus logical pages per key used to stay claimed in the
+    /// allocation table with no key's walk reaching them any more, which
+    /// `read::file` refused as "claimed but attributed to no key's B-tree".
+    /// Now `v6_reindex` releases exactly those surplus pages before it
+    /// returns, so the write -- and `verify::written` on the result -- both
+    /// succeed, in either build profile.
     #[test]
-    fn verify_writes_catches_a_real_defect_in_multi_key_v6_reindex() {
-        let dir = crate::testing::scratch("verify-writes-idxprobe-defect");
+    fn a_shrinking_multi_key_v6_reindex_releases_its_surplus_pages() {
+        let dir = crate::testing::scratch("verify-writes-idxprobe-shrink");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/IDXPROBE.DAT");
         let path = dir.join("IDXPROBE.DAT");
         std::fs::copy(&source, &path).expect("the fixture copies into scratch");
@@ -6454,43 +6474,167 @@ mod tests {
         let mut record = vec![0u8; reclen];
         record[..4].copy_from_slice(&999_999u32.to_le_bytes());
 
-        if cfg!(debug_assertions) {
-            // `Self::verify_write` runs in this build, so the defect
-            // surfaces exactly where a real debug-mode board would meet it:
-            // as this `insert` call's own `Err`.
-            let err = block.insert(&record).expect_err(
-                "this insert's own write is structurally unsound, and verify_writes must say \
-                 so rather than let it through",
-            );
-            assert!(
-                err.why.contains("cannot even parse back"),
-                "a file the crate cannot even read back is refused as such, distinctly from a \
-                 byte mismatch: {}",
-                err.why
-            );
-            assert!(
-                err.why.contains(
-                    "claimed by the allocation table but attributed to no key's B-tree"
-                ),
-                "names the specific structural predicate that failed, not just \"bytes differ\": {}",
-                err.why
-            );
-        } else {
-            // A `--release` build compiles `Self::verify_write`'s check
-            // out entirely (see `verify::written`'s doc comment for why),
-            // so the insert itself reports success here -- and the defect
-            // is still real, just uncaught by this build. Checking
-            // `verify::written` directly, the way `verify_writes` would
-            // have, is what still proves the defect exists in this profile.
-            block.insert(&record).expect("the write itself still succeeds in release");
-            let err = crate::verify::written(&path)
-                .expect_err("the defect is real regardless of build profile");
-            assert!(err.contains("cannot even parse back"), "{err}");
-            assert!(
-                err.contains("claimed by the allocation table but attributed to no key's B-tree"),
-                "{err}"
-            );
+        // `Self::verify_write` runs in a debug build and is compiled out in
+        // `--release` (`verify::written`'s own doc comment for why), so the
+        // insert's own success is the only assertion that holds in both
+        // profiles; the explicit `verify::written` call after it is what
+        // still proves the file is sound in `--release`, where `insert`
+        // alone would not have checked.
+        block.insert(&record).expect(
+            "a multi-key v6 tree that shrinks on rebuild must still leave a file this crate \
+             can read back",
+        );
+        assert_eq!(
+            crate::verify::written(&path),
+            Ok(()),
+            "the write must leave a file read::file accepts, independent of whether \
+             verify_writes caught anything already"
+        );
+    }
+
+    /// **Task 3b blast-radius census (throwaway, not the plan's pinned test)** --
+    /// drives one real, verified write (insert for a variable-length file,
+    /// update for a fixed-length one, both through the real `Block::insert`/
+    /// `Block::update` and real `verify::written`) against every v6 file this
+    /// box's `archive/` corpus holds, and counts how many hit the exact
+    /// "claimed by the allocation table but attributed to no key's B-tree"
+    /// refusal. Run once to answer Step 1 of the task-3b brief and left in as
+    /// `#[ignore]`d evidence rather than a scratch script that leaves nothing
+    /// behind.
+    #[test]
+    #[ignore = "drives real writes across every v6 file in archive/; slow, opt-in, needs the archive"]
+    fn task3b_v6_shrink_census() {
+        let Some(_root) = crate::corpus::root() else {
+            eprintln!("census: no archive/ on this box, nothing measured");
+            return;
+        };
+        let entries = crate::corpus::walk();
+        let mut total_v6 = 0usize;
+        let mut single_key_v6 = 0usize;
+        let mut multi_key_v6 = 0usize;
+        let mut clean_before = 0usize;
+        let mut attempted = 0usize;
+        let mut attempted_multi_key = 0usize;
+        let mut hit_defect = 0usize;
+        let mut hit_defect_single_key = 0usize;
+        let mut hit_defect_multi_key = 0usize;
+        let mut other_failure = 0usize;
+        let mut hit_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        for (n, entry) in entries.iter().enumerate() {
+            if !entry.id.generation.is_v6() {
+                continue;
+            }
+            total_v6 += 1;
+            let Ok(geometry) = Geometry::read("census", &entry.path) else {
+                continue;
+            };
+            if geometry.keys >= 2 {
+                multi_key_v6 += 1;
+            } else {
+                single_key_v6 += 1;
+            }
+
+            let dir = crate::testing::scratch(&format!("task3b-census-{n}"));
+            let name = entry
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("FILE{n}.DAT"));
+            let dest = dir.join(&name);
+            if std::fs::copy(&entry.path, &dest).is_err() {
+                continue;
+            }
+
+            // Only files that round-trip clean *before* any write touches
+            // them count -- a refusal on an already-broken fixture would be
+            // blaming this task's write for a defect the file already had.
+            if crate::verify::written(&dest).is_err() {
+                continue;
+            }
+            clean_before += 1;
+
+            let mut block = block_from_file(dest.clone(), &name);
+            block.verify_writes = true;
+
+            let result = if geometry.variable {
+                let reclen = usize::from(block.geometry.reclen);
+                if block.geometry.physical < reclen as u16 + 2 {
+                    continue;
+                }
+                let mut record = vec![0u8; reclen];
+                if reclen >= 4 {
+                    record[..4].copy_from_slice(&999_999u32.to_le_bytes());
+                }
+                block.insert(&record).map(|_| ())
+            } else {
+                let Ok(records) = block.records() else {
+                    continue;
+                };
+                if records.is_empty() {
+                    continue;
+                }
+                let rec = records.physical(0).expect("just checked non-empty").clone();
+                // Flip whichever byte does not change a non-modifiable key's
+                // value -- byte 0 lands inside a leading key field on many
+                // real files, which reports "status 10" and never reaches
+                // `v6_reindex` at all, undercounting real exposure. Try a
+                // few candidate offsets rather than always the front.
+                let candidates = [
+                    rec.bytes.len().saturating_sub(1),
+                    rec.bytes.len() / 2,
+                    rec.bytes.len().saturating_sub(2),
+                    0,
+                ];
+                let mut chosen = None;
+                for &at in &candidates {
+                    if at >= rec.bytes.len() {
+                        continue;
+                    }
+                    let mut bytes = rec.bytes.clone();
+                    bytes[at] ^= 0xff;
+                    if block.would_change_unmodifiable_key(rec.position, &bytes).ok().flatten().is_none() {
+                        chosen = Some(bytes);
+                        break;
+                    }
+                }
+                let Some(bytes) = chosen else {
+                    continue;
+                };
+                block.update(rec.position, &bytes)
+            };
+            attempted += 1;
+            if geometry.keys >= 2 {
+                attempted_multi_key += 1;
+            }
+
+            match result {
+                Ok(()) => {}
+                Err(e)
+                    if e.why.contains(
+                        "claimed by the allocation table but attributed to no key's B-tree",
+                    ) =>
+                {
+                    hit_defect += 1;
+                    hit_names.insert(name.clone());
+                    if geometry.keys >= 2 {
+                        hit_defect_multi_key += 1;
+                    } else {
+                        hit_defect_single_key += 1;
+                    }
+                }
+                Err(_) => other_failure += 1,
+            }
         }
+
+        eprintln!(
+            "TASK3B CENSUS: {total_v6} v6 corpus files ({single_key_v6} single-key, \
+             {multi_key_v6} multi-key); {clean_before} round-tripped clean before any write; \
+             {attempted} real writes attempted ({attempted_multi_key} of them multi-key); \
+             {hit_defect} hit the shrink-leak defect \
+             ({hit_defect_single_key} single-key, {hit_defect_multi_key} multi-key); \
+             {other_failure} other failures; distinct hit filenames: {hit_names:?}"
+        );
     }
 
     /// A write that relocates the same pair twice, interrupted, is still the
