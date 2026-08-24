@@ -1965,14 +1965,140 @@ impl<M: Mem> Block<M> {
         Ok((layout.position(logical, 0), head))
     }
 
+    /// Which physical page currently holds logical page `logical`, read by
+    /// formula rather than by loading the file.
+    ///
+    /// [`format::alloc::block_of`] finds which allocation-table block
+    /// answers for `logical`, and [`format::alloc::pair_position`] finds
+    /// that block's own shadow pair the same way -- the identical formula
+    /// [`v6::Map::read`] uses internally, except that function walks *every*
+    /// block in the file to build a complete lookup and this reads only the
+    /// one block a caller actually wants resolved. On `WCCMP002.DAT`
+    /// (fourteen blocks) that is two pages instead of twenty-eight, and none
+    /// of the file's other 13,579 pages are touched at all.
+    ///
+    /// This is what [`Self::v6_slot`] used to spend its whole-file read
+    /// resolving; see that function's own doc comment for why it still reads
+    /// the whole file afterward, for an unrelated reason.
+    ///
+    /// # Errors
+    ///
+    /// If either shadow page cannot be read in full (short reads past the
+    /// end of the file are refused, not silently truncated), if neither
+    /// carries the `"PP"` allocation-table magic, if one does but disagrees
+    /// about which block it is, if both do and their generations tie, if the
+    /// resolved entry's marker says never-claimed, or if the physical page it
+    /// names is the file control record's own shadow pair or past
+    /// [`Self::geometry`]'s own page count.
+    fn v6_resolve_logical(&self, logical: u32) -> Result<u32, String> {
+        let page_size = usize::from(self.geometry.page);
+        let (block, entry) = format::alloc::block_of(logical, page_size)?;
+        let (first, second) = format::alloc::pair_position(page_size, block);
+
+        let page_at = |physical: usize| -> Result<Vec<u8>, String> {
+            let page = read_at(&self.path, physical * page_size, page_size)
+                .map_err(|e| format!("{}: {e}", self.path.display()))?;
+            if page.len() != page_size {
+                return Err(format!(
+                    "physical page {physical} is only {} of {page_size} bytes \
+                     -- past the end of the file",
+                    page.len()
+                ));
+            }
+            Ok(page)
+        };
+        let first_page = page_at(first)?;
+        let second_page = page_at(second)?;
+
+        let has_magic = |page: &[u8]| page[..2] == *format::alloc::MAGIC;
+        let generation = |page: &[u8]| {
+            let at = format::alloc::at::GENERATION;
+            u16::from_le_bytes([page[at], page[at + 1]])
+        };
+        let block_index = |page: &[u8]| {
+            let at = format::alloc::at::BLOCK;
+            u16::from_le_bytes([page[at], page[at + 1]])
+        };
+
+        let candidates: Vec<(usize, &[u8])> =
+            [(first, first_page.as_slice()), (second, second_page.as_slice())]
+                .into_iter()
+                .filter(|&(_, page)| has_magic(page))
+                .collect();
+        if candidates.is_empty() {
+            return Err(format!(
+                "neither physical page {first} nor {second} carries the \"PP\" \
+                 allocation-table magic -- there is no block {block} where this \
+                 logical id's own arithmetic says one must be"
+            ));
+        }
+        for &(page_number, page) in &candidates {
+            let stored = block_index(page);
+            if usize::from(stored) != block {
+                return Err(format!(
+                    "physical page {page_number} is where allocation-table \
+                     block {block} lives, but it calls itself block {stored}"
+                ));
+            }
+        }
+
+        let top_generation = candidates.iter().map(|&(_, page)| generation(page)).max().unwrap_or(0);
+        let live: Vec<&[u8]> = candidates
+            .iter()
+            .filter(|&&(_, page)| generation(page) == top_generation)
+            .map(|&(_, page)| page)
+            .collect();
+        if live.len() > 1 {
+            return Err(format!(
+                "allocation-table block {block} has {} copies all claiming \
+                 generation {top_generation}, and there is no rule measured \
+                 for choosing between them",
+                live.len()
+            ));
+        }
+        let live = live[0];
+
+        let at = format::alloc::at::ENTRIES + entry * format::alloc::ENTRY_WIDTH;
+        let marker = u16::from_le_bytes([live[at], live[at + 1]]);
+        let claimed_page = u16::from_le_bytes([live[at + 2], live[at + 3]]);
+
+        if marker >> 8 == 0 {
+            return Err(format!(
+                "the allocation table claims no physical page for logical page \
+                 {logical}, which is where its record's position says it is"
+            ));
+        }
+        if claimed_page <= 1 {
+            return Err(format!(
+                "allocation-table block {block} claims physical page \
+                 {claimed_page}, which is the file control record's own \
+                 shadow pair and cannot hold a logical page"
+            ));
+        }
+        if u32::from(claimed_page) >= self.geometry.pages {
+            return Err(format!(
+                "allocation-table block {block} claims physical page \
+                 {claimed_page}, and the file has only {} pages",
+                self.geometry.pages
+            ));
+        }
+
+        Ok(u32::from(claimed_page))
+    }
+
     /// A v6 record's page, and where its slot starts inside that page.
     ///
     /// The four quantities every v6 write below needs and none of them should
     /// re-derive: the record's logical page, the physical page currently
     /// holding it, the slot's byte offset within a page, and the whole file
-    /// read into memory (every v6 write is
-    /// read-modify-append-elsewhere-and-flip-the-shadow-pair, never an
-    /// in-place edit, so all of them start by reading the whole file anyway).
+    /// read into memory. The first three are resolved by
+    /// [`Self::v6_resolve_logical`] and pure arithmetic, without loading the
+    /// file -- see that function's own doc comment. The whole file is still
+    /// read here, but for a different reason than locating this one slot:
+    /// every v6 *write* is read-modify-append-elsewhere-and-flip-the-shadow-
+    /// pair, never an in-place edit, so [`Self::update_v6`] and
+    /// [`Self::delete_v6`] need the whole buffer regardless of how cheaply
+    /// this function found the one slot they asked about.
     ///
     /// # Errors
     ///
@@ -1980,19 +2106,13 @@ impl<M: Mem> Block<M> {
     /// allocation table cannot be resolved or does not claim the record's
     /// logical page, or the page it names lies past the end of the file.
     fn v6_slot(&self, position: u32, layout: pages::Layout) -> Result<V6Slot, String> {
-        let file = std::fs::read(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
-
         let (logical, slot) = layout.slot_of(position).ok_or_else(|| {
             format!("position {position} is not on a slot boundary of this file's layout")
         })?;
 
-        let map = v6::Map::read(&file, self.geometry.page)?;
-        let physical = map.physical(logical).ok_or_else(|| {
-            format!(
-                "the allocation table claims no physical page for logical page \
-                 {logical}, which is where position {position} says its record is"
-            )
-        })?;
+        let physical = self.v6_resolve_logical(logical)?;
+
+        let file = std::fs::read(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
 
         let page_size = usize::from(self.geometry.page);
         let at = page_size * physical as usize;
@@ -6930,6 +7050,84 @@ mod tests {
         assert!(
             map_reads < 20,
             "the allocation table was walked {map_reads} times for one update"
+        );
+    }
+
+    /// Task 4 of the incremental-updates plan: locating a v6 record's
+    /// physical page must read a small, fixed number of pages, never the
+    /// whole file.
+    ///
+    /// `v6_slot` used to spend one `std::fs::read(&self.path)` -- the entire
+    /// 55,734,272-byte `WCCMP002.DAT` -- resolving a single logical id.
+    /// `Self::v6_resolve_logical` is the fix: it reads only the one
+    /// allocation-table block that answers for the logical id in question
+    /// (two pages, found by [`format::alloc::block_of`] and
+    /// [`format::alloc::pair_position`], never a scan), and nothing else.
+    /// This calls it directly -- the same private function `v6_slot` itself
+    /// calls, not a reimplementation -- so a regression that put the
+    /// whole-file read back would fail this test even if every other
+    /// assertion in this file kept passing.
+    ///
+    /// Bounded at eight pages rather than exactly two: generous enough that a
+    /// small, deliberate change to how many blocks get consulted would not
+    /// make this flap, tight enough that a whole-file read (13,607 pages on
+    /// this file) cannot sneak through unnoticed.
+    ///
+    /// Ignored: needs a real `WCCMP002.DAT`, named by `$WCCMP002`.
+    #[test]
+    #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+    fn locating_a_v6_slot_reads_pages_not_the_file() {
+        let Ok(source) = std::env::var("WCCMP002") else {
+            eprintln!("set WCCMP002=/path/to/WCCMP002.DAT to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v6-locate-io-cost");
+        let path = dir.join("WCCMP002.DAT");
+        std::fs::copy(&source, &path).expect("the file copies into scratch");
+        let file_len = std::fs::metadata(&path).expect("metadata").len();
+
+        let io = || -> u64 {
+            let text = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+            text.lines()
+                .find_map(|l| l.strip_prefix("rchar:"))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+
+        let mut block = block_from_file(path, "WCCMP002.DAT");
+        assert_eq!(block.geometry.version, Version::V6);
+        let page = u64::from(block.geometry.page);
+
+        let position = block
+            .records()
+            .expect("the records read")
+            .physical(0)
+            .expect("a first record")
+            .position;
+        let layout = pages::Layout {
+            page: block.geometry.page,
+            physical: block.geometry.physical,
+            pages: block.geometry.pages,
+        };
+        let (logical, _slot) = layout.slot_of(position).expect("a slot-aligned position");
+
+        let before = io();
+        let physical = block.v6_resolve_logical(logical).expect("the logical page resolves");
+        let after = io();
+        let read = after - before;
+
+        eprintln!(
+            "locating logical page {logical} (-> physical {physical}) in a {} MB file read \
+             {read} bytes ({} pages of {page})",
+            file_len / 1_048_576,
+            read / page.max(1)
+        );
+
+        assert!(
+            read <= 8 * page,
+            "locating one slot read {read} bytes of a {page}-byte page -- expected a small \
+             multiple of the page size, not something that scales with the file's \
+             {file_len} bytes"
         );
     }
 
