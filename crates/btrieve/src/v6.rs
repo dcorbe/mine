@@ -809,53 +809,6 @@ impl Map {
         Ok(Self { physical })
     }
 
-    /// Claim a new logical page in block 1's allocation table, appending a
-    /// fresh physical page to hold it.
-    ///
-    /// Task 13 of `docs/plans/2026-08-15-host-api-surface-track-b.md`, Step 1
-    /// (allocation-table maintenance) folded together with enough of Steps 2
-    /// and 3 (shadow-copy flipping, generation bumping) to make Step 1
-    /// testable at all: block 1's own two copies are shadowed exactly like
-    /// the file control record's, so even the *first* entry this adds has
-    /// nowhere honest to land except "write the stale copy, then make it
-    /// live" -- there is no unshadowed place to put it.
-    ///
-    /// `content` is a whole `page_size`-byte page, header included; the
-    /// first six bytes ([`super::pages::HEADER`]) are overwritten with the
-    /// new page's own tag and logical id before anything is written, so a
-    /// caller only has to prepare the record bytes that follow.
-    ///
-    /// Returns the new page's logical id.
-    ///
-    /// # Scope, stated rather than silently assumed
-    ///
-    /// **Single block only.** A file with more than one `"PP"` block is
-    /// refused: growing a *second* block is a distinct, harder mechanism
-    /// (Evidence 5 -- where a new block's physical pages live is not
-    /// established even for reading) and this claims none of that ground.
-    /// A block whose regular entry array is already full (every one of
-    /// `(page_size - 0x0c) / 4` entries claimed) is refused for the same
-    /// reason -- growing past one block's capacity is exactly that
-    /// mechanism.
-    ///
-    /// **Always appends; never reuses a freed page.** v6's free-list
-    /// representation is not established (Evidence 5, `records::walk_v6`'s
-    /// own doc comment) -- reusing a page this code cannot prove is
-    /// genuinely free would be inventing an answer, which the plan's Global
-    /// Constraints forbid. Appending costs space a real engine might not
-    /// spend, and nothing here claims otherwise.
-    ///
-    /// **The new logical id is the first free slot's own position**,
-    /// because a slot's position within its block *is* the id it answers for
-    /// (`W32MKDE_decompiled.c:14276-14278`). There is no id to pick: filling
-    /// slot `n` claims logical `n + 1` and nothing else can.
-    ///
-    /// # Errors
-    ///
-    /// If more than one `"PP"` block exists, if block 1's two copies are not
-    /// at physical 2 and 3, if their generations tie, if the regular entry
-    /// array is already full, or if `content` is not exactly `page_size`
-    /// bytes.
     /// How many regular entries one allocation-table block holds.
     ///
     /// One number, one place. Both write paths and [`Self::read`] agree on it
@@ -1020,6 +973,56 @@ impl Map {
         }
     }
 
+    /// Claim a new logical page in the first allocation-table block that has
+    /// a free entry, appending a fresh physical page to hold it.
+    ///
+    /// Task 13 of `docs/plans/2026-08-15-host-api-surface-track-b.md`, Step 1
+    /// (allocation-table maintenance) folded together with enough of Steps 2
+    /// and 3 (shadow-copy flipping, generation bumping) to make Step 1
+    /// testable at all: every block's own two copies are shadowed exactly
+    /// like the file control record's, so even the *first* entry this adds
+    /// has nowhere honest to land except "write the stale copy, then make it
+    /// live" -- there is no unshadowed place to put it.
+    ///
+    /// `content` is a whole `page_size`-byte page, header included; the
+    /// first six bytes ([`super::pages::HEADER`]) are overwritten with the
+    /// new page's own tag and logical id before anything is written, so a
+    /// caller only has to prepare the record bytes that follow.
+    ///
+    /// Returns the new page's logical id.
+    ///
+    /// # Scope, stated rather than silently assumed
+    ///
+    /// **Every existing block is scanned, in order, for the first free
+    /// entry** -- see the loop's own doc comment below for why this is a
+    /// linear scan bounded by block count rather than page count, and why
+    /// it stops at the first block whose pair is missing rather than at
+    /// block 1. **Growing a *new* block is still refused** if every
+    /// existing one is full: that is a distinct, harder mechanism (Evidence
+    /// 5 -- where a new block's physical pages live is not established even
+    /// for reading) and this claims none of that ground. An earlier version
+    /// of this doc comment described this function as single-block-only;
+    /// that stopped being true once the scan below was written to walk
+    /// every block, and the doc was left describing the function it
+    /// replaced.
+    ///
+    /// **Always appends; never reuses a freed page.** v6's free-list
+    /// representation is not established (Evidence 5, `records::walk_v6`'s
+    /// own doc comment) -- reusing a page this code cannot prove is
+    /// genuinely free would be inventing an answer, which the plan's Global
+    /// Constraints forbid. Appending costs space a real engine might not
+    /// spend, and nothing here claims otherwise.
+    ///
+    /// **The new logical id is the first free slot's own position**,
+    /// because a slot's position within its block *is* the id it answers for
+    /// (`W32MKDE_decompiled.c:14276-14278`). There is no id to pick: filling
+    /// slot `n` claims logical `n + 1` and nothing else can.
+    ///
+    /// # Errors
+    ///
+    /// If no allocation-table block exists at all, if every existing
+    /// block's regular entry array is already full, or if `content` is not
+    /// exactly `page_size` bytes.
     pub(crate) fn claim(
         store: &mut Store,
         page_size: u16,
@@ -1238,21 +1241,30 @@ impl Map {
     /// re-deriving it from `content` would be trusting the very value this
     /// function's caller is responsible for getting right.
     ///
-    /// # Scope, the same boundary [`Self::claim`] states
+    /// # Scope
     ///
-    /// **Single block only**, for the identical reason: relocating into a
-    /// second block is not established. `logical`'s own slot -- `logical - 1`
-    /// of block 1 -- must already be claimed in the live copy; a `logical`
-    /// nothing claims is refused rather than
-    /// silently claimed fresh, because that is [`Self::claim`]'s job, and a
-    /// caller that meant to call it should not be quietly redirected here.
+    /// **Every block, not only the first.** [`Self::block_of`] resolves
+    /// which block and slot `logical` names, wherever it falls, and
+    /// [`Self::pair_of`] resolves that block's own shadow pair by the same
+    /// formula [`Self::read`] uses -- there is no block-1-only shortcut
+    /// left in this function. An earlier version refused any logical id
+    /// outside block 1 outright, with the genuine board-observed refusal
+    /// `WGSERVER.EXE.dfaupdatedup refused: ... relocating a page only
+    /// handles a single-block file`;
+    /// [`a_logical_id_in_the_second_block_relocates_through_that_blocks_
+    /// pair`] is the regression test for the fix, and this doc used to
+    /// describe the refusal that test now disproves. `logical`'s own slot
+    /// must already be claimed in its block's live copy; a `logical`
+    /// nothing claims is refused rather than silently claimed fresh,
+    /// because that is [`Self::claim`]'s job, and a caller that meant to
+    /// call it should not be quietly redirected here.
     ///
     /// # Errors
     ///
-    /// If more than one `"PP"` block exists, if block 1's two copies are not
-    /// at physical 2 and 3, if their generations tie, if `content` is not
-    /// exactly `page_size` bytes, or if `logical`'s own slot is not claimed
-    /// in block 1's live copy.
+    /// If the block `logical` belongs to has no live pair, if that block's
+    /// two copies' generations tie, if `content` is not exactly
+    /// `page_size` bytes, or if `logical`'s own slot is not claimed in that
+    /// block's live copy.
     pub(crate) fn relocate(
         store: &mut Store,
         page_size: u16,
@@ -1279,11 +1291,11 @@ impl Map {
 
         // Where `logical` is claimed is not something to search for. The engine
         // derives the slot *from* the id -- slot `(logical - 1) % entries` of
-        // block `(logical - 1) / entries + 1` (`:14276-14278`) -- and this
-        // function handles only single-block files, so the slot is `logical - 1`
-        // outright. The old search read each claimed page's own header looking
-        // for a match, which is the inverted resolution `Self::read` no longer
-        // performs either.
+        // block `(logical - 1) / entries + 1` (`:14276-14278`) -- which is
+        // exactly what `Self::block_of` above just computed, whichever block
+        // that lands on. The old search read each claimed page's own header
+        // looking for a match, which is the inverted resolution `Self::read`
+        // no longer performs either.
         let at = ENTRIES + entry * ENTRY;
         let live_bytes = store.page(live)?;
         let marker = u16::from_le_bytes([live_bytes[at], live_bytes[at + 1]]);
@@ -2292,9 +2304,11 @@ mod tests {
     }
 
     /// `Map::claim`, Task 13 Step 1 of the plan (allocation-table
-    /// maintenance) -- see the function's own doc comment for scope. Not yet
-    /// wired into `Block::insert` or the oracle: this is the mechanism in
-    /// isolation, checked against this module's own reader.
+    /// maintenance) -- see the function's own doc comment for scope. Written
+    /// when `claim` had no caller yet, so this checked the mechanism in
+    /// isolation, against this module's own reader; `Block::insert_v6` and
+    /// `Block::v6_reindex` both call it now, and this test still stands
+    /// alongside them as the direct, single-call check.
     #[test]
     fn claim_adds_a_new_logical_page_and_disturbs_nothing_else() {
         let mut file = fixture("DUPKEY30.DAT");

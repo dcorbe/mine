@@ -5463,24 +5463,25 @@ mod tests {
         bytes
     }
 
-    /// Every write to a v6 file whose key permits duplicates is refused --
-    /// insert, update and delete alike -- and not one byte of it moves.
+    /// Updating a v6 file whose key permits duplicates succeeds, and an
+    /// update that moves no record between duplicate groups writes no chain
+    /// pages.
     ///
-    /// This used to assert that *all* v6 updates and deletes were refused,
-    /// which they no longer are ([`Block::update_v6`],
-    /// [`Block::delete_v6`]). What survives that change is the narrower and
-    /// more interesting claim: a duplicate-permitting key is out of scope for
-    /// all three, because the chain joining records that share a value is
-    /// written into the records themselves by [`Block::reindex`], which is
-    /// not v6-aware -- and all three now refuse it in the same place, for the
-    /// same stated reason, because they share [`Block::v6_reindex`].
-    ///
-    /// The "not one byte written" assertion is the load-bearing half. A v6
-    /// write mutates a copy of the whole file in memory and commits it with a
-    /// single `std::fs::write` at the very end, so a refusal raised anywhere
-    /// before that -- including one raised *after* the record's own page has
-    /// been relocated in the in-memory copy, which is exactly what happens
-    /// here -- must leave the file on disk exactly as it was.
+    /// **This used to assert the opposite: that every write to such a file
+    /// was refused, insert, update and delete alike.** It is not, and has
+    /// not been since duplicate chains were made v6-aware --
+    /// [`Block::v6_reindex`]/[`Block::v6_write_chains`] build them, shared
+    /// by [`Block::insert_v6`], [`Block::update_v6`] and
+    /// [`Block::delete_v6`] alike (see `insert_v6`'s own doc comment), and
+    /// none of the three refuses a duplicate-permitting key any more. This
+    /// comment said otherwise for longer than it should have: the test
+    /// body beneath it has asserted a *successful* update
+    /// (`.expect("an update off the key")`) the whole time, and its sibling
+    /// below, [`insert_extends_a_v6_duplicate_keys_chain_rather_than_
+    /// refusing`], says as much by name. What this test actually checks is
+    /// a cost bound, not a refusal: an update that does not move a record
+    /// between duplicate groups should not pay for a chain-page relocation
+    /// it did not need.
     ///
     /// The history worth keeping: until Task 5 the write path was v6-safe
     /// only by accident, because `Records::read` refused every v6 file and
@@ -5490,8 +5491,6 @@ mod tests {
     /// a **logical** page id. On `DUPKEY30.DAT` logical 2 is physical 10, so
     /// an update would have written over a different page entirely and
     /// reported success. That is what the v6 paths exist to prevent.
-    /// An update that leaves a duplicate key's groups alone writes no chain
-    /// pages.
     ///
     /// `Block::v6_write_chains` recomputes every duplicate-permitting key's
     /// `[prev][next]` pairs on every write, which is cheap, and then relocated
