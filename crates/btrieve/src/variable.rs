@@ -865,27 +865,71 @@ pub(crate) fn rewrite_fragment_in_place_v6<P: PagesMut>(
 /// - **An entry between `which` and the boundary that is already `0xffff`.**
 ///   The interior branch rebases every one of those entries by subtracting
 ///   the freed length; doing that to an already-`0xffff` entry corrupts the
-///   freed-slot sentinel rather than shifting a real offset. No corpus file
-///   exercises this -- every v6 file here is first-generation, zero real
-///   deletions (harvest 5 SS6.3) -- and neither does the oracle ladder, which
-///   never deletes twice from the same page before the fragments in between
-///   are already gone. Refused rather than guessed at a second-delete rule
-///   nothing has measured.
+///   freed-slot sentinel rather than shifting a real offset. This is the
+///   *only* shape a second delete on the same page can make unsafe -- see
+///   the next section for why a second delete that does not hit this is
+///   fine, not merely untested.
+///
+/// # A second delete on the same page: what is and is not safe
+///
+/// No corpus file exercises this (every v6 file here is first-generation,
+/// zero real deletions, harvest 5 SS6.3) and neither does the oracle ladder,
+/// which never deletes twice from the same page before the fragments in
+/// between are already gone -- so this is reasoned from the array's own
+/// invariant, the same way the trailing derivation above is, not measured.
+///
+/// **A page that already took an *interior* free is unsafe for a later
+/// delete whose rebase range reaches the resulting `0xffff`** -- refused
+/// above, and that check is history-independent: it inspects the entries a
+/// delete is about to rebase, not how many prior deletes produced them, so
+/// it catches this whether it is the second delete on the page or the
+/// fifth.
+///
+/// **A page that already took a *trailing* free is safe for another
+/// delete, and this is not merely unrefused -- it is provably so.** The
+/// trailing branch leaves no `0xffff` anywhere: it only decrements the
+/// count, so the resulting page is byte-for-byte the shape a page that had
+/// always held that many fragments would be (see the trailing derivation
+/// above: entry `which`'s address becomes the new boundary's address
+/// verbatim). Nothing downstream -- `fragment()`, this function's own
+/// checks, a later `Chain::follow` -- can tell the two apart, because there
+/// is no bit anywhere that distinguishes "always had N fragments" from
+/// "had more, now has N." A later delete against such a page runs the
+/// identical code a first delete against a virgin N-fragment page would,
+/// and cannot behave differently. Exercised directly by
+/// [`tests::a_second_delete_after_a_trailing_free_is_not_a_special_case`],
+/// which frees, then frees again, and checks the resulting bytes rather
+/// than only that the call succeeded.
 ///
 /// # What is written
 ///
 /// Interior: the content between the freed fragment and the old boundary
 /// shifts down over it (`copy_within`), every entry from `which + 1` through
 /// the boundary is rebased down by the freed length, and entry `which`
-/// itself becomes `0xffff`. Trailing: only the fragment count, by one. The
-/// header, the free chain and every fragment before `which` are read and
-/// never written.
+/// itself becomes `0xffff`. Trailing: only the fragment count, by one.
+/// Either way, if the page was off the write-side free-space chain and now
+/// has room, its own [`FREE_CHAIN`] field joins it at `head` -- see "What
+/// this host also leaks" on `Block::delete_v6`, which this
+/// replaces. The header (past `FREE_CHAIN`), the free chain (when this does
+/// not rejoin it) and every fragment before `which` are read and never
+/// written.
 ///
 /// # Errors
 ///
 /// If any of the checks above fails, or the page cannot be read or written
 /// back.
-pub(crate) fn free_fragment_v6<P: PagesMut>(pages: &mut P, pointer: Pointer) -> Result<(), String> {
+///
+/// # Returns
+///
+/// The write-side free-space chain's head after this call, for the caller
+/// to write back to `pages::fcr::VARIABLE_HEAD` -- `head` unchanged unless
+/// this page just joined the chain, the same threading `Space::head` does
+/// for the insert side.
+pub(crate) fn free_fragment_v6<P: PagesMut>(
+    pages: &mut P,
+    pointer: Pointer,
+    head: Option<u32>,
+) -> Result<Option<u32>, String> {
     let page = pages.page(pointer.page)?.to_vec();
     let header = Header::read(&page, pointer.page, Version::V6)?;
 
@@ -947,7 +991,30 @@ pub(crate) fn free_fragment_v6<P: PagesMut>(pages: &mut P, pointer: Pointer) -> 
         set_entry(&mut rewritten, which, UNUSED)?;
     }
 
-    pages.write_page(pointer.page, &rewritten)
+    // Rejoin the write-side free-space chain if this page just gained real
+    // room and was not already reachable from it. The oracle's own ladder
+    // ("The chain is LIFO"): every delete that freed space on a page put
+    // that page at the *head* -- `head 4` -> `delete key 1: head 5` -> etc.
+    // A page already on the chain somewhere (`Next`/`Last`) is left exactly
+    // where it is: moving it to the head from the middle needs an unlink
+    // this host has not measured, the same restriction `Space::reoffer`
+    // already holds itself to for the symmetric insert-side case.
+    let after = Header::read(&rewritten, pointer.page, Version::V6)?;
+    let new_head = if after.free_chain == FreeChain::Off && is_roomy(&rewritten, after)? {
+        set_chain(
+            &mut rewritten,
+            match head {
+                Some(next) => FreeChain::Next(next),
+                None => FreeChain::Last,
+            },
+        );
+        Some(pointer.page)
+    } else {
+        head
+    };
+
+    pages.write_page(pointer.page, &rewritten)?;
+    Ok(new_head)
 }
 
 /// [`PagesMut`] over an actual file on disk, addressed by page number.
@@ -2403,7 +2470,7 @@ mod tests {
 
         let mut pages = Held(vec![blank(512), blank(512), blank(512), blank(512), blank(512), five]);
 
-        free_fragment_v6(&mut pages, Pointer { page: 5, fragment: 0 })
+        free_fragment_v6(&mut pages, Pointer { page: 5, fragment: 0 }, None)
             .expect("an unchained fragment on a page with siblings after it");
 
         let after = &pages.0[5];
@@ -2432,7 +2499,7 @@ mod tests {
             v
         });
 
-        free_fragment_v6(&mut pages, Pointer { page: 7, fragment: 1 })
+        free_fragment_v6(&mut pages, Pointer { page: 7, fragment: 1 }, None)
             .expect("the last of two fragments, unchained");
 
         let after = &pages.0[7];
@@ -2462,7 +2529,7 @@ mod tests {
         });
         let before = pages.0[9].clone();
 
-        let e = free_fragment_v6(&mut pages, Pointer { page: 9, fragment: 0 })
+        let e = free_fragment_v6(&mut pages, Pointer { page: 9, fragment: 0 }, None)
             .expect_err("the only fragment on its page");
         assert!(e.contains("the only one on its page"), "{e}");
         assert_eq!(pages.0[9], before, "a refused free must not touch the page");
@@ -2481,7 +2548,7 @@ mod tests {
         let mut pages = Held(vec![blank(128), blank(128), blank(128), blank(128), four]);
         let before = pages.0[4].clone();
 
-        let e = free_fragment_v6(&mut pages, Pointer { page: 4, fragment: 0 })
+        let e = free_fragment_v6(&mut pages, Pointer { page: 4, fragment: 0 }, None)
             .expect_err("fragment 0 continues onto page 3");
         assert!(e.contains("continues onto another page"), "{e}");
         assert_eq!(pages.0[4], before, "a refused free must not touch the page");
@@ -2501,10 +2568,147 @@ mod tests {
         let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), blank(256), six]);
         let before = pages.0[6].clone();
 
-        let e = free_fragment_v6(&mut pages, Pointer { page: 6, fragment: 0 })
+        let e = free_fragment_v6(&mut pages, Pointer { page: 6, fragment: 0 }, None)
             .expect_err("entry 1, between fragment 0 and the boundary, is already freed");
         assert!(e.contains("already a freed slot"), "{e}");
         assert_eq!(pages.0[6], before, "a refused free must not touch the page");
+    }
+
+    /// **The Critical review finding, made concrete.** `Self::insert_v6`
+    /// (`lib.rs`) has called [`Space::place`] for every v6 variable-length
+    /// insert since before this task -- so a page a delete gives real room
+    /// back to, but never rejoins to the chain, is permanently unreachable
+    /// to that insert path: a claimed-but-unreachable leak. This builds
+    /// exactly that page by hand (two fragments, packed until it is off the
+    /// chain -- the same shape
+    /// `a_page_that_fills_up_is_taken_off_the_free_space_chain` builds with
+    /// one), frees the trailing fragment, and checks that a `Space` seeded
+    /// with the head this returns lands its next `place` call on the same
+    /// page rather than claiming a new one.
+    #[test]
+    fn a_delete_on_a_previously_full_page_leaves_it_reachable_to_a_later_insert() {
+        let mut source = Scratch::new(512, Version::V6);
+
+        // First fragment: 200 bytes, 204 with its pointer. Leaves the page
+        // roomy, so it joins the chain.
+        let mut space = Space::new(&mut source, Version::V6, None);
+        let first = space.place(&[0xa1u8; 200]).expect("200 fits fresh");
+        let head = space.head();
+        assert_eq!(head, Some(first.page), "roomy after one fragment, offered");
+
+        // Second fragment: 270 bytes, 274 with its pointer -- 494 - (204 +
+        // 274) = 16 bytes left, under the 512 / 20 = 25 threshold. Fills the
+        // page and takes it off the chain, `reoffer`'s own unlink path.
+        let mut space = Space::new(&mut source, Version::V6, head);
+        let second = space.place(&[0xa2u8; 270]).expect("270 still fits, same page");
+        assert_eq!(second.page, first.page, "the second fragment shares the first's page");
+        assert_eq!(space.head(), None, "full now, and taken off the chain");
+        assert_eq!(source.claimed(), 1, "one page for both fragments");
+
+        let page = source.page(first.page).expect("reads");
+        let header = Header::read(page, first.page, Version::V6).expect("a header");
+        assert_eq!(header.free_chain, FreeChain::Off, "confirmed full and unreachable");
+
+        // Delete the trailing fragment. The page has real room again --
+        // 16 + 274 = 290 free of 512 -- and was off the chain, so this must
+        // rejoin it.
+        let new_head = free_fragment_v6(&mut source, second, None)
+            .expect("the trailing fragment, unchained, on a page with a sibling");
+        assert_eq!(new_head, Some(first.page), "the freed page becomes the new head");
+
+        let page = source.page(first.page).expect("reads");
+        let header = Header::read(page, first.page, Version::V6).expect("a header");
+        assert_eq!(header.free_chain, FreeChain::Last, "on the chain, and the only member");
+
+        // The property under test: a `Space` seeded with the head this
+        // delete returned reuses the page rather than claiming a fresh one.
+        let mut space = Space::new(&mut source, Version::V6, new_head);
+        let third = space.place(&[0xa3u8; 50]).expect("50 fits in the reclaimed room");
+        assert_eq!(third.page, first.page, "landed on the page the delete just freed");
+        assert_eq!(source.claimed(), 1, "no new page was needed -- the freed one was reachable");
+    }
+
+    /// A page already reachable from the chain (`Next`/`Last`) is left
+    /// exactly where it is -- moving it to the head from the middle needs an
+    /// unlink this host has not measured, `Space::reoffer`'s own restriction
+    /// for the symmetric insert-side case.
+    #[test]
+    fn a_page_already_on_the_chain_is_not_moved_when_it_is_freed_further() {
+        let mut source = Scratch::new(512, Version::V6);
+
+        let mut space = Space::new(&mut source, Version::V6, None);
+        let first = space.place(&[0xb1u8; 200]).expect("200 fits");
+        let head_after_first = space.head();
+        assert_eq!(head_after_first, Some(first.page), "roomy, on the chain");
+
+        let mut space = Space::new(&mut source, Version::V6, head_after_first);
+        let second = space.place(&[0xb2u8; 30]).expect("30 more, plenty of room left");
+        let head = space.head();
+        assert_eq!(head, Some(first.page), "still the only page, still the head");
+
+        // Freeing the second (trailing) fragment leaves the page even
+        // roomier, but it was already `Last`, not `Off` -- nothing to rejoin.
+        let new_head = free_fragment_v6(&mut source, second, head).expect("trailing, unchained");
+        assert_eq!(new_head, head, "unchanged -- it was already reachable");
+
+        let page = source.page(first.page).expect("reads");
+        let header = Header::read(page, first.page, Version::V6).expect("a header");
+        assert_eq!(header.free_chain, FreeChain::Last, "still exactly what it was");
+    }
+
+    /// **The Important review finding, made concrete.** The interior-branch
+    /// guard only refuses rebasing across a pre-existing `0xffff`; a page
+    /// that already took a *trailing* free leaves no such marker, so a
+    /// second delete against it hits no guard at all. This proves that is
+    /// correct rather than merely unrefused: two deletes against the same
+    /// three-fragment page -- trailing, then interior on what remains --
+    /// leave exactly the bytes a single delete against the smaller page
+    /// would, checked directly rather than only asserting success.
+    #[test]
+    fn a_second_delete_after_a_trailing_free_is_not_a_special_case() {
+        let frag0 = [V6_END.as_slice(), &[0xc1u8; 40]].concat();
+        let frag1 = [V6_END.as_slice(), &[0xc2u8; 40]].concat();
+        let frag2 = [V6_END.as_slice(), &[0xc3u8; 40]].concat();
+        assert_eq!(frag0.len(), 44);
+
+        let ten = page_v6(10, 256, &[&frag0, &frag1, &frag2]);
+        let mut pages = Held({
+            let mut v = vec![blank(256); 10];
+            v.push(ten);
+            v
+        });
+
+        // First: free the trailing fragment (index 2 of 3). No `0xffff`
+        // results -- the count just drops to 2.
+        free_fragment_v6(&mut pages, Pointer { page: 10, fragment: 2 }, None)
+            .expect("the last of three, unchained");
+        assert_eq!(fragment_count(&pages.0[10]), 2, "trailing free drops the count");
+        assert_eq!(entry(&pages.0[10], 0), Ok(FIRST_FRAGMENT));
+        assert_eq!(entry(&pages.0[10], 1), Ok(FIRST_FRAGMENT + frag0.len() as u32));
+
+        // Second: free fragment 0, now interior (fragment 1 still follows
+        // it) on a page that has already had one delete. Nothing refuses
+        // this, and the result below is checked against what a page that
+        // *always* held exactly two fragments would produce.
+        free_fragment_v6(&mut pages, Pointer { page: 10, fragment: 0 }, None)
+            .expect("fragment 0 is interior now that fragment 2 is gone");
+
+        let after = &pages.0[10];
+        assert_eq!(fragment_count(after), 2, "interior free leaves the count alone");
+        assert_eq!(entry(after, 0), Ok(UNUSED), "the freed entry, in place");
+        assert_eq!(entry(after, 1), Ok(FIRST_FRAGMENT), "fragment 1 shifted down to close the gap");
+        assert_eq!(
+            entry(after, 2),
+            Ok(FIRST_FRAGMENT + frag1.len() as u32),
+            "the boundary, rebased by fragment 0's length"
+        );
+        assert_eq!(
+            &after[FIRST_FRAGMENT as usize..FIRST_FRAGMENT as usize + frag1.len()],
+            frag1.as_slice(),
+            "fragment 1's own bytes, shifted down -- exactly what a two-fragment page's \
+             own first delete would produce, because nothing distinguishes this page from \
+             one that always held two fragments"
+        );
     }
 
     /// [`FilePages`] is what a real `Block::update` runs against -- every

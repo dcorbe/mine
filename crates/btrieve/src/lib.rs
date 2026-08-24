@@ -2327,18 +2327,27 @@ impl<M: Mem> Block<M> {
     /// here rather than quietly tolerated because the two halves *ought* to be
     /// one mechanism. Making insert pop the head is the next piece of work.
     ///
-    /// # What this host also leaks: a freed fragment page never rejoins the
-    /// write-side free-space chain
+    /// # A freed fragment page rejoins the write-side free-space chain
     ///
-    /// [`variable::free_fragment_v6`] reclaims the space *within* the
-    /// fragment page's own entry array, but this function does not thread
-    /// that page onto the write-side free-space chain at `pages::fcr::
-    /// VARIABLE_HEAD` (`write_fcr`'s `None` below, unchanged from before this
-    /// task) the way `variable::Space::reoffer` does for v5 inserts. This is
-    /// not a regression: v6 write-side allocation is refused entirely today
-    /// (no v6 insert consults that chain), so there is nothing yet that
-    /// would read the link this would add. Wiring it is future work, once a
-    /// v6 variable-length insert exists to consume it.
+    /// **Corrected during review**: an earlier version of this comment
+    /// claimed rejoining the chain was safe to defer because "no v6 insert
+    /// consults it." That was false -- `Self::insert_v6` has called
+    /// [`variable::head_of`] and [`variable::Space::place`] for every v6
+    /// variable-length insert since before this task
+    /// (`insert_writes_a_variable_length_record_into_a_file_the_engine_made`).
+    /// Deferring the rejoin would have made a page `free_fragment_v6` just
+    /// gave real room to permanently unreachable to that exact insert path
+    /// -- a claimed-but-unreachable leak of the same class Task 3b already
+    /// fixed once for index pages, this time for fragment pages.
+    ///
+    /// [`variable::free_fragment_v6`] now threads the chain's head the same
+    /// way [`Self::insert_v6`] does (`was`/`now`): read
+    /// [`variable::head_of`] off the live file control record before the
+    /// free, pass it in, and write back whatever comes out through
+    /// `write_fcr`'s `variable_head` (doubly optional, same as insert's own
+    /// call). A page already reachable from the chain is left exactly where
+    /// it is -- see the function's own doc comment for why moving it is out
+    /// of scope, the same restriction `Space::reoffer` holds itself to.
     ///
     /// # Errors
     ///
@@ -2378,6 +2387,15 @@ impl<M: Mem> Block<M> {
         // pre-write pointer, before a byte of the slot itself is touched --
         // see this function's own doc comment for why. `Self::v6_slot`'s
         // `within` already accounts for the marker.
+        //
+        // `variable_head` threads the write-side free-space chain's head
+        // exactly the way `Self::insert_v6` threads it (`was`/`now` there):
+        // `None` here means "this delete never touched the chain" (a fixed-
+        // length file, or nothing to rejoin), and
+        // `Some(new_head)` -- even when `new_head == was` -- says "checked,
+        // write it back," matching `v6::write_fcr`'s own doubly-optional
+        // contract for this field.
+        let mut variable_head: Option<Option<u32>> = None;
         if self.geometry.variable {
             let reclen = usize::from(self.geometry.reclen);
             let pre_write = store.page(physical as usize).map_err(&fail)?.to_vec();
@@ -2388,8 +2406,10 @@ impl<M: Mem> Block<M> {
                 pre_write[pointer_at + 2],
                 pre_write[pointer_at + 3],
             ]);
+            let was = variable::head_of(&fcr);
             let mut fragments = variable::V6Pages::new(&mut store, page_size).map_err(&fail)?;
-            variable::free_fragment_v6(&mut fragments, pointer).map_err(&fail)?;
+            let now = variable::free_fragment_v6(&mut fragments, pointer, was).map_err(&fail)?;
+            variable_head = Some(now);
         }
 
         let mut content = store.page(physical as usize).map_err(&fail)?.to_vec();
@@ -2418,8 +2438,7 @@ impl<M: Mem> Block<M> {
             total_records,
             &key_record_counts,
             Some(position),
-            // A delete does not yet touch the variable free-space chain.
-            None,
+            variable_head,
         )
         .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
