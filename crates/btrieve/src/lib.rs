@@ -3727,6 +3727,34 @@ impl<M: Mem> Block<M> {
                 return Ok((None, free_head));
             }
 
+            // Every recorded underflow crosses at exactly `half_entries - 1`,
+            // the first-crossing value (split rules §5's own citation); a
+            // node found already deeper than that -- more than one entry
+            // below `half_entries` -- was never measured, "sub-half_entries
+            // underflow depth paired with a large donor" in the rules doc's
+            // own "out of scope" list. This engine's own writes never
+            // produce that shape (every merge/redistribute here lands
+            // exactly at the first crossing too), but a file this engine did
+            // not build -- a foreign real-Btrieve file, which owes this
+            // engine's own invariants nothing -- can arrive already in it,
+            // and extrapolating the redistribute/merge predicate onto a
+            // depth nothing observed would be exactly the guess this task's
+            // rulings forbid.
+            let first_crossing = half_entries.saturating_sub(1);
+            if cur_entries.len() < first_crossing {
+                return Err(fail(format!(
+                    "key {}: this node has {} entries, more than one below \
+                     half_entries ({half_entries}) -- every recorded underflow \
+                     crossed at exactly half_entries - 1 ({first_crossing}), and \
+                     a deeper one was never measured (docs/2026-08-25-btree-\
+                     split-rules.md's own 'out of scope' list) -- refusing \
+                     rather than guessing at the redistribute/merge predicate \
+                     for a depth nothing observed",
+                    key.number,
+                    cur_entries.len()
+                )));
+            }
+
             let parent_level = level - 1;
             let child_idx = located.path[parent_level].descended_via;
             let mut parent_entries =
@@ -8889,6 +8917,94 @@ mod tests {
         assert!(
             map_reads < 20,
             "the allocation table was walked {map_reads} times for one insert"
+        );
+    }
+
+    /// Task 6's own retire/reclaim cycle, driven entirely through
+    /// `Block::insert`/`Block::delete` -- not the oracle replay's own
+    /// fixtures -- ends with no net growth in the file: retiring a page (a
+    /// merge) and later reclaiming it (a split needing a fresh left id)
+    /// nets to zero pages, the whole point of threading the B-tree free
+    /// list at all rather than growing the file on every split.
+    ///
+    /// `V6EMPTY1KEY.DAT`'s key is 4 bytes, unique, on a 512-byte page --
+    /// `Shape::capacity` gives it the identical `max_entries = 41` the
+    /// split rules doc's own `append512u` fixtures measure, asserted here
+    /// rather than assumed, so a change to that geometry fails loudly
+    /// instead of silently changing what this test drives.
+    ///
+    /// The sequence, all ascending keys so every insert lands on the
+    /// current rightmost leaf: 64 inserts force two leaf splits, leaving
+    /// the root with 2 entries / 3 children -- deliberately more than the
+    /// 2-child, 1-entry root a single split leaves, because merging the
+    /// *middle* child's own pair of siblings must not put the root at risk
+    /// of collapsing to zero entries the way merging one of only two
+    /// children would (that scenario is `a_shrinking_v6_reindex_releases_
+    /// its_surplus_pages_on_delete`'s own subject, a refusal, not this
+    /// test's). Deleting the middle child's own lowest two entries
+    /// underflows it (21->20, no underflow; 20->19, underflows) and its
+    /// right sibling's own entries are not `> half_entries`, so §6 merges
+    /// rather than redistributes, retiring the middle child's own
+    /// (freshly-claimed, second-split) id -- the root drops from 2 to 1
+    /// entries, still healthy. Two more inserts push the merged survivor
+    /// past `max_entries` again, needing a new left id, which the split
+    /// must reclaim from the free list rather than grow the file for.
+    #[test]
+    fn a_retire_then_reclaim_cycle_through_ordinary_inserts_and_deletes_nets_no_growth() {
+        let (mut block, path) = v6_scratch("btv-v6-retire-reclaim-cycle");
+        let max_entries = block.keys[0].shape().capacity(block.geometry.page);
+        assert_eq!(max_entries, 41, "this test's own arithmetic assumes append512u's geometry");
+
+        let key_at = |n: u32| -> [u8; 4] {
+            format!("{n:04}").into_bytes().try_into().expect("4 ASCII digits")
+        };
+
+        // 64 ascending inserts: the first split lands at n=41 (root gains
+        // 1 entry, 2 children); continuing to insert onto the new
+        // rightmost leaf lands the second split at n=63 (root gains a
+        // second entry, 3 children) -- both split points established by
+        // this same arithmetic (`ceil(41/2)=21` left, 20 right) as the
+        // oracle-recorded `append512u_leaf_split` fixture, just carried
+        // one level further here.
+        let mut positions = Vec::with_capacity(64);
+        for n in 0..64u32 {
+            positions.push(block.insert(&v6_record(&key_at(n))).expect("insert"));
+        }
+
+        // The middle child (the second split's own new left leaf) holds
+        // keys 22..=42 -- its own lowest two.
+        block.delete(positions[22]).expect("first delete off the middle child (21->20, no underflow)");
+        block.delete(positions[23]).expect("second delete triggers the middle child's own merge");
+
+        let after_merge = std::fs::read(&path).expect("reads");
+        let free_head_after_merge = pages::long(
+            &v6_fcr(&block, &after_merge)[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4],
+        );
+        assert_ne!(
+            free_head_after_merge,
+            pages::NOWHERE,
+            "the merge must have retired a page onto the B-tree free list"
+        );
+        let size_with_retired_page = after_merge.len();
+
+        block.insert(&v6_record(&key_at(64))).expect("push the merged survivor to max_entries");
+        block.insert(&v6_record(&key_at(65))).expect("push it past max_entries, forcing another split");
+
+        let after_reclaim = std::fs::read(&path).expect("reads");
+        let free_head_after_reclaim = pages::long(
+            &v6_fcr(&block, &after_reclaim)[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4],
+        );
+        assert_eq!(
+            free_head_after_reclaim,
+            pages::NOWHERE,
+            "the next split needing a fresh left id must reclaim the retired page, not \
+             leave it on the free list and claim a new one instead"
+        );
+        assert_eq!(
+            after_reclaim.len(),
+            size_with_retired_page,
+            "a retire-then-reclaim cycle must not grow the file: the reclaim reused the \
+             retired page's own physical slot rather than appending a fresh one"
         );
     }
 

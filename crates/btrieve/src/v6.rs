@@ -1599,9 +1599,17 @@ impl Map {
         // The page itself keeps its physical home -- retirement is a
         // marker change, not a relocation (§8). Its own header tag flips
         // to TAG_RETIRED and its `rightmost` field (offset 8) becomes this
-        // free list's next hop.
+        // free list's next hop. The stamp still advances -- retiring is a
+        // rewrite of this logical id's live copy like any other (§10:
+        // "+1 every time that logical id's live copy is rewritten"), and
+        // is measured to on a genuine retire: `underflow-lifecycle-4096`'s
+        // own recording shows the retired copy's stamp one past what the
+        // pre-retirement page held.
         let mut content = store.page(claimed_physical)?.to_vec();
+        let stamp_at = super::format::page::v6::at::STAMP;
+        let stamp = u16::from_le_bytes([content[stamp_at], content[stamp_at + 1]]).wrapping_add(1);
         content[0..2].copy_from_slice(&retired_tag.to_le_bytes());
+        content[stamp_at..stamp_at + 2].copy_from_slice(&stamp.to_le_bytes());
         content[8..12].copy_from_slice(&super::pages::to_long(next));
         store.write_page(claimed_physical, &content)?;
 
