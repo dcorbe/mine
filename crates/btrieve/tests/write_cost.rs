@@ -395,6 +395,86 @@ fn measure_second_update(label: &str, path: &Path) -> Cost {
     }
 }
 
+/// Same shape as [`measure_second_update`], but the second update touches
+/// a *different* record than the first, rather than the same one twice.
+/// Named directly by Task 3's own review (Important 4): this is the case
+/// this file's own bounds do not, and are not claimed to, speed up.
+/// `v6::Map::read`'s bounded allocation-table walk and `v6::Map::relocate`'s
+/// twin search both read their own header bytes fresh off disk every
+/// single operation -- uncached across operations by design, see
+/// [`wccmp002_update_cost_today`]'s own comment on its `page_fetches`
+/// bound for why. Measured here, not bounded: this task did not change
+/// that cost, so there is no claim for an assertion to protect -- only
+/// visibility into what remains, deferred to Task 6's write-path rebuild.
+///
+/// # Panics
+///
+/// Same as [`measure_one_update`], plus if `path` has fewer than two
+/// records.
+fn measure_second_update_different_record(label: &str, path: &Path) -> Cost {
+    let mut mem = FlatMem::new(64 * 1024);
+    let mut heap = FlatHeap::new(0x100);
+    let mut btrieve = Btrieve::<Flat>::default();
+
+    let geometry = Geometry::read(label, path).unwrap_or_else(|e| panic!("{label}: {e}"));
+    let maxlen = geometry.reclen;
+    let at = btrieve
+        .open(&mut mem, &mut heap, label, path, geometry, maxlen)
+        .unwrap_or_else(|e| panic!("{label}: open: {e}"));
+
+    let (first, second) = {
+        let block = btrieve.block_mut(at).expect("just opened");
+        let records = block.records().unwrap_or_else(|e| panic!("{label}: records: {e}"));
+        assert!(records.len() >= 2, "{label}: this measurement needs at least two records");
+        // Halfway through the file, not the adjacent index-1 record: two
+        // records next to each other in logical order almost always share
+        // the same allocation-table block (~1,022 entries per 4,096-byte
+        // block, per `format::alloc`), which the first update's own
+        // resolution already made cache-resident -- indistinguishable from
+        // the same-record case this measurement exists to contrast with.
+        // Halfway across a 13,607-page file all but guarantees a different
+        // block, one this session has not resolved yet.
+        let midpoint = records.len() / 2;
+        let first = records.physical(0).expect("index 0").clone();
+        let second = records.physical(midpoint).expect("the midpoint index").clone();
+        (first, second)
+    };
+
+    let mut first_bytes = first.bytes.clone();
+    first_bytes[0] ^= 0xff;
+    btrieve
+        .block_mut(at)
+        .expect("still open")
+        .update(first.position, &first_bytes)
+        .unwrap_or_else(|e| panic!("{label}: first update: {e}"));
+
+    let mut second_bytes = second.bytes.clone();
+    second_bytes[0] ^= 0xff;
+
+    let (r0, w0, sc0) = proc_io();
+    btrieve::testing::reset_file_opens();
+    btrieve::testing::reset_page_fetches();
+    reset_peak();
+    let start = Instant::now();
+    btrieve
+        .block_mut(at)
+        .expect("still open")
+        .update(second.position, &second_bytes)
+        .unwrap_or_else(|e| panic!("{label}: second update: {e}"));
+    let wall = start.elapsed();
+    let (r1, w1, sc1) = proc_io();
+
+    Cost {
+        rchar: r1.saturating_sub(r0),
+        wchar: w1.saturating_sub(w0),
+        syscr: sc1.saturating_sub(sc0),
+        opens: file_opens(),
+        page_fetches: btrieve::testing::page_fetches(),
+        peak: peak_growth_since_reset(),
+        wall,
+    }
+}
+
 fn report(label: &str, file_len: u64, cost: &Cost) {
     eprintln!(
         "write_cost[{label}]: file {file_len} bytes -- read {read} bytes ({syscr} read \
@@ -500,11 +580,27 @@ fn wccmp002_update_cost_today() {
     let cost = measure_one_update("WCCMP002.DAT", &big_path);
     report("WCCMP002.DAT (warm -- records() primed before the window)", big_len, &cost);
 
-    // A second update on the same open Block must resolve its pages from the
-    // cache: the allocation-table walk is paid once per open, not per op.
-    // Before this task the second update re-probes every PP pair (measured
-    // live: 97.7% of all reads). Bound: the SECOND update fetches at most
-    // the pages it newly touches -- assert page_fetches delta <= 32.
+    // A second update on the same open Block must resolve its FULL PAGES
+    // from the cache: a record's data/index pages, and whichever
+    // allocation-table page `Block::v6_resolve_logical`/`v6::Store::attach`
+    // touch in full, must not cost a fresh disk read on the next operation
+    // once an earlier one has already fetched or written them -- that is
+    // exactly what `Block::write_changed_pages`'s write-through and
+    // `v6_resolve_logical`'s own cache routing buy. Bound: the SECOND
+    // update fetches at most the full pages it newly touches -- assert
+    // page_fetches delta <= 32.
+    //
+    // What this does **not** cover, and is not claimed to: `v6::Map::read`'s
+    // bounded allocation-table walk and `v6::Map::relocate`'s twin search
+    // both read their own HEADER-only bytes (`v6::Store::header`) straight
+    // off disk every single operation, uncached across operations by
+    // design -- `v6::Store::attach`'s own doc comment explains why routing
+    // an 8-byte header check through the shared, whole-page cache would
+    // reintroduce the 55.7 MB whole-file scan Task 5 eliminated. That
+    // per-operation header cost is the "8-byte allocation-table probes...
+    // re-read up to 36x" traffic this task's own brief cites; it is not
+    // fixed here, and is deferred to Task 6's write-path rebuild, not
+    // silently dropped.
     //
     // A fresh copy, not `big_path` above: that file already carries the
     // first test's own edit, and this scenario -- two updates in one
@@ -546,6 +642,41 @@ fn wccmp002_update_cost_today() {
          second one from v6_resolve_logical falling back to its own",
         second.opens
     );
+
+    // A third bound, on `rchar` itself: neither `page_fetches` nor `opens`
+    // above catches a full `v6::Store::attach` -> `v6::Store::open`
+    // reversion at this file's own two call sites (`Block::insert_v6`,
+    // `Block::v6_slot`) -- both open exactly one handle either way
+    // (`opens` stays 1), and a reverted `Store` never touches `PageCache`
+    // at all, so `page_fetches` stays ~0 regardless (confirmed directly,
+    // not assumed -- see `docs/2026-08-24-btrieve-write-cost-baseline.md`'s
+    // own "Important 3" section for the red/green output both ways).
+    // `rchar` is what actually moves: measured 389 B with the cache wired
+    // in, reverting toward the pre-Task-3 524,678 B this same second-update
+    // scenario cost before. `65_536` (16 pages of headroom at this file's
+    // 4,096-byte page size) sits between the two with real margin either
+    // way -- large enough that ordinary variance or a future, deliberate
+    // change to how many pages a second update touches will not flap it,
+    // small enough that a full reversion (524,678 B) cannot hide under it.
+    assert!(
+        second.rchar <= 65_536,
+        "a second update on the same open Block read {} bytes -- expected at most \
+         65,536 (measured with the cache wired in: 389 B; a full Store::attach -> \
+         Store::open reversion measures 524,678 B), not something that scales back \
+         toward a fresh per-operation disk read",
+        second.rchar
+    );
+
+    // A DIFFERENT record for the second update, not the same one -- see
+    // `measure_second_update_different_record`'s own doc comment. Measured
+    // and reported, deliberately not bounded: this is the partial-fix
+    // visibility Task 3's review asked for, not a new claim.
+    let third_dir = scratch("write-cost-big-third");
+    let third_path = third_dir.join("WCCMP002.DAT");
+    std::fs::copy(&source, &third_path).unwrap_or_else(|e| panic!("copying {source}: {e}"));
+    make_keys_modifiable(&third_path);
+    let different_record = measure_second_update_different_record("WCCMP002.DAT", &third_path);
+    report("WCCMP002.DAT (second update, a DIFFERENT record)", big_len, &different_record);
 
     // `verify_writes` (debug builds only) re-reads and re-parses the whole
     // file on top of the write itself -- Task 1's own cost, not Task 5's to
