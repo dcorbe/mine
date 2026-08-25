@@ -209,9 +209,13 @@ struct Cli {
     /// above the module at startup, for QoL commands the module itself
     /// never had -- `mbbs-lua`'s own crate doc has the full seam.
     ///
-    /// **`Wg16` only.** MajorMUD is the 16-bit machine; extending scripting
-    /// to a `--module32` (LunatiX) board is a separate decision nobody has
-    /// asked for, so this flag has no effect there.
+    /// Loads on whichever machine(s) this board boots -- `Wg16`, `Wg32`, or
+    /// both, each getting its own `LuaExtension` instance. **Caution:** the
+    /// shipped scripts (`summon`, `cash`, `setexp`) were written and measured
+    /// against the 16-bit MajorMUD build -- their export names and record
+    /// offsets are not known to hold for a 32-bit module. See
+    /// `mbbs-lua`'s own crate doc and `crates/mbbs/src/extension.rs`'s module
+    /// doc for the specifics.
     ///
     /// A directory that fails to load is a startup error, not a warning: a
     /// board that silently came up without its scripts is exactly the
@@ -348,20 +352,19 @@ struct Plan {
 ///    binary has always done. Requires `--root`. This is deliberate backward
 ///    compatibility: `mbbs-server --root tmp` must keep booting MajorMUD
 ///    unchanged, so the default cannot simply be removed.
-/// 4. `--scripts` given but rules 1-3 leave no `Wg16` machine booting
-///    (a `Wg32`-only board, rule 2) -- refused. `--scripts` only ever
-///    reaches a `Wg16` machine (see its own doc comment); left unchecked,
-///    a `--module32`-only command line that also passes `--scripts` would
-///    silently come up unscriptable despite being told to script -- the
-///    same failure mode `--scripts`'s own doc names ("a board that
-///    silently came up without its scripts"), just caused one flag earlier.
+///
+/// `--scripts` has no rule of its own here: it reaches whichever machine(s)
+/// end up booting (see its own doc comment), so a `--module32`-only board
+/// with `--scripts` plans exactly as cleanly as any other -- there used to be
+/// a fourth rule refusing that combination, back when `--scripts` could only
+/// ever reach a `Wg16` machine; it no longer applies now that `LuaExtension`
+/// implements `Extension<A>` for any ABI.
 ///
 /// Every rejection is a plain, named `Err(String)` -- never a panic, and
 /// never a silent no-op the way the `if let (Some(a), Some(b))` pattern this
 /// replaced was: `--module32` without `--root32` used to fall through that
 /// `if let` and boot a `Wg16`-only board with no message at all, despite
-/// `--root32`'s own doc comment calling itself required. Rule 4 above is the
-/// same mistake shape, caught the same way.
+/// `--root32`'s own doc comment calling itself required.
 ///
 /// `MachineId(0)` for `Wg16` and `MachineId(1)` for `Wg32` are assigned here,
 /// fixed, never computed from presence: `pool.rs`'s module doc explains that
@@ -407,26 +410,6 @@ fn plan(cli: &Cli) -> Result<Plan, String> {
         None => None,
     };
 
-    if wg16.is_none() && cli.scripts.is_some() {
-        // Rule 4 (implicit in the doc list above, made explicit here):
-        // `--scripts` only ever reaches a `Wg16` machine (see its own doc
-        // comment) -- refusing this the same way `--module32` without
-        // `--root32` is refused, rather than letting a `--module32`-only
-        // board silently come up unscriptable despite being told to
-        // script. That is the same failure mode `--scripts`'s own doc
-        // comment already names: a board that silently comes up without
-        // the behaviour it was asked for, just with the mistake made one
-        // flag earlier.
-        return Err(
-            "--scripts was given but no Wg16 machine is booting -- --scripts only ever \
-             reaches a Wg16 machine (see its own doc comment), and this command line \
-             boots a Wg32-only board (--module32 with no --module). Give --module (or \
-             drop --module32) to boot a Wg16 machine, or drop --scripts for a Wg32-only \
-             board"
-                .to_string(),
-        );
-    }
-
     if wg16.is_none() && wg32.is_none() {
         // Defensive: rule 3's fallback should make this unreachable, since
         // it only yields `None` when `wg32` is `Some`.
@@ -471,8 +454,13 @@ fn build_wg32_cpu(module_path: PathBuf) -> impl Fn() -> io::Result<Wg32Cpu> + Se
 }
 
 /// Build [`Boot::extension`]'s closure for `--scripts`: load `dir` as an
-/// `mbbs_lua::LuaExtension`, boxed as the ABI-erased `Extension<Wg16>` the
-/// field expects.
+/// `mbbs_lua::LuaExtension`, boxed as the ABI-erased `Extension<A>` the field
+/// expects. Generic over `A: Abi` -- `mbbs_lua::LuaExtension` implements
+/// `Extension<A>` for any ABI (its struct carries nothing ABI-specific; see
+/// its own crate doc), so this builder can hand one to a `Wg16` machine, a
+/// `Wg32` machine, or both, each getting its own freshly-loaded `LuaExtension`
+/// -- see the call sites in `main` below and their own comments on why a
+/// dual-machine board never shares one VM between machines.
 ///
 /// A directory that fails to load names both the directory and the
 /// underlying reason -- see [`Boot::extension`]'s own doc comment for why
@@ -481,11 +469,11 @@ fn build_wg32_cpu(module_path: PathBuf) -> impl Fn() -> io::Result<Wg32Cpu> + Se
 /// `Fn`, not `FnOnce`, the same way [`build_wg32_cpu`] is: [`host::run`]'s
 /// restart loop calls this once per life, so a restarted machine gets its
 /// scripts freshly loaded rather than losing them after the first restart.
-fn build_lua_extension(dir: PathBuf) -> ExtensionBuilder<Wg16> {
+fn build_lua_extension<A: mbbs::abi::Abi + 'static>(dir: PathBuf) -> ExtensionBuilder<A> {
     Box::new(move || {
         let ext = mbbs_lua::LuaExtension::load(&dir)
             .map_err(|e| io::Error::other(format!("loading scripts from {}: {e}", dir.display())))?;
-        Ok(Box::new(ext) as Box<dyn mbbs::extension::Extension<Wg16>>)
+        Ok(Box::new(ext) as Box<dyn mbbs::extension::Extension<A>>)
     })
 }
 
@@ -585,10 +573,13 @@ async fn main() -> ExitCode {
             dispatched_total: None,
             calls_total: None,
             survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
-            // `--scripts` is `Wg16` only -- see its own doc comment. LunatiX
-            // (the 32-bit board) has no scripting story; scripting it is a
-            // separate decision nobody has asked for.
-            extension: None,
+            // Its own `LuaExtension`, built by its own closure call -- see
+            // `build_lua_extension`'s own doc comment on why a dual-machine
+            // board never shares one Lua VM between machines. What the
+            // shipped scripts (`summon`/`cash`/`setexp`) actually do against
+            // a `Wg32` module is unverified -- see `--scripts`'s own doc
+            // comment.
+            extension: cli.scripts.clone().map(build_lua_extension),
         };
         machines.push(Machine {
             id: wg32.machine,
@@ -709,9 +700,11 @@ async fn shut_down_machines(machines: &[(String, std::sync::mpsc::Sender<In>)], 
 mod tests {
     use clap::Parser;
 
+    use mbbs::abi::Wg32;
+
     use super::{
         Cli, DEFAULT_MODULE, DEFAULT_POLLS_PER_SECOND, MachineId,
-        check_module32_count, listeners, plan,
+        build_lua_extension, check_module32_count, listeners, plan,
     };
 
     fn args<'a>(v: &[&'a str]) -> Vec<&'a str> {
@@ -868,13 +861,13 @@ mod tests {
     }
 
     /// `--scripts` together with a `--module32`-only command line (no
-    /// `--module`, so no `Wg16` machine boots at all) parses cleanly at the
-    /// clap layer -- the same shape as `--module32` without `--root32`
-    /// above -- but `plan` must refuse it: `--scripts` only ever reaches a
-    /// `Wg16` machine, so honouring this command line would silently boot
-    /// a board that came up unscriptable despite being told to script.
+    /// `--module`, so no `Wg16` machine boots at all) now plans cleanly:
+    /// `LuaExtension` implements `Extension<A>` for any ABI, so `--scripts`
+    /// reaches a `Wg32`-only board exactly as it reaches a `Wg16` one. This
+    /// used to be a refusal (`--scripts` was `Wg16`-only); that guard was
+    /// removed once the Lua seam stopped being pinned to one ABI.
     #[test]
-    fn scripts_without_wg16_parses_but_plan_refuses_it() {
+    fn scripts_without_wg16_plans_cleanly_on_a_wg32_only_board() {
         let cli = Cli::try_parse_from(args(&[
             "--module32",
             "LUNATIX.EXE",
@@ -883,18 +876,28 @@ mod tests {
             "--scripts",
             "scripts",
         ]))
-        .expect("parses; --scripts needing a Wg16 machine is plan's problem, not clap's");
-        let err = plan(&cli).expect_err("plan must refuse --scripts with no Wg16 machine");
-        assert!(err.contains("--scripts"), "error should name the flag: {err}");
-        assert!(
-            err.contains("Wg16") || err.contains("16-bit"),
-            "error should say why: no Wg16 machine is booting: {err}"
-        );
+        .expect("parses");
+        let plan = plan(&cli).expect("--scripts with a Wg32-only board is now a valid plan");
+        assert!(plan.wg16.is_none(), "no --module and no default fallback: no Wg16 machine");
+        assert!(plan.wg32.is_some(), "--module32 + --root32 were given");
+    }
+
+    /// `build_lua_extension` is what `main` actually maps `--scripts` through
+    /// for a `Wg32` machine's own `Boot::extension` field -- `plan` alone
+    /// (the test above) only proves a `--module32`-only board is accepted,
+    /// not that it would actually carry a working extension. This proves the
+    /// generic builder produces a real `LuaExtension`, boxed as
+    /// `Extension<Wg32>`, from the same shipped `scripts/` directory
+    /// `mbbs-lua`'s own tests load against `Wg16`.
+    #[test]
+    fn build_lua_extension_produces_a_wg32_extension_from_the_shipped_scripts() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+        let builder = build_lua_extension::<Wg32>(dir);
+        builder().expect("the shipped scripts/ directory loads against Wg32 just as it does against Wg16");
     }
 
     /// `--scripts` together with a `Wg16` machine (the default, plain
-    /// `--root` case) parses and plans cleanly -- the refusal above is
-    /// specific to a `Wg32`-only board, not to `--scripts` itself.
+    /// `--root` case) parses and plans cleanly.
     #[test]
     fn scripts_with_wg16_present_plans_cleanly() {
         let cli =

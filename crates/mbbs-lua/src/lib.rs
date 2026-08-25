@@ -1,11 +1,27 @@
 //! The Lua side of the extension seam: loads `*.lua` scripts from a
 //! directory, lets them register `mmud.command(name, handler)` callbacks, and
-//! implements `mbbs::extension::Extension<Wg16>` by dispatching a player's
-//! line to the matching handler.
+//! implements `mbbs::extension::Extension<A>`, for any ABI, by dispatching a
+//! player's line to the matching handler.
 //!
 //! `mbbs` never depends on this crate -- see `crates/mbbs/src/extension.rs`,
 //! which is deliberately Lua-agnostic. The dependency runs one way:
 //! `mbbs-server -> mbbs-lua -> mbbs`.
+//!
+//! # `adjust_wealth`'s offsets are a 16-bit measurement, not a fact about the ABI
+//!
+//! [`Extension`] is implemented here for any `A: Abi`, but `adjust_wealth`'s
+//! grant path reads and writes the caller's copper accumulator at raw record
+//! offsets `0x613` (low word) and `0x615` (carry word) -- numbers measured
+//! against the 16-bit MajorMUD build, not derived from the `Abi` trait. Making
+//! this impl generic means it will now compile and run against a 32-bit
+//! module and apply those same numbers, which are **not known to hold**
+//! there. There is direct precedent in this repo for a record layout
+//! differing by ABI: `struct fsdfld` is 23 bytes in the 16-bit build and 36
+//! bytes in the 32-bit build of the same product (`crates/mbbs/src/fsd.rs`,
+//! `abi.rs`'s `FsdField` layout), and a shared constant of 23 let 32-bit
+//! MajorMUD overwrite the stat min/max columns. Treat `0x613`/`0x615` the
+//! same way: unverified on any ABI but `Wg16`, and due for re-measurement
+//! before a script that calls `adjust_wealth` is trusted on one.
 //!
 //! # A registered command name shadows *any* line, not just in-game input
 //!
@@ -86,7 +102,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use mbbs::Outcome;
-use mbbs::abi::{Abi, Arg, Wg16};
+use mbbs::abi::{Abi, Arg};
 use mbbs::extension::{CommandCtx, Extension, Verdict};
 use mlua::{Function, Lua, Value};
 
@@ -96,6 +112,17 @@ use mlua::{Function, Lua, Value};
 /// here runs on one thread and the whole point is that no `Send`/`Sync`
 /// bound is required.
 type Handlers = Rc<RefCell<Vec<(String, Function)>>>;
+
+// `LuaExtension` holds nothing ABI-specific -- a Lua VM, handlers, a set of
+// disabled names -- so it stays non-generic; only its `Extension<A>` impl
+// carries the type parameter. This assertion is the proof: it fails to
+// compile if that impl is ever narrowed back to `Extension<Wg16>` alone,
+// which unit tests (all of which infer `A = Wg16`) would not catch.
+const _: fn() = || {
+    fn assert_impl<A: mbbs::abi::Abi, E: Extension<A>>() {}
+    assert_impl::<mbbs::abi::Wg16, LuaExtension>();
+    assert_impl::<mbbs::abi::Wg32, LuaExtension>();
+};
 
 /// A directory of Lua scripts, loaded and ready to dispatch commands.
 pub struct LuaExtension {
@@ -205,7 +232,7 @@ fn to_verdict(value: Value) -> Verdict {
 /// message only.
 ///
 /// [`CommandCtx::call_export`]: mbbs::extension::CommandCtx::call_export
-fn expect_returned(name: &str, outcome: Outcome<Wg16>) -> mlua::Result<(u32, u32)> {
+fn expect_returned<A: Abi>(name: &str, outcome: Outcome<A>) -> mlua::Result<(u32, u32)> {
     match outcome {
         Outcome::Returned { lo, hi } => Ok((lo, hi)),
         Outcome::Stopped(poison) => Err(mlua::Error::RuntimeError(format!("{name} stopped the machine: {poison:?}"))),
@@ -241,7 +268,7 @@ fn expect_returned(name: &str, outcome: Outcome<Wg16>) -> mlua::Result<(u32, u32
 /// CP437 in, CP437 out, no re-encoding at this seam.
 ///
 /// [`CommandCtx::print`]: mbbs::extension::CommandCtx::print
-fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result<(bool, Option<&'static str>)> {
+fn summon<A: Abi>(ctx: &RefCell<&mut CommandCtx<'_, A>>, name: &[u8]) -> mlua::Result<(bool, Option<&'static str>)> {
     // A NUL inside `name` would truncate the C string the module reads at
     // that byte, silently searching for a shorter (and wrong) name instead
     // of the one the player typed -- refuse outright rather than let that
@@ -283,13 +310,13 @@ fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result
         Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Ok((false, Some("item name too long"))),
         Err(e) => return Err(mlua::Error::external(e)),
     };
-    let count_ptr = Wg16::ptr_offset(base, count_at as u16);
+    let count_ptr = A::ptr_offset(base, count_at as u16);
 
     let outcome = ctx
         .borrow_mut()
         .call_export(
             "_GET_ITEM_FROM_NAME",
-            &[Arg::Ptr(base), Arg::Ptr(Wg16::null_ptr()), Arg::Ptr(count_ptr)],
+            &[Arg::Ptr(base), Arg::Ptr(A::null_ptr()), Arg::Ptr(count_ptr)],
         )
         .map_err(mlua::Error::external)?;
     let (lo, hi) = expect_returned("_GET_ITEM_FROM_NAME", outcome)?;
@@ -298,9 +325,9 @@ fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result
     // the same order `Abi::ptr_to_bytes` writes one in.
     let mut ptr_bytes = (lo as u16).to_le_bytes().to_vec();
     ptr_bytes.extend_from_slice(&(hi as u16).to_le_bytes());
-    let item = Wg16::ptr_from_bytes(&ptr_bytes);
+    let item = A::ptr_from_bytes(&ptr_bytes);
 
-    if item == Wg16::null_ptr() {
+    if item == A::null_ptr() {
         let count_bytes = ctx.borrow().read_at(count_ptr, 2).map_err(mlua::Error::external)?;
         let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]);
         // Nonzero: several items matched and the DLL already told the
@@ -312,12 +339,18 @@ fn summon(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, name: &[u8]) -> mlua::Result
     // already pointed the global at it before this seam ever ran, so
     // reading `ctx.chan()` back is the same value a fresh memory read
     // would give, without the read.
-    let usrnum = ctx.borrow().chan().number() as u16;
+    let usrnum = A::Int::from(ctx.borrow().chan().number() as u16);
     let add_outcome = ctx
         .borrow_mut()
         .call_export(
             "_ADD_ITEM_TO_INVENTORY",
-            &[Arg::Int(usrnum), Arg::Int(0), Arg::Int(0), Arg::Int(0xfffe), Arg::Ptr(item)],
+            &[
+                Arg::Int(usrnum),
+                Arg::Int(A::Int::from(0u16)),
+                Arg::Int(A::Int::from(0u16)),
+                Arg::Int(A::Int::from(0xfffeu16)),
+                Arg::Ptr(item),
+            ],
         )
         .map_err(mlua::Error::external)?;
     // A `char` return: only the low byte (AL) is meaningful, so mask
@@ -418,14 +451,14 @@ fn add_with_carry(low: u16, carry: u16, amount: u32) -> (u16, u16) {
 /// module doc's own note on where this fires).
 ///
 /// [`CommandCtx::player_record`]: mbbs::extension::CommandCtx::player_record
-fn adjust_wealth(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua::Result<(bool, Option<&'static str>)> {
+fn adjust_wealth<A: Abi>(ctx: &RefCell<&mut CommandCtx<'_, A>>, amount: f64) -> mlua::Result<(bool, Option<&'static str>)> {
     if !amount.is_finite() || amount.fract() != 0.0 {
         return Ok((false, Some("amount must be a whole number")));
     }
 
     // `usrnum` is exactly this channel's number -- see `summon`'s own
     // comment on the same read.
-    let usrnum = ctx.borrow().chan().number() as u16;
+    let usrnum = A::Int::from(ctx.borrow().chan().number() as u16);
 
     if amount >= 0.0 {
         let Ok(copper) = u32::try_from(amount as i64) else {
@@ -441,8 +474,8 @@ fn adjust_wealth(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua:
         let Some(record) = ctx.borrow_mut().try_player_record().map_err(mlua::Error::external)? else {
             return Ok((false, Some("no character loaded on this channel")));
         };
-        let low_ptr = Wg16::ptr_offset(record, 0x613);
-        let carry_ptr = Wg16::ptr_offset(record, 0x615);
+        let low_ptr = A::ptr_offset(record, 0x613);
+        let carry_ptr = A::ptr_offset(record, 0x615);
 
         let low_bytes = ctx.borrow().read_at(low_ptr, 2).map_err(mlua::Error::external)?;
         let carry_bytes = ctx.borrow().read_at(carry_ptr, 2).map_err(mlua::Error::external)?;
@@ -468,7 +501,7 @@ fn adjust_wealth(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua:
 
         let outcome = ctx
             .borrow_mut()
-            .call_export("_ADDON_ADJUST_USER_WEALTH", &[Arg::Int(usrnum), Arg::Int(lo), Arg::Int(hi)])
+            .call_export("_ADDON_ADJUST_USER_WEALTH", &[Arg::Int(usrnum), Arg::Int(A::Int::from(lo)), Arg::Int(A::Int::from(hi))])
             .map_err(mlua::Error::external)?;
         let (lo_ret, _hi_ret) = expect_returned("_ADDON_ADJUST_USER_WEALTH", outcome)?;
 
@@ -508,7 +541,7 @@ fn adjust_wealth(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua:
 /// `amount`.
 ///
 /// [`CommandCtx::set_experience`]: mbbs::extension::CommandCtx::set_experience
-fn set_exp(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua::Result<(bool, Option<&'static str>)> {
+fn set_exp<A: Abi>(ctx: &RefCell<&mut CommandCtx<'_, A>>, amount: f64) -> mlua::Result<(bool, Option<&'static str>)> {
     if !amount.is_finite() || amount.fract() != 0.0 {
         return Ok((false, Some("amount must be a whole number")));
     }
@@ -537,8 +570,8 @@ fn set_exp(ctx: &RefCell<&mut CommandCtx<'_, Wg16>>, amount: f64) -> mlua::Resul
     Ok((true, None))
 }
 
-impl Extension<Wg16> for LuaExtension {
-    fn command(&mut self, ctx: &mut CommandCtx<'_, Wg16>) -> Verdict {
+impl<A: Abi> Extension<A> for LuaExtension {
+    fn command(&mut self, ctx: &mut CommandCtx<'_, A>) -> Verdict {
         let line = ctx.line().to_string();
         let (name, args) = split_command(&line);
 

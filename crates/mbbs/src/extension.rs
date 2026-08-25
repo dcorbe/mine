@@ -21,6 +21,23 @@
 //! Where a new command's business logic should live -- `mbbs-lua` versus a
 //! `CommandCtx` method here -- is also written down, in `mbbs-lua`'s own
 //! crate doc, not repeated here.
+//!
+//! # These record offsets are a 16-bit measurement, not a fact about the ABI
+//!
+//! `CommandCtx` is generic over `A: Abi`, but its private `get_player`'s
+//! loaded-flag check (`+0x1e`) and [`CommandCtx::set_experience`]'s three
+//! experience fields (`0x3c`/`0x3e`, `0x46f`/`0x471`, `0x46b`/`0x46d`) are
+//! raw offsets measured against the 16-bit MajorMUD player record, not
+//! derived from the `Abi` trait. Being generic means this code will now
+//! compile and run against a 32-bit module and apply those same numbers --
+//! which are **not known to hold** there. This repo already has a case of
+//! exactly that kind of number differing by ABI: `struct fsdfld` is 23
+//! bytes in the 16-bit build and 36 bytes in the 32-bit build of the same
+//! product (`crate::fsd`, `abi.rs`'s `FsdField` layout), and a shared
+//! constant of 23 let 32-bit MajorMUD overwrite the stat min/max columns.
+//! Treat every offset in this file the same way: unverified on any ABI but
+//! `Wg16`, and due for re-measurement before this seam is trusted on
+//! another one.
 
 use std::io;
 
