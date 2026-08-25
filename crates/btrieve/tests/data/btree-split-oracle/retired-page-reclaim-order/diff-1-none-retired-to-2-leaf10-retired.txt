@@ -1,0 +1,260 @@
+--- crates/btrieve/tests/data/btree-split-oracle/retired-page-reclaim-order/1-none-retired.txt	2026-08-25 16:59:33.681471487 -0400
++++ crates/btrieve/tests/data/btree-split-oracle/retired-page-reclaim-order/2-leaf10-retired.txt	2026-08-25 16:59:33.684804820 -0400
+@@ -1,23 +1,23 @@
+ len=11264 page_size=512
+-control: live_page=1 generation=155 records=150 pages=14 free_v6=0x00000780 index_free_v6=NOWHERE write_counter=154 usage_4c=1 index_alloc_4e=60 usage_52=13
+-key[0] number=0x80 root_page=7 records=150 attributes=0x0104 key_length=4 entry_size=12 max_entries=41 half_entries=20 chain=0
++control: live_page=1 generation=156 records=149 pages=14 free_v6=0x00000772 index_free_v6=0x0000000a write_counter=155 usage_4c=1 index_alloc_4e=60 usage_52=13
++key[0] number=0x80 root_page=7 records=149 attributes=0x0104 key_length=4 entry_size=12 max_entries=41 half_entries=20 chain=0
+ alloc block=1 logical=1 marker=0x8000 physical=18
+ alloc block=1 logical=2 marker=0x4400 physical=5
+-alloc block=1 logical=3 marker=0x4400 physical=4
++alloc block=1 logical=3 marker=0x4400 physical=11
+ alloc block=1 logical=4 marker=0x8000 physical=6
+ alloc block=1 logical=5 marker=0x4400 physical=8
+ alloc block=1 logical=6 marker=0x8000 physical=9
+-alloc block=1 logical=7 marker=0x8000 physical=17
+-alloc block=1 logical=8 marker=0x8000 physical=20
++alloc block=1 logical=7 marker=0x8000 physical=19
++alloc block=1 logical=8 marker=0x8000 physical=7
+ alloc block=1 logical=9 marker=0x4400 physical=12
+-alloc block=1 logical=10 marker=0x8000 physical=10
++alloc block=1 logical=10 marker=0x4500 physical=16
+ alloc block=1 logical=11 marker=0x4400 physical=15
+ alloc block=1 logical=12 marker=0x8000 physical=13
+ alloc block=1 logical=13 marker=0x8000 physical=14
+-alloc block=1 logical=14 marker=0x0000 physical=11
+-alloc block=1 logical=15 marker=0x0000 physical=16
+-alloc block=1 logical=16 marker=0x0000 physical=19
+-alloc block=1 logical=17 marker=0x0000 physical=7
++alloc block=1 logical=14 marker=0x0000 physical=4
++alloc block=1 logical=15 marker=0x0000 physical=10
++alloc block=1 logical=16 marker=0x0000 physical=17
++alloc block=1 logical=17 marker=0x0000 physical=20
+ alloc block=1 logical=18 marker=0x0000 physical=21
+ alloc block=1 logical=19 marker=0x0000 physical=22
+ alloc block=1 logical=20 marker=0x0000 physical=23
+@@ -127,43 +127,8 @@
+ alloc block=1 logical=124 marker=0x0000 physical=127
+ alloc block=1 logical=125 marker=0x0000 physical=128
+ alloc block=1 logical=126 marker=0x0000 physical=129
+-page 4 DATA tag=0x4400 logical=3 stamp=32805
+-  slot[0] LIVE marker=1 body=250000002500000000000000
+-  slot[1] LIVE marker=1 body=260000002600000000000000
+-  slot[2] LIVE marker=1 body=270000002700000000000000
+-  slot[3] LIVE marker=1 body=280000002800000000000000
+-  slot[4] LIVE marker=1 body=290000002900000000000000
+-  slot[5] LIVE marker=1 body=2a0000002a00000000000000
+-  slot[6] LIVE marker=1 body=2b0000002b00000000000000
+-  slot[7] LIVE marker=1 body=2c0000002c00000000000000
+-  slot[8] LIVE marker=1 body=2d0000002d00000000000000
+-  slot[9] LIVE marker=1 body=2e0000002e00000000000000
+-  slot[10] LIVE marker=1 body=2f0000002f00000000000000
+-  slot[11] LIVE marker=1 body=300000003000000000000000
+-  slot[12] LIVE marker=1 body=310000003100000000000000
+-  slot[13] LIVE marker=1 body=320000003200000000000000
+-  slot[14] LIVE marker=1 body=330000003300000000000000
+-  slot[15] LIVE marker=1 body=340000003400000000000000
+-  slot[16] LIVE marker=1 body=350000003500000000000000
+-  slot[17] LIVE marker=1 body=360000003600000000000000
+-  slot[18] LIVE marker=1 body=370000003700000000000000
+-  slot[19] LIVE marker=1 body=380000003800000000000000
+-  slot[20] LIVE marker=1 body=390000003900000000000000
+-  slot[21] LIVE marker=1 body=3a0000003a00000000000000
+-  slot[22] LIVE marker=1 body=3b0000003b00000000000000
+-  slot[23] LIVE marker=1 body=3c0000003c00000000000000
+-  slot[24] LIVE marker=1 body=3d0000003d00000000000000
+-  slot[25] LIVE marker=1 body=3e0000003e00000000000000
+-  slot[26] LIVE marker=1 body=3f0000003f00000000000000
+-  slot[27] FREE next=0x0000078e fill_nonzero=false
+-  slot[28] FREE next=0x00001676 fill_nonzero=false
+-  slot[29] LIVE marker=1 body=420000004200000000000000
+-  slot[30] LIVE marker=1 body=430000004300000000000000
+-  slot[31] LIVE marker=1 body=440000004400000000000000
+-  slot[32] LIVE marker=1 body=450000004500000000000000
+-  slot[33] LIVE marker=1 body=460000004600000000000000
+-  slot[34] LIVE marker=1 body=470000004700000000000000
+-  slot[35] LIVE marker=1 body=480000004800000000000000
++page 4 ORPHAN tag=0x4400 logical=3 stamp=32805
++  orphan bytes=506
+ page 5 DATA tag=0x4400 logical=2 stamp=32804
+   slot[0] LIVE marker=1 body=010000000100000000000000
+   slot[1] LIVE marker=1 body=020000000200000000000000
+@@ -224,8 +189,48 @@
+   entry[18] key=29000000 (41) head=0x0000063e tail=none child=NOWHERE
+   entry[19] key=2a000000 (42) head=0x0000064c tail=none child=NOWHERE
+   entry[20] key=2b000000 (43) head=0x0000065a tail=none child=raw=0x00000000 tag=0x00 logical=0
+-page 7 ORPHAN tag=0x8000 logical=8 stamp=0
+-  orphan bytes=506
++page 7 INDEX(key=0x00) tag=0x8000 logical=8 stamp=2
++  leftmost=NOWHERE rightmost=NOWHERE entries=40
++  entry[0] key=2d000000 (45) head=0x00000676 tail=none child=NOWHERE
++  entry[1] key=2e000000 (46) head=0x00000684 tail=none child=NOWHERE
++  entry[2] key=2f000000 (47) head=0x00000692 tail=none child=NOWHERE
++  entry[3] key=30000000 (48) head=0x000006a0 tail=none child=NOWHERE
++  entry[4] key=31000000 (49) head=0x000006ae tail=none child=NOWHERE
++  entry[5] key=32000000 (50) head=0x000006bc tail=none child=NOWHERE
++  entry[6] key=33000000 (51) head=0x000006ca tail=none child=NOWHERE
++  entry[7] key=34000000 (52) head=0x000006d8 tail=none child=NOWHERE
++  entry[8] key=35000000 (53) head=0x000006e6 tail=none child=NOWHERE
++  entry[9] key=36000000 (54) head=0x000006f4 tail=none child=NOWHERE
++  entry[10] key=37000000 (55) head=0x00000702 tail=none child=NOWHERE
++  entry[11] key=38000000 (56) head=0x00000710 tail=none child=NOWHERE
++  entry[12] key=39000000 (57) head=0x0000071e tail=none child=NOWHERE
++  entry[13] key=3a000000 (58) head=0x0000072c tail=none child=NOWHERE
++  entry[14] key=3b000000 (59) head=0x0000073a tail=none child=NOWHERE
++  entry[15] key=3c000000 (60) head=0x00000748 tail=none child=NOWHERE
++  entry[16] key=3d000000 (61) head=0x00000756 tail=none child=NOWHERE
++  entry[17] key=3e000000 (62) head=0x00000764 tail=none child=NOWHERE
++  entry[18] key=42000000 (66) head=0x0000079c tail=none child=NOWHERE
++  entry[19] key=43000000 (67) head=0x000007aa tail=none child=NOWHERE
++  entry[20] key=44000000 (68) head=0x000007b8 tail=none child=NOWHERE
++  entry[21] key=45000000 (69) head=0x000007c6 tail=none child=NOWHERE
++  entry[22] key=46000000 (70) head=0x000007d4 tail=none child=NOWHERE
++  entry[23] key=47000000 (71) head=0x000007e2 tail=none child=NOWHERE
++  entry[24] key=48000000 (72) head=0x000007f0 tail=none child=NOWHERE
++  entry[25] key=49000000 (73) head=0x00000a06 tail=none child=NOWHERE
++  entry[26] key=4a000000 (74) head=0x00000a14 tail=none child=NOWHERE
++  entry[27] key=4b000000 (75) head=0x00000a22 tail=none child=NOWHERE
++  entry[28] key=4c000000 (76) head=0x00000a30 tail=none child=NOWHERE
++  entry[29] key=4d000000 (77) head=0x00000a3e tail=none child=NOWHERE
++  entry[30] key=4e000000 (78) head=0x00000a4c tail=none child=NOWHERE
++  entry[31] key=4f000000 (79) head=0x00000a5a tail=none child=NOWHERE
++  entry[32] key=50000000 (80) head=0x00000a68 tail=none child=NOWHERE
++  entry[33] key=51000000 (81) head=0x00000a76 tail=none child=NOWHERE
++  entry[34] key=52000000 (82) head=0x00000a84 tail=none child=NOWHERE
++  entry[35] key=53000000 (83) head=0x00000a92 tail=none child=NOWHERE
++  entry[36] key=54000000 (84) head=0x00000aa0 tail=none child=NOWHERE
++  entry[37] key=55000000 (85) head=0x00000aae tail=none child=NOWHERE
++  entry[38] key=56000000 (86) head=0x00000abc tail=none child=NOWHERE
++  entry[39] key=57000000 (87) head=0x00000aca tail=none child=raw=0x00000000 tag=0x00 logical=0
+ page 8 DATA tag=0x4400 logical=5 stamp=32803
+   slot[0] LIVE marker=1 body=490000004900000000000000
+   slot[1] LIVE marker=1 body=4a0000004a00000000000000
+@@ -286,30 +291,45 @@
+   entry[18] key=13000000 (19) head=0x00000502 tail=none child=NOWHERE
+   entry[19] key=14000000 (20) head=0x00000510 tail=none child=NOWHERE
+   entry[20] key=15000000 (21) head=0x0000051e tail=none child=raw=0x00000000 tag=0x00 logical=0
+-page 10 INDEX(key=0x00) tag=0x8000 logical=10 stamp=2
+-  leftmost=NOWHERE rightmost=NOWHERE entries=20
+-  entry[0] key=2d000000 (45) head=0x00000676 tail=none child=NOWHERE
+-  entry[1] key=2e000000 (46) head=0x00000684 tail=none child=NOWHERE
+-  entry[2] key=2f000000 (47) head=0x00000692 tail=none child=NOWHERE
+-  entry[3] key=30000000 (48) head=0x000006a0 tail=none child=NOWHERE
+-  entry[4] key=31000000 (49) head=0x000006ae tail=none child=NOWHERE
+-  entry[5] key=32000000 (50) head=0x000006bc tail=none child=NOWHERE
+-  entry[6] key=33000000 (51) head=0x000006ca tail=none child=NOWHERE
+-  entry[7] key=34000000 (52) head=0x000006d8 tail=none child=NOWHERE
+-  entry[8] key=35000000 (53) head=0x000006e6 tail=none child=NOWHERE
+-  entry[9] key=36000000 (54) head=0x000006f4 tail=none child=NOWHERE
+-  entry[10] key=37000000 (55) head=0x00000702 tail=none child=NOWHERE
+-  entry[11] key=38000000 (56) head=0x00000710 tail=none child=NOWHERE
+-  entry[12] key=39000000 (57) head=0x0000071e tail=none child=NOWHERE
+-  entry[13] key=3a000000 (58) head=0x0000072c tail=none child=NOWHERE
+-  entry[14] key=3b000000 (59) head=0x0000073a tail=none child=NOWHERE
+-  entry[15] key=3c000000 (60) head=0x00000748 tail=none child=NOWHERE
+-  entry[16] key=3d000000 (61) head=0x00000756 tail=none child=NOWHERE
+-  entry[17] key=3e000000 (62) head=0x00000764 tail=none child=NOWHERE
+-  entry[18] key=3f000000 (63) head=0x00000772 tail=none child=NOWHERE
+-  entry[19] key=42000000 (66) head=0x0000079c tail=none child=raw=0x00000000 tag=0x00 logical=0
+-page 11 ORPHAN tag=0x4400 logical=3 stamp=32804
++page 10 ORPHAN tag=0x8000 logical=10 stamp=2
+   orphan bytes=506
++page 11 DATA tag=0x4400 logical=3 stamp=32806
++  slot[0] LIVE marker=1 body=250000002500000000000000
++  slot[1] LIVE marker=1 body=260000002600000000000000
++  slot[2] LIVE marker=1 body=270000002700000000000000
++  slot[3] LIVE marker=1 body=280000002800000000000000
++  slot[4] LIVE marker=1 body=290000002900000000000000
++  slot[5] LIVE marker=1 body=2a0000002a00000000000000
++  slot[6] LIVE marker=1 body=2b0000002b00000000000000
++  slot[7] LIVE marker=1 body=2c0000002c00000000000000
++  slot[8] LIVE marker=1 body=2d0000002d00000000000000
++  slot[9] LIVE marker=1 body=2e0000002e00000000000000
++  slot[10] LIVE marker=1 body=2f0000002f00000000000000
++  slot[11] LIVE marker=1 body=300000003000000000000000
++  slot[12] LIVE marker=1 body=310000003100000000000000
++  slot[13] LIVE marker=1 body=320000003200000000000000
++  slot[14] LIVE marker=1 body=330000003300000000000000
++  slot[15] LIVE marker=1 body=340000003400000000000000
++  slot[16] LIVE marker=1 body=350000003500000000000000
++  slot[17] LIVE marker=1 body=360000003600000000000000
++  slot[18] LIVE marker=1 body=370000003700000000000000
++  slot[19] LIVE marker=1 body=380000003800000000000000
++  slot[20] LIVE marker=1 body=390000003900000000000000
++  slot[21] LIVE marker=1 body=3a0000003a00000000000000
++  slot[22] LIVE marker=1 body=3b0000003b00000000000000
++  slot[23] LIVE marker=1 body=3c0000003c00000000000000
++  slot[24] LIVE marker=1 body=3d0000003d00000000000000
++  slot[25] LIVE marker=1 body=3e0000003e00000000000000
++  slot[26] FREE next=0x00000780 fill_nonzero=false
++  slot[27] FREE next=0x0000078e fill_nonzero=false
++  slot[28] FREE next=0x00001676 fill_nonzero=false
++  slot[29] LIVE marker=1 body=420000004200000000000000
++  slot[30] LIVE marker=1 body=430000004300000000000000
++  slot[31] LIVE marker=1 body=440000004400000000000000
++  slot[32] LIVE marker=1 body=450000004500000000000000
++  slot[33] LIVE marker=1 body=460000004600000000000000
++  slot[34] LIVE marker=1 body=470000004700000000000000
++  slot[35] LIVE marker=1 body=480000004800000000000000
+ page 12 DATA tag=0x4400 logical=9 stamp=32803
+   slot[0] LIVE marker=1 body=6d0000006d00000000000000
+   slot[1] LIVE marker=1 body=6e0000006e00000000000000
+@@ -430,16 +450,10 @@
+   slot[33] FREE next=0x000017e2 fill_nonzero=false
+   slot[34] FREE next=0x000017f0 fill_nonzero=false
+   slot[35] FREE next=NOWHERE fill_nonzero=false
+-page 16 ORPHAN tag=0x8000 logical=10 stamp=1
++page 16 RETIRED tag=0x4500 logical=10 stamp=3
++  retired next=NOWHERE
++page 17 ORPHAN tag=0x8000 logical=7 stamp=6
+   orphan bytes=506
+-page 17 INDEX(key=0x00) tag=0x8000 logical=7 stamp=6
+-  leftmost=raw=0x80000006 tag=0x80 logical=6 rightmost=raw=0x80000001 tag=0x80 logical=1 entries=6
+-  entry[0] key=16000000 (22) head=0x0000052c tail=none child=raw=0x80000004 tag=0x80 logical=4
+-  entry[1] key=2c000000 (44) head=0x00000668 tail=none child=raw=0x8000000a tag=0x80 logical=10
+-  entry[2] key=43000000 (67) head=0x000007aa tail=none child=raw=0x80000008 tag=0x80 logical=8
+-  entry[3] key=58000000 (88) head=0x00000ad8 tail=none child=raw=0x8000000d tag=0x80 logical=13
+-  entry[4] key=6e000000 (110) head=0x00001214 tail=none child=raw=0x8000000c tag=0x80 logical=12
+-  entry[5] key=84000000 (132) head=0x00001348 tail=none child=raw=0x00000000 tag=0x00 logical=0
+ page 18 INDEX(key=0x00) tag=0x8000 logical=1 stamp=152
+   leftmost=NOWHERE rightmost=NOWHERE entries=20
+   entry[0] key=85000000 (133) head=0x00001356 tail=none child=NOWHERE
+@@ -462,29 +476,14 @@
+   entry[17] key=96000000 (150) head=0x0000164c tail=none child=NOWHERE
+   entry[18] key=97000000 (151) head=0x0000165a tail=none child=NOWHERE
+   entry[19] key=98000000 (152) head=0x00001668 tail=none child=raw=0x00000000 tag=0x00 logical=0
+-page 19 ORPHAN tag=0x8000 logical=7 stamp=5
++page 19 INDEX(key=0x00) tag=0x8000 logical=7 stamp=7
++  leftmost=raw=0x80000006 tag=0x80 logical=6 rightmost=raw=0x80000001 tag=0x80 logical=1 entries=5
++  entry[0] key=16000000 (22) head=0x0000052c tail=none child=raw=0x80000004 tag=0x80 logical=4
++  entry[1] key=2c000000 (44) head=0x00000668 tail=none child=raw=0x80000008 tag=0x80 logical=8
++  entry[2] key=58000000 (88) head=0x00000ad8 tail=none child=raw=0x8000000d tag=0x80 logical=13
++  entry[3] key=6e000000 (110) head=0x00001214 tail=none child=raw=0x8000000c tag=0x80 logical=12
++  entry[4] key=84000000 (132) head=0x00001348 tail=none child=raw=0x00000000 tag=0x00 logical=0
++page 20 ORPHAN tag=0x8000 logical=8 stamp=1
+   orphan bytes=506
+-page 20 INDEX(key=0x00) tag=0x8000 logical=8 stamp=1
+-  leftmost=NOWHERE rightmost=NOWHERE entries=20
+-  entry[0] key=44000000 (68) head=0x000007b8 tail=none child=NOWHERE
+-  entry[1] key=45000000 (69) head=0x000007c6 tail=none child=NOWHERE
+-  entry[2] key=46000000 (70) head=0x000007d4 tail=none child=NOWHERE
+-  entry[3] key=47000000 (71) head=0x000007e2 tail=none child=NOWHERE
+-  entry[4] key=48000000 (72) head=0x000007f0 tail=none child=NOWHERE
+-  entry[5] key=49000000 (73) head=0x00000a06 tail=none child=NOWHERE
+-  entry[6] key=4a000000 (74) head=0x00000a14 tail=none child=NOWHERE
+-  entry[7] key=4b000000 (75) head=0x00000a22 tail=none child=NOWHERE
+-  entry[8] key=4c000000 (76) head=0x00000a30 tail=none child=NOWHERE
+-  entry[9] key=4d000000 (77) head=0x00000a3e tail=none child=NOWHERE
+-  entry[10] key=4e000000 (78) head=0x00000a4c tail=none child=NOWHERE
+-  entry[11] key=4f000000 (79) head=0x00000a5a tail=none child=NOWHERE
+-  entry[12] key=50000000 (80) head=0x00000a68 tail=none child=NOWHERE
+-  entry[13] key=51000000 (81) head=0x00000a76 tail=none child=NOWHERE
+-  entry[14] key=52000000 (82) head=0x00000a84 tail=none child=NOWHERE
+-  entry[15] key=53000000 (83) head=0x00000a92 tail=none child=NOWHERE
+-  entry[16] key=54000000 (84) head=0x00000aa0 tail=none child=NOWHERE
+-  entry[17] key=55000000 (85) head=0x00000aae tail=none child=NOWHERE
+-  entry[18] key=56000000 (86) head=0x00000abc tail=none child=NOWHERE
+-  entry[19] key=57000000 (87) head=0x00000aca tail=none child=raw=0x00000000 tag=0x00 logical=0
+ page 21 ORPHAN tag=0x0000 logical=0 stamp=0
+   orphan bytes=506

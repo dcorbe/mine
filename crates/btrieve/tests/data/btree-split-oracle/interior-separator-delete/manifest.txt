@@ -1,0 +1,19 @@
+reclen 12, pagesize 512, unique 4-byte key. insert 1..42 (the same
+minimal leaf split as round 1's append512u/leaf-split): root ends up
+holding exactly ONE entry, key 22 -- present ONLY in the interior root,
+never in either leaf (round 1's own finding: a promoted median is
+removed from both leaves).
+
+before.dat: root (logical 7) = one entry, key 22, leftmost=leaf 6
+(keys 1-21), rightmost=leaf 1 (keys 23-42).
+delete(22) -> after.dat.
+
+Finding: the engine replaces the deleted separator with its IN-ORDER
+PREDECESSOR -- the maximum key of the LEFT subtree (21, leaf 6's own
+highest). That predecessor's own leaf entry is removed from leaf 6
+(21 -> 20 entries), key 22's own record is freed (pushed onto free_v6),
+and the root's entry is rewritten to key 21, now pointing directly at
+predecessor 21's own (unmoved) record position -- not a new copy. Not
+independently tested: whether the engine ever prefers the in-order
+SUCCESSOR (the right subtree's minimum) instead -- every case recorded
+used the predecessor.

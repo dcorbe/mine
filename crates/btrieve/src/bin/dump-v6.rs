@@ -90,13 +90,18 @@ fn main() -> ExitCode {
     match &file.control {
         Control::Single(_) => println!("control: v5 (single copy) -- this dumper is v6-only"),
         Control::Shadowed { live, live_is_page, .. } => {
+            let head_at =
+                live_is_page * file.id.page_size as usize + btrieve::pages::fcr::INDEX_FREE_V6;
+            let index_free = btrieve::pages::long(&bytes[head_at..head_at + 4]);
             println!(
                 "control: live_page={live_is_page} generation={} records={} pages={} \
-                 free_v6={:#010x} write_counter={} usage_4c={} index_alloc_4e={} usage_52={}",
+                 free_v6={:#010x} index_free_v6={} write_counter={} usage_4c={} \
+                 index_alloc_4e={} usage_52={}",
                 live.generation,
                 live.records,
                 live.pages,
                 live.free_v6,
+                decode_pos(index_free),
                 live.write_counter,
                 live.usage_4c,
                 live.index_alloc_4e,
@@ -143,6 +148,8 @@ fn main() -> ExitCode {
             "ACS".to_string()
         } else if p.fragment.is_some() {
             "VARIABLE".to_string()
+        } else if p.retired.is_some() {
+            "RETIRED".to_string()
         } else if p.orphan.is_some() {
             "ORPHAN".to_string()
         } else {
@@ -188,6 +195,10 @@ fn main() -> ExitCode {
         }
         if let Some(orphan) = &p.orphan {
             println!("  orphan bytes={}", orphan.len());
+        }
+        if let Some(body) = &p.retired {
+            let next = btrieve::pages::long(&body[2..6]);
+            println!("  retired next={}", decode_pos(next));
         }
     }
 

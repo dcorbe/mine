@@ -60,6 +60,14 @@
  *     cmd_delete does the same GET_EQUAL+DELETE pair but for its own
  *     hardcoded 32-byte-reclen rig; this one takes the key as hex so it
  *     works against whatever geometry `create` above just built.
+ *   crtprobe delete_nth <path> <key-hex> <n>
+ *     GET_EQUAL on key 0, then GET_NEXT <n> times (n=0 deletes the record
+ *     GET_EQUAL itself positioned on -- the chain's HEAD for a duplicate-
+ *     permitting key), then DELETE whatever GET_NEXT left the cursor on.
+ *     For picking a specific member -- first/middle/last -- out of a
+ *     duplicate group, where plain `delete` above can only ever reach the
+ *     head. Added for the partial-duplicate-chain-deletion oracle
+ *     (docs/2026-08-25-btree-split-oracle.md).
  *   crtprobe dumpraw <path> <bytes>
  *     print the first <bytes> of the file AS THE ENGINE SEES IT -- opened
  *     and STAT'd first so a stale Microkernel cache is forced to notice the
@@ -78,6 +86,7 @@
 #define B_INSERT     2
 #define B_DELETE     4
 #define B_GET_EQUAL  5
+#define B_GET_NEXT   6
 #define B_GET_FIRST 12
 #define B_CREATE    14
 #define B_STAT      15
@@ -348,6 +357,65 @@ static void cmd_delete(const char *path, const char *hex)
         exit(1);
 }
 
+/* delete_nth: GET_EQUAL(keynum 0, raw hex key) to position on the chain's
+ * head, GET_NEXT n times to walk forward within (or past) the duplicate
+ * group, then DELETE whatever the cursor is left on. n=0 deletes the head
+ * itself. */
+static void cmd_delete_nth(const char *path, const char *hex, int n)
+{
+    char posblk[POSBLK_SIZE];
+    unsigned char record[DATA_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    DWORD dlen;
+    size_t len, i;
+    int st, k;
+
+    len = strlen(hex);
+    if (len % 2 != 0 || len / 2 > sizeof keybuf) {
+        fprintf(stderr, "FAIL: bad hex length %zu\n", len);
+        exit(2);
+    }
+    memset(keybuf, 0, sizeof keybuf);
+    for (i = 0; i < len / 2; i++) {
+        int hi = hexval(hex[i * 2]), lo = hexval(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            fprintf(stderr, "FAIL: bad hex digit at byte %zu\n", i);
+            exit(2);
+        }
+        keybuf[i] = (unsigned char)((hi << 4) | lo);
+    }
+
+    st = open_file(posblk, path, MODE_NORMAL);
+    if (st != ST_OK)
+        die("open", st);
+
+    dlen = sizeof record;
+    st = btrcall(B_GET_EQUAL, posblk, record, &dlen, keybuf, (BYTE)(len / 2), (char)0);
+    printf("delete_nth: get_equal status %d (%s)\n", st, status_name(st));
+    if (st != ST_OK) {
+        { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+        exit(1);
+    }
+
+    for (k = 0; k < n; k++) {
+        dlen = sizeof record;
+        st = btrcall(B_GET_NEXT, posblk, record, &dlen, keybuf, sizeof keybuf - 1, (char)0);
+        printf("delete_nth: get_next[%d] status %d (%s)\n", k, st, status_name(st));
+        if (st != ST_OK) {
+            { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+            exit(1);
+        }
+    }
+
+    dlen = 0;
+    st = btrcall(B_DELETE, posblk, NULL, &dlen, NULL, 0, (char)0);
+    printf("delete_nth: delete status %d (%s)\n", st, status_name(st));
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+    if (st != ST_OK)
+        exit(1);
+}
+
 /* dumpraw: open+STAT (forces the Microkernel to notice this path rather than
  * serve a stale cache entry, the same reason sweep.sh gives every file a
  * fresh name), then read `bytes` off disk with plain file I/O and print hex.
@@ -390,11 +458,12 @@ int main(int argc, char **argv)
 
     if (argc < 2) {
         fprintf(stderr,
-            "usage: crtprobe <create|insert|delete|dumpraw> ...\n"
+            "usage: crtprobe <create|insert|delete|delete_nth|dumpraw> ...\n"
             "  create <path> <reclen> <pagesize> <cflags> <prealloc> "
             "<overwrite:0|1> <nsegs> [pos len type flags]...\n"
             "  insert <path> <hex-bytes>\n"
             "  delete <path> <key-hex>\n"
+            "  delete_nth <path> <key-hex> <n>\n"
             "  dumpraw <path> <bytes>\n");
         return 2;
     }
@@ -420,6 +489,9 @@ int main(int argc, char **argv)
     } else if (!strcmp(cmd, "delete")) {
         if (argc < 4) { fprintf(stderr, "FAIL: delete needs a path and a key in hex\n"); return 2; }
         cmd_delete(argv[2], argv[3]);
+    } else if (!strcmp(cmd, "delete_nth")) {
+        if (argc < 5) { fprintf(stderr, "FAIL: delete_nth needs a path, key hex and n\n"); return 2; }
+        cmd_delete_nth(argv[2], argv[3], atoi(argv[4]));
     } else if (!strcmp(cmd, "dumpraw")) {
         if (argc < 4) { fprintf(stderr, "FAIL: dumpraw needs a path and byte count\n"); return 2; }
         cmd_dumpraw(argv[2], atoi(argv[3]));

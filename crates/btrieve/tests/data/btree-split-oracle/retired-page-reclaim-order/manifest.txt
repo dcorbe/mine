@@ -1,0 +1,30 @@
+reclen 12, pagesize 512, unique 4-byte key. Built a 7-leaf tree (insert
+1..152 ascending), then retired two WELL-SEPARATED leaves independently
+(each via delete-its-own-top-3-keys: one redistribution, then a merge on
+the second underflow -- the same recipe underflow-lifecycle-512 uses).
+
+1-none-retired.dat / 2-leaf10-retired.dat: deleting leaf 10's own top two
+  keys (65, then 64) retires it -- FCR+0x98 (INDEX_FREE_V6) becomes
+  0x0000000a (10).
+3-before-leaf12-retirement.dat / 4-both-retired.dat: deleting leaf 12's
+  own top two keys retires IT too -- FCR+0x98 becomes 0x0000000c (12),
+  and logical-12's own retired page body (offset 2..6, word-swapped long)
+  now holds 10 -- the free list is a genuine LIFO chain: head -> 12 ->
+  10 -> NOWHERE.
+5-before-first-reclaim.dat / 6-leaf12-reclaimed-first.dat: enough more
+  ascending inserts (to key 155) to force a fresh split -- logical 12
+  (the chain HEAD, most recently retired) is the one reclaimed. FCR+0x98
+  updates to 0x0000000a (10) -- the chain's OWN next-hop becomes the new
+  head, exactly like popping a stack.
+7-before-second-reclaim.dat / 8-leaf10-reclaimed-second.dat: further
+  inserts (to key 177) force another split -- logical 10 (now the only
+  remaining retired page) is reclaimed, FCR+0x98 returns to NOWHERE.
+
+Finding: reclamation is LIFO (pulls from the free list's HEAD, i.e. the
+MOST RECENTLY retired page) -- not FIFO (list tail) and not lowest-
+logical-id-first (12 was reclaimed before 10 despite 12 > 10). Matches
+`docs/2026-08-25-btree-split-rules.md`'s own description of the same
+mechanism (built independently by the concurrent implementer from this
+same class of recording) and `crates/btrieve/src/pages.rs`'s
+`fcr::INDEX_FREE_V6` constant / `V6Page::retired` field, added since round
+1 of this doc specifically to support tag `0x4500`.

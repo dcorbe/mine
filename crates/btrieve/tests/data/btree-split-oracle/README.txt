@@ -107,3 +107,33 @@ fallback was needed.
                                       docs/2026-08-25-btree-split-oracle.md's
                                       "Round 3" section for the full
                                       predicate tree this settles.
+
+## Round 4 (partial duplicate-chain delete, interior-separator delete, delete-to-empty, multi-candidate reclaim)
+
+Added 2026-08-25, after the concurrent implementer landed real incremental
+v6 maintenance and tag 0x4500 support (Task 6) from this doc's own rules.
+Every fixture here decodes through plain `read::file` -- `V6Page::retired`
+and `pages::fcr::INDEX_FREE_V6` (both new since Round 3) mean rawscan.py's
+fallback is not needed for anything recorded from this round on.
+
+  dup-chain-partial-delete/    -- deleting the first/middle/last member of
+                                   a 3-member duplicate group, then draining
+                                   a separate group to solo and eliminating
+                                   it.
+  interior-separator-delete/   -- deleting a key that exists only as a
+                                   promoted separator in an interior node;
+                                   settles predecessor-vs-successor
+                                   (predecessor).
+  delete-to-empty/             -- deleting a key's last remaining record
+                                   (genuine Btrieve allows it; reproduces
+                                   the incremental engine's own refusal
+                                   bug) and re-inserting afterward.
+  retired-page-reclaim-order/  -- two independently-retired (0x4500) pages
+                                   queued at once, then two splits: proves
+                                   the free list is LIFO (most-recently-
+                                   retired reclaimed first), not FIFO or
+                                   lowest-logical-id-first.
+
+See each directory's own manifest.txt for the exact op sequence and
+`docs/2026-08-25-btree-split-oracle.md`'s "Round 4" section for the full
+findings.

@@ -104,6 +104,16 @@ def delete(name, value):
     return rc, status
 
 
+def delete_nth(name, value, n):
+    """Delete the nth member (0 = head) of `value`'s duplicate chain --
+    GET_EQUAL then GET_NEXT n times, then DELETE. `value` need not be
+    unique to the chain the way plain `delete` above assumes."""
+    key_hex = value.to_bytes(4, "little").hex()
+    rc, out, err = wine(["delete_nth", dos_path(name), key_hex, str(n)], check=False)
+    status = "OK" if rc == 0 else (out.splitlines()[-1] if out else err)
+    return rc, status
+
+
 def snapshot(name, dest):
     src = os.path.join(WORK, name)
     if not os.path.exists(src):
@@ -154,6 +164,11 @@ class Recorder:
     def do_delete(self, value):
         rc, status = delete(self.name, value)
         self.snap("delete", value, "-", status)
+        return rc == 0
+
+    def do_delete_nth(self, value, n):
+        rc, status = delete_nth(self.name, value, n)
+        self.snap(f"delete_nth{n}", value, "-", status)
         return rc == 0
 
     def close(self):

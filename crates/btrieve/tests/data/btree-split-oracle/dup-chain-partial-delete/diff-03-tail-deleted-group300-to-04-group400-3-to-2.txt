@@ -1,0 +1,75 @@
+--- crates/btrieve/tests/data/btree-split-oracle/dup-chain-partial-delete/03-tail-deleted-group300.txt	2026-08-25 16:59:33.668138152 -0400
++++ crates/btrieve/tests/data/btree-split-oracle/dup-chain-partial-delete/04-group400-3-to-2.txt	2026-08-25 16:59:33.668138152 -0400
+@@ -1,10 +1,10 @@
+ len=4096 page_size=512
+-control: live_page=1 generation=26 records=19 pages=3 free_v6=0x00000592 index_free_v6=NOWHERE write_counter=25 usage_4c=1 index_alloc_4e=16 usage_52=3
++control: live_page=1 generation=27 records=18 pages=3 free_v6=0x000005a8 index_free_v6=NOWHERE write_counter=26 usage_4c=1 index_alloc_4e=16 usage_52=3
+ key[0] number=0x80 root_page=1 records=14 attributes=0x0105 key_length=4 entry_size=16 max_entries=31 half_entries=15 chain=14
+-alloc block=1 logical=1 marker=0x8000 physical=4
+-alloc block=1 logical=2 marker=0x4400 physical=6
+-alloc block=1 logical=3 marker=0x0000 physical=5
+-alloc block=1 logical=4 marker=0x0000 physical=7
++alloc block=1 logical=1 marker=0x8000 physical=7
++alloc block=1 logical=2 marker=0x4400 physical=5
++alloc block=1 logical=3 marker=0x0000 physical=6
++alloc block=1 logical=4 marker=0x0000 physical=4
+ alloc block=1 logical=5 marker=0x0000 physical=8
+ alloc block=1 logical=6 marker=0x0000 physical=9
+ alloc block=1 logical=7 marker=0x0000 physical=10
+@@ -127,25 +127,9 @@
+ alloc block=1 logical=124 marker=0x0000 physical=127
+ alloc block=1 logical=125 marker=0x0000 physical=128
+ alloc block=1 logical=126 marker=0x0000 physical=129
+-page 4 INDEX(key=0x00) tag=0x8000 logical=1 stamp=24
+-  leftmost=NOWHERE rightmost=NOWHERE entries=14
+-  entry[0] key=01000000 (1) head=0x00000406 tail=0x00000406 child=NOWHERE
+-  entry[1] key=02000000 (2) head=0x0000041c tail=0x0000041c child=NOWHERE
+-  entry[2] key=03000000 (3) head=0x00000432 tail=0x00000432 child=NOWHERE
+-  entry[3] key=04000000 (4) head=0x00000448 tail=0x00000448 child=NOWHERE
+-  entry[4] key=05000000 (5) head=0x0000045e tail=0x0000045e child=NOWHERE
+-  entry[5] key=06000000 (6) head=0x00000474 tail=0x00000474 child=NOWHERE
+-  entry[6] key=07000000 (7) head=0x0000048a tail=0x0000048a child=NOWHERE
+-  entry[7] key=08000000 (8) head=0x000004a0 tail=0x000004a0 child=NOWHERE
+-  entry[8] key=09000000 (9) head=0x000004b6 tail=0x000004b6 child=NOWHERE
+-  entry[9] key=0a000000 (10) head=0x000004cc tail=0x000004cc child=NOWHERE
+-  entry[10] key=64000000 (100) head=0x000004f8 tail=0x0000050e child=NOWHERE
+-  entry[11] key=c8000000 (200) head=0x00000524 tail=0x00000550 child=NOWHERE
+-  entry[12] key=2c010000 (300) head=0x00000566 tail=0x0000057c child=NOWHERE
+-  entry[13] key=90010000 (400) head=0x000005a8 tail=0x000005d4 child=raw=0x00000000 tag=0x00 logical=0
+-page 5 ORPHAN tag=0x4400 logical=2 stamp=32792
++page 4 ORPHAN tag=0x8000 logical=1 stamp=24
+   orphan bytes=506
+-page 6 DATA tag=0x4400 logical=2 stamp=32793
++page 5 DATA tag=0x4400 logical=2 stamp=32794
+   slot[0] LIVE marker=1 body=010000000100000000000000ffffffffffffffff
+   slot[1] LIVE marker=1 body=020000000200000000000000ffffffffffffffff
+   slot[2] LIVE marker=1 body=030000000300000000000000ffffffffffffffff
+@@ -165,9 +149,25 @@
+   slot[16] LIVE marker=1 body=2c0100000100000000000000ffffffff00007c05
+   slot[17] LIVE marker=1 body=2c010000020000000000000000006605ffffffff
+   slot[18] FREE next=0x0000053a fill_nonzero=false
+-  slot[19] LIVE marker=1 body=900100000100000000000000ffffffff0000be05
+-  slot[20] LIVE marker=1 body=9001000002000000000000000000a8050000d405
++  slot[19] FREE next=0x00000592 fill_nonzero=false
++  slot[20] LIVE marker=1 body=900100000200000000000000ffffffff0000d405
+   slot[21] LIVE marker=1 body=9001000003000000000000000000be05ffffffff
+   slot[22] FREE next=NOWHERE fill_nonzero=false
+-page 7 ORPHAN tag=0x8000 logical=1 stamp=23
++page 6 ORPHAN tag=0x4400 logical=2 stamp=32793
+   orphan bytes=506
++page 7 INDEX(key=0x00) tag=0x8000 logical=1 stamp=25
++  leftmost=NOWHERE rightmost=NOWHERE entries=14
++  entry[0] key=01000000 (1) head=0x00000406 tail=0x00000406 child=NOWHERE
++  entry[1] key=02000000 (2) head=0x0000041c tail=0x0000041c child=NOWHERE
++  entry[2] key=03000000 (3) head=0x00000432 tail=0x00000432 child=NOWHERE
++  entry[3] key=04000000 (4) head=0x00000448 tail=0x00000448 child=NOWHERE
++  entry[4] key=05000000 (5) head=0x0000045e tail=0x0000045e child=NOWHERE
++  entry[5] key=06000000 (6) head=0x00000474 tail=0x00000474 child=NOWHERE
++  entry[6] key=07000000 (7) head=0x0000048a tail=0x0000048a child=NOWHERE
++  entry[7] key=08000000 (8) head=0x000004a0 tail=0x000004a0 child=NOWHERE
++  entry[8] key=09000000 (9) head=0x000004b6 tail=0x000004b6 child=NOWHERE
++  entry[9] key=0a000000 (10) head=0x000004cc tail=0x000004cc child=NOWHERE
++  entry[10] key=64000000 (100) head=0x000004f8 tail=0x0000050e child=NOWHERE
++  entry[11] key=c8000000 (200) head=0x00000524 tail=0x00000550 child=NOWHERE
++  entry[12] key=2c010000 (300) head=0x00000566 tail=0x0000057c child=NOWHERE
++  entry[13] key=90010000 (400) head=0x000005be tail=0x000005d4 child=raw=0x00000000 tag=0x00 logical=0

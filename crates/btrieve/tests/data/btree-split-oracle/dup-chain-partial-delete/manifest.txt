@@ -1,0 +1,27 @@
+reclen 12, pagesize 512, DUP-permitting 4-byte key (dup512-style: same
+geometry as tools/btrieve-oracle round-1 dup512 experiments).
+
+1. create; insert 1..10 (unique baseline keys); insert four 3-member
+   duplicate groups, keys 100/200/300/400, members tagged 1/2/3 in
+   insertion order -> 00-baseline-all-groups.dat
+2. delete_nth(100, n=0): deletes the HEAD (tag 1) of group 100
+   -> 01-head-deleted-group100.dat
+3. delete_nth(200, n=1): deletes the MIDDLE (tag 2) of group 200
+   -> 02-middle-deleted-group200.dat
+4. delete_nth(300, n=2): deletes the TAIL (tag 3) of group 300
+   -> 03-tail-deleted-group300.dat
+5. delete_nth(400, n=0), three times in a row: 3 members -> 2 -> solo (1)
+   -> group eliminated (0)
+   -> 04-group400-3-to-2.dat, 05-group400-2-to-1-solo.dat,
+      06-group400-eliminated.dat
+
+Findings: deleting the HEAD updates the leaf entry's own `head` field to
+the second member's position, and that member's own `prev` link becomes
+NOWHERE (it is the new head) -- `tail` and the entry count are untouched.
+Deleting the TAIL is the mirror image (`tail` moves, the new-tail's `next`
+becomes NOWHERE). Deleting a MIDDLE member changes neither `head` nor
+`tail` -- only the two neighbouring records' `prev`/`next` links skip over
+it, exactly a doubly-linked-list node removal. Draining a group down to a
+SOLO member and deleting that one behaves exactly like deleting any
+unique key's only record: the leaf's entry disappears entirely (entry
+count drops by one), not a special "empty duplicate group" state.

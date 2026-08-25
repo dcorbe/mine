@@ -1,0 +1,47 @@
+--- crates/btrieve/tests/data/btree-split-oracle/delete-to-empty/2-emptied.txt	2026-08-25 16:59:33.678138153 -0400
++++ crates/btrieve/tests/data/btree-split-oracle/delete-to-empty/3-reinserted.txt	2026-08-25 16:59:33.678138153 -0400
+@@ -1,10 +1,10 @@
+ len=4096 page_size=512
+-control: live_page=1 generation=3 records=0 pages=3 free_v6=0x00000406 index_free_v6=NOWHERE write_counter=2 usage_4c=1 index_alloc_4e=16 usage_52=3
+-key[0] number=0x80 root_page=1 records=0 attributes=0x0104 key_length=4 entry_size=12 max_entries=41 half_entries=20 chain=0
+-alloc block=1 logical=1 marker=0x8000 physical=4
+-alloc block=1 logical=2 marker=0x4400 physical=5
+-alloc block=1 logical=3 marker=0x0000 physical=6
+-alloc block=1 logical=4 marker=0x0000 physical=7
++control: live_page=1 generation=4 records=1 pages=3 free_v6=0x00000414 index_free_v6=NOWHERE write_counter=3 usage_4c=1 index_alloc_4e=16 usage_52=3
++key[0] number=0x80 root_page=1 records=1 attributes=0x0104 key_length=4 entry_size=12 max_entries=41 half_entries=20 chain=0
++alloc block=1 logical=1 marker=0x8000 physical=7
++alloc block=1 logical=2 marker=0x4400 physical=6
++alloc block=1 logical=3 marker=0x0000 physical=5
++alloc block=1 logical=4 marker=0x0000 physical=4
+ alloc block=1 logical=5 marker=0x0000 physical=8
+ alloc block=1 logical=6 marker=0x0000 physical=9
+ alloc block=1 logical=7 marker=0x0000 physical=10
+@@ -127,10 +127,12 @@
+ alloc block=1 logical=124 marker=0x0000 physical=127
+ alloc block=1 logical=125 marker=0x0000 physical=128
+ alloc block=1 logical=126 marker=0x0000 physical=129
+-page 4 INDEX(key=0x00) tag=0x8000 logical=1 stamp=2
+-  leftmost=raw=0x00000000 tag=0x00 logical=0 rightmost=NOWHERE entries=0
+-page 5 DATA tag=0x4400 logical=2 stamp=32770
+-  slot[0] FREE next=0x00000414 fill_nonzero=false
++page 4 ORPHAN tag=0x8000 logical=1 stamp=2
++  orphan bytes=506
++page 5 ORPHAN tag=0x4400 logical=2 stamp=32770
++  orphan bytes=506
++page 6 DATA tag=0x4400 logical=2 stamp=32771
++  slot[0] LIVE marker=1 body=020000000200000000000000
+   slot[1] FREE next=0x00000422 fill_nonzero=false
+   slot[2] FREE next=0x00000430 fill_nonzero=false
+   slot[3] FREE next=0x0000043e fill_nonzero=false
+@@ -166,7 +168,6 @@
+   slot[33] FREE next=0x000005e2 fill_nonzero=false
+   slot[34] FREE next=0x000005f0 fill_nonzero=false
+   slot[35] FREE next=NOWHERE fill_nonzero=false
+-page 6 ORPHAN tag=0x4400 logical=2 stamp=32769
+-  orphan bytes=506
+-page 7 ORPHAN tag=0x8000 logical=1 stamp=1
+-  orphan bytes=506
++page 7 INDEX(key=0x00) tag=0x8000 logical=1 stamp=3
++  leftmost=NOWHERE rightmost=NOWHERE entries=1
++  entry[0] key=02000000 (2) head=0x00000406 tail=none child=raw=0x00000000 tag=0x00 logical=0

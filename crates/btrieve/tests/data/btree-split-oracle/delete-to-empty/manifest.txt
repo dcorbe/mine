@@ -1,0 +1,17 @@
+reclen 12, pagesize 512, unique 4-byte key, fresh file.
+
+1. create; insert one record (key 1) -> 1-one-record.dat
+2. delete(1) -- the file's ONLY record -- status OK
+   -> 2-emptied.dat
+3. insert one more record (key 2) -> 3-reinserted.dat
+
+Findings: genuine Btrieve 6.15 ALLOWS deleting a key's last record
+(status OK) -- the incremental engine's own refusal of this case is a
+bug, not a faithful reproduction. After emptying: the FCR's root_page
+pointer is UNCHANGED (still names the same logical id); that logical
+id's own page reverts to the exact "virgin root" shape a brand-new file
+starts in (entries=0, leftmost=0x00000000, rightmost=NOWHERE -- not
+retired, not orphaned, not some other empty-specific tag). Re-inserting
+afterward reuses the SAME logical id for the root (never abandoned, so
+nothing to reclaim) and the SAME data-page slot the deleted record's own
+LIFO free-list entry had just vacated.
