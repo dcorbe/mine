@@ -1050,7 +1050,11 @@ pub fn chain_pair(slot: &[u8], offset: usize) -> Option<[u32; 2]> {
 /// levels (`docs/plans/2026-08-07-btrieve-interior-pages-design.md`), and a
 /// file claiming more than this is corrupt in a way that would otherwise cost
 /// the box its memory before it cost anyone an error message.
-const MAX_DEPTH: usize = 32;
+///
+/// `pub(crate)`: `nav::TreeCursor`'s own lazy descent needs the identical
+/// bound (its own depth guard, not a duplicated magic number) -- see that
+/// module's `fetch_page`.
+pub(crate) const MAX_DEPTH: usize = 32;
 
 /// What walking a key's tree found.
 #[derive(Debug)]

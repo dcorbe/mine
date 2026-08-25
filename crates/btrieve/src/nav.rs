@@ -31,17 +31,24 @@
 //! [`super::records::Records::ordered`] byte for byte rather than with the
 //! chain's own insertion order.
 //!
-//! # Only `next()`-after-`seek()` and `prev()`-after-`seek()` are proven
+//! # A cursor is one-directional, and a flip is a hard refusal
 //!
-//! [`TreeCursor`] commits to one direction on the call that first produces a
-//! position ([`Bias::Lowest`]/[`Bias::Equal`]/[`Bias::AtLeast`]/
-//! [`Bias::Greater`] prime it for [`TreeCursor::next`];
-//! [`Bias::Highest`]/[`Bias::AtMost`]/[`Bias::Less`] prime it for
-//! [`TreeCursor::prev`]) and the differential test only ever calls one of
-//! the two after a given `seek`. Calling the *other* method afterward is not
-//! rejected, but its correctness has not been measured -- a future caller
-//! that needs a true bidirectional cursor (a keyed `Get` followed by a `Get
-//! Previous`) should treat that combination as unproven until it is.
+//! [`Frame::at`] means "`[0, at)` emitted" when a forward step
+//! ([`TreeCursor::advance_entry_forward`]) built the frame, and "`[at,
+//! len)` emitted" when a backward step built it instead -- two genuinely
+//! different conventions sharing one field, with no per-frame marker of
+//! which one applies. [`TreeCursor::seek`] commits a whole cursor to one of
+//! them from `bias` alone ([`Bias::Lowest`]/[`Bias::Equal`]/
+//! [`Bias::AtLeast`]/[`Bias::Greater`] -> forward, for [`TreeCursor::next`];
+//! [`Bias::Highest`]/[`Bias::AtMost`]/[`Bias::Less`] -> backward, for
+//! [`TreeCursor::prev`]) and remembers the choice as [`Direction`]. Calling
+//! the *other* method reinterprets every frame on the stack under the
+//! convention it was not built with, which would silently re-emit or skip
+//! entries rather than merely fail loudly -- so `next`/`prev` each check
+//! [`Direction`] first and return `Err` naming the mismatch instead of ever
+//! attempting it. A true bidirectional cursor (a keyed `Get` followed by a
+//! `Get Previous`) is not implemented, and a caller that needs one gets a
+//! clean refusal to build on rather than a silent wrong answer.
 //!
 //! Not yet reachable from `Block::query`/`Block::get` -- that cutover is a
 //! later task. This module and [`super::Block::nav_root`] exist to be
@@ -57,10 +64,6 @@ use super::pages::{self, IndexPage, Layout, Shape};
 /// here instead of a bias, because they act on an already-positioned cursor
 /// rather than a fresh search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// `Greater`/`AtLeast`/`Less`/`AtMost` are exercised by hand (see this
-// module's own doc comment on what is and is not differentially proven),
-// not by the corpus test -- Task 7's cutover is what gives them a caller.
-#[allow(dead_code)]
 pub(crate) enum Bias {
     Equal,
     Greater,
@@ -86,32 +89,54 @@ pub(crate) struct Duplicates {
     pub(crate) offset: usize,
 }
 
-/// The stored root for key definition `keynum`, straight off the file
-/// control record. `None` when there is no tree yet: a virgin file, or an
-/// `ANOSEG` continuation definition, both read a bare zero at
-/// [`pages::fcr::KEY_ROOT`] (`format::fcr`'s own module doc).
+/// The stored root for key **definition** `definition`, straight off the
+/// file control record, for key **number** `number`. `None` when there is
+/// no tree yet: a virgin file, or an `ANOSEG` continuation definition, both
+/// read a bare zero at [`pages::fcr::KEY_ROOT`] (`format::fcr`'s own module
+/// doc).
 ///
-/// Returned **still decorated** -- top byte `0x80|keynum`, low 24 bits the
+/// **`definition` and `number` are not the same quantity, and a real corpus
+/// file can make them differ.** A key's root and per-key record count live
+/// at `fcr::KEYS + definition*KEY_WIDTH` -- `definition` is this key's
+/// ordinal among the file's *definitions*, one per segment
+/// (`Key::definition`'s own doc comment) -- but the tag the root and every
+/// descendant page actually carry is `0x80 + number`, this key's ordinal
+/// among the file's *keys* (`Key::number`), which only equals `definition`
+/// when every earlier key is single-segment. `GALTELA.DAT`'s own key 1
+/// (`number == 1`) starts at definition 2, and passing `2` for both purposes
+/// -- this function's very first version -- refused every real lookup with
+/// "carries tag 0x81, not 0x82", a false positive caught by the
+/// differential test, not a hypothetical. `v6_reindex`'s write side
+/// (`Self::v6_decorate`, `tag_high = 0x80 + key.number`) already keeps the
+/// two separate for exactly this reason; this is its read-side mirror.
+///
+/// Returned **still decorated** -- top byte `0x80|number`, low 24 bits the
 /// logical root page ([`pages::fcr::ROOT_PAGE`]'s own doc comment is the
-/// authority this mirrors: the code `Block::v6_reindex` uses to *write* this
-/// same field reads it back the identical way, masking only once the value
-/// is actually used as a logical id). Every child pointer inside the tree
+/// authority this mirrors). Every child pointer inside the tree
 /// ([`IndexPage::leftmost`]/[`IndexPage::rightmost`]/each entry's own child)
 /// is stored the same decorated way, so [`TreeCursor`] applies one mask to
 /// all of them rather than treating the root as a special case.
 ///
 /// # Errors
 ///
-/// If `fcr` is too short to hold definition `keynum`'s root field, or the
+/// If `fcr` is too short to hold definition `definition`'s root field, the
 /// stored value does not carry the v6 marker bit (`0x8000_0000`) every v6
-/// key root measured so far has set.
-pub(crate) fn root_of(fcr: &[u8], keynum: usize) -> Result<Option<u32>, String> {
-    let at = pages::fcr::KEYS + keynum * pages::fcr::KEY_WIDTH + pages::fcr::KEY_ROOT;
+/// key root measured so far has set, or **the stored tag disagrees with
+/// `number`** -- `(raw >> 24) != 0x80 | number`. This last check is not
+/// optional: without it, a corrupted FCR or a caller that passed the wrong
+/// `definition`/`number` pair would hand [`TreeCursor::seek`] a root whose
+/// top byte it then trusts for every page-tag check for the rest of the
+/// walk ([`TreeCursor::key_tag`]) -- the walk would stay perfectly
+/// self-consistent while silently reading a *different* key's entire tree.
+/// Refusing here, at the one point this crate is told which key it meant to
+/// ask for, is what makes that impossible instead of merely unlikely.
+pub(crate) fn root_of(fcr: &[u8], definition: usize, number: u16) -> Result<Option<u32>, String> {
+    let at = pages::fcr::KEYS + definition * pages::fcr::KEY_WIDTH + pages::fcr::KEY_ROOT;
     let end = at + 4;
     if end > fcr.len() {
         return Err(format!(
-            "key {keynum}'s root field would occupy {at:#x}..{end:#x}, past the \
-             {}-byte file control record",
+            "key definition {definition}'s root field would occupy \
+             {at:#x}..{end:#x}, past the {}-byte file control record",
             fcr.len()
         ));
     }
@@ -121,8 +146,32 @@ pub(crate) fn root_of(fcr: &[u8], keynum: usize) -> Result<Option<u32>, String> 
     }
     if raw & 0x8000_0000 == 0 {
         return Err(format!(
-            "key {keynum}'s root {raw:#010x} does not carry the v6 marker bit \
-             (0x80000000) every v6 key root measured so far has set"
+            "key {number} (definition {definition})'s root {raw:#010x} does not \
+             carry the v6 marker bit (0x80000000) every v6 key root measured so \
+             far has set"
+        ));
+    }
+    // `v6_reindex`'s own write side (the authority this function's doc
+    // comment cites) computes this identical `0x80 + number` tag when it
+    // builds a fresh root; reading it back is the read-side mirror of that,
+    // not a new rule.
+    let expected_tag = 0x80u8
+        .checked_add(u8::try_from(number).map_err(|_| {
+            format!("key {number}: does not fit a page tag's low byte")
+        })?)
+        .ok_or_else(|| {
+            format!(
+                "key {number}: a page tag's high byte is 0x80 plus the key's own \
+                 number, and this key's number does not fit"
+            )
+        })?;
+    let actual_tag = (raw >> 24) as u8;
+    if actual_tag != expected_tag {
+        return Err(format!(
+            "key {number} (definition {definition})'s root {raw:#010x} carries tag \
+             {actual_tag:#04x}, not the {expected_tag:#04x} (0x80|number) this key's \
+             own root must carry -- refusing rather than walking what would silently \
+             be a different key's tree"
         ));
     }
     Ok(Some(raw))
@@ -176,22 +225,37 @@ fn child_slot(page: &IndexPage, k: usize) -> u32 {
 
 /// Fetch, tag-check and decode the page a raw (still-tagged) pointer names.
 ///
-/// Two checks, both refusals rather than silent decoding: the pointer's own
-/// top byte must be this key's tag (a child cannot belong to a different
-/// key's tree -- `read.rs`'s `v6_enter_child` makes the identical check for
-/// the eager reader this mirrors), and the *page's own header tag*, once
-/// fetched, must match too. The second is what catches a page this cursor
-/// should never land on at all: unclaimed (marker `0x0000`) or
-/// merge-retired (marker `0x4500`, `docs/2026-08-25-btree-split-oracle.md`)
-/// -- either reads back as *some* tag other than this key's own, so the one
-/// comparison below refuses both by construction rather than needing a
-/// marker-specific case for each.
+/// Three checks, all refusals rather than silent decoding or an unbounded
+/// loop: the pointer's own top byte must be this key's tag (a child cannot
+/// belong to a different key's tree -- `read.rs`'s `v6_enter_child` makes
+/// the identical check for the eager reader this mirrors); this logical
+/// page must not already be in `seen` (a cycle -- `pages::walk_with`'s own
+/// `HashSet`, mirrored here because this cursor is `walk_with`'s lazy
+/// equivalent and a corrupted or cyclic tree is exactly what a *production*
+/// read path, unlike a one-shot test walk, cannot be allowed to spin
+/// forever on); `depth` must be under `pages::MAX_DEPTH` (the same bound,
+/// for the same reason -- a cycle through more than `MAX_DEPTH` distinct
+/// pages would pass the `seen` check every time yet still never
+/// terminate); and the *page's own header tag*, once fetched, must match
+/// too. The last is what catches a page this cursor should never land on
+/// at all: unclaimed (marker `0x0000`) or merge-retired (marker `0x4500`,
+/// `docs/2026-08-25-btree-split-oracle.md`) -- either reads back as *some*
+/// tag other than this key's own, so the one comparison below refuses both
+/// by construction rather than needing a marker-specific case for each.
+///
+/// # Errors
+///
+/// See above: a tag mismatch (pointer or page), a repeated logical page, or
+/// `depth >= pages::MAX_DEPTH`, in addition to whatever `resolve` or the
+/// cache itself refuse.
 fn fetch_page(
     cache: &RefCell<PageCache>,
     resolve: &mut dyn FnMut(u32) -> Result<u32, String>,
     shape: Shape,
     key_tag: u8,
     raw_pointer: u32,
+    seen: &mut std::collections::HashSet<u32>,
+    depth: usize,
 ) -> Result<IndexPage, String> {
     let top = (raw_pointer >> 24) as u8;
     if top != key_tag {
@@ -202,6 +266,19 @@ fn fetch_page(
         ));
     }
     let logical = raw_pointer & pages::fcr::ROOT_PAGE;
+    if !seen.insert(logical) {
+        return Err(format!(
+            "logical page {logical} appears twice in this key's own tree -- the tree \
+             does not terminate cleanly (a cycle)"
+        ));
+    }
+    if depth >= pages::MAX_DEPTH {
+        return Err(format!(
+            "this key's tree is more than {} levels deep at logical page {logical} -- \
+             not a real B-tree (pages::MAX_DEPTH, the same bound pages::walk_with uses)",
+            pages::MAX_DEPTH
+        ));
+    }
     let physical = resolve(logical)?;
     let bytes = {
         let mut guard = cache.borrow_mut();
@@ -228,6 +305,18 @@ fn fetch_page(
         .map_err(|e| format!("logical page {logical} (physical {physical}): {e}"))
 }
 
+/// Which of [`Frame::at`]'s two conventions this cursor's own frames use --
+/// set once, from `bias`, at [`TreeCursor::seek`] and never changed
+/// afterward. [`TreeCursor::next`]/[`TreeCursor::prev`] each refuse outright
+/// when called against the wrong one, rather than silently reinterpreting
+/// `at` under a convention the frame was not built with -- see this
+/// module's own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
 /// A lazy in-order cursor over one key's v6 B-tree. See this module's own
 /// doc comment for the shape of the tree it walks and the limits of what is
 /// proven about it.
@@ -236,6 +325,9 @@ pub(crate) struct TreeCursor {
     /// [`Self::seek`] and checked against every page reached from there --
     /// see [`fetch_page`].
     key_tag: u8,
+    /// Which `bias` this cursor was seeded with committed it to -- see
+    /// [`Direction`].
+    direction: Direction,
     stack: Vec<Frame>,
     /// A child pointer (still tagged, not yet resolved) to descend into on
     /// the next step -- leftmost-first for a forward-primed cursor,
@@ -243,6 +335,13 @@ pub(crate) struct TreeCursor {
     pending: Option<u32>,
     group: Option<Group>,
     dup: Option<Duplicates>,
+    /// Every logical page this cursor has fetched so far, across its whole
+    /// lifetime (one `seek` plus however many `next`/`prev` calls follow) --
+    /// [`fetch_page`]'s cycle guard. Never pruned, matching
+    /// `pages::walk_with`'s own `seen`: a well-formed tree visits each page
+    /// at most once in a single walk, so nothing here should ever need to
+    /// forget one.
+    seen: std::collections::HashSet<u32>,
 }
 
 impl TreeCursor {
@@ -279,12 +378,18 @@ impl TreeCursor {
         dup: Option<Duplicates>,
         cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
     ) -> Result<(Self, Option<u32>), String> {
+        let direction = match bias {
+            Bias::Lowest | Bias::Equal | Bias::AtLeast | Bias::Greater => Direction::Forward,
+            Bias::Highest | Bias::Less | Bias::AtMost => Direction::Backward,
+        };
         let mut cursor = Self {
             key_tag: (root >> 24) as u8,
+            direction,
             stack: Vec::new(),
             pending: Some(root),
             group: None,
             dup,
+            seen: std::collections::HashSet::new(),
         };
         let position = match bias {
             Bias::Lowest => cursor.next(cache, resolve, shape)?,
@@ -362,14 +467,28 @@ impl TreeCursor {
     ///
     /// # Errors
     ///
-    /// If continuing the descent hits a page [`fetch_page`] refuses, or a
-    /// duplicate chain does not check out (see [`Self::chain_members`]).
+    /// If this cursor was primed backward (`Highest`/`AtMost`/`Less` at
+    /// [`Self::seek`]) -- see [`Direction`] and this module's own doc
+    /// comment: its frames' own `at` means "`[at, len)` emitted", and
+    /// reinterpreting them under `next`'s "`[0, at)` emitted" convention
+    /// would silently re-emit or skip entries rather than fail loudly, so
+    /// this refuses instead of ever attempting it. Also if continuing the
+    /// descent hits a page [`fetch_page`] refuses, or a duplicate chain does
+    /// not check out (see [`Self::chain_members`]).
     pub(crate) fn next(
         &mut self,
         cache: &RefCell<PageCache>,
         resolve: &mut dyn FnMut(u32) -> Result<u32, String>,
         shape: Shape,
     ) -> Result<Option<u32>, String> {
+        if self.direction != Direction::Forward {
+            return Err(
+                "this cursor was primed backward (Highest/AtMost/Less) -- next() would \
+                 reinterpret its frames under the wrong convention, so it is refused \
+                 rather than risking a silently wrong position"
+                    .to_owned(),
+            );
+        }
         if let Some(group) = &mut self.group {
             if group.at + 1 < group.members.len() {
                 group.at += 1;
@@ -387,13 +506,22 @@ impl TreeCursor {
     ///
     /// # Errors
     ///
-    /// See [`Self::next`].
+    /// See [`Self::next`] -- the mirror refusal fires here when this cursor
+    /// was primed forward (`Lowest`/`Equal`/`AtLeast`/`Greater`).
     pub(crate) fn prev(
         &mut self,
         cache: &RefCell<PageCache>,
         resolve: &mut dyn FnMut(u32) -> Result<u32, String>,
         shape: Shape,
     ) -> Result<Option<u32>, String> {
+        if self.direction != Direction::Backward {
+            return Err(
+                "this cursor was primed forward (Lowest/Equal/AtLeast/Greater) -- \
+                 prev() would reinterpret its frames under the wrong convention, so \
+                 it is refused rather than risking a silently wrong position"
+                    .to_owned(),
+            );
+        }
         if let Some(group) = &mut self.group {
             if group.at > 0 {
                 group.at -= 1;
@@ -424,7 +552,8 @@ impl TreeCursor {
     ) -> Result<Option<(Vec<u8>, u32, u32)>, String> {
         loop {
             while let Some(raw) = self.pending.take() {
-                let page = fetch_page(cache, resolve, shape, self.key_tag, raw)?;
+                let page =
+                    fetch_page(cache, resolve, shape, self.key_tag, raw, &mut self.seen, self.stack.len())?;
                 let leftmost = (!page.leaf()).then_some(page.leftmost);
                 self.stack.push(Frame { page, at: 0 });
                 self.pending = leftmost;
@@ -460,7 +589,8 @@ impl TreeCursor {
     ) -> Result<Option<(Vec<u8>, u32, u32)>, String> {
         loop {
             while let Some(raw) = self.pending.take() {
-                let page = fetch_page(cache, resolve, shape, self.key_tag, raw)?;
+                let page =
+                    fetch_page(cache, resolve, shape, self.key_tag, raw, &mut self.seen, self.stack.len())?;
                 let rightmost = (!page.leaf()).then_some(page.rightmost);
                 let at = page.entries.len();
                 self.stack.push(Frame { page, at });
@@ -511,7 +641,8 @@ impl TreeCursor {
             let Some(raw) = self.pending.take() else {
                 return Ok(());
             };
-            let page = fetch_page(cache, resolve, shape, self.key_tag, raw)?;
+            let page =
+                    fetch_page(cache, resolve, shape, self.key_tag, raw, &mut self.seen, self.stack.len())?;
             let idx = page.entries.partition_point(|e| cmp(&e.0, target) == Ordering::Less);
             let exact = idx < page.entries.len() && cmp(&page.entries[idx].0, target) == Ordering::Equal;
             let leaf = page.leaf();
@@ -547,7 +678,8 @@ impl TreeCursor {
             let Some(raw) = self.pending.take() else {
                 return Ok(());
             };
-            let page = fetch_page(cache, resolve, shape, self.key_tag, raw)?;
+            let page =
+                    fetch_page(cache, resolve, shape, self.key_tag, raw, &mut self.seen, self.stack.len())?;
             let idx = if inclusive {
                 page.entries.partition_point(|e| cmp(&e.0, target) != Ordering::Greater)
             } else {
@@ -743,20 +875,121 @@ mod tests {
         Some((btrieve, at))
     }
 
+    /// `ops::Block::query`'s own per-`Op` semantics (`ops.rs`'s `match op {
+    /// ... }` inside `Block::query`), mirrored directly against `Records`
+    /// instead of a live `Block::query` call -- no lock table or module ABI
+    /// needed, and this is the reference every bias check below is measured
+    /// against, not this cursor's own idea of what it should do. `target`
+    /// is required for every bias but `Lowest`/`Highest`.
+    fn reference_answer(
+        records: &Records,
+        keys: &[Key],
+        key: u16,
+        bias: Bias,
+        target: Option<&[u8]>,
+    ) -> Option<u32> {
+        let count = records.ordered_len(key).unwrap_or(0);
+        let at = match bias {
+            Bias::Lowest => (count > 0).then_some(0),
+            Bias::Highest => count.checked_sub(1),
+            Bias::Equal => {
+                let target = target.expect("Equal needs a target");
+                let at = records.seek(keys, key, target);
+                records.matches(keys, key, at, target).then_some(at)
+            }
+            Bias::AtLeast => {
+                let target = target.expect("AtLeast needs a target");
+                Some(records.seek(keys, key, target)).filter(|at| *at < count)
+            }
+            Bias::Greater => {
+                let target = target.expect("Greater needs a target");
+                let mut at = records.seek(keys, key, target);
+                while records.matches(keys, key, at, target) {
+                    at += 1;
+                }
+                Some(at).filter(|at| *at < count)
+            }
+            Bias::AtMost => {
+                let target = target.expect("AtMost needs a target");
+                let mut at = records.seek(keys, key, target);
+                while records.matches(keys, key, at, target) {
+                    at += 1;
+                }
+                at.checked_sub(1)
+            }
+            Bias::Less => {
+                let target = target.expect("Less needs a target");
+                records.seek(keys, key, target).checked_sub(1)
+            }
+        };
+        at.map(|at| records.ordered(key, at).expect("in range").position)
+    }
+
+    /// Try small byte-level mutations of `base` until one is both (a) not
+    /// an exact match for any record and (b) `Records::seek` places its
+    /// lower bound at exactly `want_seek` -- i.e. genuinely between
+    /// whatever sits at indices `want_seek - 1` and `want_seek` in this
+    /// key's own order (or below everything, for `want_seek == 0`; or
+    /// above everything, for `want_seek == count`).
+    ///
+    /// `None` is an expected, non-failing answer, not a weakened check: a
+    /// tightly packed key space (dense sequential integers, a one-byte
+    /// enumerated field near exhaustion) can have no value between two
+    /// adjacent ones at all, and this must not fabricate one. The caller
+    /// tracks how often a probe actually was constructed
+    /// (`probes_found`/`probes_attempted`) and fails the whole run if that
+    /// count is ever zero, so a version of this function that stopped
+    /// finding anything would not silently pass.
+    fn probe_absent(
+        records: &Records,
+        keys: &[Key],
+        key: u16,
+        base: &[u8],
+        want_seek: usize,
+    ) -> Option<Vec<u8>> {
+        const DELTAS: [i16; 14] = [1, -1, 2, -2, 3, -3, 5, -5, 7, -7, 16, -16, 64, -64];
+        for byte in (0..base.len()).rev() {
+            for delta in DELTAS {
+                let mut candidate = base.to_vec();
+                let v = i16::from(candidate[byte]) + delta;
+                if !(0..=255).contains(&v) {
+                    continue;
+                }
+                candidate[byte] = v as u8;
+                let at = records.seek(keys, key, &candidate);
+                if at == want_seek && !records.matches(keys, key, at, &candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
     /// For every v6 file this box has (`archive/` plus the committed
-    /// fixtures), for every key with at least one record: enumerate
-    /// positions through [`TreeCursor`] (`Lowest` + `next` until `None`,
-    /// then `Highest` + `prev` until `None`) and through
-    /// `Records::ordered`, and require the forward sequence equal and the
-    /// backward sequence its reverse. Then, for every distinct value the key
-    /// holds, `seek(Equal)` must land on the same record `Records::seek`
-    /// finds.
+    /// fixtures), for every key with at least one record:
+    ///
+    /// 1. Enumerate positions through [`TreeCursor`] (`Lowest` + `next`
+    ///    until `None`, then `Highest` + `prev` until `None`) and through
+    ///    `Records::ordered`, and require the forward sequence equal and
+    ///    the backward sequence its reverse.
+    /// 2. For every one of `Bias`'s five comparison variants
+    ///    (`Equal`/`AtLeast`/`Greater`/`Less`/`AtMost` -- `Lowest`/`Highest`
+    ///    need no target and are already covered by (1)), at every distinct
+    ///    value the key holds, `seek(bias, value)` must equal
+    ///    [`reference_answer`]'s mirror of what `ops::Block::query` would
+    ///    do against `Records` for the identical `(bias, value)`.
+    /// 3. The same five biases again, at an absent value between each pair
+    ///    of adjacent distinct values (via [`probe_absent`]) plus one below
+    ///    the minimum and one above the maximum -- exercising the "no exact
+    ///    match anywhere in the tree" path through `seek_lower_bound`/
+    ///    `seek_upper_bound` that (2) alone cannot reach, since every (2)
+    ///    target is an exact match by construction.
     ///
     /// Duplicate-permitting keys are not special-cased: their tree entries
-    /// group several records under one value, and both sequences above are
-    /// per-*record*, so a cursor that silently collapsed a group to one
-    /// position would already fail the length check -- confirmed separately
-    /// by asserting this run actually saw at least one such group.
+    /// group several records under one value, and every sequence/bias check
+    /// above is per-*record*, so a cursor that silently collapsed a group to
+    /// one position would already fail -- confirmed separately by asserting
+    /// this run actually saw at least one such group.
     #[test]
     fn tree_cursor_matches_records_over_the_v6_corpus() {
         let mut files_compared = 0usize;
@@ -764,6 +997,9 @@ mod tests {
         let mut records_compared = 0usize;
         let mut dup_group_hit = false;
         let mut dup_files = 0usize;
+        let mut bias_checks = 0usize;
+        let mut probes_attempted = 0usize;
+        let mut probes_found = 0usize;
 
         for path in v6_candidate_paths() {
             let Some((btrieve, at)) = open_v6(&path) else { continue };
@@ -852,36 +1088,65 @@ mod tests {
                 reversed.reverse();
                 assert_eq!(backward, reversed, "{name} key {}: backward sequence", key.number);
 
-                // Equal, for every distinct value this key holds.
-                let mut at = 0usize;
-                while at < count {
-                    let anchor = records.ordered(key.number, at).expect("in range").clone();
-                    let value = key.extract(&records.keyed(&anchor.bytes));
-
-                    let expected_at = records.seek(&keys, key.number, &value);
-                    let expected_position =
-                        records.ordered(key.number, expected_at).expect("in range").position;
-
+                // All five comparison biases (`Lowest`/`Highest` need no
+                // target and are already covered above), for every distinct
+                // value this key holds, plus an absent probe between each
+                // pair of adjacent distinct values and one below the
+                // minimum / above the maximum -- each checked against
+                // `reference_answer`'s own mirror of `ops::Block::query`'s
+                // per-bias `Records` semantics, not against this cursor's
+                // own idea of what it should do.
+                const COMPARISON_BIASES: [Bias; 5] =
+                    [Bias::Equal, Bias::AtLeast, Bias::Greater, Bias::Less, Bias::AtMost];
+                let mut check_bias = |bias: Bias, target: &[u8], where_: &str| {
+                    let expected = reference_answer(&records, &keys, key.number, bias, Some(target));
                     let (_cursor, found) = TreeCursor::seek(
                         cache,
                         &mut *resolve,
                         root,
                         shape,
-                        Some(&value),
-                        Bias::Equal,
+                        Some(target),
+                        bias,
                         dup,
                         &cmp,
                     )
                     .unwrap_or_else(|e| {
-                        panic!("{name} key {}: seek(Equal) at {at}: {e}", key.number)
+                        panic!("{name} key {}: seek({bias:?}) at {where_}: {e}", key.number)
                     });
                     assert_eq!(
-                        found,
-                        Some(expected_position),
-                        "{name} key {}: seek(Equal) disagrees with Records::seek at distinct \
-                         value {at}",
+                        found, expected,
+                        "{name} key {}: seek({bias:?}) disagrees with Records at {where_}",
                         key.number
                     );
+                };
+
+                let mut at = 0usize;
+                let mut previous_group: Option<(usize, Vec<u8>)> = None;
+                while at < count {
+                    let anchor = records.ordered(key.number, at).expect("in range").clone();
+                    let value = key.extract(&records.keyed(&anchor.bytes));
+
+                    for bias in COMPARISON_BIASES {
+                        check_bias(bias, &value, &format!("distinct value index {at}"));
+                    }
+                    bias_checks += COMPARISON_BIASES.len();
+
+                    if let Some((prev_at, prev_value)) = &previous_group {
+                        probes_attempted += 1;
+                        if let Some(probe) =
+                            probe_absent(&records, &keys, key.number, prev_value, at)
+                        {
+                            probes_found += 1;
+                            for bias in COMPARISON_BIASES {
+                                check_bias(
+                                    bias,
+                                    &probe,
+                                    &format!("an absent value between indices {prev_at} and {at}"),
+                                );
+                            }
+                            bias_checks += COMPARISON_BIASES.len();
+                        }
+                    }
 
                     // Advance past every record sharing this value -- the
                     // same comparator `Records::reindex` groups ties with,
@@ -902,7 +1167,32 @@ mod tests {
                         dup_group_hit = true;
                     }
                     records_compared += next_at - at;
+                    previous_group = Some((at, value));
                     at = next_at;
+                }
+
+                // Below the minimum and above the maximum -- the two edges
+                // no "between two adjacent values" probe can reach.
+                let min_value =
+                    key.extract(&records.keyed(&records.ordered(key.number, 0).expect("in range").bytes));
+                probes_attempted += 1;
+                if let Some(probe) = probe_absent(&records, &keys, key.number, &min_value, 0) {
+                    probes_found += 1;
+                    for bias in COMPARISON_BIASES {
+                        check_bias(bias, &probe, "a probe below this key's minimum value");
+                    }
+                    bias_checks += COMPARISON_BIASES.len();
+                }
+                let max_value = key.extract(
+                    &records.keyed(&records.ordered(key.number, count - 1).expect("in range").bytes),
+                );
+                probes_attempted += 1;
+                if let Some(probe) = probe_absent(&records, &keys, key.number, &max_value, count) {
+                    probes_found += 1;
+                    for bias in COMPARISON_BIASES {
+                        check_bias(bias, &probe, "a probe above this key's maximum value");
+                    }
+                    bias_checks += COMPARISON_BIASES.len();
                 }
 
                 keys_compared += 1;
@@ -923,10 +1213,139 @@ mod tests {
             "no duplicatable key was hit across the whole run -- a cursor that silently \
              collapsed a duplicate group to one position could otherwise pass"
         );
+        assert!(
+            bias_checks > 0,
+            "no bias was checked against any distinct value -- this test verified nothing \
+             about Equal/AtLeast/Greater/Less/AtMost"
+        );
+        assert!(
+            probes_found > 0,
+            "not one absent-value probe (between/below/above) was constructible across the \
+             whole run -- the 'no exact match' code path in seek_lower_bound/seek_upper_bound \
+             went completely untested"
+        );
         println!(
             "nav differential: {files_compared} v6 files, {keys_compared} keys, \
              {records_compared} records compared, {dup_files} files exercised a real \
-             duplicate group"
+             duplicate group, {bias_checks} (bias, target) checks across all seven biases, \
+             {probes_found}/{probes_attempted} absent-value probes constructed and checked"
         );
+    }
+
+    /// A page whose own `leftmost` names itself is a one-page cycle.
+    /// `pages::walk_with`'s own `a_cycle_in_the_tree_is_refused` proves the
+    /// eager reader this cursor mirrors refuses exactly this shape; this
+    /// proves the lazy cursor does too, rather than looping forever on a
+    /// corrupt tree reached from what would become a production read path.
+    /// No real corpus file is cyclic, so this is a synthetic fixture, not a
+    /// corpus finding -- built the same way `pages.rs`'s own cycle test
+    /// builds its v5 fixture, adapted to v6's decorated addressing.
+    #[test]
+    fn a_self_referencing_page_is_refused_not_looped_forever() {
+        let dir = crate::testing::scratch("nav-cycle");
+        let path = dir.join("LOOP.DAT");
+        let page_size = 512usize;
+
+        // Physical page 0 is padding, never resolved to. Physical page 1 is
+        // the self-referencing index page: v6 tag word 0x8000 (key 0's own
+        // tag), zero entries, `leftmost` naming decorated logical
+        // `0x80000001` -- itself, since the identity resolver below maps
+        // logical 1 to physical 1.
+        let mut file = vec![0u8; page_size * 2];
+        let page1 = &mut file[page_size..page_size * 2];
+        page1[0..2].copy_from_slice(&[0x00, 0x80]);
+        page1[6..8].copy_from_slice(&0u16.to_le_bytes());
+        page1[8..12].copy_from_slice(&pages::to_long(pages::NOWHERE));
+        page1[12..16].copy_from_slice(&pages::to_long(0x8000_0001));
+        std::fs::write(&path, &file).expect("writes");
+
+        let cache = RefCell::new(
+            crate::cache::PageCache::open(&path, page_size as u16).expect("opens"),
+        );
+        let shape = Shape { length: 4, duplicates: false };
+        let mut resolve = |logical: u32| -> Result<u32, String> { Ok(logical) };
+        let cmp = |a: &[u8], b: &[u8]| a.cmp(b);
+
+        // `TreeCursor` derives no `Debug` (it holds a decoded page per
+        // frame, not worth a derive for one test), so the error is pulled
+        // out by hand rather than via `Result::expect_err`.
+        let err = match TreeCursor::seek(
+            &cache,
+            &mut resolve,
+            0x8000_0001,
+            shape,
+            None,
+            Bias::Lowest,
+            None,
+            &cmp,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a page that names itself as its own leftmost child must not loop forever"),
+        };
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    /// [`Direction`]'s refusal, proven rather than merely argued: a cursor
+    /// primed by one direction refuses the other outright instead of
+    /// silently reinterpreting its own frames under the wrong convention.
+    /// Uses the first real v6 file and key this box has with more than one
+    /// record, so both directions have somewhere real to go before the
+    /// guard is expected to fire.
+    #[test]
+    fn a_cursor_refuses_the_direction_it_was_not_primed_for() {
+        for path in v6_candidate_paths() {
+            let Some((btrieve, at)) = open_v6(&path) else { continue };
+            let block = btrieve.block(at).expect("just opened");
+            let keys: Vec<Key> = block.keys().to_vec();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let Ok(records) = Records::read(&name, &path, block.geometry(), &keys) else {
+                continue;
+            };
+            for key in &keys {
+                if records.ordered_len(key.number).unwrap_or(0) < 2 {
+                    continue;
+                }
+                let Some((root, shape, dup, cache, mut resolve)) =
+                    block.nav_root(key.number).expect("nav_root")
+                else {
+                    continue;
+                };
+                let cmp = |a: &[u8], b: &[u8]| key.compare_extracted(a, b);
+
+                let (mut forward, _) = TreeCursor::seek(
+                    cache,
+                    &mut *resolve,
+                    root,
+                    shape,
+                    None,
+                    Bias::Lowest,
+                    dup,
+                    &cmp,
+                )
+                .expect("seek(Lowest)");
+                let err = forward
+                    .prev(cache, &mut *resolve, shape)
+                    .expect_err("a forward-primed cursor must refuse prev()");
+                assert!(err.contains("forward"), "{err}");
+
+                let (mut backward, _) = TreeCursor::seek(
+                    cache,
+                    &mut *resolve,
+                    root,
+                    shape,
+                    None,
+                    Bias::Highest,
+                    dup,
+                    &cmp,
+                )
+                .expect("seek(Highest)");
+                let err = backward
+                    .next(cache, &mut *resolve, shape)
+                    .expect_err("a backward-primed cursor must refuse next()");
+                assert!(err.contains("backward"), "{err}");
+                return;
+            }
+        }
+        panic!("no v6 file/key with at least two records was found to run this test against");
     }
 }

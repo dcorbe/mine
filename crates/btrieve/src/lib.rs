@@ -2378,7 +2378,7 @@ impl<M: Mem> Block<M> {
         })?;
         let mut store = v6::Store::attach(cache, &self.path, self.geometry.page)?;
         let fcr = self.v6_live_fcr(&mut store)?;
-        let Some(root) = nav::root_of(&fcr, usize::from(found.definition))? else {
+        let Some(root) = nav::root_of(&fcr, usize::from(found.definition), found.number)? else {
             return Ok(None);
         };
         let shape = found.shape();
