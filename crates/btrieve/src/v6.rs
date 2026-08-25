@@ -1313,6 +1313,12 @@ impl Map {
     /// block `logical` belongs to has no live pair, or if `logical`'s own
     /// slot is not claimed in that block's live copy -- there is nothing to
     /// release.
+    ///
+    /// Its only production caller is `Block::v6_reindex` (Task 6 stopped
+    /// calling that from the per-op write path; `unclaim` stays for the
+    /// same future create/repair reason `v6_reindex` does) -- still
+    /// directly exercised by this module's own tests below.
+    #[allow(dead_code)]
     pub(crate) fn unclaim(store: &mut Store, page_size: u16, logical: u32) -> Result<(), String> {
         let page_size_usize = usize::from(page_size);
 
@@ -1544,6 +1550,178 @@ impl Map {
 
         Ok(u32::from(new_physical16))
     }
+
+    /// Retire a claimed logical id from a key's own B-tree into the free
+    /// list (`docs/2026-08-25-btree-split-rules.md` §8): flip its tag to
+    /// `TAG_RETIRED` (`0x4500`) **in place** -- same logical id, same
+    /// physical page, not a relocation -- and thread it onto the list by
+    /// writing `next` (the list's own head *before* this call) into its
+    /// repurposed `rightmost` field (page offset `0x08`).
+    ///
+    /// The caller is responsible for then writing `logical` as the list's
+    /// new head (`super::pages::fcr::INDEX_FREE_V6`, via [`write_fcr`]) --
+    /// this function only threads the retired page itself, the same
+    /// division of labour [`Self::claim`]'s own caller (`Block::insert_v6`)
+    /// already has for the free record-slot list.
+    ///
+    /// The allocation table's own entry for `logical` still goes through
+    /// the ordinary shadow-pair copy-on-write every table write in this
+    /// module uses -- only the page's own physical location is exempt from
+    /// relocation, per §8's own measurement ("an allocation-table marker
+    /// change, not a relocation").
+    ///
+    /// # Errors
+    ///
+    /// If the block `logical` belongs to has no live pair, if that block's
+    /// two copies' generations tie, or if `logical`'s own slot is not
+    /// claimed in that block's live copy.
+    pub(crate) fn retire(store: &mut Store, page_size: u16, logical: u32, next: u32) -> Result<(), String> {
+        let page_size_usize = usize::from(page_size);
+        let (block, entry) = Self::block_of(logical, page_size_usize)?;
+        let (stale, live) = Self::pair_of(store, page_size_usize, block)?;
+
+        let at = ENTRIES + entry * ENTRY;
+        let live_bytes = store.page(live)?;
+        let marker = u16::from_le_bytes([live_bytes[at], live_bytes[at + 1]]);
+        if marker >> 8 == 0 {
+            return Err(format!(
+                "logical id {logical} is not claimed in block {block}'s live copy -- \
+                 there is nothing to retire"
+            ));
+        }
+        let claimed_physical = usize::from(u16::from_le_bytes([live_bytes[at + 2], live_bytes[at + 3]]));
+
+        let header = store.header(live)?;
+        let new_generation = u16::from_le_bytes([header[GENERATION], header[GENERATION + 1]]).wrapping_add(1);
+
+        let retired_tag = super::format::page::v6::TAG_RETIRED;
+
+        // The page itself keeps its physical home -- retirement is a
+        // marker change, not a relocation (§8). Its own header tag flips
+        // to TAG_RETIRED and its `rightmost` field (offset 8) becomes this
+        // free list's next hop.
+        let mut content = store.page(claimed_physical)?.to_vec();
+        content[0..2].copy_from_slice(&retired_tag.to_le_bytes());
+        content[8..12].copy_from_slice(&super::pages::to_long(next));
+        store.write_page(claimed_physical, &content)?;
+
+        // The allocation table's own entry, by contrast, always goes
+        // through its shadow pair -- the same copy-on-write every other
+        // table write in this module uses.
+        store.note_structural_pair(stale, live);
+        let live_page = store.page(live)?.to_vec();
+        store.write_page(stale, &live_page)?;
+
+        let stale_bytes = store.page_mut(stale)?;
+        stale_bytes[at..at + 2].copy_from_slice(&retired_tag.to_le_bytes());
+        stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
+
+        Ok(())
+    }
+
+    /// Reclaim a retired (`TAG_RETIRED`/`0x4500`) logical id for fresh
+    /// content -- [`Self::claim`]'s sibling for an id that already exists
+    /// but is retired, rather than one that has never been claimed at all.
+    /// [`Self::relocate`]'s own physical-placement mechanics (a same-id
+    /// twin, or an appended page) apply unchanged; what differs is that
+    /// this ALSO flips the marker to `tag`, which [`Self::relocate`] never
+    /// touches (§8: "marker flips `0x4500`->`0x8000`, no new logical id is
+    /// minted, physical page relocates per the ordinary shadow-copy rule").
+    ///
+    /// # Errors
+    ///
+    /// If the block `logical` belongs to has no live pair, if that block's
+    /// two copies' generations tie, if `content` is not exactly
+    /// `page_size` bytes, or if `logical`'s own slot is not marked
+    /// `TAG_RETIRED` in that block's live copy.
+    pub(crate) fn reclaim(
+        store: &mut Store,
+        page_size: u16,
+        logical: u32,
+        content: &[u8],
+        tag: [u8; 2],
+    ) -> Result<u32, String> {
+        let page_size_usize = usize::from(page_size);
+        if content.len() != page_size_usize {
+            return Err(format!(
+                "a reclaimed page must be exactly {page_size} bytes, and this one is {}",
+                content.len()
+            ));
+        }
+        let pages = store.total_pages();
+
+        let (block, entry) = Self::block_of(logical, page_size_usize)?;
+        let (stale, live) = Self::pair_of(store, page_size_usize, block)?;
+
+        let logical16 = u16::try_from(logical)
+            .map_err(|_| format!("logical id {logical} does not fit in this format's u16"))?;
+
+        let retired_tag = super::format::page::v6::TAG_RETIRED;
+        let at = ENTRIES + entry * ENTRY;
+        let live_bytes = store.page(live)?;
+        let marker = u16::from_le_bytes([live_bytes[at], live_bytes[at + 1]]);
+        if marker != retired_tag {
+            return Err(format!(
+                "logical id {logical} carries marker {marker:#06x} in block {block}'s \
+                 live copy, not TAG_RETIRED ({retired_tag:#06x}) -- there is nothing \
+                 retired to reclaim"
+            ));
+        }
+        let claimed_physical = usize::from(u16::from_le_bytes([live_bytes[at + 2], live_bytes[at + 3]]));
+
+        let header = store.header(live)?;
+        let new_generation = u16::from_le_bytes([header[GENERATION], header[GENERATION + 1]]).wrapping_add(1);
+
+        // Same twin-or-append placement `Self::relocate` uses -- see its
+        // own doc comment for why a same-id abandoned twin is preferred
+        // over growing the file.
+        let mut claimed = vec![false; pages];
+        for (_, page) in Self::read(store, page_size)?.entries() {
+            let page = page as usize;
+            if page < pages {
+                claimed[page] = true;
+            }
+        }
+        let mut twin = None;
+        for page in 4..pages {
+            if page == claimed_physical || claimed[page] {
+                continue;
+            }
+            let header = store.header(page)?;
+            if header[..2] == *MAGIC {
+                continue;
+            }
+            if u16::from_le_bytes([header[LOGICAL], header[LOGICAL + 1]]) == logical16 {
+                twin = Some(page);
+                break;
+            }
+        }
+
+        let new_physical16 = u16::try_from(twin.unwrap_or(pages))
+            .map_err(|_| format!("physical page {pages} does not fit in this format's u16"))?;
+        let mut page = content.to_vec();
+        page[..2].copy_from_slice(&tag);
+        page[LOGICAL..LOGICAL + 2].copy_from_slice(&logical16.to_le_bytes());
+        match twin {
+            Some(at) => store.write_page(at, &page)?,
+            None => {
+                store.append_page(&page)?;
+            }
+        }
+
+        store.note_structural_pair(stale, live);
+        let live_page = store.page(live)?.to_vec();
+        store.write_page(stale, &live_page)?;
+
+        let stale_bytes = store.page_mut(stale)?;
+        let repoint = ENTRIES + entry * ENTRY;
+        let new_marker = u16::from_le_bytes([tag[0], tag[1]]);
+        stale_bytes[repoint..repoint + 2].copy_from_slice(&new_marker.to_le_bytes());
+        stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
+        stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
+
+        Ok(u32::from(new_physical16))
+    }
 }
 
 /// Write a v6 file's shadowed file control record (physical pages 0 and 1)
@@ -1585,6 +1763,8 @@ pub(crate) fn write_fcr(
     key_record_counts: &[(usize, u32)],
     free_head: Option<u32>,
     variable_head: Option<Option<u32>>,
+    index_free_head: Option<u32>,
+    key_roots: &[(usize, u32)],
 ) -> Result<(), String> {
     let page_size_usize = usize::from(page_size);
     if store.total_pages() < 2 {
@@ -1642,6 +1822,17 @@ pub(crate) fn write_fcr(
         stale_bytes[at..at + 4].copy_from_slice(&super::pages::to_long(value));
     }
 
+    // The B-tree page free list's own head (Task 6, `docs/2026-08-25-btree-
+    // split-rules.md` §8) -- a third, independent list from both of the
+    // above. `Some` whenever this op retired or reclaimed a page; `NOWHERE`
+    // is a real, writable value here (an empty list), not a sentinel for
+    // "leave alone" -- that role belongs to the outer `None`, same as
+    // `free_head`.
+    if let Some(head) = index_free_head {
+        let at = super::pages::fcr::INDEX_FREE_V6;
+        stale_bytes[at..at + 4].copy_from_slice(&super::pages::to_long(head));
+    }
+
     for &(offset, count) in key_record_counts {
         if offset + 4 > page_size_usize {
             return Err(format!(
@@ -1650,6 +1841,21 @@ pub(crate) fn write_fcr(
             ));
         }
         stale_bytes[offset..offset + 4].copy_from_slice(&super::pages::to_long(count));
+    }
+
+    // Task 6: a key's own root moves when its tree's incremental
+    // maintenance grew a level (a leaf split cascading past the top,
+    // `docs/2026-08-25-btree-split-rules.md` §3) -- `(byte offset of that
+    // key's own KEY_ROOT field, new decorated root)` pairs, the identical
+    // shape `key_record_counts` already uses for KEY_RECORDS.
+    for &(offset, root) in key_roots {
+        if offset + 4 > page_size_usize {
+            return Err(format!(
+                "a key-root offset of {offset} does not leave room for its \
+                 four bytes in a {page_size}-byte page"
+            ));
+        }
+        stale_bytes[offset..offset + 4].copy_from_slice(&super::pages::to_long(root));
     }
 
     stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());

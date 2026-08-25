@@ -804,6 +804,109 @@ impl TreeCursor {
     }
 }
 
+/// One page on the path [`descend_for_write`] took from a key's root down
+/// to wherever it stopped -- like [`TreeCursor`]'s own `Frame`, but the
+/// whole path is kept rather than only the frames a lazy walk still needs,
+/// because an insert's split or a delete's underflow may have to rewrite
+/// its way back UP through any number of these, not just step through them
+/// once the way `Get`/`Step` do.
+pub(crate) struct WriteFrame {
+    /// This page's own logical id, undecorated (top-byte tag masked off).
+    pub(crate) logical: u32,
+    pub(crate) page: IndexPage,
+    /// The child slot (0..=entries.len()) the descent followed FROM this
+    /// frame to reach the next one -- meaningless (always `0`) on the last
+    /// frame, since nothing descends further from it. A split that
+    /// propagates up into this frame's own parent needs this to know which
+    /// of the parent's children it is replacing.
+    pub(crate) descended_via: usize,
+}
+
+/// What [`descend_for_write`] found: the whole path from a key's root to
+/// either an exact match (at any level -- a duplicate-permitting key's
+/// already-present value lives wherever it was promoted to, split rules §0/
+/// §9) or the leaf a genuinely new value belongs on.
+pub(crate) struct Located {
+    /// Root first, whatever `descend_for_write` stopped at last.
+    pub(crate) path: Vec<WriteFrame>,
+    /// `target`'s sorted position within `path`'s own last entries -- where
+    /// it already sits, if `exact`, or where it belongs if not.
+    pub(crate) at: usize,
+    pub(crate) exact: bool,
+}
+
+/// Descend from `root` toward `target`, keeping every page the descent
+/// passes through -- [`TreeCursor::seek_lower_bound`]'s identical search
+/// (one `partition_point` per page, the same early stop on an exact match),
+/// but collecting the whole path instead of leaving only the frames a lazy
+/// walk still needs on the stack, since a write may have to edit any
+/// number of them afterward.
+///
+/// # Errors
+///
+/// Whatever [`fetch_page`] refuses.
+pub(crate) fn descend_for_write(
+    cache: &RefCell<PageCache>,
+    resolve: &mut dyn FnMut(u32) -> Result<u32, String>,
+    root: u32,
+    shape: Shape,
+    target: &[u8],
+    cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
+) -> Result<Located, String> {
+    use std::cmp::Ordering;
+    let key_tag = (root >> 24) as u8;
+    let mut seen = std::collections::HashSet::new();
+    let mut path: Vec<WriteFrame> = Vec::new();
+    let mut pending = root;
+    loop {
+        let page = fetch_page(cache, resolve, shape, key_tag, pending, &mut seen, path.len())?;
+        let idx = page.entries.partition_point(|e| cmp(&e.0, target) == Ordering::Less);
+        let exact = idx < page.entries.len() && cmp(&page.entries[idx].0, target) == Ordering::Equal;
+        let leaf = page.leaf();
+        let logical = pending & pages::fcr::ROOT_PAGE;
+        let child_before = child_slot(&page, idx);
+        path.push(WriteFrame { logical, page, descended_via: idx });
+        if exact || leaf {
+            return Ok(Located { path, at: idx, exact });
+        }
+        pending = child_before;
+    }
+}
+
+/// Every child pointer of a page, `leftmost` first and `rightmost` last --
+/// [`child_slot`] applied at every slot, so a caller editing an interior
+/// page's own entries can edit its children the same uniform way, rather
+/// than hand-rolling the leftmost/entries/rightmost cases itself. Empty for
+/// a leaf (`page.leaf()`), the same convention [`IndexPage::entries`]'s own
+/// child field uses.
+pub(crate) fn children_of(page: &IndexPage) -> Vec<u32> {
+    if page.leaf() {
+        return Vec::new();
+    }
+    (0..=page.entries.len()).map(|k| child_slot(page, k)).collect()
+}
+
+/// Fetch and decode one page by its decorated pointer, standalone -- for a
+/// sibling an underflow's merge/redistribute (split rules §6/§7) needs to
+/// inspect, which [`descend_for_write`]'s own path never includes (a
+/// sibling is never on the direct root-to-target descent). A fresh `seen`
+/// set each call: this is one page, not a walk, so there is nothing for a
+/// cycle guard to catch across calls.
+///
+/// # Errors
+///
+/// Whatever [`fetch_page`] refuses.
+pub(crate) fn fetch_one(
+    cache: &RefCell<PageCache>,
+    resolve: &mut dyn FnMut(u32) -> Result<u32, String>,
+    shape: Shape,
+    key_tag: u8,
+    decorated: u32,
+) -> Result<IndexPage, String> {
+    let mut seen = std::collections::HashSet::new();
+    fetch_page(cache, resolve, shape, key_tag, decorated, &mut seen, 0)
+}
+
 #[cfg(test)]
 mod tests {
     //! The differential test the task brief calls `tests/nav_differential.rs`.

@@ -73,6 +73,28 @@ pub mod fcr {
     /// would have been misread.
     pub const ROOT_PAGE: u32 = 0x00ff_ffff;
 
+    /// Head of the **B-tree page free list**, version 6 only: which retired
+    /// (`TAG_RETIRED`/`0x4500`) index page a split should reclaim next. A
+    /// plain [`long`](super::long) -- the bare logical id, decoded the same
+    /// word-swapped way every other pointer in this format is -- and
+    /// `0xffffffff` ([`NOWHERE`](super::NOWHERE)) for an empty list. Each
+    /// member's own `rightmost` field (its header offset `0x08`, repurposed
+    /// once retired) holds the next hop, the same encoding.
+    ///
+    /// `docs/2026-08-25-btree-split-rules.md` §8 describes this as packed
+    /// `(logical_id << 16)`, which is what the same four bytes look like to
+    /// a plain (non-word-swapped) little-endian `u32` read -- the tool that
+    /// recorded it never applied this crate's own [`long`](super::long)
+    /// convention. Measured directly against
+    /// `underflow512u/merge-on-delete/after.dat` (`FCR+0x98` decodes, via
+    /// [`long`](super::long), to `10`; physical page 10's own `rightmost`
+    /// decodes to `8`; physical page 7's to `1`; physical page 15's to
+    /// `0xffffffff` -- the chain `10 -> 8 -> 1 -> NOWHERE` §8 cites, with
+    /// every hop a bare logical id rather than a shifted one). A different
+    /// field from [`FREE_V6`]: that one threads free *record slots*, this
+    /// one threads retired *index pages*.
+    pub const INDEX_FREE_V6: usize = 0x98;
+
     /// Head of the **variable free-space chain**: which variable page still
     /// has room for a fragment. A [`long`](super::long), holding a *page*
     /// number rather than the record position [`FREE_V6`] holds.
@@ -1490,6 +1512,87 @@ pub fn number_pages(built: &Built, numbers: &[u32]) -> Result<Vec<(u32, Vec<u8>)
         out.push((placed[*at], image));
     }
     Ok(out)
+}
+
+/// Encode one v6 index/leaf page's content directly, for incremental B-tree
+/// maintenance (Task 6) -- a single node, given already, rather than
+/// [`build_index`]'s whole-tree bottom-up rebuild.
+///
+/// `entries` are already in sorted order and already sized to fit one page
+/// (the caller enforces `entries.len() <= shape.capacity(layout.page)`,
+/// per the split rules -- this function does not check it, the same trust
+/// [`push_node`] places in its own caller). `children` is empty for a leaf
+/// and `entries.len() + 1` **decorated** pointers for an interior node --
+/// `children[0]` becomes `leftmost`, `children[last]` becomes `rightmost`,
+/// and `children[n + 1]` becomes entry `n`'s own child field, mirroring
+/// [`number_pages`]'s post-pass for a tree built one node at a time instead
+/// of all at once.
+///
+/// The header's own tag/logical bytes (offsets `0..4`) are left zero:
+/// [`super::v6::Map::claim`]/[`relocate`](super::v6::Map::relocate)/
+/// [`retire`](super::v6::Map::retire)/[`reclaim`](super::v6::Map::reclaim)
+/// always overwrite them with the page's real identity on write, the same
+/// contract [`push_node`]'s own placeholder header relies on.
+///
+/// # Panics
+///
+/// If `children` is neither empty nor `entries.len() + 1` long.
+pub(crate) fn encode_v6_index_page(
+    layout: Layout,
+    shape: Shape,
+    stamp: u16,
+    entries: &[Entry],
+    children: &[u32],
+) -> Vec<u8> {
+    let leaf = children.is_empty();
+    assert!(
+        leaf || children.len() == entries.len() + 1,
+        "an interior node needs one more child than it has entries"
+    );
+
+    let mut image = vec![0u8; usize::from(layout.page)];
+    image[4..6].copy_from_slice(&(stamp & 0x7fff).to_le_bytes());
+    let count = u16::try_from(entries.len()).expect("a page holds far fewer than 65,535 entries");
+    image[6..8].copy_from_slice(&count.to_le_bytes());
+
+    if leaf {
+        image[8..12].copy_from_slice(&to_long(NOWHERE));
+        image[12..16].copy_from_slice(&to_long(NOWHERE));
+    } else {
+        image[8..12].copy_from_slice(&to_long(children[children.len() - 1]));
+        image[12..16].copy_from_slice(&to_long(children[0]));
+    }
+
+    let width = shape.entry_size();
+    let mut at = INDEX_HEADER;
+    for (n, entry) in entries.iter().enumerate() {
+        image[at..at + entry.key.len()].copy_from_slice(&entry.key);
+        let mut field = at + entry.key.len();
+        image[field..field + 4].copy_from_slice(&to_long(entry.head));
+        if shape.duplicates {
+            field += 4;
+            image[field..field + 4].copy_from_slice(&to_long(entry.tail));
+        }
+        let tail = field;
+        // The last entry's child slot is a placeholder (`0`, never a
+        // pointer -- see `INDEX_ENTRY_TAIL`'s own doc comment); every other
+        // entry gets its real child from `children`, or `NOWHERE` on a leaf.
+        // Left unwritten (default zero) when the page is packed to exactly
+        // the engine's own capacity and there is no room for it, matching
+        // `push_node`'s identical tolerance.
+        if tail + 8 <= image.len() {
+            let child = if n + 1 == entries.len() {
+                0
+            } else if leaf {
+                NOWHERE
+            } else {
+                children[n + 1]
+            };
+            image[tail + 4..tail + 8].copy_from_slice(&to_long(child));
+        }
+        at += width;
+    }
+    image
 }
 
 /// Append one zeroed page to a file and return its number.

@@ -1135,6 +1135,15 @@ pub(crate) enum Stop {
     AfterFirstFlip = 3,
 }
 
+/// Which sibling an underflowing v6 B-tree node redistributes with or
+/// merges into -- `docs/2026-08-25-btree-split-rules.md` §6's right-first
+/// predicate (`Block::v6_tree_delete`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
+
 #[cfg(test)]
 thread_local! {
     /// Which [`Stop`] to fail at, or `None` for the only value production has.
@@ -1910,9 +1919,46 @@ impl<M: Mem> Block<M> {
             .insert(&self.keys, new_position, bytes.clone())
             .map_err(|why| fail(format!("adding the new record to the model: {why}")))?;
 
-        let key_record_counts = self
-            .v6_reindex(&mut store, &records_clone, &fcr, layout)
-            .map_err(&fail)?;
+        // Task 6: every key's own B-tree, edited incrementally -- locate,
+        // insert (extending a duplicate group's tail, or splitting a full
+        // leaf and cascading upward per the rules doc) -- never a full
+        // `v6_reindex` rebuild. `index_free_head` threads the B-tree page
+        // free list's own running head across every key in this one op, so
+        // a page one key's split reclaims is gone by the time the next
+        // key's split looks for one.
+        let cache_rc = self.v6_tree_cache().map_err(&fail)?;
+        let shift = records_clone.key_shift();
+        let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
+        let mut key_roots: Vec<(usize, u32)> = Vec::new();
+        let mut index_free_head =
+            pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
+        for key in &self.keys {
+            let len = records_clone.ordered_len(key.number).ok_or_else(|| {
+                fail(format!(
+                    "key {}: not among the keys the loaded records were ordered by",
+                    key.number
+                ))
+            })?;
+            let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+            key_record_counts
+                .push((definition + pages::fcr::KEY_RECORDS, u32::try_from(len).expect("far fewer records than u32::MAX")));
+
+            let value = key.extract(&records::keyed(shift, &bytes));
+            let (new_root, next_free_head) = self.v6_tree_insert(
+                &mut store,
+                &cache_rc,
+                layout,
+                key,
+                &fcr,
+                &value,
+                new_position,
+                index_free_head,
+            )?;
+            index_free_head = next_free_head;
+            if let Some(root) = new_root {
+                key_roots.push((definition + pages::fcr::KEY_ROOT, root));
+            }
+        }
 
         let total_records =
             u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
@@ -1923,6 +1969,8 @@ impl<M: Mem> Block<M> {
             &key_record_counts,
             Some(new_head),
             variable_head,
+            Some(index_free_head),
+            &key_roots,
         )
         .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
@@ -2532,6 +2580,8 @@ impl<M: Mem> Block<M> {
 
         let mut content = store.page(physical as usize).map_err(&fail)?.to_vec();
         let body = within + V6_SLOT_MARKER;
+        let reclen = usize::from(self.geometry.reclen);
+        let old_record = content[body..body + reclen].to_vec();
 
         // Variable-length records: rewrite the fragment first, on the
         // pre-write pointer, then re-read the slot's own page fresh -- see
@@ -2540,7 +2590,6 @@ impl<M: Mem> Block<M> {
         // are) and `bytes.len()` for a fixed-length record, where there is
         // no pointer to disturb.
         let fixed_len = if self.geometry.variable {
-            let reclen = usize::from(self.geometry.reclen);
             let pointer_at = body + reclen;
             let pointer = variable::Pointer::decode([
                 content[pointer_at],
@@ -2576,14 +2625,96 @@ impl<M: Mem> Block<M> {
         v6::Map::relocate(&mut store, page_size, logical, &content, [0x00, 0x44])
             .map_err(|why| fail(format!("relocating the record's page: {why}")))?;
 
-        let key_record_counts = self
-            .v6_reindex(&mut store, &records_clone, &fcr, layout)
-            .map_err(&fail)?;
+        // Task 6: only a key whose own VALUE changed is touched at all
+        // (measured -- see this function's own doc comment); an unchanged
+        // key's tree is not even read, let alone rewritten. A changed key
+        // is a delete of its old value followed by an insert of its new
+        // one -- both already incremental, and this composition is sound
+        // even though no oracle recording exercises a key-changing update
+        // specifically (the replay corpus's own `ReplayOp` has no `Update`
+        // variant at all).
+        let shift = records_clone.key_shift();
+        let cache_rc = self.v6_tree_cache().map_err(&fail)?;
+        let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
+        let mut key_roots: Vec<(usize, u32)> = Vec::new();
+        let mut index_free_head =
+            pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
+        for key in &self.keys {
+            let len = records_clone.ordered_len(key.number).ok_or_else(|| {
+                fail(format!(
+                    "key {}: not among the keys the loaded records were ordered by",
+                    key.number
+                ))
+            })?;
+            let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+            key_record_counts
+                .push((definition + pages::fcr::KEY_RECORDS, u32::try_from(len).expect("far fewer records than u32::MAX")));
+
+            let before = records::keyed(shift, &old_record);
+            let after = records::keyed(shift, bytes);
+            if key.compare(&before, &after) == std::cmp::Ordering::Equal {
+                continue;
+            }
+            let old_value = key.extract(&before);
+            let new_value = key.extract(&after);
+
+            let (root_after_delete, free_head_after_delete) = self.v6_tree_delete(
+                &mut store,
+                &cache_rc,
+                layout,
+                key,
+                &fcr,
+                &old_value,
+                position,
+                index_free_head,
+            )?;
+            index_free_head = free_head_after_delete;
+            if let Some(root) = root_after_delete {
+                key_roots.push((definition + pages::fcr::KEY_ROOT, root));
+            }
+
+            // The FCR this second call reads a root from must reflect the
+            // delete's own root move, if any -- the live `fcr` bytes this
+            // function read at the top of `update_v6` are a snapshot, so a
+            // key whose delete just grew or shrank its own tree gets its
+            // updated root spliced in before the matching insert looks for
+            // it, exactly as `v6_reindex`'s own single-pass loop kept every
+            // key's view consistent across its own writes.
+            let mut fcr_for_insert = fcr.clone();
+            if let Some(root) = root_after_delete {
+                let root_at = definition + pages::fcr::KEY_ROOT;
+                fcr_for_insert[root_at..root_at + 4].copy_from_slice(&pages::to_long(root));
+            }
+            let (root_after_insert, free_head_after_insert) = self.v6_tree_insert(
+                &mut store,
+                &cache_rc,
+                layout,
+                key,
+                &fcr_for_insert,
+                &new_value,
+                position,
+                index_free_head,
+            )?;
+            index_free_head = free_head_after_insert;
+            if let Some(root) = root_after_insert {
+                key_roots.retain(|&(offset, _)| offset != definition + pages::fcr::KEY_ROOT);
+                key_roots.push((definition + pages::fcr::KEY_ROOT, root));
+            }
+        }
 
         let total_records =
             u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
-        v6::write_fcr(&mut store, page_size, total_records, &key_record_counts, None, None)
-            .map_err(|why| fail(format!("updating the file control record: {why}")))?;
+        v6::write_fcr(
+            &mut store,
+            page_size,
+            total_records,
+            &key_record_counts,
+            None,
+            None,
+            Some(index_free_head),
+            &key_roots,
+        )
+        .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
         self.capture_for_journal()?;
         self.write_changed_pages(&mut store)?;
@@ -2696,6 +2827,18 @@ impl<M: Mem> Block<M> {
             within,
         } = self.v6_slot(position, layout).map_err(&fail)?;
 
+        let shift = self.records.as_ref().map_or(0, Records::key_shift);
+        let old_record = {
+            let records = self
+                .records
+                .as_ref()
+                .expect("Self::delete calls Self::records() before this");
+            let at = records.find_physical(position).ok_or_else(|| {
+                fail(format!("position {position} does not name a live record in the model"))
+            })?;
+            records.physical(at).expect("just found").bytes.clone()
+        };
+
         let mut records_clone = self
             .records
             .as_ref()
@@ -2751,9 +2894,42 @@ impl<M: Mem> Block<M> {
         v6::Map::relocate(&mut store, page_size, logical, &content, [0x00, 0x44])
             .map_err(|why| fail(format!("relocating the record's page: {why}")))?;
 
-        let key_record_counts = self
-            .v6_reindex(&mut store, &records_clone, &fcr, layout)
-            .map_err(&fail)?;
+        // Task 6: every key's own B-tree, edited incrementally -- locate
+        // the deleted record's own entry, remove it, redistribute or merge
+        // an underflow per the rules doc, cascading upward at most to the
+        // root -- never a full `v6_reindex` rebuild.
+        let cache_rc = self.v6_tree_cache().map_err(&fail)?;
+        let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
+        let mut key_roots: Vec<(usize, u32)> = Vec::new();
+        let mut index_free_head =
+            pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
+        for key in &self.keys {
+            let len = records_clone.ordered_len(key.number).ok_or_else(|| {
+                fail(format!(
+                    "key {}: not among the keys the loaded records were ordered by",
+                    key.number
+                ))
+            })?;
+            let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+            key_record_counts
+                .push((definition + pages::fcr::KEY_RECORDS, u32::try_from(len).expect("far fewer records than u32::MAX")));
+
+            let value = key.extract(&records::keyed(shift, &old_record));
+            let (new_root, next_free_head) = self.v6_tree_delete(
+                &mut store,
+                &cache_rc,
+                layout,
+                key,
+                &fcr,
+                &value,
+                position,
+                index_free_head,
+            )?;
+            index_free_head = next_free_head;
+            if let Some(root) = new_root {
+                key_roots.push((definition + pages::fcr::KEY_ROOT, root));
+            }
+        }
 
         let total_records =
             u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
@@ -2764,6 +2940,8 @@ impl<M: Mem> Block<M> {
             &key_record_counts,
             Some(position),
             variable_head,
+            Some(index_free_head),
+            &key_roots,
         )
         .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
@@ -2891,6 +3069,12 @@ impl<M: Mem> Block<M> {
     /// genuine 6.15 writes -- zeros would name page 0, the control record, as
     /// the next record in the chain
     /// (`docs/2026-08-17-v6-duplicate-key-oracle.md`).
+    ///
+    /// Unreferenced now that [`Self::insert_v6`]/[`Self::update_v6`]/
+    /// [`Self::delete_v6`] no longer call [`Self::v6_reindex`] (Task 6) --
+    /// kept, not deleted, for the same reason that function is: a future
+    /// create/repair path that still wants a from-scratch tree.
+    #[allow(dead_code)]
     fn v6_write_chains(
         &self,
         store: &mut v6::Store,
@@ -2980,6 +3164,684 @@ impl<M: Mem> Block<M> {
         Ok(())
     }
 
+    // ---- Task 6: incremental v6 B-tree maintenance -------------------------
+    //
+    // Everything below replaces the per-op call to `Self::v6_reindex` in
+    // `insert_v6`/`update_v6`/`delete_v6` with leaf-local edits per
+    // `docs/2026-08-25-btree-split-rules.md`: locate the touched entry with
+    // `nav::descend_for_write`, edit only the pages a split/merge/
+    // redistribute actually needs, and relocate/claim/retire/reclaim
+    // exactly those. `v6_reindex` itself is untouched -- it still exists
+    // for create/repair/close-time rebuild of a v5-style caller.
+
+    /// The page cache a v6 tree edit reads through: this block's own `Rc`
+    /// when it has one (every `Block` a real `Self::open` produced), or a
+    /// fresh cache scoped to this one call when it does not -- a test-built
+    /// `Block` that skipped `Self::open`, the same graceful fallback
+    /// [`Self::v6_slot`]/[`Self::v6_resolve_logical`] already use so this
+    /// incremental path works the same way against either kind of `Block`.
+    ///
+    /// # Errors
+    ///
+    /// If a fresh cache cannot be opened (this block has no attached one).
+    fn v6_tree_cache(&self) -> Result<std::rc::Rc<std::cell::RefCell<cache::PageCache>>, String> {
+        match &self.cache {
+            Some(rc) => Ok(std::rc::Rc::clone(rc)),
+            None => Ok(std::rc::Rc::new(std::cell::RefCell::new(cache::PageCache::open(
+                &self.path,
+                self.geometry.page,
+            )?))),
+        }
+    }
+
+    /// `key`'s current root (still tag-decorated) and shape, off `fcr` --
+    /// the non-cache half of what [`Self::nav_root`] bundles, split out
+    /// because a tree write already carries its own cache handle
+    /// ([`Self::v6_tree_cache`]) alongside.
+    ///
+    /// `None` when `key` has no tree yet (a virgin file) -- Task 6's
+    /// incremental path only maintains an existing tree; a key's very
+    /// first index page is [`Self::v6_reindex`]'s job (reached only from
+    /// create/repair), never this one's.
+    fn v6_key_root(&self, key: &keys::Key, fcr: &[u8]) -> Result<Option<(u32, pages::Shape)>, String> {
+        let Some(root) = nav::root_of(fcr, usize::from(key.definition), key.number)? else {
+            return Ok(None);
+        };
+        Ok(Some((root, key.shape())))
+    }
+
+    /// A logical id as `key`'s own index pages tag it -- `0x80 + key.number`
+    /// in the high byte, `0x00` in the low one, matching
+    /// [`Self::v6_decorate`]/[`Self::v6_reindex`]'s identical computation.
+    fn v6_key_tag_bytes(key: &keys::Key) -> Result<[u8; 2], BtvError> {
+        let fail = |why: String| BtvError { file: String::new(), why };
+        let high = 0x80u8
+            .checked_add(u8::try_from(key.number).map_err(|_| {
+                fail(format!("key {}: does not fit a page tag's low byte", key.number))
+            })?)
+            .ok_or_else(|| {
+                fail(format!(
+                    "key {}: a page tag's high byte is 0x80 plus the key's own \
+                     number, and this key's number does not fit",
+                    key.number
+                ))
+            })?;
+        Ok([0x00, high])
+    }
+
+    /// Reconstruct [`pages::Entry`] values from a decoded [`pages::IndexPage`]'s
+    /// own `entries`/`tails` arrays -- [`pages::encode_v6_index_page`]'s
+    /// input shape, needed because `IndexPage` keeps a duplicate-permitting
+    /// key's tail in a parallel array rather than alongside `head`.
+    fn entries_from_page(page: &pages::IndexPage, tails: &[u32]) -> Vec<pages::Entry> {
+        page.entries
+            .iter()
+            .enumerate()
+            .map(|(n, (key, head, _child))| pages::Entry {
+                key: key.clone(),
+                head: *head,
+                tail: tails.get(n).copied().unwrap_or(*head),
+            })
+            .collect()
+    }
+
+    /// Split a full node's already-merged entry sequence (`max_entries + 1`
+    /// entries, sorted) per split rules §2/§3: left = the first
+    /// `ceil_half`, the next entry promoted (removed from both sides),
+    /// right = the remainder. `children`, non-empty only for an interior
+    /// node, is one longer than `entries` and splits at the identical
+    /// point (`ceil_half + 1` left, the rest right) -- see
+    /// [`nav::children_of`]'s own convention.
+    ///
+    /// Returns `(left entries, left children, promoted, right entries,
+    /// right children)`.
+    ///
+    /// # Panics
+    ///
+    /// If `entries.len() <= ceil_half` -- the caller only calls this on a
+    /// node that has just overflowed past `ceil_half`.
+    fn split_merged(
+        ceil_half: usize,
+        mut entries: Vec<pages::Entry>,
+        mut children: Vec<u32>,
+    ) -> (Vec<pages::Entry>, Vec<u32>, pages::Entry, Vec<pages::Entry>, Vec<u32>) {
+        let right_entries = entries.split_off(ceil_half + 1);
+        let promoted = entries.pop().expect("caller only splits an overflowed node");
+        let left_entries = entries;
+        let (left_children, right_children) = if children.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let right_children = children.split_off(ceil_half + 1);
+            (children, right_children)
+        };
+        (left_entries, left_children, promoted, right_entries, right_children)
+    }
+
+    /// Claim a fresh logical id for `image`, reclaiming the B-tree page
+    /// free list's own head first when it is non-empty rather than growing
+    /// the file -- this crate's own resolution of the split rules' open
+    /// "preference among multiple simultaneously-vacated candidates"
+    /// question (§8): a LIFO free list only ever offers ONE candidate (its
+    /// own head), so there is no multi-candidate choice to make here,
+    /// exactly the shape `underflow-lifecycle-512/4-reclaimed.dat` (the
+    /// only recorded reclaim) measured. Falls back to
+    /// [`v6::Map::claim`] (mechanism 1, marker-zero) only once the free
+    /// list is empty.
+    ///
+    /// Returns `(the id claimed or reclaimed, the free list's head as this
+    /// call leaves it)`.
+    ///
+    /// # Errors
+    ///
+    /// If the free list's head names a page the allocation table does not
+    /// claim, or if the underlying claim/reclaim fails.
+    fn v6_claim_or_reclaim(
+        &self,
+        store: &mut v6::Store,
+        page_size: u16,
+        image: &[u8],
+        tag: [u8; 2],
+        free_head: u32,
+    ) -> Result<(u32, u32), String> {
+        if free_head == pages::NOWHERE {
+            let logical = v6::Map::claim(store, page_size, image, tag)?;
+            return Ok((logical, free_head));
+        }
+        let next = {
+            let physical = v6::Map::read(store, page_size)?.physical(free_head).ok_or_else(|| {
+                format!(
+                    "the B-tree free list names logical {free_head}, which the \
+                     allocation table claims no physical page for"
+                )
+            })?;
+            let body = store.page(physical as usize)?;
+            pages::long(&body[8..12])
+        };
+        v6::Map::reclaim(store, page_size, free_head, image, tag)?;
+        Ok((free_head, next))
+    }
+
+    /// Commit one split's two halves and answer with what the level above
+    /// must absorb: RIGHT always keeps `old_logical`'s own identity, LEFT
+    /// always claims (or reclaims) a fresh one -- split rules §2, "the
+    /// opposite of the naive 'left keeps identity' default".
+    ///
+    /// Returns `(the promoted entry, left's own decorated pointer, the
+    /// free list's head as this call leaves it)`.
+    ///
+    /// # Errors
+    ///
+    /// If claiming, reclaiming or relocating either half fails.
+    #[allow(clippy::too_many_arguments)]
+    fn v6_place_split(
+        &self,
+        store: &mut v6::Store,
+        layout: pages::Layout,
+        shape: pages::Shape,
+        tag: [u8; 2],
+        ceil_half: usize,
+        entries: Vec<pages::Entry>,
+        children: Vec<u32>,
+        old_logical: u32,
+        old_stamp: u16,
+        free_head: u32,
+    ) -> Result<(pages::Entry, u32, u32), String> {
+        let page_size = self.geometry.page;
+        let (left_entries, left_children, promoted, right_entries, right_children) =
+            Self::split_merged(ceil_half, entries, children);
+
+        // A newly-claimed (or reclaimed) id starts its stamp at 0 --
+        // split rules §10.
+        let left_image = pages::encode_v6_index_page(layout, shape, 0, &left_entries, &left_children);
+        let (left_logical, new_free_head) =
+            self.v6_claim_or_reclaim(store, page_size, &left_image, tag, free_head)?;
+
+        let right_image =
+            pages::encode_v6_index_page(layout, shape, old_stamp.wrapping_add(1), &right_entries, &right_children);
+        v6::Map::relocate(store, page_size, old_logical, &right_image, tag)?;
+
+        Ok((promoted, Self::v6_decorate(left_logical, tag), new_free_head))
+    }
+
+    /// Thread a newly-inserted record onto an existing duplicate-value
+    /// group's chain: the new record's own `[prev][next]` pair becomes
+    /// `[old_tail, NOWHERE]`, and the old tail's own `next` half (the
+    /// pair's second four bytes) now names the new record. `head` never
+    /// moves (`docs/2026-08-25-btree-split-rules.md` §1/§9) -- only these
+    /// two records' own slots change, never the index.
+    ///
+    /// Resolves both records' logical pages through `store` itself
+    /// (`v6::Map::read(store, ...)`, not [`Self::v6_resolve_logical`]):
+    /// the new record's own page was already relocated earlier in this
+    /// same op ([`Self::v6_pop_free`]/[`Self::v6_claim_threaded_page`]),
+    /// before this call, and only `store` -- not the block's own
+    /// [`Self::cache`], which is not written through until the whole
+    /// operation commits -- has seen that move yet.
+    ///
+    /// Batches both writes onto one relocate when the new record and the
+    /// old tail share a physical page, rather than relocating it twice.
+    ///
+    /// # Errors
+    ///
+    /// If either position is not on a slot boundary, or its logical page
+    /// is claimed by nothing.
+    fn v6_write_dup_chain_extend(
+        &self,
+        store: &mut v6::Store,
+        layout: pages::Layout,
+        offset: usize,
+        old_tail: u32,
+        new_position: u32,
+    ) -> Result<(), String> {
+        let page_size = self.geometry.page;
+
+        let (new_logical, new_slot) = layout.slot_of(new_position).ok_or_else(|| {
+            format!("record position {new_position} is not on a slot boundary")
+        })?;
+        let new_within = layout.position(0, new_slot) as usize + offset;
+        let (old_logical, old_slot) = layout
+            .slot_of(old_tail)
+            .ok_or_else(|| format!("record position {old_tail} is not on a slot boundary"))?;
+        let old_within = layout.position(0, old_slot) as usize + offset;
+
+        let resolve = |store: &mut v6::Store, logical: u32| -> Result<u32, String> {
+            v6::Map::read(store, page_size)?.physical(logical).ok_or_else(|| {
+                format!("logical page {logical} is claimed by nothing")
+            })
+        };
+
+        if new_logical == old_logical {
+            let physical = resolve(store, new_logical)?;
+            let mut content = store.page(physical as usize)?.to_vec();
+            content[new_within..new_within + 4].copy_from_slice(&pages::to_long(old_tail));
+            content[new_within + 4..new_within + 8].copy_from_slice(&pages::to_long(pages::NOWHERE));
+            content[old_within + 4..old_within + 8].copy_from_slice(&pages::to_long(new_position));
+            v6::Map::relocate(store, page_size, new_logical, &content, [0x00, 0x44])?;
+            return Ok(());
+        }
+
+        let new_physical = resolve(store, new_logical)?;
+        let mut new_content = store.page(new_physical as usize)?.to_vec();
+        new_content[new_within..new_within + 4].copy_from_slice(&pages::to_long(old_tail));
+        new_content[new_within + 4..new_within + 8].copy_from_slice(&pages::to_long(pages::NOWHERE));
+        v6::Map::relocate(store, page_size, new_logical, &new_content, [0x00, 0x44])?;
+
+        let old_physical = resolve(store, old_logical)?;
+        let mut old_content = store.page(old_physical as usize)?.to_vec();
+        old_content[old_within + 4..old_within + 8].copy_from_slice(&pages::to_long(new_position));
+        v6::Map::relocate(store, page_size, old_logical, &old_content, [0x00, 0x44])?;
+        Ok(())
+    }
+
+    /// Insert `position` under `key`'s own extracted `value`, maintaining
+    /// `key`'s B-tree incrementally instead of rebuilding it --
+    /// `docs/2026-08-25-btree-split-rules.md` §1-§3. `free_head` is this
+    /// whole op's own running B-tree free-list head, threaded across every
+    /// key so a page one key's split reclaims is visible to the next key's
+    /// own split in the same insert.
+    ///
+    /// # Returns
+    ///
+    /// `(key's new root if this write changed it, the free list's head as
+    /// this call leaves it)`.
+    ///
+    /// # Errors
+    ///
+    /// If `key` has no tree yet, the descent or any relocate/claim/reclaim
+    /// fails, or an exact match is found on a key whose shape carries no
+    /// duplicate-chain tail (a genuinely new value should never exact-match
+    /// at all).
+    fn v6_tree_insert(
+        &self,
+        store: &mut v6::Store,
+        cache: &std::cell::RefCell<cache::PageCache>,
+        layout: pages::Layout,
+        key: &keys::Key,
+        fcr: &[u8],
+        value: &[u8],
+        position: u32,
+        free_head: u32,
+    ) -> Result<(Option<u32>, u32), BtvError> {
+        let name = self.name.clone();
+        let fail = |why: String| BtvError { file: name.clone(), why };
+        let page_size = self.geometry.page;
+
+        let Some((root, shape)) = self.v6_key_root(key, fcr).map_err(&fail)? else {
+            return Err(fail(format!(
+                "key {}: has no tree yet -- Task 6's incremental path only \
+                 maintains an existing one",
+                key.number
+            )));
+        };
+        let tag = Self::v6_key_tag_bytes(key)?;
+        let cmp = |a: &[u8], b: &[u8]| key.compare_extracted(a, b);
+        let mut resolve = |logical: u32| self.v6_resolve_logical(logical);
+        let located =
+            nav::descend_for_write(cache, &mut resolve, root, shape, value, &cmp).map_err(&fail)?;
+
+        if located.exact {
+            // A duplicate-permitting key's already-present value: only the
+            // tail advances (§1); head, and every other entry, untouched.
+            let frame = located.path.last().expect("descend_for_write always returns at least one frame");
+            if frame.page.tails.is_empty() {
+                return Err(fail(format!(
+                    "key {}: value already present in the tree, but this key's \
+                     own shape carries no duplicate-chain tail column -- a \
+                     genuinely new value should never exact-match",
+                    key.number
+                )));
+            }
+            let old_tail = frame.page.tails[located.at];
+            let mut tails = frame.page.tails.clone();
+            tails[located.at] = position;
+            let entries = Self::entries_from_page(&frame.page, &tails);
+            let children = nav::children_of(&frame.page);
+            let stamp = frame.page.stamp.wrapping_add(1);
+            let image = pages::encode_v6_index_page(layout, shape, stamp, &entries, &children);
+            v6::Map::relocate(store, page_size, frame.logical, &image, tag).map_err(&fail)?;
+
+            // The chain itself lives in the records, not the index (§0/§9):
+            // the new record's own `[prev][next]` names the old tail and
+            // `NOWHERE`, and the old tail's own `next` half now names the
+            // new record. `head` never moves once a chain exists.
+            let chain_offset = usize::from(key.chain.ok_or_else(|| {
+                fail(format!(
+                    "key {}: permits duplicates but names no chain offset",
+                    key.number
+                ))
+            })?);
+            self.v6_write_dup_chain_extend(store, layout, chain_offset, old_tail, position)
+                .map_err(&fail)?;
+
+            return Ok((None, free_head));
+        }
+
+        // Not an exact match: the last frame IS the leaf, `located.at` is
+        // where the new entry belongs (positional, in the merged sorted
+        // sequence -- §2's own "not an append fast path" finding).
+        let leaf_idx = located.path.len() - 1;
+        let leaf_logical = located.path[leaf_idx].logical;
+        let leaf_stamp = located.path[leaf_idx].page.stamp;
+        let mut entries =
+            Self::entries_from_page(&located.path[leaf_idx].page, &located.path[leaf_idx].page.tails);
+        entries.insert(located.at, pages::Entry { key: value.to_vec(), head: position, tail: position });
+
+        let max_entries = shape.capacity(page_size);
+        if entries.len() <= max_entries {
+            // Leaf insert, no split (§1): this leaf's own stamp advances,
+            // nothing above it is touched.
+            let stamp = leaf_stamp.wrapping_add(1);
+            let image = pages::encode_v6_index_page(layout, shape, stamp, &entries, &[]);
+            v6::Map::relocate(store, page_size, leaf_logical, &image, tag).map_err(&fail)?;
+            return Ok((None, free_head));
+        }
+
+        // Leaf split (§2), and possibly cascading interior splits (§3).
+        let ceil_half = max_entries.div_ceil(2);
+        let (mut promoted, mut left_decorated, mut free_head) = self
+            .v6_place_split(store, layout, shape, tag, ceil_half, entries, Vec::new(), leaf_logical, leaf_stamp, free_head)
+            .map_err(&fail)?;
+
+        let mut carried_past_root = true;
+        for level in (0..leaf_idx).rev() {
+            let frame_logical = located.path[level].logical;
+            let frame_stamp = located.path[level].page.stamp;
+            let child_idx = located.path[level].descended_via;
+            let mut entries =
+                Self::entries_from_page(&located.path[level].page, &located.path[level].page.tails);
+            let mut children = nav::children_of(&located.path[level].page);
+            entries.insert(child_idx, promoted.clone());
+            children.insert(child_idx, left_decorated);
+
+            if entries.len() <= max_entries {
+                let stamp = frame_stamp.wrapping_add(1);
+                let image = pages::encode_v6_index_page(layout, shape, stamp, &entries, &children);
+                v6::Map::relocate(store, page_size, frame_logical, &image, tag).map_err(&fail)?;
+                carried_past_root = false;
+                break;
+            }
+
+            let (p, l, f) = self
+                .v6_place_split(store, layout, shape, tag, ceil_half, entries, children, frame_logical, frame_stamp, free_head)
+                .map_err(&fail)?;
+            promoted = p;
+            left_decorated = l;
+            free_head = f;
+        }
+
+        if !carried_past_root {
+            return Ok((None, free_head));
+        }
+
+        // The split cascaded all the way up: a new root, one entry, the
+        // old root demoted to an ordinary (right-hand) child -- §3.
+        let root_entries = vec![promoted];
+        let root_children = vec![left_decorated, root];
+        let new_root_image = pages::encode_v6_index_page(layout, shape, 0, &root_entries, &root_children);
+        let (new_root_logical, free_head) =
+            self.v6_claim_or_reclaim(store, page_size, &new_root_image, tag, free_head).map_err(&fail)?;
+        Ok((Some(Self::v6_decorate(new_root_logical, tag)), free_head))
+    }
+
+    /// Delete `position` (whose value under `key` is `value`) from `key`'s
+    /// B-tree incrementally, per `docs/2026-08-25-btree-split-rules.md`
+    /// §4-§8: no underflow leaves the touched leaf's own stamp advanced and
+    /// nothing else touched; an underflow redistributes with or merges
+    /// into a sibling (donor-slack is the sole discriminator, §6), possibly
+    /// cascading into the parent (never past the root -- see Errors).
+    ///
+    /// # Returns
+    ///
+    /// `(key's new root if this write changed it, the free list's head as
+    /// this call leaves it)`.
+    ///
+    /// # Errors
+    ///
+    /// Three refusals this task's own rulings require, named with their
+    /// predicate rather than silently guessed at: **root-level underflow**
+    /// (never recorded -- "out of scope" in the rules doc); **a node with
+    /// neither a left nor a right sibling** at its own level (an
+    /// unexpected tree shape); and **one member of an active 2+-record
+    /// duplicate-value group** (`head != tail`), since §4's own "Open" item
+    /// says no recording exercises a partial chain removal and this crate
+    /// will not fabricate the mechanism. Also if `key` has no tree, the
+    /// value is not found at all (a model/tree disagreement), it is found
+    /// at an interior level (ordinary delete's "shift entries down" rule is
+    /// only measured at the leaf; an interior removal needs a successor
+    /// swap this task does not implement), or any relocate/retire fails.
+    #[allow(clippy::too_many_lines)]
+    fn v6_tree_delete(
+        &self,
+        store: &mut v6::Store,
+        cache: &std::cell::RefCell<cache::PageCache>,
+        layout: pages::Layout,
+        key: &keys::Key,
+        fcr: &[u8],
+        value: &[u8],
+        position: u32,
+        free_head: u32,
+    ) -> Result<(Option<u32>, u32), BtvError> {
+        let name = self.name.clone();
+        let fail = |why: String| BtvError { file: name.clone(), why };
+        let page_size = self.geometry.page;
+
+        let Some((root, shape)) = self.v6_key_root(key, fcr).map_err(&fail)? else {
+            return Err(fail(format!("key {}: has no tree to delete from", key.number)));
+        };
+        let key_tag_byte = (root >> 24) as u8;
+        let tag = Self::v6_key_tag_bytes(key)?;
+        let cmp = |a: &[u8], b: &[u8]| key.compare_extracted(a, b);
+        let mut resolve = |logical: u32| self.v6_resolve_logical(logical);
+        let located =
+            nav::descend_for_write(cache, &mut resolve, root, shape, value, &cmp).map_err(&fail)?;
+
+        if !located.exact {
+            return Err(fail(format!(
+                "key {}: value not found in the tree at all -- the in-memory \
+                 model and the on-disk tree disagree",
+                key.number
+            )));
+        }
+        let leaf_idx = located.path.len() - 1;
+        let frame = &located.path[leaf_idx];
+        if !frame.page.leaf() {
+            return Err(fail(format!(
+                "key {}: the deleted record's value is an interior separator -- \
+                 removing it needs a B-tree successor swap this task does not \
+                 implement (no recording exercises an ordinary delete at the \
+                 interior level)",
+                key.number
+            )));
+        }
+        let head = frame.page.entries[located.at].1;
+        let tail = frame.page.tails.get(located.at).copied().unwrap_or(head);
+        if head != tail {
+            return Err(fail(format!(
+                "key {}: this value's entry spans a 2+-record duplicate chain \
+                 (head {head} != tail {tail}) -- deleting one member of an \
+                 active chain is docs/2026-08-25-btree-split-rules.md §4's own \
+                 unmeasured 'Open' item; refusing rather than guessing at the \
+                 mechanism",
+                key.number
+            )));
+        }
+        if head != position {
+            return Err(fail(format!(
+                "key {}: the located entry's own record ({head}) does not match \
+                 the position being deleted ({position})",
+                key.number
+            )));
+        }
+
+        let max_entries = shape.capacity(page_size);
+        let half_entries = max_entries / 2;
+
+        let mut cur_entries = Self::entries_from_page(&frame.page, &frame.page.tails);
+        cur_entries.remove(located.at);
+        let mut cur_children: Vec<u32> = Vec::new();
+        let mut cur_logical = frame.logical;
+        let mut cur_stamp = frame.page.stamp;
+        let mut free_head = free_head;
+
+        let mut level = leaf_idx;
+        loop {
+            // The root is never subject to the half_entries floor at all --
+            // it has no sibling to redistribute or merge with, which is
+            // exactly why genuine Btrieve's own underflow trigger (§5) is
+            // never observed to fire there. The only root-level shape this
+            // task refuses is the one the rules doc actually names "out of
+            // scope": the root collapsing to zero entries (one child,
+            // ready to become the new root, mirroring how a split grows
+            // one) -- not merely a root that is thinner than half_entries.
+            if level == 0 {
+                if cur_entries.is_empty() {
+                    return Err(fail(format!(
+                        "key {}: the root would collapse to zero entries (one \
+                         child) after this delete -- tree-shrinking-a-level is \
+                         never recorded (docs/2026-08-25-btree-split-rules.md's \
+                         own 'out of scope' list names it explicitly)",
+                        key.number
+                    )));
+                }
+                let stamp = cur_stamp.wrapping_add(1);
+                let image = pages::encode_v6_index_page(layout, shape, stamp, &cur_entries, &cur_children);
+                v6::Map::relocate(store, page_size, cur_logical, &image, tag).map_err(&fail)?;
+                return Ok((None, free_head));
+            }
+
+            if cur_entries.len() >= half_entries {
+                let stamp = cur_stamp.wrapping_add(1);
+                let image = pages::encode_v6_index_page(layout, shape, stamp, &cur_entries, &cur_children);
+                v6::Map::relocate(store, page_size, cur_logical, &image, tag).map_err(&fail)?;
+                return Ok((None, free_head));
+            }
+
+            let parent_level = level - 1;
+            let child_idx = located.path[parent_level].descended_via;
+            let mut parent_entries =
+                Self::entries_from_page(&located.path[parent_level].page, &located.path[parent_level].page.tails);
+            let mut parent_children = nav::children_of(&located.path[parent_level].page);
+
+            let has_right = child_idx + 1 < parent_children.len();
+            let has_left = child_idx > 0;
+
+            let (side, sibling_decorated, separator_idx) = if has_right {
+                (Side::Right, parent_children[child_idx + 1], child_idx)
+            } else if has_left {
+                (Side::Left, parent_children[child_idx - 1], child_idx - 1)
+            } else {
+                return Err(fail(format!(
+                    "key {}: the node at tree level {level} has neither a left \
+                     nor a right sibling to redistribute or merge with -- an \
+                     unexpected tree shape",
+                    key.number
+                )));
+            };
+
+            let sibling_page =
+                nav::fetch_one(cache, &mut resolve, shape, key_tag_byte, sibling_decorated).map_err(&fail)?;
+            let sibling_logical = sibling_decorated & pages::fcr::ROOT_PAGE;
+            let mut sibling_entries = Self::entries_from_page(&sibling_page, &sibling_page.tails);
+            let mut sibling_children = nav::children_of(&sibling_page);
+
+            if sibling_entries.len() > half_entries {
+                // REDISTRIBUTE (§7): the parent's separator moves down as
+                // this node's new extreme entry; the donor's own nearest
+                // extreme entry moves up, wholesale, to replace it. The
+                // parent's own entry COUNT is unchanged, so this cannot
+                // cascade any further -- write all three and stop.
+                let old_separator = parent_entries[separator_idx].clone();
+                let new_separator = match side {
+                    Side::Right => {
+                        let donor_first = sibling_entries.remove(0);
+                        let moved = (!sibling_children.is_empty()).then(|| sibling_children.remove(0));
+                        cur_entries.push(old_separator);
+                        if let Some(child) = moved {
+                            cur_children.push(child);
+                        }
+                        donor_first
+                    }
+                    Side::Left => {
+                        let donor_last = sibling_entries.pop().expect("more than half_entries entries");
+                        let moved = if sibling_children.is_empty() {
+                            None
+                        } else {
+                            Some(sibling_children.pop().expect("children.len() == entries.len() + 1"))
+                        };
+                        cur_entries.insert(0, old_separator);
+                        if let Some(child) = moved {
+                            cur_children.insert(0, child);
+                        }
+                        donor_last
+                    }
+                };
+                parent_entries[separator_idx] = new_separator;
+
+                let cur_stamp_new = cur_stamp.wrapping_add(1);
+                let cur_image = pages::encode_v6_index_page(layout, shape, cur_stamp_new, &cur_entries, &cur_children);
+                v6::Map::relocate(store, page_size, cur_logical, &cur_image, tag).map_err(&fail)?;
+
+                let sibling_stamp_new = sibling_page.stamp.wrapping_add(1);
+                let sibling_image =
+                    pages::encode_v6_index_page(layout, shape, sibling_stamp_new, &sibling_entries, &sibling_children);
+                v6::Map::relocate(store, page_size, sibling_logical, &sibling_image, tag).map_err(&fail)?;
+
+                let parent_stamp_new = located.path[parent_level].page.stamp.wrapping_add(1);
+                let parent_image =
+                    pages::encode_v6_index_page(layout, shape, parent_stamp_new, &parent_entries, &parent_children);
+                v6::Map::relocate(store, page_size, located.path[parent_level].logical, &parent_image, tag)
+                    .map_err(&fail)?;
+
+                return Ok((None, free_head));
+            }
+
+            // MERGE (§6): the underflowing node's surviving entries, the
+            // separator pulled down as a real entry (§0/§6), and the
+            // sibling's own entries -- concatenated in key order, whichever
+            // side survives keeps its OWN id, the other retires.
+            let separator = parent_entries.remove(separator_idx);
+            parent_children.remove(child_idx);
+
+            let (survivor_logical, survivor_stamp, retired_logical, new_entries, new_children) = match side {
+                Side::Right => {
+                    let mut entries = std::mem::take(&mut cur_entries);
+                    entries.push(separator);
+                    entries.extend(sibling_entries);
+                    let mut children = std::mem::take(&mut cur_children);
+                    children.extend(sibling_children);
+                    (sibling_logical, sibling_page.stamp, cur_logical, entries, children)
+                }
+                Side::Left => {
+                    let mut entries = sibling_entries;
+                    entries.push(separator);
+                    entries.extend(std::mem::take(&mut cur_entries));
+                    let mut children = sibling_children;
+                    children.extend(std::mem::take(&mut cur_children));
+                    (sibling_logical, sibling_page.stamp, cur_logical, entries, children)
+                }
+            };
+
+            let survivor_image = pages::encode_v6_index_page(
+                layout,
+                shape,
+                survivor_stamp.wrapping_add(1),
+                &new_entries,
+                &new_children,
+            );
+            v6::Map::relocate(store, page_size, survivor_logical, &survivor_image, tag).map_err(&fail)?;
+            v6::Map::retire(store, page_size, retired_logical, free_head).map_err(&fail)?;
+            free_head = retired_logical;
+
+            // The parent just lost one entry and one child -- continue the
+            // loop one level up, checking whether IT now underflows.
+            cur_entries = parent_entries;
+            cur_children = parent_children;
+            cur_logical = located.path[parent_level].logical;
+            cur_stamp = located.path[parent_level].page.stamp;
+            level = parent_level;
+        }
+    }
+
     /// A logical id as a v6 index page names it: the key's own tag byte in
     /// the top eight bits, the id in the low twenty-four.
     ///
@@ -3011,6 +3873,11 @@ impl<M: Mem> Block<M> {
     /// If the allocation table cannot be read, if a child slot carries some
     /// other key's tag byte, if an id the tree names is claimed by nothing, or
     /// if any page of the tree does not decode.
+    ///
+    /// Unreferenced now that the per-op write path no longer calls
+    /// [`Self::v6_reindex`] (Task 6) -- kept for the same reason that
+    /// function is.
+    #[allow(dead_code)]
     fn v6_index_logicals(
         store: &mut v6::Store,
         page_size: u16,
@@ -3043,6 +3910,12 @@ impl<M: Mem> Block<M> {
             .collect())
     }
 
+    /// Unreferenced by any per-op write path now that [`Self::insert_v6`]/
+    /// [`Self::update_v6`]/[`Self::delete_v6`] maintain each key's B-tree
+    /// incrementally instead (Task 6) -- kept, not deleted, for a future
+    /// create/repair/close-time caller that still wants a from-scratch
+    /// rebuild, per this task's own brief.
+    #[allow(dead_code)]
     fn v6_reindex(
         &self,
         store: &mut v6::Store,
@@ -7380,15 +8253,28 @@ mod tests {
     /// oracle (`tools/btrieve-oracle/crtprobe.exe create`, Pervasive Btrieve
     /// 6.15 under Wine -- not hand-crafted bytes), one key (STRING, 48
     /// bytes, unique), reclen 48, page 512. `Shape::capacity` gives this key
-    /// 8 entries per index page ((512-12)/(48+8)), so this crate's own
-    /// `pages::build_index` packs 8 records into a single leaf and 9 into
-    /// three nodes (2 leaves + 1 root) -- the committed fixture holds those
-    /// 9, inserted through this crate's own `Block::insert` after the
-    /// oracle-built shell. `existing.len()=3, index.nodes.len()=1` after
-    /// this test's delete, measured directly (temporary instrumentation,
-    /// removed before commit) -- the identical shrink shape as `WCCMP002.DAT`
-    /// (208 -> 106) and `IDXPROBE.DAT` (6 -> 4), just reached by a delete on
-    /// a single key rather than an insert on two.
+    /// 8 entries per index page ((512-12)/(48+8)), and the committed
+    /// fixture's 9 records split 4-and-4 under one root separator.
+    ///
+    /// **Re-expressed for Task 6, per that task's own ruling.** Before
+    /// incremental maintenance landed, `v6_reindex`'s full rebuild packed
+    /// this same 9-record tree into fewer nodes than the genuine-Btrieve-
+    /// built file it started from, and this test proved the surplus was
+    /// released rather than left as a dangling allocation-table claim. That
+    /// mechanism (`v6_reindex`, `v6::Map::unclaim`) is unreferenced by any
+    /// per-op write path now -- deleting **any** one of these 9 records
+    /// underflows a leaf whose sibling sits at exactly `half_entries` (4
+    /// and 4, never `> half_entries`), which per split rules §6 merges
+    /// rather than redistributes, pulling the root's own one separator down
+    /// and collapsing it to zero entries -- the root-level tree-shrink this
+    /// task's own rulings name as never recorded and refuse rather than
+    /// guess at. This test's *intent* -- a shrink must never silently leak
+    /// a claimed page -- still holds, just satisfied a different way: a
+    /// refusal that touches no page at all (`v6::Store`'s pending edits are
+    /// never flushed unless the whole operation returns `Ok`, so an early
+    /// `Err` leaves disk untouched by construction) leaks nothing, and this
+    /// now asserts exactly that -- the refusal itself, named by its own
+    /// predicate, and the file left byte-identical.
     #[test]
     fn a_shrinking_v6_reindex_releases_its_surplus_pages_on_delete() {
         let dir = crate::testing::scratch("verify-writes-v6shrink-delete");
@@ -7401,6 +8287,7 @@ mod tests {
             "the untouched fixture must round-trip, or this test would be \
              blaming the write for a defect the fixture already had"
         );
+        let before = std::fs::read(&path).expect("the untouched fixture reads");
 
         let mut block = block_from_file(path.clone(), "V6SHRINK.DAT");
         block.verify_writes = true;
@@ -7408,15 +8295,21 @@ mod tests {
         assert_eq!(records.len(), 9, "the fixture's own committed record count");
         let first = records.physical(0).expect("9 records, so index 0 exists").clone();
 
-        block.delete(first.position).expect(
-            "a single-key v6 tree that shrinks on delete must still leave a file this crate \
-             can read back",
+        let err = block
+            .delete(first.position)
+            .expect_err("this tree's 4-and-4 split means any delete collapses the root");
+        assert!(
+            err.why.contains("the root would collapse to zero entries"),
+            "a different refusal than the one this test recorded: {}",
+            err.why
         );
+
+        let after = std::fs::read(&path).expect("the file still reads");
+        assert_eq!(before, after, "a refused delete must leave the file untouched -- no leak, no partial write");
         assert_eq!(
             crate::verify::written(&path),
             Ok(()),
-            "the write must leave a file read::file accepts, independent of whether \
-             verify_writes caught anything already"
+            "the untouched-by-refusal file must still round-trip"
         );
     }
 
@@ -7795,6 +8688,76 @@ mod tests {
         // `write_cost.rs`'s `wccmp002_update_cost_today` and `_cold` are
         // Plan 3 Task 5's actual bound tests for this number, and they do
         // serialise.
+    }
+
+    /// Task 6's own deferred measurement: **an insert's B-tree maintenance
+    /// touches a bounded number of pages -- tree depth, not tree size** --
+    /// closing the twin-search cost question Task 3 of the incremental-
+    /// updates plan left open ("your rewritten write path should either
+    /// eliminate it naturally ... or explicitly re-defer with a
+    /// measurement in the report").
+    ///
+    /// Before Task 6, every insert called `Block::v6_reindex`, which
+    /// rebuilds and relocates every node of every key's tree -- on
+    /// `WCCMP002.DAT` (thousands of index pages) that was thousands of
+    /// `Map::relocate` calls, each paying its own twin-search scan, for a
+    /// single record. This task's incremental path instead descends to one
+    /// leaf per key and edits its own path back to the root: at most `tree
+    /// depth` pages touched, never the whole tree.
+    ///
+    /// Ignored because it needs a `WCCMP002.DAT`, which is not in the repo.
+    #[test]
+    #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+    fn v6_insert_touches_a_bounded_number_of_pages_not_the_whole_tree() {
+        let Ok(source) = std::env::var("WCCMP002") else {
+            eprintln!("set WCCMP002=/path/to/WCCMP002.DAT to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v6-insert-bounded-cost");
+        let path = dir.join("WCCMP002.DAT");
+        std::fs::copy(&source, &path).expect("the file copies into scratch");
+
+        let mut block = block_from_file(path, "WCCMP002.DAT");
+        assert_eq!(block.geometry.version, Version::V6);
+        let page = usize::from(block.geometry.page);
+        let reclen = usize::from(block.geometry.reclen);
+
+        let before = std::fs::read(&block.path).expect("the file reads");
+        crate::v6::READS.with(|reads| reads.set(0));
+        WROTE.with(|wrote| wrote.set(0));
+
+        let mut record = vec![0u8; reclen];
+        record[..4].copy_from_slice(&999_999_001u32.to_le_bytes());
+        block.insert(&record).expect("a fresh record inserts");
+
+        let map_reads = crate::v6::READS.with(std::cell::Cell::get);
+        let wrote = WROTE.with(std::cell::Cell::get);
+
+        let after = std::fs::read(&block.path).expect("the file reads back");
+        let common = before.len().min(after.len()) / page;
+        let differing = (0..common)
+            .filter(|n| before[n * page..(n + 1) * page] != after[n * page..(n + 1) * page])
+            .count();
+        let appended = (after.len() - before.len()) / page;
+
+        eprintln!(
+            "one insert: wrote {wrote} bytes, {differing} of {common} existing pages \
+             differ, {appended} pages appended, allocation map walked {map_reads} times"
+        );
+
+        // The bound that matters: a handful of pages (this record's own
+        // data page plus each touched key's own root-to-leaf path), never
+        // the thousands a full-tree rebuild would touch.
+        assert!(
+            differing + appended < 20,
+            "an insert touched {differing} existing pages and appended {appended} -- \
+             far more than one key's own tree depth, so this is rebuilding the \
+             whole tree again"
+        );
+        assert!(
+            map_reads < 20,
+            "the allocation table was walked {map_reads} times for one insert"
+        );
     }
 
     /// Task 4 of the incremental-updates plan: locating a v6 record's
@@ -10653,8 +11616,20 @@ mod tests {
     /// (this file's own test helpers) never attach a cache, so every
     /// existing `abort_undoes_*` test above is structurally blind to it.
     /// This one goes through the genuine `Btrieve::open`, on
-    /// `V6SHRINK.DAT` (a real v6 fixture, already used elsewhere in this
-    /// file -- 9 records, one key, reclen 48, page 512).
+    /// `V6EMPTY1KEY.DAT` (`v6_scratch`'s own fixture) with two records
+    /// inserted -- **not** `V6SHRINK.DAT` (this test's own fixture before
+    /// Task 6): that file's 9 records split 4-and-4 under one root
+    /// separator, so *any* single delete underflows a leaf whose sibling
+    /// sits at exactly `half_entries`, which per §6 merges rather than
+    /// redistributes and collapses the root -- the root-level tree-shrink
+    /// this task's own rulings refuse rather than guess at (see
+    /// `a_shrinking_v6_reindex_releases_its_surplus_pages_on_delete`,
+    /// which now asserts that refusal directly). A key-changing update is
+    /// a delete-then-insert (`Block::update_v6`'s own doc comment), so it
+    /// hit the identical refusal here -- unrelated to what this test is
+    /// actually about (cache invalidation on abort), so it moved to a
+    /// fixture with only two records, nowhere near any split or underflow
+    /// boundary.
     #[test]
     fn abort_invalidates_the_v6_cache_not_just_disk_and_the_model() {
         let mut mem = FlatMem::new(64 * 1024);
@@ -10662,34 +11637,30 @@ mod tests {
         let mut btrieve = Btrieve::<Flat>::default();
 
         let dir = crate::testing::scratch("txn-abort-invalidates-cache");
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/V6SHRINK.DAT");
-        let path = dir.join("V6SHRINK.DAT");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let path = dir.join("V6EMPTY1KEY.DAT");
         std::fs::copy(&source, &path).expect("the fixture copies into scratch");
-        // The fixture's one key covers the whole 48-byte record -- any
-        // change at all is a key change, so it must be modifiable first,
-        // the same helper `write_cost.rs` uses for the identical reason.
+        // This fixture's one key is not modifiable by default -- the same
+        // reason `a_v6_update_that_reorders_a_key_relocates_that_keys_root`
+        // calls this helper.
         crate::testing::make_keys_modifiable(&path);
 
-        let geometry = Geometry::read("V6SHRINK.DAT", &path).expect("reads");
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
         let maxlen = geometry.reclen;
         let at = btrieve
-            .open(&mut mem, &mut heap, "V6SHRINK.DAT", &path, geometry, maxlen)
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, maxlen)
             .expect("opens");
         assert!(
             btrieve.block(at).expect("open").cache.is_some(),
             "a real v6 open attaches a cache -- this test is meaningless without one"
         );
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("first insert");
+        let position = btrieve.block_mut(at).expect("open").insert(&v6_record(b"BBBB")).expect("second insert");
 
-        let (position, layout) = {
-            let block = btrieve.block_mut(at).expect("open");
-            let records = block.records().expect("reads");
-            let first = records.physical(0).expect("at least one record").clone();
-            let layout = pages::Layout {
-                page: block.geometry.page,
-                physical: block.geometry.physical,
-                pages: block.geometry.pages,
-            };
-            (first.position, layout)
+        let layout = {
+            let block = btrieve.block(at).expect("open");
+            pages::Layout { page: block.geometry.page, physical: block.geometry.physical, pages: block.geometry.pages }
         };
         let (logical, _slot) = layout.slot_of(position).expect("a slot-aligned position");
         let physical_before = btrieve
@@ -10699,8 +11670,7 @@ mod tests {
             .expect("resolves before the transaction");
 
         btrieve.begin().expect("begin");
-        let mut bytes = vec![0xEEu8; usize::from(maxlen)];
-        bytes[..4].copy_from_slice(b"ABRT");
+        let bytes = v6_record(b"ABRT");
         btrieve
             .block_mut(at)
             .expect("open")
@@ -10749,7 +11719,7 @@ mod tests {
         // other way.
         btrieve.block_mut(at).expect("open").records = None;
         let reread = btrieve.block_mut(at).expect("open").records().expect("a fresh read from disk");
-        let restored = reread.physical(0).expect("still there");
+        let restored = at_position(&reread, position).expect("still there, at its own unmoved position");
         assert_ne!(
             restored.bytes[..4],
             *b"ABRT",
