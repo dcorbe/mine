@@ -343,6 +343,50 @@ mod tests {
         assert_eq!(c.dirty_pages(), vec![3]);
     }
 
+    /// The interplay [`drop_dirty_restores_total_pages_to_the_disk_count`]'s
+    /// own doc comment asserts in prose but did not test: an extension that
+    /// was `put`, actually flushed to disk, and `mark_clean`ed by one
+    /// operation must survive a *later*, unrelated operation's `drop_dirty`
+    /// -- only the trailing run of never-flushed extensions rolls back.
+    /// [`crate::v6::Store::cache_put`]/[`crate::v6::Store::cache_mark_clean`]
+    /// run exactly this sequence -- flush, then `put` plus one
+    /// `mark_clean` -- after every successful write, so a *later* write's
+    /// own abort must not undo it.
+    #[test]
+    fn a_flushed_extension_survives_a_later_unrelated_drop_dirty() {
+        let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = three_page_file("cache-flush-survives-later-drop-dirty");
+        let mut c = PageCache::open(&path, 512).expect("opens");
+        assert_eq!(c.total_pages(), 3);
+
+        // One operation extends the file and its write actually lands on
+        // disk -- `put` then `mark_clean`, exactly what a real flush's
+        // write-through does.
+        c.put(3, vec![0xABu8; 512]);
+        c.mark_clean();
+        assert_eq!(c.total_pages(), 4, "the flushed extension stays counted");
+        assert_eq!(c.dirty_pages(), Vec::<u32>::new(), "mark_clean cleared it");
+
+        // A later, unrelated operation extends again but never flushes --
+        // the abort path this test is really about.
+        c.put(4, vec![0xCDu8; 512]);
+        assert_eq!(c.total_pages(), 5);
+        assert_eq!(c.dirty_pages(), vec![4]);
+
+        assert_eq!(c.drop_dirty(), 1, "only the later, unflushed extension is dirty");
+        assert_eq!(
+            c.total_pages(),
+            4,
+            "drop_dirty must roll back only the trailing unflushed extension, \
+             not the earlier one a real flush already committed"
+        );
+        assert_eq!(
+            c.page(3).expect("still resident, never evicted")[0],
+            0xAB,
+            "the earlier flush's bytes must survive an unrelated later drop_dirty"
+        );
+    }
+
     /// [`PageCache::mark_clean`] is the flush-succeeded half of the contract
     /// [`a_dirty_page_survives_drop_dirty_only_on_disk`] exercises the
     /// abort half of: the write stays in memory and stays readable, but the

@@ -977,6 +977,32 @@ pub struct Block<M: Mem> {
     /// every test-only `Block` literal in this crate leaves it `false` unless
     /// a test is deliberately exercising verification itself.
     verify_writes: bool,
+
+    /// A v6 file's page cache, attached for this block's whole open
+    /// lifetime -- `None` for a v5 file (no allocation table to re-walk)
+    /// and for every test-built `Block` that skips [`Self::open`].
+    ///
+    /// `RefCell`, not a plain field: [`Self::v6_resolve_logical`] is a
+    /// read-serving method other `Block` methods call with only `&self`,
+    /// and it has to mutate this cache (fault a page in) without demanding
+    /// `&mut self`. The host is single-threaded by construction, so the
+    /// interior mutability this buys is never contended -- it exists for
+    /// the borrow checker, not for concurrency.
+    ///
+    /// `Rc`, not a bare `&RefCell`: [`v6::Store::attach`] needs its own
+    /// handle to the same cache for the length of one write
+    /// (`insert_v6`/`update_v6`/`delete_v6`), and those functions still
+    /// have to mutate *other* fields of `self` after building that `Store`
+    /// -- `Self::capture_for_journal`, `self.dirty = true`, and the rest of
+    /// each function's tail. A plain borrowed reference would tie the
+    /// `Store`'s lifetime to a borrow of the whole `Block`, and the
+    /// borrow checker cannot see that only `cache` is aliased -- it refuses
+    /// the later `&mut self` outright (measured: `cannot borrow `*self` as
+    /// mutable because it is also borrowed as immutable`, from a minimal
+    /// reproduction of exactly this shape). `Rc::clone` hands `Store` an
+    /// independent, reference-counted handle instead, with no lifetime tied
+    /// to `self` at all.
+    cache: Option<std::rc::Rc<std::cell::RefCell<cache::PageCache>>>,
 }
 
 /// One block's state as it was the moment a transaction first wrote to it --
@@ -1458,7 +1484,19 @@ impl<M: Mem> Block<M> {
     /// below -- one flip per pair, live/stale by generation, a double flip
     /// collapsed to nothing -- is unchanged; only where the before/after
     /// bytes come from is.
-    fn write_changed_pages(&self, store: &v6::Store) -> Result<(), BtvError> {
+    ///
+    /// # Coherence with `store`'s attached cache
+    ///
+    /// `store` takes `&mut` now, not `&`: after every phase below has
+    /// actually flushed, this pushes the final bytes of every page it just
+    /// wrote into whatever cache `store` is attached to
+    /// ([`v6::Store::cache_put`], then one [`v6::Store::cache_mark_clean`])
+    /// -- a no-op when there is none. Without this, the cache would go on
+    /// answering a later operation's reads with the bytes this write just
+    /// made stale, which is worse than not caching at all. Both calls are
+    /// no-ops for a `Store` built with [`v6::Store::open`] or
+    /// [`v6::Store::from_bytes`] rather than [`v6::Store::attach`].
+    fn write_changed_pages(&self, store: &mut v6::Store) -> Result<(), BtvError> {
         use std::io::{Seek, SeekFrom, Write};
 
         let fail = |why: String| BtvError {
@@ -1619,6 +1657,25 @@ impl<M: Mem> Block<M> {
         }
         flush(&out)?;
 
+        // Every page this call just wrote, live on disk from here on --
+        // pushed into `store`'s attached cache (a no-op if it has none) so
+        // the next operation on this same `Block` sees the final bytes
+        // without a fresh disk read. Content pages first (their final
+        // bytes are just `store.current`), then flips: `flip.image` already
+        // carries `flip.generation`, the *live* value phase 3 just made
+        // real, not the held-back one phase 2 wrote to disk -- see the
+        // `Flip` struct above. One `cache_mark_clean` at the end, not one
+        // per `cache_put`: see that method's own doc comment for why
+        // clearing dirty state cache-wide is still correct here.
+        for &number in &content {
+            let bytes = store.current(number).to_vec();
+            store.cache_put(number, bytes);
+        }
+        for flip in &flips {
+            store.cache_put(flip.page, flip.image.clone());
+        }
+        store.cache_mark_clean();
+
         Ok(())
     }
 
@@ -1708,12 +1765,19 @@ impl<M: Mem> Block<M> {
             )));
         }
 
-        // `Store::open` reads only the file's length -- every page this
+        // `Store::open`/`Store::attach` read only the file's length (or, for
+        // `attach`, the attached cache's own page count) -- every page this
         // write actually touches is read lazily, once, the first time
         // something below asks for it. See `Store`'s own doc comment for
         // what this replaced (a `std::fs::read` of the whole file, plus a
         // full clone of it for `write_changed_pages` to diff against).
-        let mut store = v6::Store::open(&self.path, page_size).map_err(&fail)?;
+        // `attach`, when this block has a cache (`Self::cache`'s own doc
+        // comment), is what lets a page an earlier operation already
+        // fetched or wrote answer from memory here instead.
+        let mut store = match &self.cache {
+            Some(cache) => v6::Store::attach(cache, &self.path, page_size).map_err(&fail)?,
+            None => v6::Store::open(&self.path, page_size).map_err(&fail)?,
+        };
 
         let layout = pages::Layout {
             page: page_size,
@@ -1807,7 +1871,7 @@ impl<M: Mem> Block<M> {
         // disk is still exactly the pre-image a rollback would want.
         self.capture_for_journal()?;
 
-        self.write_changed_pages(&store)?;
+        self.write_changed_pages(&mut store)?;
 
         self.records = Some(records_clone);
         self.geometry.records = total_records;
@@ -2086,12 +2150,33 @@ impl<M: Mem> Block<M> {
         let (block, entry) = format::alloc::block_of(logical, page_size)?;
         let (first, second) = format::alloc::pair_position(page_size, block);
 
-        // One handle for both shadow halves, not one `read_at` open apiece:
-        // this used to cost two `openat`s per record write for a resolution
-        // that needs exactly two `read`s and no more.
-        let mut file = open_for_read(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
+        // Read through this block's attached cache when it has one (every
+        // v6 `Block` a real `opnbtv` reaches -- see `Self::cache`'s own doc
+        // comment), so a later resolution against the same allocation-table
+        // block answers from memory instead of disk -- this is the "same
+        // offsets re-read up to 36x" traffic a fresh `Store` per operation
+        // used to cost. Each borrow is scoped to one page: the bytes are
+        // copied out before it ends.
+        //
+        // Only a test-built `Block` that skips `Self::open` ever has no
+        // cache; that fallback keeps the one-handle-for-both-shadow-halves
+        // discipline this used to be the whole of -- two `openat`s per
+        // record write for a resolution that needs exactly two `read`s and
+        // no more.
+        let mut file = None;
         let mut page_at = |physical: usize| -> Result<Vec<u8>, String> {
-            let page = read_at_open(&mut file, physical * page_size, page_size)
+            if let Some(cache) = &self.cache {
+                let physical_u32 = u32::try_from(physical)
+                    .map_err(|_| format!("physical page {physical} does not fit a u32"))?;
+                let mut guard = cache.borrow_mut();
+                return Ok(guard.page(physical_u32)?.to_vec());
+            }
+            if file.is_none() {
+                file = Some(
+                    open_for_read(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?,
+                );
+            }
+            let page = read_at_open(file.as_mut().expect("just opened"), physical * page_size, page_size)
                 .map_err(|e| format!("{}: {e}", self.path.display()))?;
             if page.len() != page_size {
                 return Err(format!(
@@ -2207,7 +2292,10 @@ impl<M: Mem> Block<M> {
 
         let physical = self.v6_resolve_logical(logical)?;
 
-        let mut store = v6::Store::open(&self.path, self.geometry.page)?;
+        let mut store = match &self.cache {
+            Some(cache) => v6::Store::attach(cache, &self.path, self.geometry.page)?,
+            None => v6::Store::open(&self.path, self.geometry.page)?,
+        };
         // Touch the page now, not lazily on first write: a `physical` the
         // allocation table named but that does not actually exist in the
         // file is exactly the "past the end" refusal this used to raise
@@ -2359,7 +2447,7 @@ impl<M: Mem> Block<M> {
             .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
         self.capture_for_journal()?;
-        self.write_changed_pages(&store)?;
+        self.write_changed_pages(&mut store)?;
 
         self.records = Some(records_clone);
         self.geometry.pages =
@@ -2541,7 +2629,7 @@ impl<M: Mem> Block<M> {
         .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
         self.capture_for_journal()?;
-        self.write_changed_pages(&store)?;
+        self.write_changed_pages(&mut store)?;
 
         self.records = Some(records_clone);
         self.geometry.records = total_records;
@@ -4341,6 +4429,21 @@ impl<M: Mem> Btrieve<M> {
         }
         M::write(block, mem, &image).map_err(|e| e.to_string())?;
 
+        // A v6 file gets a page cache for its whole time open, so its
+        // second operation stops re-walking the allocation table from
+        // disk (`Block::cache`'s own doc comment). A v5 file has no such
+        // table, so it gets none. `PageCache::open` propagates its error
+        // as-is -- already `path`-prefixed -- rather than wrapping it
+        // again.
+        let cache = if geometry.version == Version::V6 {
+            Some(std::rc::Rc::new(std::cell::RefCell::new(cache::PageCache::open(
+                path,
+                geometry.page,
+            )?)))
+        } else {
+            None
+        };
+
         self.open.push(Block {
             id: ops::BlockId::fresh(),
             name: name.to_owned(),
@@ -4365,6 +4468,7 @@ impl<M: Mem> Btrieve<M> {
             // one that did -- so this is the one place verification is worth
             // its cost, and only in a debug build; see `Self::verify_write`.
             verify_writes: cfg!(debug_assertions),
+            cache,
         });
         Ok(block)
     }
@@ -5653,6 +5757,9 @@ mod tests {
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
+            // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that builds one.
+            cache: None,
         }
     }
 
@@ -6764,6 +6871,9 @@ mod tests {
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
+            // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that builds one.
+            cache: None,
         }
     }
 
@@ -8579,6 +8689,9 @@ mod tests {
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
+            // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that builds one.
+            cache: None,
         }
     }
 
@@ -8831,6 +8944,9 @@ mod tests {
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
+            // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that builds one.
+            cache: None,
         }
     }
 
@@ -9332,6 +9448,9 @@ mod tests {
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
+            // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that builds one.
+            cache: None,
         }
     }
 

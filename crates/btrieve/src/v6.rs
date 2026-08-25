@@ -260,6 +260,11 @@ struct Entry {
 pub(crate) struct Store {
     path: std::path::PathBuf,
     file: Option<std::fs::File>,
+    /// The block-lifetime cache this write is attached to, if any -- see
+    /// [`Self::attach`]. Only full pages ([`Self::ensure_loaded`]) are ever
+    /// asked of it; `header` reads never are, and always go through `file`
+    /// instead -- see [`Self::read_disk`]'s own doc comment for why.
+    cache: Option<std::rc::Rc<std::cell::RefCell<crate::cache::PageCache>>>,
     page_size: usize,
     original_pages: usize,
     total_pages: usize,
@@ -301,6 +306,53 @@ impl Store {
         Ok(Self {
             path: path.to_path_buf(),
             file: Some(file),
+            cache: None,
+            page_size: page_size_usize,
+            original_pages: pages,
+            total_pages: pages,
+            pages: HashMap::new(),
+            headers: HashMap::new(),
+            structural_pairs: std::collections::BTreeSet::new(),
+        })
+    }
+
+    /// Open `path` attached to a block-lifetime cache, instead of reading
+    /// fresh from disk every time: every full page this write asks for
+    /// ([`Self::ensure_loaded`], so [`Self::page`]/[`Self::page_mut`]/
+    /// [`Self::write_page`]) is served through `cache`, so a second write
+    /// against the same `Block` does not pay for a page an earlier one
+    /// already fetched -- or wrote, see
+    /// [`super::lib::Block::write_changed_pages`]'s own write-through
+    /// afterward.
+    ///
+    /// `path` is still opened here, for [`Self::header`]'s partial reads
+    /// only: `cache` holds whole pages, and promoting an 8-byte header
+    /// check into a whole-page fetch through it would turn [`Map::relocate`]'s
+    /// twin search back into a whole-file-sized read -- exactly what this
+    /// type exists to avoid (see [`Map::relocate`]'s own doc comment: up to
+    /// 13,603 candidate pages at 8 bytes each, not one page's worth of
+    /// bytes each). So a header this write asks for always costs
+    /// [`HEADER_LEN`] bytes of *this* handle, cache or not; only a full page
+    /// ever rides the shared one.
+    ///
+    /// # Errors
+    ///
+    /// If `page_size` is zero, or `path` cannot be opened for reading.
+    pub(crate) fn attach(
+        cache: &std::rc::Rc<std::cell::RefCell<crate::cache::PageCache>>,
+        path: &std::path::Path,
+        page_size: u16,
+    ) -> Result<Self, String> {
+        let page_size_usize = usize::from(page_size);
+        if page_size_usize == 0 {
+            return Err("a v6 file's page size cannot be zero".to_owned());
+        }
+        let file = super::open_for_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let pages = cache.borrow().total_pages();
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Some(file),
+            cache: Some(std::rc::Rc::clone(cache)),
             page_size: page_size_usize,
             original_pages: pages,
             total_pages: pages,
@@ -353,6 +405,7 @@ impl Store {
         Ok(Self {
             path: std::path::PathBuf::new(),
             file: None,
+            cache: None,
             page_size: page_size_usize,
             original_pages: total,
             total_pages: total,
@@ -395,13 +448,31 @@ impl Store {
         self.original_pages
     }
 
-    /// Reads through the handle [`Self::open`] opened, never a fresh one --
-    /// this used to be a `read_at(&self.path, ...)` call, one `open(2)` per
-    /// invocation; see this type's own doc comment for what that cost on a
-    /// live board. `expect`s a handle because the only `Store` without one,
-    /// [`Self::from_bytes`], pre-loads every page, so [`Self::header`] and
-    /// [`Self::ensure_loaded`] never fall through to this on that variant.
+    /// Reads through the handle [`Self::open`]/[`Self::attach`] opened,
+    /// never a fresh one -- this used to be a `read_at(&self.path, ...)`
+    /// call, one `open(2)` per invocation; see this type's own doc comment
+    /// for what that cost on a live board. `expect`s a handle because the
+    /// only `Store` without one, [`Self::from_bytes`], pre-loads every
+    /// page, so [`Self::header`] and [`Self::ensure_loaded`] never fall
+    /// through to this on that variant.
+    ///
+    /// A *full page* request (`len == self.page_size`, always
+    /// [`Self::ensure_loaded`]'s own call) is served through `cache` when
+    /// this `Store` is [`Self::attach`]ed to one, instead of `file` -- see
+    /// [`Self::attach`]'s own doc comment for why a header-length request
+    /// never takes this branch even when a cache is attached. The borrow
+    /// this takes on `cache` is scoped to this one page: the bytes are
+    /// copied out before it ends, so nothing here can re-enter it.
     fn read_disk(&mut self, page: usize, len: usize) -> Result<Vec<u8>, String> {
+        if len == self.page_size {
+            if let Some(cache) = &self.cache {
+                let physical = u32::try_from(page)
+                    .map_err(|_| format!("physical page {page} does not fit a u32"))?;
+                let mut guard = cache.borrow_mut();
+                let bytes = guard.page(physical)?.to_vec();
+                return Ok(bytes);
+            }
+        }
         let file = self
             .file
             .as_mut()
@@ -603,6 +674,36 @@ impl Store {
             .get(&n)
             .unwrap_or_else(|| panic!("physical page {n} was never read or written this operation"))
             .current
+    }
+
+    /// Push a page this write just put down on disk into the attached
+    /// cache too -- see [`super::lib::Block::write_changed_pages`]'s own
+    /// doc comment for the coherence rule this exists for -- so a later
+    /// operation on the same `Block` sees the final bytes without a fresh
+    /// disk read. A no-op when this `Store` has no attached cache: a v5
+    /// file, or any of this crate's own tests built with [`Self::open`] or
+    /// [`Self::from_bytes`] rather than [`Self::attach`].
+    pub(crate) fn cache_put(&mut self, page: usize, bytes: Vec<u8>) {
+        if let Some(cache) = &self.cache {
+            let physical = u32::try_from(page).expect("fewer than 2^32 physical pages");
+            cache.borrow_mut().put(physical, bytes);
+        }
+    }
+
+    /// Mark every page in the attached cache clean, once a flush has
+    /// actually written every [`Self::cache_put`] call this operation made.
+    /// A no-op under the same condition as [`Self::cache_put`].
+    ///
+    /// Safe to call unconditionally even though
+    /// [`crate::cache::PageCache::mark_clean`] clears dirty state
+    /// cache-wide rather than per page: nothing but [`Self::cache_put`]
+    /// ever marks a page dirty in this cache (a v6 write never reads
+    /// through it with `page_mut`), so there is never an unrelated pending
+    /// write here for this to paper over.
+    pub(crate) fn cache_mark_clean(&mut self) {
+        if let Some(cache) = &self.cache {
+            cache.borrow_mut().mark_clean();
+        }
     }
 }
 

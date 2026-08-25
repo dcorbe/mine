@@ -186,6 +186,11 @@ struct Cost {
     wchar: u64,
     syscr: u64,
     opens: u64,
+    /// [`btrieve::testing::page_fetches`] since this window's own
+    /// [`btrieve::testing::reset_page_fetches`] -- how many pages a v6
+    /// write's attached cache actually went to disk for, as opposed to
+    /// [`Self::opens`]'s count of whole-file handles.
+    page_fetches: u64,
     peak: usize,
     wall: Duration,
 }
@@ -232,6 +237,7 @@ fn measure_one_update(label: &str, path: &Path) -> Cost {
 
     let (r0, w0, sc0) = proc_io();
     btrieve::testing::reset_file_opens();
+    btrieve::testing::reset_page_fetches();
     reset_peak();
     let start = Instant::now();
     btrieve
@@ -247,6 +253,7 @@ fn measure_one_update(label: &str, path: &Path) -> Cost {
         wchar: w1.saturating_sub(w0),
         syscr: sc1.saturating_sub(sc0),
         opens: file_opens(),
+        page_fetches: btrieve::testing::page_fetches(),
         peak: peak_growth_since_reset(),
         wall,
     }
@@ -300,6 +307,7 @@ fn measure_one_update_cold(label: &str, path: &Path) -> Cost {
 
     let (r0, w0, sc0) = proc_io();
     btrieve::testing::reset_file_opens();
+    btrieve::testing::reset_page_fetches();
     reset_peak();
     let start = Instant::now();
     btrieve
@@ -315,6 +323,73 @@ fn measure_one_update_cold(label: &str, path: &Path) -> Cost {
         wchar: w1.saturating_sub(w0),
         syscr: sc1.saturating_sub(sc0),
         opens: file_opens(),
+        page_fetches: btrieve::testing::page_fetches(),
+        peak: peak_growth_since_reset(),
+        wall,
+    }
+}
+
+/// Two updates against the same still-open `Btrieve` session, on the same
+/// `Block` -- the shape neither [`measure_one_update`] nor
+/// [`measure_one_update_cold`] covers, both opening once and writing once.
+/// The first update is untimed and unmeasured, exactly the real precondition
+/// a board's *second* write to a file faces: whatever the first write's own
+/// reads left resident.
+///
+/// A real, distinct edit -- not a flip-back of the same byte -- so the
+/// second update is not accidentally a no-op the model could special-case.
+///
+/// # Panics
+///
+/// Same as [`measure_one_update`].
+fn measure_second_update(label: &str, path: &Path) -> Cost {
+    let mut mem = FlatMem::new(64 * 1024);
+    let mut heap = FlatHeap::new(0x100);
+    let mut btrieve = Btrieve::<Flat>::default();
+
+    let geometry = Geometry::read(label, path).unwrap_or_else(|e| panic!("{label}: {e}"));
+    let maxlen = geometry.reclen;
+    let at = btrieve
+        .open(&mut mem, &mut heap, label, path, geometry, maxlen)
+        .unwrap_or_else(|e| panic!("{label}: open: {e}"));
+
+    let record = {
+        let block = btrieve.block_mut(at).expect("just opened");
+        let records = block.records().unwrap_or_else(|e| panic!("{label}: records: {e}"));
+        assert!(!records.is_empty(), "{label}: this file has no records to update");
+        records.physical(0).expect("index 0 of a non-empty Records").clone()
+    };
+
+    let mut first_bytes = record.bytes.clone();
+    first_bytes[0] ^= 0xff;
+    btrieve
+        .block_mut(at)
+        .expect("still open")
+        .update(record.position, &first_bytes)
+        .unwrap_or_else(|e| panic!("{label}: first update: {e}"));
+
+    let mut second_bytes = first_bytes.clone();
+    second_bytes[1] ^= 0xff;
+
+    let (r0, w0, sc0) = proc_io();
+    btrieve::testing::reset_file_opens();
+    btrieve::testing::reset_page_fetches();
+    reset_peak();
+    let start = Instant::now();
+    btrieve
+        .block_mut(at)
+        .expect("still open")
+        .update(record.position, &second_bytes)
+        .unwrap_or_else(|e| panic!("{label}: second update: {e}"));
+    let wall = start.elapsed();
+    let (r1, w1, sc1) = proc_io();
+
+    Cost {
+        rchar: r1.saturating_sub(r0),
+        wchar: w1.saturating_sub(w0),
+        syscr: sc1.saturating_sub(sc0),
+        opens: file_opens(),
+        page_fetches: btrieve::testing::page_fetches(),
         peak: peak_growth_since_reset(),
         wall,
     }
@@ -323,11 +398,12 @@ fn measure_one_update_cold(label: &str, path: &Path) -> Cost {
 fn report(label: &str, file_len: u64, cost: &Cost) {
     eprintln!(
         "write_cost[{label}]: file {file_len} bytes -- read {read} bytes ({syscr} read \
-         syscalls, {opens} file opens), wrote {wrote} bytes, peak heap growth {peak} bytes, \
-         wall {wall:?} (verify_writes={verify})",
+         syscalls, {opens} file opens, {fetches} page fetches), wrote {wrote} bytes, peak heap \
+         growth {peak} bytes, wall {wall:?} (verify_writes={verify})",
         read = cost.rchar,
         syscr = cost.syscr,
         opens = cost.opens,
+        fetches = cost.page_fetches,
         wrote = cost.wchar,
         peak = cost.peak,
         wall = cost.wall,
@@ -423,6 +499,53 @@ fn wccmp002_update_cost_today() {
 
     let cost = measure_one_update("WCCMP002.DAT", &big_path);
     report("WCCMP002.DAT (warm -- records() primed before the window)", big_len, &cost);
+
+    // A second update on the same open Block must resolve its pages from the
+    // cache: the allocation-table walk is paid once per open, not per op.
+    // Before this task the second update re-probes every PP pair (measured
+    // live: 97.7% of all reads). Bound: the SECOND update fetches at most
+    // the pages it newly touches -- assert page_fetches delta <= 32.
+    //
+    // A fresh copy, not `big_path` above: that file already carries the
+    // first test's own edit, and this scenario -- two updates in one
+    // session -- is its own precondition, not a continuation of the other.
+    // Checked in both build profiles: `page_fetches` never passes through
+    // `verify_writes`'s own re-read (a separate, `read::file`-based path),
+    // so nothing about this bound depends on which profile measures it.
+    let second_dir = scratch("write-cost-big-second");
+    let second_path = second_dir.join("WCCMP002.DAT");
+    std::fs::copy(&source, &second_path).unwrap_or_else(|e| panic!("copying {source}: {e}"));
+    make_keys_modifiable(&second_path);
+
+    let second = measure_second_update("WCCMP002.DAT", &second_path);
+    report("WCCMP002.DAT (second update -- same open Block)", big_len, &second);
+    assert!(
+        second.page_fetches <= 32,
+        "a second update on the same open Block fetched {} pages from disk -- \
+         expected at most 32 (only the pages it newly touches), not a fresh \
+         allocation-table walk repeating what the first update already read",
+        second.page_fetches
+    );
+
+    // A complementary bound, added after mutation-testing this one:
+    // `page_fetches` above cannot see a regression in
+    // `Block::v6_resolve_logical`'s own routing through the cache, because
+    // within one operation `v6::Map::relocate` independently re-touches the
+    // same allocation-table page `v6_resolve_logical` already resolved --
+    // whichever of the two asks first pays for the fetch and the other is
+    // free, so the total is the same either way. What actually moves is
+    // `opens`: reverting `v6_resolve_logical` to its own handle costs one
+    // extra `open(2)` every single operation (measured: 1 -> 2, on both
+    // the warm update above and this second one), because it no longer
+    // shares this open `Store::attach`'s own header handle already pays
+    // for.
+    assert!(
+        second.opens <= 1,
+        "a second update on the same open Block opened its file {} times -- \
+         expected at most 1 (Store::attach's own header handle), not a \
+         second one from v6_resolve_logical falling back to its own",
+        second.opens
+    );
 
     // `verify_writes` (debug builds only) re-reads and re-parses the whole
     // file on top of the write itself -- Task 1's own cost, not Task 5's to
