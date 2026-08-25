@@ -18,26 +18,27 @@
 //!     recorded, never silently folded into a plain pass -- see each
 //!     `Verdict::GateB`'s own diff detail in the report this test prints.
 //!
-//! **This is expected to fail almost everywhere, today.** `Block::insert_v6`/
-//! `update_v6`/`delete_v6` all call `v6_reindex` unconditionally (`lib.rs`) --
-//! every v6 write fully rebuilds the key's whole B-tree from the live record
-//! list rather than doing the incremental split/merge/redistribute maintenance
-//! `docs/2026-08-25-btree-split-oracle.md` measured against the real engine.
-//! `v6_reindex`'s packing gives a *semantically* correct tree (same live
-//! records) but essentially never the same physical layout (logical id
-//! assignment, page reuse, or the specific split-point/merge-target choices
-//! genuine Btrieve makes) that the recorder's snapshots pin -- so Gate A is
-//! expected to fail on every step, and Gate B only has a chance where the
-//! recorded target snapshot itself still has no `0x4500` (merge-vacated)
-//! page in it, since `read::file` refuses any file that does (a separate,
-//! already-pinned gap -- `btree_split_oracle.rs`'s
-//! `the_reader_refuses_a_file_with_an_emptied_leaf_pending_tag_0x4500_support`).
+//! **Task 6 landed incremental maintenance** (`Block::insert_v6`/
+//! `update_v6`/`delete_v6` locate the touched entry and edit only the pages
+//! a split/merge/redistribute needs, per `docs/2026-08-25-btree-split-
+//! rules.md`, rather than calling `v6_reindex` -- a full per-key rebuild --
+//! on any per-op path). Today's own per-step map: **0 Gate-A, 20 Gate-B,
+//! 0 red** -- every step's own live records and key order already agree
+//! with the recording exactly, but no step reaches Gate A. Two reasons,
+//! neither a disagreement about the B-tree's own shape: the FCR's own
+//! `generation` field (this crate bumps it `+1` per op, matching the rules
+//! doc's own §10, but the recorder's session had already run other
+//! operations before the snapshot each sequence starts from, so the two
+//! engines' absolute counters were never going to agree from a cold
+//! start), and `v6::Map::relocate`'s twin search inheriting different
+//! abandoned-twin availability from that same unreplayed history. Both are
+//! demonstrated on real rows, with concrete byte-level diffs, in
+//! `docs/btrieve-unproven.md` §6 -- not merely inferred from file sizes.
 //!
-//! That is exactly why the one test in this file is `#[ignore]`d: it is the
-//! standing contract a later incremental-maintenance engine (Task 6) is
-//! judged against, not a test that should be red on every `cargo test -p
-//! btrieve`. Run it with `-- --ignored --nocapture` to see today's full
-//! per-step map.
+//! This test is a standing regression, not `#[ignore]`d: any future change
+//! that turns a currently-green step red, or silently downgrades a
+//! Gate-A/Gate-B pass, fails `cargo test -p btrieve` outright. Run it with
+//! `-- --nocapture` to see the full per-step map on any run, passing or not.
 //!
 //! # Op reconstruction
 //!
