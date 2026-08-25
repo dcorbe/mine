@@ -3782,15 +3782,16 @@ impl<M: Mem> Block<M> {
     /// # Errors
     ///
     /// Refusals this task's own rulings require, named with their
-    /// predicate rather than silently guessed at: **root-level underflow**
-    /// and **multi-level root collapse** (an interior root losing its own
-    /// last entry to a cascade -- never recorded, "out of scope" in the
-    /// rules doc; a leaf-root's own last record emptying is a *different*,
-    /// now-supported shape, see [`Self::v6_delete_interior_separator`]'s
-    /// sibling case below); **a node with neither a left nor a right
-    /// sibling** at its own level (an unexpected tree shape); and **an
-    /// underflow deeper than `half_entries - 1`** (every recorded crossing
-    /// lands exactly there). Also if `key` has no tree, the value is not
+    /// predicate rather than silently guessed at: **a node with neither a
+    /// left nor a right sibling** at its own level (an unexpected tree
+    /// shape -- a well-formed tree never reaches this, so this is a
+    /// foreign file's own problem, not this engine's); and **an underflow
+    /// deeper than `half_entries - 1`** (every recorded crossing lands
+    /// exactly there). Multi-level root collapse (an interior root losing
+    /// its own last entry to a cascade, the surviving child becoming the
+    /// new root) is no longer refused -- round 5's own recording measured
+    /// it, see the `level == 0` branch below. Also if `key` has no tree,
+    /// the value is not
     /// found at all (a model/tree disagreement), or any relocate/retire/
     /// reclaim fails.
     #[allow(clippy::too_many_lines)]
@@ -3944,21 +3945,27 @@ impl<M: Mem> Block<M> {
                     }
                     // An interior root (children.len() > 1 before this)
                     // that lost its own last entry to a merge cascading
-                    // from below -- the tree would need to shrink a level
-                    // (the surviving child becoming the new root), which
-                    // no recording settles (`docs/2026-08-25-btree-split-
-                    // rules.md`'s own "out of scope" list, and the
-                    // coordinator's own phase-2 ruling: this refusal
-                    // stands, distinct from the leaf-is-root case
-                    // `delete-to-empty` settled above).
-                    return Err(fail(format!(
-                        "key {}: the root would collapse to zero entries with \
-                         more than one child remaining -- multi-level tree \
-                         shrink is never recorded (docs/2026-08-25-btree-split-\
-                         rules.md's own 'out of scope' list names it \
-                         explicitly)",
-                        key.number
-                    )));
+                    // from below -- the tree drops a level. Round 5's own
+                    // recording (`root-level-collapse`): the ONE surviving
+                    // child (an interior node has exactly `entries.len() +
+                    // 1` children, so exactly one remains once `entries` is
+                    // empty) becomes the new root DIRECTLY -- the FCR's own
+                    // root pointer moves to that child's own decorated
+                    // logical id, never a content copy into the old root's
+                    // id. `cur_children[0]` is already that decorated
+                    // pointer (read straight off the surviving page's own
+                    // `leftmost`/`rightmost` field, the same convention
+                    // every other sibling lookup in this cascade uses), so
+                    // it is returned as-is. The vacated root retires into
+                    // the same `0x4500` free list a leaf uses, chained
+                    // after whatever this same delete already retired --
+                    // this op's own last retiree becomes the list's new
+                    // head, exactly the LIFO discipline every other retire
+                    // in this engine follows.
+                    let new_root = cur_children[0];
+                    v6::Map::retire(store, page_size, cur_logical, free_head).map_err(&fail)?;
+                    free_head = cur_logical;
+                    return Ok((Some(new_root), free_head));
                 }
                 let stamp = cur_stamp.wrapping_add(1);
                 let image = pages::encode_v6_index_page(layout, shape, stamp, &cur_entries, &cur_children);
@@ -8662,25 +8669,28 @@ mod tests {
     /// 8 entries per index page ((512-12)/(48+8)), and the committed
     /// fixture's 9 records split 4-and-4 under one root separator.
     ///
-    /// **Re-expressed for Task 6, per that task's own ruling.** Before
-    /// incremental maintenance landed, `v6_reindex`'s full rebuild packed
-    /// this same 9-record tree into fewer nodes than the genuine-Btrieve-
-    /// built file it started from, and this test proved the surplus was
-    /// released rather than left as a dangling allocation-table claim. That
-    /// mechanism (`v6_reindex`, `v6::Map::unclaim`) is unreferenced by any
-    /// per-op write path now -- deleting **any** one of these 9 records
+    /// **Re-expressed for Task 6, per that task's own ruling, then again
+    /// for round 5's own recording.** Before incremental maintenance
+    /// landed, `v6_reindex`'s full rebuild packed this same 9-record tree
+    /// into fewer nodes than the genuine-Btrieve-built file it started
+    /// from, and this test proved the surplus was released rather than
+    /// left as a dangling allocation-table claim. That mechanism
+    /// (`v6_reindex`, `v6::Map::unclaim`) is unreferenced by any per-op
+    /// write path now -- deleting **any** one of these 9 records
     /// underflows a leaf whose sibling sits at exactly `half_entries` (4
     /// and 4, never `> half_entries`), which per split rules §6 merges
-    /// rather than redistributes, pulling the root's own one separator down
-    /// and collapsing it to zero entries -- the root-level tree-shrink this
-    /// task's own rulings name as never recorded and refuse rather than
-    /// guess at. This test's *intent* -- a shrink must never silently leak
-    /// a claimed page -- still holds, just satisfied a different way: a
-    /// refusal that touches no page at all (`v6::Store`'s pending edits are
-    /// never flushed unless the whole operation returns `Ok`, so an early
-    /// `Err` leaves disk untouched by construction) leaks nothing, and this
-    /// now asserts exactly that -- the refusal itself, named by its own
-    /// predicate, and the file left byte-identical.
+    /// rather than redistributes, pulling the root's own one separator
+    /// down and collapsing it to zero entries. Task 6's own rulings
+    /// refused this (never recorded); round 5's own recording
+    /// (`root-level-collapse`, `docs/btrieve-unproven.md` §6.1.4) measured
+    /// it: status OK, the tree drops a level, the surviving leaf becomes
+    /// the new root under its OWN logical id, and the vacated root retires
+    /// onto the same free list a leaf does. This test's original *intent*
+    /// -- a shrink must never silently leak a claimed page -- still holds,
+    /// now satisfied the way the measured rule actually works: nothing is
+    /// leaked because the vacated root is retired, not orphaned or
+    /// dropped, and the allocation table still claims it (as `0x4500`,
+    /// reusable) rather than losing track of it.
     #[test]
     fn a_shrinking_v6_reindex_releases_its_surplus_pages_on_delete() {
         let dir = crate::testing::scratch("verify-writes-v6shrink-delete");
@@ -8693,29 +8703,90 @@ mod tests {
             "the untouched fixture must round-trip, or this test would be \
              blaming the write for a defect the fixture already had"
         );
-        let before = std::fs::read(&path).expect("the untouched fixture reads");
+        let before_bytes = std::fs::read(&path).expect("the untouched fixture reads");
+        let before = crate::read::file(&before_bytes).expect("the untouched fixture decodes");
+        let old_root = before.key_descriptors[0].root_page;
+        let root_page_before = before
+            .v6_pages
+            .iter()
+            .find(|p| u32::from(p.logical) == old_root)
+            .expect("the root's own page is present");
+        let idx_before = root_page_before.index.as_ref().expect("this fixture's own committed interior root");
+        assert_eq!(idx_before.entries.len(), 1, "one separator between two leaves, the fixture's own 4-and-4 split");
+        let leftmost = idx_before.leftmost & pages::fcr::ROOT_PAGE;
+        let rightmost = idx_before.rightmost & pages::fcr::ROOT_PAGE;
 
         let mut block = block_from_file(path.clone(), "V6SHRINK.DAT");
         block.verify_writes = true;
         let records = block.records().expect("the fixture's records load");
         assert_eq!(records.len(), 9, "the fixture's own committed record count");
         let first = records.physical(0).expect("9 records, so index 0 exists").clone();
+        let free_head_before = pages::long(
+            &v6_fcr(&block, &before_bytes)[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4],
+        );
+        assert_eq!(free_head_before, pages::NOWHERE, "a fresh oracle-built fixture retires nothing yet");
 
-        let err = block
+        block
             .delete(first.position)
-            .expect_err("this tree's 4-and-4 split means any delete collapses the root");
+            .expect("round 5's own recording: this collapse is status OK, not refused");
+
+        let after_bytes = std::fs::read(&path).expect("the file still reads");
+        let after = crate::read::file(&after_bytes).expect("the written file decodes");
+        let new_root = after.key_descriptors[0].root_page;
+        assert_ne!(new_root, old_root, "the old root did not survive its own collapse");
         assert!(
-            err.why.contains("the root would collapse to zero entries"),
-            "a different refusal than the one this test recorded: {}",
-            err.why
+            new_root == leftmost || new_root == rightmost,
+            "the new root is one of the two original leaves (the survivor), not a freshly claimed page"
+        );
+        let retired_leaf = if new_root == leftmost { rightmost } else { leftmost };
+
+        let new_root_page = after
+            .v6_pages
+            .iter()
+            .find(|p| u32::from(p.logical) == new_root)
+            .expect("the new root's own page");
+        let idx_after = new_root_page.index.as_ref().expect("still a real index page");
+        assert_eq!(idx_after.leftmost, pages::NOWHERE, "a genuine populated leaf now, not an interior node");
+        assert_eq!(idx_after.rightmost, pages::NOWHERE);
+        assert_eq!(idx_after.entries.len(), 8, "3 survivors + the pulled-down separator + 4 donor entries");
+
+        // Both pages this collapse retires -- the vacated root AND the
+        // underflowing leaf -- are chained onto the SAME free list a leaf
+        // alone would use, root last (LIFO: this op's own last retiree is
+        // the list's new head).
+        let old_root_page = after
+            .v6_pages
+            .iter()
+            .find(|p| u32::from(p.logical) == old_root)
+            .expect("the old root's own page still exists, now retired");
+        assert!(old_root_page.retired.is_some(), "the vacated interior root is retired, not orphaned");
+        let retired_leaf_page = after
+            .v6_pages
+            .iter()
+            .find(|p| u32::from(p.logical) == retired_leaf)
+            .expect("the underflowing leaf's own page still exists, now retired");
+        assert!(retired_leaf_page.retired.is_some(), "the underflowing leaf retires exactly like any ordinary merge");
+
+        let free_head_after = pages::long(
+            &v6_fcr(&block, &after_bytes)[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4],
+        );
+        assert_eq!(free_head_after, old_root, "the just-retired root becomes the free list's new head");
+        let next_link = |page: &crate::model::V6Page| pages::long(&page.retired.as_ref().expect("retired")[2..6]);
+        assert_eq!(
+            next_link(old_root_page),
+            retired_leaf,
+            "the root's own link names the other page retired within this same operation"
+        );
+        assert_eq!(
+            next_link(retired_leaf_page),
+            pages::NOWHERE,
+            "nothing was retired before this op, so the chain ends here"
         );
 
-        let after = std::fs::read(&path).expect("the file still reads");
-        assert_eq!(before, after, "a refused delete must leave the file untouched -- no leak, no partial write");
         assert_eq!(
             crate::verify::written(&path),
             Ok(()),
-            "the untouched-by-refusal file must still round-trip"
+            "the written file must still round-trip after the collapse"
         );
     }
 
