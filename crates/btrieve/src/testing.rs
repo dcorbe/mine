@@ -112,6 +112,23 @@ pub fn scratch(name: &str) -> PathBuf {
     at
 }
 
+/// Zero [`crate::FILE_OPENS`] so a measurement window starts clean.
+///
+/// A test that wants to prove a read path opens its file once, not once per
+/// page, calls this immediately before the window it is timing -- the same
+/// role `write_cost.rs`'s own `reset_peak`/`proc_io` baseline plays for heap
+/// growth and `/proc/self/io`.
+pub fn reset_file_opens() {
+    crate::FILE_OPENS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How many times this process has opened a file to serve a Btrieve read
+/// since the last [`reset_file_opens`]. See [`crate::FILE_OPENS`]'s own doc
+/// comment for exactly which call sites this counts.
+pub fn file_opens() -> u64 {
+    crate::FILE_OPENS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// A pointer into [`FlatMem`]: one number, no segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct FlatPtr(pub u32);

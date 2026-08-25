@@ -233,8 +233,33 @@ struct Entry {
 /// known rather than rediscovered, and [`Self::original`] is the one
 /// pre-image `write_changed_pages` needs per dirty page, not the whole
 /// file's.
+///
+/// # One open handle, not one per page
+///
+/// [`Self::open`] used to record only `path`, and [`Self::read_disk`] opened
+/// it fresh -- `std::fs::File::open`, seek, read, drop -- on every cache
+/// miss. Caching already keeps that to at most once per physical page within
+/// one write, but a `WCCMP002.DAT`-sized write still touches hundreds of
+/// distinct pages, and on a live board doing many writes a second that
+/// measured as 35,860 `openat`s in three seconds against one file,
+/// `/proc/[pid]/fd` showing *zero* held handles throughout -- pure syscall
+/// overhead, not I/O (page cache absorbed every `read`). `Self::open` now
+/// opens the file once and keeps the handle in `file`; `read_disk` reads
+/// through it. `file` is `None` only for [`Self::from_bytes`], whose own doc
+/// comment already guarantees `read_disk` is never reached for that variant.
+///
+/// This handle is never used to write, and never outlives one write
+/// operation -- `Store` is opened fresh at the top of `insert_v6`/
+/// `update_v6`/`delete_v6` and dropped at the end of that call, and every
+/// read through it happens before [`super::lib::Block::write_changed_pages`]
+/// opens its own, separate handle to actually write the pages back (see that
+/// function's own doc comment). So there is no window where this handle
+/// could observe stale bytes: nothing writes to the file while it is open,
+/// and the *next* write opens a brand new handle, which a fresh `open(2)`
+/// always resolves against the file's current contents.
 pub(crate) struct Store {
     path: std::path::PathBuf,
+    file: Option<std::fs::File>,
     page_size: usize,
     original_pages: usize,
     total_pages: usize,
@@ -245,18 +270,24 @@ pub(crate) struct Store {
 
 impl Store {
     /// Open `path` for a page-at-a-time write. Nothing is read yet -- only
-    /// the file's length, to know how many pages it starts with.
+    /// the file's length, to know how many pages it starts with -- but the
+    /// handle itself is opened here and kept for every page [`Self::header`]
+    /// or [`Self::ensure_loaded`] later reads; see this type's own doc
+    /// comment for why one open handle replaces one open per page.
     ///
     /// # Errors
     ///
-    /// If the file's metadata cannot be read, or its length is not a whole
-    /// number of `page_size`-byte pages.
+    /// If the file cannot be opened, its metadata cannot be read, or its
+    /// length is not a whole number of `page_size`-byte pages.
     pub(crate) fn open(path: &std::path::Path, page_size: u16) -> Result<Self, String> {
         let page_size_usize = usize::from(page_size);
         if page_size_usize == 0 {
             return Err("a v6 file's page size cannot be zero".to_owned());
         }
-        let len = std::fs::metadata(path)
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        super::FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let len = file
+            .metadata()
             .map_err(|e| format!("{}: {e}", path.display()))?
             .len();
         let len = usize::try_from(len)
@@ -270,6 +301,7 @@ impl Store {
         let pages = len / page_size_usize;
         Ok(Self {
             path: path.to_path_buf(),
+            file: Some(file),
             page_size: page_size_usize,
             original_pages: pages,
             total_pages: pages,
@@ -321,6 +353,7 @@ impl Store {
         }
         Ok(Self {
             path: std::path::PathBuf::new(),
+            file: None,
             page_size: page_size_usize,
             original_pages: total,
             total_pages: total,
@@ -363,8 +396,18 @@ impl Store {
         self.original_pages
     }
 
-    fn read_disk(&self, page: usize, len: usize) -> Result<Vec<u8>, String> {
-        let bytes = super::read_at(&self.path, page * self.page_size, len)
+    /// Reads through the handle [`Self::open`] opened, never a fresh one --
+    /// this used to be a `read_at(&self.path, ...)` call, one `open(2)` per
+    /// invocation; see this type's own doc comment for what that cost on a
+    /// live board. `expect`s a handle because the only `Store` without one,
+    /// [`Self::from_bytes`], pre-loads every page, so [`Self::header`] and
+    /// [`Self::ensure_loaded`] never fall through to this on that variant.
+    fn read_disk(&mut self, page: usize, len: usize) -> Result<Vec<u8>, String> {
+        let file = self
+            .file
+            .as_mut()
+            .expect("Store::from_bytes pre-loads every page, so this is unreached on that variant");
+        let bytes = super::read_at_open(file, page * self.page_size, len)
             .map_err(|e| format!("{}: {e}", self.path.display()))?;
         if bytes.len() != len {
             return Err(format!(

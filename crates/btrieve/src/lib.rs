@@ -520,15 +520,43 @@ fn version(bytes: &[u8]) -> Option<Version> {
     None
 }
 
+/// How many times this process has opened a file to serve a Btrieve read,
+/// since the last [`testing::reset_file_opens`].
+///
+/// This crate's own choke-point count, not a kernel one: `/proc/self/io`'s
+/// `syscr` counts `read(2)`, and a page cached by [`v6::Store`] is read at
+/// most once regardless of how many times something asks for it, so `syscr`
+/// alone cannot see an open-per-page caller collapse to an open-per-operation
+/// one -- only the open count moves. Linux exposes no per-process `open(2)`
+/// counter of its own (that needs ptrace or an audit rule, both out of reach
+/// for a std-only crate), so every `std::fs::File::open` performed to serve a
+/// Btrieve read is counted right here instead: [`read_head`], [`read_at`],
+/// [`v6::Store::open`], and [`Block::v6_resolve_logical`].
+pub(crate) static FILE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The first `len` bytes of a file, or fewer if it is shorter.
 ///
 /// `WCCUPDAT.DAT` is 77 MB and `WCCMP001.VIR` 43. Reading a header is reading a
 /// header.
+///
+/// Opens `path` itself -- for the one-shot callers this exists for (a file
+/// scanned once, at open/census/stat time). A caller reading many times from
+/// the same file within one operation should hold its own `File` and call
+/// [`read_head_open`] instead; see that function's own doc comment for why.
 fn read_head(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-
-    let mut out = vec![0u8; len];
     let mut file = std::fs::File::open(path)?;
+    FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    read_head_open(&mut file, len)
+}
+
+/// [`read_head`]'s body, through a handle the caller already has open rather
+/// than one this function opens itself -- no [`FILE_OPENS`] count of its own,
+/// because it opens nothing.
+fn read_head_open(file: &mut std::fs::File, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut out = vec![0u8; len];
     let mut got = 0;
     while got < len {
         match file.read(&mut out[got..])? {
@@ -546,10 +574,26 @@ fn read_head(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
 /// [`read_head`] does not read the whole file: a v6 file's second
 /// control-record copy can start many kilobytes in, and this file can be
 /// tens of megabytes.
+///
+/// Opens `path` itself, same one-shot caveat as [`read_head`]: a caller that
+/// reads many times from the same file within one operation should hold its
+/// own `File` and call [`read_at_open`] instead. [`v6::Store`] is the reason
+/// this distinction exists at all -- it used to reach here once per page,
+/// which measured as 35,860 `openat`s in three seconds against a live
+/// board's `WCCMP002.DAT` (`docs/2026-08-24-btrieve-write-cost-baseline.md`'s
+/// follow-up); it now opens once per operation and calls [`read_at_open`].
 pub(crate) fn read_at(path: &Path, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    read_at_open(&mut file, offset, len)
+}
+
+/// [`read_at`]'s body, through a handle the caller already has open rather
+/// than one this function opens itself -- no [`FILE_OPENS`] count of its own,
+/// because it opens nothing.
+pub(crate) fn read_at_open(file: &mut std::fs::File, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset as u64))?;
     let mut out = vec![0u8; len];
     let mut got = 0;
@@ -1988,8 +2032,13 @@ impl<M: Mem> Block<M> {
         let (block, entry) = format::alloc::block_of(logical, page_size)?;
         let (first, second) = format::alloc::pair_position(page_size, block);
 
-        let page_at = |physical: usize| -> Result<Vec<u8>, String> {
-            let page = read_at(&self.path, physical * page_size, page_size)
+        // One handle for both shadow halves, not one `read_at` open apiece:
+        // this used to cost two `openat`s per record write for a resolution
+        // that needs exactly two `read`s and no more.
+        let mut file = std::fs::File::open(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
+        FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut page_at = |physical: usize| -> Result<Vec<u8>, String> {
+            let page = read_at_open(&mut file, physical * page_size, page_size)
                 .map_err(|e| format!("{}: {e}", self.path.display()))?;
             if page.len() != page_size {
                 return Err(format!(

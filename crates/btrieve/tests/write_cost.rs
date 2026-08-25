@@ -12,6 +12,26 @@
 //!   are bytes this process asked the kernel for, which is exactly the
 //!   question." Linux-only, and that is fine -- a diagnostic test, not a
 //!   portability contract.
+//! - **Read syscalls**: `/proc/self/io`'s `syscr` delta, alongside `rchar`.
+//!   Added after a live-board defect this file's own byte counters could not
+//!   see: `v6::Store` and `read_at`/`read_head` used to open the file fresh
+//!   on every page access, so bytes read fell (page-scoped reads instead of
+//!   a whole-file `Vec<u8>`) while `open`+`seek`+`read`+`close` syscall
+//!   traffic *rose* -- measured live at 35,860 `openat`s in three seconds
+//!   against one 55 MB file, `/proc/[pid]/fd` showing zero held handles the
+//!   whole time. `rchar` fell 56x across that same change and nothing here
+//!   noticed, because nothing was watching `syscr`. It is not, by itself,
+//!   a discriminator for *this specific* defect -- `Store`'s own per-operation
+//!   page cache already keeps `read(2)` calls bounded to one per distinct
+//!   page touched, before or after the fix -- so [`file_opens`] below is the
+//!   instrument that actually moves.
+//! - **File opens**: [`btrieve::testing::file_opens`], a choke-point counter
+//!   this crate keeps of its own (`Block::FILE_OPENS`) -- Linux exposes no
+//!   per-process `open(2)` count via `/proc/self/io` the way it does `syscr`
+//!   for `read(2)`, so this is the crate counting its own chokepoint rather
+//!   than a kernel one. This is the number an open-per-page regression
+//!   actually moves, and what `wccmp002_update_cost_today`'s new bound below
+//!   is written against.
 //! - **Peak heap growth**: a `#[global_allocator]` wrapping `System` with two
 //!   atomics (current, peak-since-reset).
 //!
@@ -116,22 +136,46 @@ fn peak_growth_since_reset() -> usize {
 
 // --- /proc/self/io --------------------------------------------------------
 
-/// `(rchar, wchar)` -- total bytes ever passed to `read(2)`/`write(2)` by
-/// this process, per `proc(5)`. Monotonic counters; a caller diffs two
-/// readings to get one call's traffic.
-fn proc_io() -> (u64, u64) {
+/// `(rchar, wchar, syscr)` -- total bytes ever passed to `read(2)`/`write(2)`
+/// by this process, and the total count of read syscalls themselves, per
+/// `proc(5)`. Monotonic counters; a caller diffs two readings to get one
+/// call's traffic.
+///
+/// `syscr` is read alongside `rchar` so a falling byte count can no longer
+/// hide a rising syscall count the way it did here: Task 5 cut `rchar` 56x
+/// (55.7 MB to ~992 KB) by moving from a whole-file read to page-scoped
+/// ones, and nothing watching only `rchar` noticed that the *live* board's
+/// syscall traffic went the other way (`openat`s specifically -- see
+/// [`file_opens`] below for why `syscr` itself is tracked but is not the
+/// instrument that catches that particular regression).
+fn proc_io() -> (u64, u64, u64) {
     let text = std::fs::read_to_string("/proc/self/io")
         .expect("this test reads /proc/self/io and only runs on Linux");
     let mut rchar = 0u64;
     let mut wchar = 0u64;
+    let mut syscr = 0u64;
     for line in text.lines() {
         if let Some(v) = line.strip_prefix("rchar: ") {
             rchar = v.trim().parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("wchar: ") {
             wchar = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("syscr: ") {
+            syscr = v.trim().parse().unwrap_or(0);
         }
     }
-    (rchar, wchar)
+    (rchar, wchar, syscr)
+}
+
+/// How many times this process has opened a file to serve a Btrieve read,
+/// since the caller's own [`btrieve::testing::reset_file_opens`] -- the
+/// crate's own choke-point count, because `/proc/self/io` has no per-process
+/// `open(2)` counter the way it has `syscr` for `read(2)`. This is the
+/// number an open-per-page regression actually moves: `Store`'s in-memory
+/// page cache already bounds `read(2)` calls to one per distinct page a
+/// write touches, before or after such a regression, so `syscr` stays flat
+/// while this does not.
+fn file_opens() -> u64 {
+    btrieve::testing::file_opens()
 }
 
 // --- the measurement itself -----------------------------------------------
@@ -140,6 +184,8 @@ fn proc_io() -> (u64, u64) {
 struct Cost {
     rchar: u64,
     wchar: u64,
+    syscr: u64,
+    opens: u64,
     peak: usize,
     wall: Duration,
 }
@@ -184,7 +230,8 @@ fn measure_one_update(label: &str, path: &Path) -> Cost {
     let mut bytes = record.bytes.clone();
     bytes[0] ^= 0xff; // the smallest possible semantic change: flip one bit
 
-    let (r0, w0) = proc_io();
+    let (r0, w0, sc0) = proc_io();
+    btrieve::testing::reset_file_opens();
     reset_peak();
     let start = Instant::now();
     btrieve
@@ -193,11 +240,13 @@ fn measure_one_update(label: &str, path: &Path) -> Cost {
         .update(record.position, &bytes)
         .unwrap_or_else(|e| panic!("{label}: update: {e}"));
     let wall = start.elapsed();
-    let (r1, w1) = proc_io();
+    let (r1, w1, sc1) = proc_io();
 
     Cost {
         rchar: r1.saturating_sub(r0),
         wchar: w1.saturating_sub(w0),
+        syscr: sc1.saturating_sub(sc0),
+        opens: file_opens(),
         peak: peak_growth_since_reset(),
         wall,
     }
@@ -249,7 +298,8 @@ fn measure_one_update_cold(label: &str, path: &Path) -> Cost {
         .open(&mut mem, &mut heap, label, path, geometry, maxlen)
         .unwrap_or_else(|e| panic!("{label}: open: {e}"));
 
-    let (r0, w0) = proc_io();
+    let (r0, w0, sc0) = proc_io();
+    btrieve::testing::reset_file_opens();
     reset_peak();
     let start = Instant::now();
     btrieve
@@ -258,11 +308,13 @@ fn measure_one_update_cold(label: &str, path: &Path) -> Cost {
         .update(position, &bytes)
         .unwrap_or_else(|e| panic!("{label}: update: {e}"));
     let wall = start.elapsed();
-    let (r1, w1) = proc_io();
+    let (r1, w1, sc1) = proc_io();
 
     Cost {
         rchar: r1.saturating_sub(r0),
         wchar: w1.saturating_sub(w0),
+        syscr: sc1.saturating_sub(sc0),
+        opens: file_opens(),
         peak: peak_growth_since_reset(),
         wall,
     }
@@ -270,9 +322,12 @@ fn measure_one_update_cold(label: &str, path: &Path) -> Cost {
 
 fn report(label: &str, file_len: u64, cost: &Cost) {
     eprintln!(
-        "write_cost[{label}]: file {file_len} bytes -- read {read} bytes, wrote {wrote} \
-         bytes, peak heap growth {peak} bytes, wall {wall:?} (verify_writes={verify})",
+        "write_cost[{label}]: file {file_len} bytes -- read {read} bytes ({syscr} read \
+         syscalls, {opens} file opens), wrote {wrote} bytes, peak heap growth {peak} bytes, \
+         wall {wall:?} (verify_writes={verify})",
         read = cost.rchar,
+        syscr = cost.syscr,
+        opens = cost.opens,
         wrote = cost.wchar,
         peak = cost.peak,
         wall = cost.wall,
@@ -386,6 +441,39 @@ fn wccmp002_update_cost_today() {
          something that scales with the file's {big_len} bytes",
         cost.rchar
     );
+
+    // `syscr` alongside `rchar`, per this file's own module doc: a page-scoped
+    // read path can drop `rchar` while raising syscall traffic, and `rchar`
+    // alone would not notice. `Store`'s per-operation page cache already
+    // bounds `read(2)` calls to one per distinct page a write touches, so
+    // this shares `rchar`'s own page-count reasoning rather than a tighter
+    // one -- it is a sanity bound on read syscalls, not the instrument that
+    // catches an open-per-page regression (that is `opens`, below).
+    assert!(
+        cost.syscr <= 300,
+        "update() on a warm WCCMP002.DAT issued {} read(2) syscalls -- expected at most 300, \
+         a small multiple of the pages a write actually touches",
+        cost.syscr
+    );
+
+    // The bound this class of defect actually needs: before the fix that
+    // added `FILE_OPENS`, `v6::Store` opened `path` fresh on every page
+    // access (`Store::read_disk`), so this count scaled with the number of
+    // distinct pages a write touched -- in the hundreds for `WCCMP002.DAT`,
+    // exactly the shape measured live: 35,860 `openat`s in three seconds
+    // against one file, with zero handles ever held (`/proc/[pid]/fd`).
+    // After the fix, a v6 write opens the file at most twice: once in
+    // `Block::v6_resolve_logical` (both shadow allocation-table halves
+    // through one handle) and once in `v6::Store::open` (every page touched
+    // after that reads through the same handle). `4` gives headroom without
+    // hiding a regression back toward one open per page.
+    assert!(
+        cost.opens <= 4,
+        "update() on a warm WCCMP002.DAT opened its file {} times -- expected at most 4 \
+         (one for Block::v6_resolve_logical, one for v6::Store::open), not something that \
+         scales with how many pages the write touches",
+        cost.opens
+    );
 }
 
 /// The same file, the same one-record update, but *cold*: nothing has
@@ -438,5 +526,18 @@ fn wccmp002_update_cost_today_cold() {
          (one full-file read for records() to prime from, plus the warm update's own \
          bounded read), not something that scales with a second full-file read on top",
         cost.rchar
+    );
+
+    // Same reasoning as `wccmp002_update_cost_today`'s own `opens` bound: a
+    // cold update pays one extra whole-file read for `records()` to prime
+    // from (`walk_v6` -- `std::fs::read`, one `open` of its own, not routed
+    // through `FILE_OPENS`), on top of the warm update's own opens. `5`
+    // gives that one extra open room without hiding a regression back
+    // toward one open per page.
+    assert!(
+        cost.opens <= 5,
+        "a cold update() on WCCMP002.DAT opened its file {} times -- expected at most 5, not \
+         something that scales with how many pages the write touches",
+        cost.opens
     );
 }
