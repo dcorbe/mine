@@ -52,6 +52,7 @@
 
 pub mod acs;
 pub mod btrcall;
+mod cache;
 pub mod canvas;
 pub mod corpus;
 pub mod census;
@@ -542,6 +543,17 @@ fn version(bytes: &[u8]) -> Option<Version> {
 /// changes by construction, and folding writes in here would make a bound
 /// written against reads silently start describing something else.
 pub(crate) static FILE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times this process has read a page from disk into a
+/// [`cache::PageCache`], since the last [`testing::reset_page_fetches`].
+///
+/// The same reasoning as [`FILE_OPENS`], one level down: Linux exposes no
+/// per-process counter for "how many distinct pages did a cache actually go
+/// to disk for" either, and a page cache's whole job is keeping that number
+/// from scaling with how many times something asks for the same page --
+/// [`cache::PageCache::page`]'s own doc comment names the one call site
+/// this is incremented from.
+pub(crate) static PAGE_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Open `path` for reading, counting the open in [`FILE_OPENS`].
 ///

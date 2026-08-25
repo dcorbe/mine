@@ -129,6 +129,21 @@ pub fn file_opens() -> u64 {
     crate::FILE_OPENS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Zero [`crate::PAGE_FETCHES`] so a measurement window starts clean. Same
+/// role as [`reset_file_opens`], for a [`crate::cache::PageCache`]'s own
+/// choke point instead of [`crate::FILE_OPENS`]'s.
+pub fn reset_page_fetches() {
+    crate::PAGE_FETCHES.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How many times this process has read a page from disk into a
+/// [`crate::cache::PageCache`] since the last [`reset_page_fetches`]. See
+/// [`crate::PAGE_FETCHES`]'s own doc comment for exactly which call site
+/// this counts.
+pub fn page_fetches() -> u64 {
+    crate::PAGE_FETCHES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// A pointer into [`FlatMem`]: one number, no segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct FlatPtr(pub u32);
