@@ -2460,7 +2460,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
             // rather than guess" discipline `orphan` already uses -- this
             // crate's own write path is what interprets the repurposed
             // `rightmost` field as the free list's next hop
-            // (`docs/2026-08-25-btree-split-rules.md` §8); the model makes
+            // (`docs/2026-08-25-btree-split-rules.md` section 8); the model makes
             // no claim about it beyond round-tripping the bytes.
             if tag == page::v6::TAG_RETIRED {
                 let body = bytes[page_start + page::v6::LEN..page_start + page_size].to_vec();

@@ -2658,6 +2658,17 @@ impl<M: Mem> Block<M> {
             let old_value = key.extract(&before);
             let new_value = key.extract(&after);
 
+            // The fast path first: old and new value on the same leaf is a
+            // same-count swap, one relocate, nothing above it touched or
+            // even read. Only when that does not apply does this fall back
+            // to the general delete-then-insert composition below.
+            if self
+                .v6_tree_update_key_same_leaf(&mut store, &cache_rc, layout, key, &fcr, &old_value, &new_value, position)?
+                .is_some()
+            {
+                continue;
+            }
+
             let (root_after_delete, free_head_after_delete) = self.v6_tree_delete(
                 &mut store,
                 &cache_rc,
@@ -3840,6 +3851,90 @@ impl<M: Mem> Block<M> {
             cur_stamp = located.path[parent_level].page.stamp;
             level = parent_level;
         }
+    }
+
+    /// A key-changing update's fast path: when the old and new values both
+    /// belong to the SAME leaf, swapping one entry for another leaves the
+    /// entry count unchanged -- no split, no underflow, nothing above the
+    /// leaf touched, one relocate. `None` when they do not, so the caller
+    /// falls back to [`Self::v6_tree_delete`] + [`Self::v6_tree_insert`]'s
+    /// general composition.
+    ///
+    /// Both descents run against the tree as this call found it -- neither
+    /// touches a page before the other completes -- so "same leaf" here is
+    /// exactly "these two entries could be swapped in place", not an
+    /// approximation.
+    ///
+    /// # Returns
+    ///
+    /// `Some((None, free_head))` if the fast path applied (a same-count
+    /// swap never moves a root); `Ok(None)` to mean "try the general path
+    /// instead", not a written no-op.
+    ///
+    /// # Errors
+    ///
+    /// If `key` has no tree, or the descent/relocate fails once this
+    /// function has already committed to the fast path.
+    fn v6_tree_update_key_same_leaf(
+        &self,
+        store: &mut v6::Store,
+        cache: &std::cell::RefCell<cache::PageCache>,
+        layout: pages::Layout,
+        key: &keys::Key,
+        fcr: &[u8],
+        old_value: &[u8],
+        new_value: &[u8],
+        position: u32,
+    ) -> Result<Option<()>, BtvError> {
+        let name = self.name.clone();
+        let fail = |why: String| BtvError { file: name.clone(), why };
+        let page_size = self.geometry.page;
+
+        let Some((root, shape)) = self.v6_key_root(key, fcr).map_err(&fail)? else {
+            return Ok(None);
+        };
+        let tag = Self::v6_key_tag_bytes(key)?;
+        let cmp = |a: &[u8], b: &[u8]| key.compare_extracted(a, b);
+        let mut resolve = |logical: u32| self.v6_resolve_logical(logical);
+
+        let old_located =
+            nav::descend_for_write(cache, &mut resolve, root, shape, old_value, &cmp).map_err(&fail)?;
+        if !old_located.exact {
+            return Ok(None);
+        }
+        let old_frame = old_located.path.last().expect("descend_for_write always returns at least one frame");
+        if !old_frame.page.leaf() {
+            return Ok(None);
+        }
+        let head = old_frame.page.entries[old_located.at].1;
+        let tail = old_frame.page.tails.get(old_located.at).copied().unwrap_or(head);
+        if head != tail || head != position {
+            return Ok(None);
+        }
+
+        let new_located =
+            nav::descend_for_write(cache, &mut resolve, root, shape, new_value, &cmp).map_err(&fail)?;
+        let new_frame = new_located.path.last().expect("descend_for_write always returns at least one frame");
+        if new_frame.logical != old_frame.logical || new_located.exact {
+            // A different leaf, or the new value already has an entry of
+            // its own (a duplicate group to extend, or a collision on a
+            // unique key) -- either way, not this fast path's job.
+            return Ok(None);
+        }
+
+        let mut entries = Self::entries_from_page(&old_frame.page, &old_frame.page.tails);
+        entries.remove(old_located.at);
+        // Re-found within the now-one-shorter list rather than adjusted
+        // arithmetically from `new_located.at` (computed against the
+        // pre-removal page) -- simpler, and just as cheap on one page.
+        let insert_at = entries.partition_point(|e| cmp(&e.key, new_value) == std::cmp::Ordering::Less);
+        entries.insert(insert_at, pages::Entry { key: new_value.to_vec(), head: position, tail: position });
+
+        let stamp = old_frame.page.stamp.wrapping_add(1);
+        let image = pages::encode_v6_index_page(layout, shape, stamp, &entries, &[]);
+        v6::Map::relocate(store, page_size, old_frame.logical, &image, tag).map_err(&fail)?;
+
+        Ok(Some(()))
     }
 
     /// A logical id as a v6 index page names it: the key's own tag byte in
@@ -7632,6 +7727,43 @@ mod tests {
         let definition = pages::fcr::KEYS + usize::from(block.keys[0].definition) * pages::fcr::KEY_WIDTH;
         file[live + definition + pages::fcr::KEY_RECORDS..][..4]
             .copy_from_slice(&pages::to_long(3));
+
+        // Task 6: the delete this test drives now locates its target
+        // through the on-disk B-tree (`nav::descend_for_write`), not a
+        // rebuild from the model -- so "BBBB"/"CCCC", injected straight
+        // into the data page above, also need entries of their own, or the
+        // delete below finds only "AAAA"'s and refuses ("value not found in
+        // the tree"). Both go into the same one-entry leaf `insert_v6`
+        // already built for "AAAA", re-encoded with three entries instead
+        // of one; this file's key is a 4-byte unique STRING, so ordinary
+        // byte order already sorts AAAA < BBBB < CCCC.
+        let key = &block.keys[0];
+        let shape = key.shape();
+        let root_raw = pages::long(&file[live + definition + pages::fcr::KEY_ROOT..][..4]);
+        let root_logical = root_raw & pages::fcr::ROOT_PAGE;
+        let root_physical = v6::Map::read(
+            &mut v6::Store::from_bytes(&file, block.geometry.page).expect("test fixture"),
+            block.geometry.page,
+        )
+        .expect("table")
+        .physical(root_logical)
+        .expect("the root is claimed") as usize;
+        let leaf_start = root_physical * page_size;
+        let leaf_before = pages::decode_index_page(&file[leaf_start..leaf_start + page_size], shape)
+            .expect("insert_v6 already built a decodable one-entry leaf");
+        assert_eq!(leaf_before.entries.len(), 1, "only AAAA is indexed before this patch");
+        let entries = vec![
+            pages::Entry::unique(b"AAAA".to_vec(), first),
+            pages::Entry::unique(b"BBBB".to_vec(), second),
+            pages::Entry::unique(b"CCCC".to_vec(), third),
+        ];
+        let mut leaf_image = pages::encode_v6_index_page(layout, shape, leaf_before.stamp, &entries, &[]);
+        // `encode_v6_index_page` leaves the header's own tag/logical bytes
+        // zero (its caller is always `v6::Map::claim`/`relocate`, which fill
+        // them in) -- copied from the page this patches in place instead.
+        leaf_image[..4].copy_from_slice(&file[leaf_start..leaf_start + 4]);
+        file[leaf_start..leaf_start + page_size].copy_from_slice(&leaf_image);
+
         std::fs::write(&path, &file).expect("written");
 
         block.geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("re-reads the shape");
@@ -11745,32 +11877,34 @@ mod tests {
         let mut btrieve = Btrieve::<Flat>::default();
 
         let dir = crate::testing::scratch("v6-stop-invalidates-cache");
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/V6SHRINK.DAT");
-        let path = dir.join("V6SHRINK.DAT");
+        // `V6EMPTY1KEY.DAT` with two inserted records, not `V6SHRINK.DAT`
+        // (this test's own fixture before Task 6) -- see
+        // `abort_invalidates_the_v6_cache_not_just_disk_and_the_model`'s own
+        // doc comment for why a key-changing update against that 9-record,
+        // 4-and-4-split file now refuses (root-level tree-shrink) rather
+        // than succeeding, and that refusal is correct, not a regression.
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let path = dir.join("V6EMPTY1KEY.DAT");
         std::fs::copy(&source, &path).expect("the fixture copies into scratch");
         crate::testing::make_keys_modifiable(&path);
 
-        let geometry = Geometry::read("V6SHRINK.DAT", &path).expect("reads");
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
         let maxlen = geometry.reclen;
         let page_size = usize::from(geometry.page);
         let at = btrieve
-            .open(&mut mem, &mut heap, "V6SHRINK.DAT", &path, geometry, maxlen)
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, maxlen)
             .expect("opens");
         assert!(
             btrieve.block(at).expect("open").cache.is_some(),
             "a real v6 open attaches a cache -- this test is meaningless without one"
         );
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("first insert");
+        let position = btrieve.block_mut(at).expect("open").insert(&v6_record(b"BBBB")).expect("second insert");
 
-        let (position, layout) = {
-            let block = btrieve.block_mut(at).expect("open");
-            let records = block.records().expect("reads");
-            let first = records.physical(0).expect("at least one record").clone();
-            let layout = pages::Layout {
-                page: block.geometry.page,
-                physical: block.geometry.physical,
-                pages: block.geometry.pages,
-            };
-            (first.position, layout)
+        let layout = {
+            let block = btrieve.block(at).expect("open");
+            pages::Layout { page: block.geometry.page, physical: block.geometry.physical, pages: block.geometry.pages }
         };
         let (logical, _slot) = layout.slot_of(position).expect("a slot-aligned position");
         let physical_original = btrieve
@@ -11785,7 +11919,7 @@ mod tests {
         // `physical_original` in full through the attached cache before the
         // record moved off it, so that page stays resident there as a
         // stale twin.
-        let first_bytes = vec![0x11u8; usize::from(maxlen)];
+        let first_bytes = v6_record(b"1111");
         btrieve
             .block_mut(at)
             .expect("open")
