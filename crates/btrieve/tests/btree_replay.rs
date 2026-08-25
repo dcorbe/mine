@@ -22,8 +22,10 @@
 //! `update_v6`/`delete_v6` locate the touched entry and edit only the pages
 //! a split/merge/redistribute needs, per `docs/2026-08-25-btree-split-
 //! rules.md`, rather than calling `v6_reindex` -- a full per-key rebuild --
-//! on any per-op path). Today's own per-step map: **0 Gate-A, 33 Gate-B,
-//! 0 red** -- every step's own live records and key order already agree
+//! on any per-op path). Today's own per-step map (run with `--nocapture`
+//! for the exact current count, printed from `sequences().len()` rather
+//! than hand-counted here): **0 Gate-A, every other step Gate-B, 0 red**
+//! -- every step's own live records and key order already agree
 //! with the recording exactly, but no step reaches Gate A. Two reasons,
 //! neither a disagreement about the B-tree's own shape: the FCR's own
 //! `generation` field (this crate bumps it `+1` per op, matching the rules
@@ -34,9 +36,11 @@
 //! abandoned-twin availability from that same unreplayed history. Both are
 //! demonstrated on real rows, with concrete byte-level diffs, in
 //! `docs/btrieve-unproven.md` §6 -- not merely inferred from file sizes.
-//! The last thirteen steps are Phase 2's own recordings: partial duplicate-
+//! Thirteen of these steps are Phase 2's own recordings: partial duplicate-
 //! chain deletion, an interior-separator delete, delete-to-empty (the root
-//! reverting to its virgin shape), and free-list reclaim order -- see
+//! reverting to its virgin shape), and free-list reclaim order. Three more
+//! (`root_level_collapse`) are round 5's: an interior root's own last two
+//! children merging into one, dropping the tree a level -- see
 //! `docs/btrieve-unproven.md` §6 for what remains unmeasured beyond them.
 //!
 //! This test is a standing regression, not `#[ignore]`d: any future change
@@ -204,8 +208,13 @@ enum Verdict {
 /// deletes a single-level key's only record; genuine Btrieve answers OK and
 /// the root reverts to the virgin shape (`docs/2026-08-25-btree-split-
 /// rules.md` §7) -- an intentionally empty key, not a broken read.
+/// `root_level_collapse`'s own final step reaches the identical virgin
+/// shape, just under the surviving child's logical id rather than the
+/// file's original root -- the same genuinely-empty exception applies.
 fn expects_empty_census(seq_name: &str, step_label: &str) -> bool {
-    seq_name == "delete_to_empty" && step_label == "delete the key's only record -- root reverts to virgin shape"
+    (seq_name == "delete_to_empty" && step_label == "delete the key's only record -- root reverts to virgin shape")
+        || (seq_name == "root_level_collapse"
+            && step_label == "delete 1 (the file's last record; reverts to delete-to-empty's virgin shape)")
 }
 
 /// Gate B: our own output round-trips cleanly, AND a fresh open of both our
@@ -644,6 +653,30 @@ fn sequences() -> Vec<Sequence> {
                 label: "insert 177 (forces another split; reclaims 10, the only one left)",
             }],
         },
+        // --- Round 5 (review-driven): the last reachable gap -- an
+        // interior root's own last two children merging into one.
+        Sequence {
+            name: "root_level_collapse",
+            start: fixture("root-level-collapse/1-interior-root-one-entry.dat"),
+            file_label: "SPLROOTC.DAT",
+            steps: vec![
+                Step {
+                    ops: vec![delete(41)],
+                    expect: fixture("root-level-collapse/2-collapsed-to-single-level.dat"),
+                    label: "delete 41 (root's last entry vanishes; drops a level, survivor becomes root)",
+                },
+                Step {
+                    ops: (2..=40).rev().map(delete).collect(),
+                    expect: fixture("root-level-collapse/3-single-level-one-record.dat"),
+                    label: "delete 40..2 descending (39 deletes; drains the single-level tree to one record)",
+                },
+                Step {
+                    ops: vec![delete(1)],
+                    expect: fixture("root-level-collapse/4-drained-to-empty.dat"),
+                    label: "delete 1 (the file's last record; reverts to delete-to-empty's virgin shape)",
+                },
+            ],
+        },
     ]
 }
 
@@ -698,13 +731,17 @@ fn run_sequence(seq: &Sequence, report: &mut Vec<(String, String, Verdict)>) {
 /// `insert_v6`/`update_v6`/`delete_v6` maintaining each key's B-tree
 /// incrementally per `docs/2026-08-25-btree-split-rules.md` -- see
 /// `docs/btrieve-unproven.md` §6 for the standing register of every step
-/// that clears only Gate B (all 20, today) and why. A standing regression:
+/// that clears only Gate B (every step, today -- run with `-- --nocapture`
+/// for the exact current count, printed from `sequences().len()` itself
+/// rather than hand-counted here) and why. A standing regression:
 /// any future change that turns a Gate-A/Gate-B pass red must fix it or
 /// re-register it there, never silently downgrade it.
 #[test]
 fn the_oracle_replay_contract() {
+    let all_sequences = sequences();
+    let sequence_count = all_sequences.len();
     let mut report: Vec<(String, String, Verdict)> = Vec::new();
-    for seq in sequences() {
+    for seq in all_sequences {
         run_sequence(&seq, &mut report);
     }
 
@@ -712,7 +749,10 @@ fn the_oracle_replay_contract() {
     let mut gate_b_only = Vec::new();
     let mut reds = Vec::new();
 
-    eprintln!("\n=== btree_replay: today's per-step map ({} steps) ===", report.len());
+    eprintln!(
+        "\n=== btree_replay: today's per-step map ({} steps across {sequence_count} sequences) ===",
+        report.len()
+    );
     for (seq, step, verdict) in &report {
         match verdict {
             Verdict::GateA => {
@@ -734,7 +774,8 @@ fn the_oracle_replay_contract() {
         }
     }
     eprintln!(
-        "\n{} Gate-A pass(es), {} Gate-B-only pass(es), {} red, {} step(s) total\n",
+        "\n{} Gate-A pass(es), {} Gate-B-only pass(es), {} red, {} step(s) total across \
+         {sequence_count} sequences\n",
         gate_a.len(),
         gate_b_only.len(),
         reds.len(),
