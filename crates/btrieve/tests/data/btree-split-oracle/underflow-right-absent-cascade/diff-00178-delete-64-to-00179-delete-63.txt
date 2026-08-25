@@ -1,0 +1,44 @@
+--- crates/btrieve/tests/data/btree-split-oracle/underflow-right-absent-cascade/00178-delete-64.txt	2026-08-25 11:51:40.899948176 -0400
++++ crates/btrieve/tests/data/btree-split-oracle/underflow-right-absent-cascade/00179-delete-63.txt	2026-08-25 11:51:40.933281512 -0400
+@@ -2,29 +2,29 @@
+ --- dump-v6 refused (an earlier merge already retagged a page 0x4500); rawscan.py below ---
+ page_size=512
+   live_fcr_page = 1
+-  generation = 178
+-  records = 63
++  generation = 179
++  records = 62
+   pages = 11
+-  free_v6 = 1920
++  free_v6 = 1906
+   root_raw = 0x80000007
+   root_logical = 7
+   root_tag = 0x80
+-  key0_records = 63
++  key0_records = 62
+ page_size=512 live_alloc_page=3
+   logical=1 marker=0x4500 physical=15
+   logical=2 marker=0x4400 physical=5
+-  logical=3 marker=0x4400 physical=11
+-  logical=4 marker=0x8000 physical=17
++  logical=3 marker=0x4400 physical=4
++  logical=4 marker=0x8000 physical=6
+   logical=5 marker=0x4400 physical=8
+   logical=6 marker=0x8000 physical=9
+-  logical=7 marker=0x8000 physical=14
++  logical=7 marker=0x8000 physical=16
+   logical=8 marker=0x4500 physical=7
+   logical=9 marker=0x4400 physical=12
+-  logical=10 marker=0x8000 physical=13
+-  logical=11 marker=0x0000 physical=4
+-  logical=12 marker=0x0000 physical=10
+-  logical=13 marker=0x0000 physical=16
+-  logical=14 marker=0x0000 physical=6
++  logical=10 marker=0x4500 physical=10
++  logical=11 marker=0x0000 physical=11
++  logical=12 marker=0x0000 physical=13
++  logical=13 marker=0x0000 physical=14
++  logical=14 marker=0x0000 physical=17
+   logical=15 marker=0x0000 physical=18
+   logical=16 marker=0x0000 physical=19
+   logical=17 marker=0x0000 physical=20

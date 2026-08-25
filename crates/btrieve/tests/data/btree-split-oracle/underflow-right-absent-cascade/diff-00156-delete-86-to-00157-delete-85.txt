@@ -1,0 +1,46 @@
+--- crates/btrieve/tests/data/btree-split-oracle/underflow-right-absent-cascade/00156-delete-86.txt	2026-08-25 11:51:40.803281502 -0400
++++ crates/btrieve/tests/data/btree-split-oracle/underflow-right-absent-cascade/00157-delete-85.txt	2026-08-25 11:51:40.836614838 -0400
+@@ -1,30 +1,30 @@
+-FAIL: not a readable Btrieve file: identified as V600: physical page 15 (logical 1, tag 0x4500) is claimed by the allocation table but attributed to no key's B-tree and is not TAG_ACS, TAG_DATA, or TAG_VARIABLE -- its tag is TAG_TEMPLATE or unrecognized, neither of which this crate decodes
++FAIL: not a readable Btrieve file: identified as V600: physical page 7 (logical 8, tag 0x4500) is claimed by the allocation table but attributed to no key's B-tree and is not TAG_ACS, TAG_DATA, or TAG_VARIABLE -- its tag is TAG_TEMPLATE or unrecognized, neither of which this crate decodes
+ --- dump-v6 refused (an earlier merge already retagged a page 0x4500); rawscan.py below ---
+ page_size=512
+   live_fcr_page = 1
+-  generation = 156
+-  records = 85
++  generation = 157
++  records = 84
+   pages = 11
+-  free_v6 = 2748
++  free_v6 = 2734
+   root_raw = 0x80000007
+   root_logical = 7
+   root_tag = 0x80
+-  key0_records = 85
++  key0_records = 84
+ page_size=512 live_alloc_page=3
+   logical=1 marker=0x4500 physical=15
+   logical=2 marker=0x4400 physical=5
+   logical=3 marker=0x4400 physical=4
+   logical=4 marker=0x8000 physical=6
+-  logical=5 marker=0x4400 physical=11
++  logical=5 marker=0x4400 physical=8
+   logical=6 marker=0x8000 physical=9
+-  logical=7 marker=0x8000 physical=14
+-  logical=8 marker=0x8000 physical=13
++  logical=7 marker=0x8000 physical=16
++  logical=8 marker=0x4500 physical=7
+   logical=9 marker=0x4400 physical=12
+-  logical=10 marker=0x8000 physical=17
+-  logical=11 marker=0x0000 physical=8
+-  logical=12 marker=0x0000 physical=7
+-  logical=13 marker=0x0000 physical=16
+-  logical=14 marker=0x0000 physical=10
++  logical=10 marker=0x8000 physical=10
++  logical=11 marker=0x0000 physical=11
++  logical=12 marker=0x0000 physical=13
++  logical=13 marker=0x0000 physical=14
++  logical=14 marker=0x0000 physical=17
+   logical=15 marker=0x0000 physical=18
+   logical=16 marker=0x0000 physical=19
+   logical=17 marker=0x0000 physical=20

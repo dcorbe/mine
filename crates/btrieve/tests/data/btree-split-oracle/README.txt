@@ -91,3 +91,19 @@ each `.dat` is either `dump-v6`'s output or, when that refuses (an 0x4500
 page present), rawscan.py's `fcr`+`alloc` output appended after the refusal
 message -- both are in the same file so a reader always sees WHY the
 fallback was needed.
+
+## Round 3 (reconciling round 1's merge-into-left with round 2's merge-into-right)
+
+  underflow-right-absent-cascade/ -- the EXACT SAME tree/delete sequence as
+                                      round 1's underflow512u/merge-on-delete,
+                                      replayed with a snapshot after every
+                                      delete instead of one before/after
+                                      pair. Shows a leaf that becomes the
+                                      rightmost mid-cascade redistributing
+                                      with its only (left) neighbour once,
+                                      then merging into it once that
+                                      neighbour is down to half_entries.
+                                      See its own manifest.txt and
+                                      docs/2026-08-25-btree-split-oracle.md's
+                                      "Round 3" section for the full
+                                      predicate tree this settles.

@@ -322,3 +322,93 @@ fn a_merge_vacated_page_is_reclaimed_by_a_later_split_not_left_behind() {
          (ceil(41/2) = 21 entries), the same split rule round 1 recorded"
     );
 }
+
+// --- Reconciling round 1's original merge-on-delete recording ----------
+//
+// Round 1's `underflow512u/merge-on-delete` recording showed a MERGE into
+// the LEFT sibling, which looked like it contradicted this file's own
+// "merge prefers the right sibling" finding until replayed one delete at a
+// time (`underflow-right-absent-cascade/`, the exact same tree and delete
+// sequence as that recording, just snapshotted after every single delete
+// instead of only before/after the whole 60-delete run).
+//
+// What actually happens: as the cascade empties the rightmost leaves one
+// after another, whichever leaf is CURRENTLY rightmost has no right
+// sibling to prefer -- so it falls back to its only neighbour, the left
+// one, exactly like `rightmost_leaf_redistributes_left_instead_of_merging`
+// above. The new fact this cascade adds: that fallback is not always a
+// redistribution. The left neighbour redistributes (donates one entry)
+// the FIRST time it is asked, dropping itself from 21 to 20 entries --
+// but 20 is exactly `half_entries`, so the SECOND time the (still
+// rightmost) leaf underflows, that same neighbour can no longer donate
+// without underflowing itself, and a full MERGE happens instead: the
+// rightmost leaf disappears, its neighbour absorbs it and becomes the new
+// rightmost. This repeats three times over the cascade (donors 8, then
+// 10, then 4), each time redistributing once and merging on the next ask.
+
+/// One neighbour, asked twice: the first ask (it has 21 > half_entries
+/// 20) redistributes; the second (it is now at exactly 20, not MORE than
+/// half_entries) merges instead. All three replicates in the cascade
+/// (donors 8, 10, 4) show the identical 21 -> redistribute -> 20 ->
+/// merge pattern.
+#[test]
+fn right_absent_redistributes_once_then_merges_once_the_donor_hits_half_entries() {
+    let cases: [(&str, &str, &str); 3] = [
+        (
+            "underflow-right-absent-cascade/00133-delete-109.dat",
+            "underflow-right-absent-cascade/00134-delete-108.dat",
+            "underflow-right-absent-cascade/00135-delete-107.dat",
+        ),
+        (
+            "underflow-right-absent-cascade/00155-delete-87.dat",
+            "underflow-right-absent-cascade/00156-delete-86.dat",
+            "underflow-right-absent-cascade/00157-delete-85.dat",
+        ),
+        (
+            "underflow-right-absent-cascade/00177-delete-65.dat",
+            "underflow-right-absent-cascade/00178-delete-64.dat",
+            "underflow-right-absent-cascade/00179-delete-63.dat",
+        ),
+    ];
+
+    for (before, redistributed, merged) in cases {
+        let data_before = read_bytes(before);
+        let ps = guess_page_size(&data_before);
+        let (root_before, entries_before) = manual_root_entries(&data_before, ps);
+
+        let data_redist = read_bytes(redistributed);
+        let (root_redist, entries_redist) = manual_root_entries(&data_redist, ps);
+        assert_eq!(root_redist, root_before, "{redistributed}: root itself did not move");
+        assert_eq!(
+            entries_redist.len(),
+            entries_before.len(),
+            "{redistributed}: same number of children -- a redistribution, not a merge"
+        );
+        // Exactly one separator key changed, by exactly 1 (the rotated
+        // entry moving across the parent).
+        let key_diffs: Vec<i64> = entries_before
+            .iter()
+            .zip(entries_redist.iter())
+            .map(|((k1, _), (k2, _))| i64::from(*k2) - i64::from(*k1))
+            .collect();
+        assert_eq!(
+            key_diffs.iter().filter(|d| **d != 0).count(),
+            1,
+            "{redistributed}: exactly one separator should have moved"
+        );
+        assert_eq!(
+            key_diffs.iter().map(|d| d.abs()).max().unwrap(),
+            1,
+            "{redistributed}: the separator moved by exactly one rotated entry"
+        );
+
+        let data_merged = read_bytes(merged);
+        let (root_merged, entries_merged) = manual_root_entries(&data_merged, ps);
+        assert_eq!(root_merged, root_before, "{merged}: the root page itself is unaffected");
+        assert_eq!(
+            entries_merged.len() + 1,
+            entries_redist.len(),
+            "{merged}: one fewer child -- the rightmost leaf is gone, not just smaller"
+        );
+    }
+}

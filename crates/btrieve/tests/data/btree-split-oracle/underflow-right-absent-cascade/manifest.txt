@@ -1,0 +1,50 @@
+The EXACT SAME file, tree and 60-delete sequence as round 1's
+underflow512u/merge-on-delete (reclen 12, pagesize 512, unique key,
+insert 1..120, then delete 120,119,...,61) -- replayed here with a
+snapshot after EVERY delete instead of one before/after pair, to settle
+which sibling a cascading underflow merges into and why.
+
+Pristine tree (5 leaves): leftmost=6(1-21), 4(23-43), 10(45-65), 8(67-87),
+rightmost=1(89-120); root (logical 7) entries [22,44,66,88].
+
+Three replicates of the same pattern, each a (before, redistributed,
+merged) snapshot triple:
+
+  00133-delete-109.dat -> 00134-delete-108.dat -> 00135-delete-107.dat
+    Deleting 120..108 empties leaf 1 down to 19 entries (< half_entries
+    20); it is the RIGHTMOST leaf (no right sibling), so it falls back to
+    its only neighbour, leaf 8 (21 entries, > half_entries): leaf 8
+    REDISTRIBUTES one entry (donates 87; root separator 88 -> 87).
+    Deleting 107 empties leaf 1 to 19 again -- but leaf 8 is now at
+    exactly 20 (== half_entries, not more), so instead of redistributing
+    again it MERGES: leaf 1 disappears, leaf 8 absorbs its remainder and
+    becomes the new rightmost. Root goes from 4 entries to 3.
+
+  00155-delete-87.dat -> 00156-delete-86.dat -> 00157-delete-85.dat
+    Leaf 8 (now rightmost, holding what it started with plus leaf 1's
+    remainder) is driven down by continued deletes; at 86 it redistributes
+    with ITS only neighbour, leaf 10 (donates 65; separator 66 -> 65).
+    At 85 leaf 10 is at exactly half_entries again, so leaf 8 MERGES into
+    leaf 10 instead. Root: 3 entries -> 2.
+
+  00177-delete-65.dat -> 00178-delete-64.dat -> 00179-delete-63.dat
+    Leaf 10 (now rightmost) redistributes with leaf 4 at 64 (donates 43;
+    separator 44 -> 43), then MERGES into leaf 4 at 63 once leaf 4 is back
+    at exactly half_entries. Root: 2 entries -> 1 -- the same end state
+    round 1's own before/after pair showed, now with every intermediate
+    step visible.
+
+The rule this settles: "right sibling first" (docs' round 2 finding) does
+not stop applying just because the cascade has already consumed the
+formal right sibling -- whichever leaf IS currently rightmost still only
+has its left neighbour to ask, and that ask is a redistribution or a merge
+by the EXACT SAME threshold as everywhere else in this doc: redistribute
+if the neighbour has MORE than half_entries (safe to donate one and stay
+at or above the minimum), merge if the neighbour is AT half_entries
+(donating would put it below the minimum too).
+
+`*.txt` next to each `.dat`: dump-v6 output for the two snapshots before
+the first merge (00133, 00134 -- no 0x4500 page exists yet); every later
+snapshot already has at least one 0x4500 page from an earlier merge in
+this same cascade, so those use rawscan.py's fcr+alloc fallback, same as
+round 2's fixtures.
