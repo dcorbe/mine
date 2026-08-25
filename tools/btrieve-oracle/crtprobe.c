@@ -53,6 +53,13 @@
  *             SEGMENT must be set on every segment but a key's last)
  *   crtprobe insert <path> <hex-bytes>
  *     one record, raw hex, no separators (e.g. "0100000000000000")
+ *   crtprobe delete <path> <key-hex>
+ *     GET_EQUAL on key 0 with the given raw key bytes, then DELETE the
+ *     record it positions on. Added for the 2026-08-25 B-tree split/underflow
+ *     oracle (docs/2026-08-25-btree-split-oracle.md) -- delprobe.c's
+ *     cmd_delete does the same GET_EQUAL+DELETE pair but for its own
+ *     hardcoded 32-byte-reclen rig; this one takes the key as hex so it
+ *     works against whatever geometry `create` above just built.
  *   crtprobe dumpraw <path> <bytes>
  *     print the first <bytes> of the file AS THE ENGINE SEES IT -- opened
  *     and STAT'd first so a stale Microkernel cache is forced to notice the
@@ -69,6 +76,8 @@
 #define B_OPEN       0
 #define B_CLOSE      1
 #define B_INSERT     2
+#define B_DELETE     4
+#define B_GET_EQUAL  5
 #define B_GET_FIRST 12
 #define B_CREATE    14
 #define B_STAT      15
@@ -290,6 +299,55 @@ static void cmd_insert(const char *path, const char *hex)
         exit(1);
 }
 
+/* delete: GET_EQUAL(keynum 0, raw hex key) to position, then DELETE. Reports
+ * both statuses; a failed GET_EQUAL means the key was not found and no
+ * delete was attempted (the FAIL below still runs B_STOP through main()'s
+ * tail, unlike cmd_insert's, so the caller sees a nonzero exit either way). */
+static void cmd_delete(const char *path, const char *hex)
+{
+    char posblk[POSBLK_SIZE];
+    unsigned char record[DATA_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    DWORD dlen;
+    size_t len, i;
+    int st;
+
+    len = strlen(hex);
+    if (len % 2 != 0 || len / 2 > sizeof keybuf) {
+        fprintf(stderr, "FAIL: bad hex length %zu\n", len);
+        exit(2);
+    }
+    memset(keybuf, 0, sizeof keybuf);
+    for (i = 0; i < len / 2; i++) {
+        int hi = hexval(hex[i * 2]), lo = hexval(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            fprintf(stderr, "FAIL: bad hex digit at byte %zu\n", i);
+            exit(2);
+        }
+        keybuf[i] = (unsigned char)((hi << 4) | lo);
+    }
+
+    st = open_file(posblk, path, MODE_NORMAL);
+    if (st != ST_OK)
+        die("open", st);
+
+    dlen = sizeof record;
+    st = btrcall(B_GET_EQUAL, posblk, record, &dlen, keybuf, (BYTE)(len / 2), (char)0);
+    printf("delete: get status %d (%s)\n", st, status_name(st));
+    if (st != ST_OK) {
+        { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+        exit(1);
+    }
+
+    dlen = 0;
+    st = btrcall(B_DELETE, posblk, NULL, &dlen, NULL, 0, (char)0);
+    printf("delete: delete status %d (%s)\n", st, status_name(st));
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+    if (st != ST_OK)
+        exit(1);
+}
+
 /* dumpraw: open+STAT (forces the Microkernel to notice this path rather than
  * serve a stale cache entry, the same reason sweep.sh gives every file a
  * fresh name), then read `bytes` off disk with plain file I/O and print hex.
@@ -332,10 +390,11 @@ int main(int argc, char **argv)
 
     if (argc < 2) {
         fprintf(stderr,
-            "usage: crtprobe <create|insert|dumpraw> ...\n"
+            "usage: crtprobe <create|insert|delete|dumpraw> ...\n"
             "  create <path> <reclen> <pagesize> <cflags> <prealloc> "
             "<overwrite:0|1> <nsegs> [pos len type flags]...\n"
             "  insert <path> <hex-bytes>\n"
+            "  delete <path> <key-hex>\n"
             "  dumpraw <path> <bytes>\n");
         return 2;
     }
@@ -358,6 +417,9 @@ int main(int argc, char **argv)
     else if (!strcmp(cmd, "insert")) {
         if (argc < 4) { fprintf(stderr, "FAIL: insert needs a path and hex bytes\n"); return 2; }
         cmd_insert(argv[2], argv[3]);
+    } else if (!strcmp(cmd, "delete")) {
+        if (argc < 4) { fprintf(stderr, "FAIL: delete needs a path and a key in hex\n"); return 2; }
+        cmd_delete(argv[2], argv[3]);
     } else if (!strcmp(cmd, "dumpraw")) {
         if (argc < 4) { fprintf(stderr, "FAIL: dumpraw needs a path and byte count\n"); return 2; }
         cmd_dumpraw(argv[2], atoi(argv[3]));

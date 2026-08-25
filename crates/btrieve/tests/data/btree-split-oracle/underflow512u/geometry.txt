@@ -1,0 +1,1 @@
+file=SPLDELU.DAT reclen=12 pagesize=512 dup=False key: unsigned-binary (type 14), 4 bytes at position 1, little-endian, EXTTYPE
