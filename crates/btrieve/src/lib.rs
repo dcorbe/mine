@@ -1284,6 +1284,43 @@ impl<M: Mem> Block<M> {
         });
     }
 
+    /// Replace this block's cache with a fresh one read straight off disk
+    /// -- or drop it to `None` if even that fails -- because whatever is
+    /// currently resident may no longer agree with what disk holds.
+    ///
+    /// Two callers, one problem: [`Btrieve::abort`] just overwrote the
+    /// whole file with a pre-image, and any page a rolled-back
+    /// transaction's own write had pushed into the cache
+    /// (`Self::write_changed_pages`'s write-through) is now stale --
+    /// resident with *post*-transaction bytes while disk holds
+    /// *pre*-transaction ones. [`Self::write_changed_pages`] itself calls
+    /// this on any error: a genuine mid-flush I/O failure (`ENOSPC`,
+    /// `EIO`) can leave disk holding whatever an earlier phase already
+    /// wrote for real while the cache still holds what was resident before
+    /// the attempt, and nothing else reconciles that on the `Err` path.
+    ///
+    /// [`cache::PageCache`] has no "forget everything" primitive (Task 2's
+    /// interface, consumed as declared); a fresh one, opened over the file
+    /// exactly as [`Btrieve::open`] would, is the equivalent -- nothing
+    /// stays resident to answer wrong. Reopening itself failing is treated
+    /// the same way `None` already is everywhere else in this crate: no
+    /// cache is always safe, since every v6 read path falls back to
+    /// reading disk directly when `Self::cache` is `None`.
+    ///
+    /// A no-op for a v5 block, or any block that never had one.
+    fn invalidate_cache(&mut self) {
+        let mut clear = false;
+        if let Some(cache) = &self.cache {
+            match cache::PageCache::open(&self.path, self.geometry.page) {
+                Ok(fresh) => *cache.borrow_mut() = fresh,
+                Err(_) => clear = true,
+            }
+        }
+        if clear {
+            self.cache = None;
+        }
+    }
+
     /// The `struct btvblk` the module holds.
     pub fn block(&self) -> M::Ptr {
         self.block
@@ -1496,7 +1533,33 @@ impl<M: Mem> Block<M> {
     /// made stale, which is worse than not caching at all. Both calls are
     /// no-ops for a `Store` built with [`v6::Store::open`] or
     /// [`v6::Store::from_bytes`] rather than [`v6::Store::attach`].
-    fn write_changed_pages(&self, store: &mut v6::Store) -> Result<(), BtvError> {
+    ///
+    /// # A failed attempt invalidates the cache too
+    ///
+    /// This is a thin wrapper around [`Self::write_changed_pages_attempt`],
+    /// which is everything below. On any `Err` -- a genuine mid-flush I/O
+    /// failure (`ENOSPC`, `EIO`) partway through phase 1, 2 or 3 -- an
+    /// earlier phase may already have written real bytes to disk that the
+    /// cache never saw (the write-through above only runs after every
+    /// phase succeeds), so whatever is resident can no longer be trusted
+    /// either way: it might be stale relative to what *did* land, or it
+    /// might simply predate an attempt that changed nothing. Either way,
+    /// [`Block::invalidate_cache`] -- same primitive [`Btrieve::abort`]
+    /// uses for the same reason -- nukes and refetches rather than trying
+    /// to reason about exactly how far the failed write got.
+    fn write_changed_pages(&mut self, store: &mut v6::Store) -> Result<(), BtvError> {
+        let result = self.write_changed_pages_attempt(store);
+        if result.is_err() {
+            self.invalidate_cache();
+        }
+        result
+    }
+
+    /// Everything [`Self::write_changed_pages`] does except invalidating
+    /// the cache on failure -- split out only so that wrapper can run
+    /// after this one returns, success or not. See that function's own
+    /// doc comment for the shadow-paging design this actually implements.
+    fn write_changed_pages_attempt(&self, store: &mut v6::Store) -> Result<(), BtvError> {
         use std::io::{Seek, SeekFrom, Write};
 
         let fail = |why: String| BtvError {
@@ -4783,6 +4846,14 @@ impl<M: Mem> Btrieve<M> {
     /// -- a later retry can still find it -- and every other block's restore
     /// still runs; one file's disk error should not strand every other
     /// file's rollback.
+    ///
+    /// A block's attached cache (v6 only) is invalidated whenever its disk
+    /// write actually lands -- [`Block::invalidate_cache`] -- because
+    /// whatever the aborted transaction's own write left resident there no
+    /// longer agrees with the file this just put back. Missed until Task
+    /// 3's own review: every existing `abort_undoes_*` test uses a v5
+    /// fixture, which never attaches a cache, so nothing caught this until
+    /// `abort_invalidates_the_v6_cache_not_just_disk_and_the_model` did.
     pub fn abort(&mut self) -> Result<(), TransactionError> {
         if !self.transaction {
             return Err(TransactionError::NoneActive);
@@ -4806,6 +4877,11 @@ impl<M: Mem> Btrieve<M> {
             block.records = pre.records;
             block.geometry = pre.geometry;
             block.dirty = pre.dirty;
+            // The disk write above just put pre-transaction bytes back --
+            // any page the transaction's own write had pushed into this
+            // block's cache is now stale. See `Block::invalidate_cache`'s
+            // own doc comment.
+            block.invalidate_cache();
         }
         Ok(())
     }
@@ -10485,6 +10561,248 @@ mod tests {
         let reread = btrieve.open[0].records().expect("a fresh read from disk");
         let reread_record = reread.find_physical(70).and_then(|at| reread.physical(at)).expect("still there");
         assert_eq!(reread_record.bytes, original, "and so does a fresh read off disk");
+    }
+
+    /// Task 3's own review, Critical 1: `Btrieve::abort` restores disk (a
+    /// whole-file `std::fs::write`) and the in-memory model, but never
+    /// touched a v6 block's attached cache -- so a page the aborted
+    /// transaction's own write pushed into the cache
+    /// (`Block::write_changed_pages`'s write-through) stayed resident with
+    /// *post*-transaction bytes even after disk went back to its
+    /// *pre*-transaction state. The next resolution through that same
+    /// cache silently answered with the wrong page -- not a crash, not a
+    /// refusal, just wrong.
+    ///
+    /// Only a real v6 `Block` can exhibit this: `block()`/`block_from_file`
+    /// (this file's own test helpers) never attach a cache, so every
+    /// existing `abort_undoes_*` test above is structurally blind to it.
+    /// This one goes through the genuine `Btrieve::open`, on
+    /// `V6SHRINK.DAT` (a real v6 fixture, already used elsewhere in this
+    /// file -- 9 records, one key, reclen 48, page 512).
+    #[test]
+    fn abort_invalidates_the_v6_cache_not_just_disk_and_the_model() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+
+        let dir = crate::testing::scratch("txn-abort-invalidates-cache");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/V6SHRINK.DAT");
+        let path = dir.join("V6SHRINK.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        // The fixture's one key covers the whole 48-byte record -- any
+        // change at all is a key change, so it must be modifiable first,
+        // the same helper `write_cost.rs` uses for the identical reason.
+        crate::testing::make_keys_modifiable(&path);
+
+        let geometry = Geometry::read("V6SHRINK.DAT", &path).expect("reads");
+        let maxlen = geometry.reclen;
+        let at = btrieve
+            .open(&mut mem, &mut heap, "V6SHRINK.DAT", &path, geometry, maxlen)
+            .expect("opens");
+        assert!(
+            btrieve.block(at).expect("open").cache.is_some(),
+            "a real v6 open attaches a cache -- this test is meaningless without one"
+        );
+
+        let (position, layout) = {
+            let block = btrieve.block_mut(at).expect("open");
+            let records = block.records().expect("reads");
+            let first = records.physical(0).expect("at least one record").clone();
+            let layout = pages::Layout {
+                page: block.geometry.page,
+                physical: block.geometry.physical,
+                pages: block.geometry.pages,
+            };
+            (first.position, layout)
+        };
+        let (logical, _slot) = layout.slot_of(position).expect("a slot-aligned position");
+        let physical_before = btrieve
+            .block(at)
+            .expect("open")
+            .v6_resolve_logical(logical)
+            .expect("resolves before the transaction");
+
+        btrieve.begin().expect("begin");
+        let mut bytes = vec![0xEEu8; usize::from(maxlen)];
+        bytes[..4].copy_from_slice(b"ABRT");
+        btrieve
+            .block_mut(at)
+            .expect("open")
+            .update(position, &bytes)
+            .expect("update inside the transaction");
+
+        let physical_after_update = btrieve
+            .block(at)
+            .expect("open")
+            .v6_resolve_logical(logical)
+            .expect("resolves after the in-transaction update");
+        assert_ne!(
+            physical_after_update, physical_before,
+            "v6 always relocates a record's data page on update (Map::relocate's own \
+             doc comment) -- if this ever ties, the rest of this test cannot tell \
+             abort's cache bug apart from an update that happened to land back where \
+             it started"
+        );
+
+        btrieve.abort().expect("abort");
+
+        // The bug, made directly observable: resolve the same logical id
+        // again, through the same `Block`'s attached cache. Before the fix,
+        // the allocation-table page the aborted update's own write pushed
+        // into the cache is still resident, so this still answers
+        // `physical_after_update` -- the aborted transaction's own
+        // relocation -- even though disk has been rolled all the way back.
+        // After the fix, the cache was rebuilt from the restored file, so
+        // this answers `physical_before` again, agreeing with disk truth.
+        let physical_after_abort = btrieve
+            .block(at)
+            .expect("open")
+            .v6_resolve_logical(logical)
+            .expect("resolves after abort");
+        assert_eq!(
+            physical_after_abort, physical_before,
+            "abort restored disk but not the cache -- v6_resolve_logical answered with \
+             the aborted transaction's own relocation instead of the rolled-back \
+             file's real allocation-table entry"
+        );
+
+        // And the record's own bytes, read straight off disk (`records`
+        // dropped and reloaded, never through the page cache), confirm
+        // what "disk truth" actually is here -- so a coincidental
+        // page-number match could not paper over a content mismatch the
+        // other way.
+        btrieve.block_mut(at).expect("open").records = None;
+        let reread = btrieve.block_mut(at).expect("open").records().expect("a fresh read from disk");
+        let restored = reread.physical(0).expect("still there");
+        assert_ne!(
+            restored.bytes[..4],
+            *b"ABRT",
+            "the aborted update's bytes must not survive on disk"
+        );
+    }
+
+    /// Task 3's own review, Critical 2: `write_changed_pages` only pushed
+    /// pages into the attached cache after every phase of a flush
+    /// succeeded, so a genuine mid-flush I/O failure (`ENOSPC`, `EIO`)
+    /// could leave an earlier phase's real disk write disagreeing with
+    /// whatever the cache already had resident for that same page, and
+    /// nothing on the `Err` path reconciled it. [`STOP_AT`] stages exactly
+    /// this -- a phase 1 content write that really lands on disk, followed
+    /// by a staged failure standing in for a crash before write-through
+    /// ever runs -- the same instrument
+    /// `a_v6_write_stopped_before_the_flip_leaves_every_record_readable`
+    /// already uses for the disk-only half of this promise.
+    #[test]
+    fn a_failed_flush_invalidates_the_v6_cache_not_just_leaves_disk_torn() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+
+        let dir = crate::testing::scratch("v6-stop-invalidates-cache");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/V6SHRINK.DAT");
+        let path = dir.join("V6SHRINK.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        crate::testing::make_keys_modifiable(&path);
+
+        let geometry = Geometry::read("V6SHRINK.DAT", &path).expect("reads");
+        let maxlen = geometry.reclen;
+        let page_size = usize::from(geometry.page);
+        let at = btrieve
+            .open(&mut mem, &mut heap, "V6SHRINK.DAT", &path, geometry, maxlen)
+            .expect("opens");
+        assert!(
+            btrieve.block(at).expect("open").cache.is_some(),
+            "a real v6 open attaches a cache -- this test is meaningless without one"
+        );
+
+        let (position, layout) = {
+            let block = btrieve.block_mut(at).expect("open");
+            let records = block.records().expect("reads");
+            let first = records.physical(0).expect("at least one record").clone();
+            let layout = pages::Layout {
+                page: block.geometry.page,
+                physical: block.geometry.physical,
+                pages: block.geometry.pages,
+            };
+            (first.position, layout)
+        };
+        let (logical, _slot) = layout.slot_of(position).expect("a slot-aligned position");
+        let physical_original = btrieve
+            .block(at)
+            .expect("open")
+            .v6_resolve_logical(logical)
+            .expect("resolves before any write");
+
+        // A successful update relocates the record away from
+        // `physical_original` -- v6 always relocates on write -- and
+        // `Block::v6_slot`'s own eager touch already read
+        // `physical_original` in full through the attached cache before the
+        // record moved off it, so that page stays resident there as a
+        // stale twin.
+        let first_bytes = vec![0x11u8; usize::from(maxlen)];
+        btrieve
+            .block_mut(at)
+            .expect("open")
+            .update(position, &first_bytes)
+            .expect("the first update succeeds");
+        let physical_after_first = btrieve
+            .block(at)
+            .expect("open")
+            .v6_resolve_logical(logical)
+            .expect("resolves after the first update");
+        assert_ne!(physical_after_first, physical_original, "v6 always relocates on update");
+
+        // A snapshot of `physical_original`'s bytes, straight off disk,
+        // before the second write touches it again -- what the still
+        // resident (now stale-twin) cache entry for this page currently
+        // agrees with.
+        let disk_before: Vec<u8> = {
+            let whole = std::fs::read(&path).expect("reads the file");
+            whole[physical_original as usize * page_size..][..page_size].to_vec()
+        };
+
+        // The second update relocates back onto `physical_original` -- the
+        // same alternation `v6::Map::relocate`'s own doc comment measures
+        // (a data page running 6, 5, 6, 5, ...) -- but this time phase 1's
+        // real disk write is followed by a staged failure standing in for
+        // a crash before write-through ever runs.
+        let mut second_bytes = vec![0x22u8; usize::from(maxlen)];
+        second_bytes[..4].copy_from_slice(b"FAIL");
+        STOP_AT.with(|at| at.set(Some(Stop::AfterContent)));
+        let refused = btrieve.block_mut(at).expect("open").update(position, &second_bytes);
+        STOP_AT.with(|at| at.set(None));
+        assert!(refused.is_err(), "the staged interruption must fail the write");
+
+        let disk_after: Vec<u8> = {
+            let whole = std::fs::read(&path).expect("reads the file");
+            whole[physical_original as usize * page_size..][..page_size].to_vec()
+        };
+        assert_ne!(
+            disk_after, disk_before,
+            "phase 1 must have really written the second update's content to \
+             physical_original before the staged interruption fired, or this test \
+             cannot tell a stale cache apart from one that was never touched"
+        );
+
+        // The bug, made directly observable: read the same physical page
+        // through the block's attached cache. Before the fix, the entry
+        // `Store::page`'s earlier eager touch left resident is untouched
+        // by the failed write (write-through never ran), so this still
+        // answers `disk_before` -- stale, and silently wrong -- even
+        // though disk now holds `disk_after`. After the fix, the failed
+        // `write_changed_pages` call invalidated the cache, so this
+        // re-fetches from disk and agrees with whatever is actually there.
+        let through_cache = {
+            let block = btrieve.block(at).expect("open");
+            let cache = block.cache.as_ref().expect("still attached");
+            cache.borrow_mut().page(physical_original).expect("reads").to_vec()
+        };
+        assert_eq!(
+            through_cache, disk_after,
+            "a failed write_changed_pages left the cache disagreeing with disk -- it \
+             answered with the page's pre-write bytes instead of what phase 1 actually \
+             wrote before the staged interruption"
+        );
     }
 
     /// Reproduces `xactprobe`'s `fail_inside` scenario indirectly: `end`
