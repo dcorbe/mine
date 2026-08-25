@@ -5162,11 +5162,17 @@ impl<A: Abi> Host<A> {
     /// block a module opened and never closed itself still gets reindexed
     /// if dirty, rather than left on disk with a stale index.
     ///
-    /// Returns how many files were closed.
+    /// Returns how many files closed successfully. Best-effort, not
+    /// fail-fast: every open block is attempted regardless of an earlier
+    /// one failing, so one stuck file never keeps the rest of the board's
+    /// data from being flushed -- see
+    /// [`btrieve::Btrieve::close_all_files`]'s doc comment for the sweep
+    /// this delegates to and how a block that fails stays open for a retry.
     ///
     /// # Errors
-    /// If any block refuses to close -- see
-    /// [`btrieve::Btrieve::close_all_files`].
+    /// If any block in the sweep refused to close or failed to reindex,
+    /// the *first* such error, once every other block has also been
+    /// attempted -- see [`btrieve::Btrieve::close_all_files`].
     pub fn close_btrieve(&mut self) -> Result<usize, String> {
         self.btrieve
             .close_all_files()

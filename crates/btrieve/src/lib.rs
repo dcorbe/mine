@@ -4851,7 +4851,10 @@ impl<M: Mem> Btrieve<M> {
     /// # Errors
     /// If the block has an outstanding transaction pre-image (see
     /// [`Self::close`]'s doc comment), or if a dirty block's
-    /// [`Block::reindex`] fails.
+    /// [`Block::reindex`] fails. Either way, `index` is left in
+    /// [`Self::open`] rather than removed -- [`Self::close_all_files`]
+    /// relies on this to retry a failing block later without having
+    /// silently dropped it.
     fn close_file(&mut self, index: usize) -> Result<Block<M>, BtvError> {
         let name = self.open[index].name.clone();
         let fail = |why: String| BtvError {
@@ -4899,20 +4902,49 @@ impl<M: Mem> Btrieve<M> {
     /// otherwise reach into (the `bb->filnam` write, the four heap frees)
     /// is going away with it and there is nothing left to free it into.
     ///
-    /// Returns how many files were closed. Idempotent: called again with
-    /// nothing left open, it returns `Ok(0)`.
+    /// **Best-effort, not fail-fast.** At shutdown, maximum data settled
+    /// wins over stopping at the first problem: every block still in
+    /// [`Self::open`] is attempted, even after an earlier one in the same
+    /// sweep failed, so one stuck file never keeps the rest of the board's
+    /// data from reaching disk. A block that closes successfully always
+    /// leaves [`Self::open`]; a block [`Self::close_file`] refuses or fails
+    /// to reindex is left *in* [`Self::open`] (never dropped on failure --
+    /// see [`Self::close_file`]'s own doc comment) so a later call --
+    /// another `close_all_files`, or a direct [`Self::close`] once whatever
+    /// blocked it clears -- can retry exactly that file and no others.
+    ///
+    /// Returns how many files closed successfully. Idempotent on the
+    /// all-clear path: called again with nothing left open, it returns
+    /// `Ok(0)`.
     ///
     /// # Errors
-    /// The first block [`Self::close_file`] refuses or fails to reindex
-    /// aborts the sweep and is returned as-is; that block and everything
-    /// after it in [`Self::open`] stay open.
+    /// If any block in the sweep refused to close or failed to reindex,
+    /// this returns the *first* such error -- after every other block has
+    /// already been attempted, not instead of attempting them.
     pub fn close_all_files(&mut self) -> Result<usize, BtvError> {
         let mut closed = 0;
-        while !self.open.is_empty() {
-            self.close_file(0)?;
-            closed += 1;
+        let mut first_err: Option<BtvError> = None;
+        let mut index = 0;
+        while index < self.open.len() {
+            match self.close_file(index) {
+                // Closed and removed from `self.open` -- the next block has
+                // shifted into this same index, so stay here rather than
+                // advance past it.
+                Ok(_) => closed += 1,
+                // `close_file` leaves a failing block in place, so advance
+                // past it explicitly -- otherwise the same refusal would
+                // repeat forever and the sweep would never reach anything
+                // after it.
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                    index += 1;
+                }
+            }
         }
-        Ok(closed)
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(closed),
+        }
     }
 
     /// Take `lock` at `at`'s current position, once a positioning call has
@@ -9548,6 +9580,68 @@ mod tests {
             "the dirty block was reindexed on the way out, same as a direct close"
         );
         assert_eq!(btrieve.close_all_files().expect("idempotent"), 0);
+    }
+
+    /// Controller ruling 2026-08-25: shutdown's close sweep is best-effort,
+    /// not fail-fast -- maximum data settled wins over stopping at the
+    /// first problem. A block with an outstanding transaction pre-image
+    /// refuses to close
+    /// (`closing_a_block_with_an_outstanding_pre_image_is_refused`), and
+    /// that refusal must not stop the sweep from reaching every block
+    /// after it, nor from reindexing what it can.
+    #[test]
+    fn close_all_files_still_settles_later_blocks_after_an_earlier_one_refuses() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::default();
+
+        // First-opened, and left mid-transaction, so `close_file` refuses
+        // it -- deterministic, no filesystem-permission dance needed to
+        // make a real write fail.
+        let stuck_path = seed_indexed(&crate::testing::scratch("btrieve-close-all-stuck"));
+        let stuck = open_indexed(&mut mem, &mut heap, &mut btrieve, stuck_path);
+        btrieve.begin().expect("begin");
+        btrieve
+            .block_mut(stuck)
+            .expect("open")
+            .insert(&record(1))
+            .expect("insert, which captures a pre-image");
+
+        // Second-opened, dirty, and otherwise unremarkable -- the block
+        // this test needs to see settle even though the sweep hit a
+        // refusal first.
+        let dirty_path =
+            seed_indexed(&crate::testing::scratch("btrieve-close-all-dirty-after-stuck"));
+        let dirty = open_indexed(&mut mem, &mut heap, &mut btrieve, dirty_path.clone());
+        btrieve
+            .block_mut(dirty)
+            .expect("open")
+            .insert(&record(2))
+            .expect("insert");
+        let root_before_close = root_page(&dirty_path);
+
+        let err = btrieve
+            .close_all_files()
+            .expect_err("the stuck block's refusal is reported");
+        assert!(err.why.contains("transaction"), "{err}");
+
+        assert_ne!(
+            root_page(&dirty_path),
+            root_before_close,
+            "the second block still reindexed on the way out, despite the first one refusing"
+        );
+        assert_eq!(
+            btrieve.len(),
+            1,
+            "the settled block left self.open; the stuck one stays"
+        );
+        assert!(btrieve.block(stuck).is_ok(), "the refusing block is still open, for a retry");
+        assert!(btrieve.block(dirty).is_err(), "the settled block is gone");
+
+        // Retry: once the transaction ends, a second sweep finishes the job.
+        btrieve.end().expect("end");
+        assert_eq!(btrieve.close_all_files().expect("retry succeeds"), 1);
+        assert!(btrieve.is_empty());
     }
 
     /// C5: the re-entrancy guard used to be `bb->filnam != NULL`, read out of
