@@ -137,3 +137,30 @@ fallback is not needed for anything recorded from this round on.
 See each directory's own manifest.txt for the exact op sequence and
 `docs/2026-08-25-btree-split-oracle.md`'s "Round 4" section for the full
 findings.
+
+## Round 5 (multi-level root collapse)
+
+Added 2026-08-25, the last reachable gap: what happens when an interior
+ROOT's own last two children merge into one.
+
+  root-level-collapse/  -- drains the SAME 5-leaf, depth-2 tree rounds 1
+                            and 3 built (insert 1..120) all the way to
+                            empty (round 3 only drained the top half).
+                            Captures the exact operation where the
+                            interior root's last entry disappears: the
+                            tree drops a level, the surviving child
+                            becomes the new root (FCR root pointer moves
+                            to the CHILD's own logical id), and BOTH the
+                            vacated interior root AND the leaf it just
+                            absorbed are retired into the same 0x4500
+                            free list, chained together from that one
+                            operation. Continues past that to a
+                            single-level tree, then to the same virgin
+                            shape delete-to-empty recorded (different
+                            logical id occupying the root role, same
+                            shape).
+
+See its own manifest.txt for the exact op sequence and
+`docs/2026-08-25-btree-split-oracle.md`'s "Round 5" section for the full
+findings. A second level-shrink (a genuine depth-3 tree draining twice)
+was not attempted -- named as the untested extension in both places.

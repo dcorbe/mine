@@ -1,0 +1,137 @@
+--- crates/btrieve/tests/data/btree-split-oracle/root-level-collapse/3-single-level-one-record.txt	2026-08-25 18:36:02.075281914 -0400
++++ crates/btrieve/tests/data/btree-split-oracle/root-level-collapse/4-drained-to-empty.txt	2026-08-25 18:36:02.078615248 -0400
+@@ -1,18 +1,18 @@
+ len=9216 page_size=512
+-control: live_page=1 generation=240 records=1 pages=11 free_v6=0x00000414 index_free_v6=0x00000007 write_counter=239 usage_4c=1 index_alloc_4e=48 usage_52=10
+-key[0] number=0x80 root_page=6 records=1 attributes=0x0104 key_length=4 entry_size=12 max_entries=41 half_entries=20 chain=0
++control: live_page=1 generation=241 records=0 pages=11 free_v6=0x00000406 index_free_v6=0x00000007 write_counter=240 usage_4c=1 index_alloc_4e=48 usage_52=10
++key[0] number=0x80 root_page=6 records=0 attributes=0x0104 key_length=4 entry_size=12 max_entries=41 half_entries=20 chain=0
+ alloc block=1 logical=1 marker=0x4500 physical=15
+-alloc block=1 logical=2 marker=0x4400 physical=11
++alloc block=1 logical=2 marker=0x4400 physical=5
+ alloc block=1 logical=3 marker=0x4400 physical=4
+ alloc block=1 logical=4 marker=0x4500 physical=6
+ alloc block=1 logical=5 marker=0x4400 physical=8
+-alloc block=1 logical=6 marker=0x8000 physical=13
++alloc block=1 logical=6 marker=0x8000 physical=9
+ alloc block=1 logical=7 marker=0x4500 physical=16
+ alloc block=1 logical=8 marker=0x4500 physical=7
+ alloc block=1 logical=9 marker=0x4400 physical=12
+ alloc block=1 logical=10 marker=0x4500 physical=10
+-alloc block=1 logical=11 marker=0x0000 physical=5
+-alloc block=1 logical=12 marker=0x0000 physical=9
++alloc block=1 logical=11 marker=0x0000 physical=11
++alloc block=1 logical=12 marker=0x0000 physical=13
+ alloc block=1 logical=13 marker=0x0000 physical=14
+ alloc block=1 logical=14 marker=0x0000 physical=17
+ alloc block=1 logical=15 marker=0x0000 physical=18
+@@ -164,8 +164,43 @@
+   slot[33] FREE next=0x000007e2 fill_nonzero=false
+   slot[34] FREE next=0x000007f0 fill_nonzero=false
+   slot[35] FREE next=0x00000a06 fill_nonzero=false
+-page 5 ORPHAN tag=0x4400 logical=2 stamp=32838
+-  orphan bytes=506
++page 5 DATA tag=0x4400 logical=2 stamp=32840
++  slot[0] FREE next=0x00000414 fill_nonzero=false
++  slot[1] FREE next=0x00000422 fill_nonzero=false
++  slot[2] FREE next=0x00000430 fill_nonzero=false
++  slot[3] FREE next=0x0000043e fill_nonzero=false
++  slot[4] FREE next=0x0000044c fill_nonzero=false
++  slot[5] FREE next=0x0000045a fill_nonzero=false
++  slot[6] FREE next=0x00000468 fill_nonzero=false
++  slot[7] FREE next=0x00000476 fill_nonzero=false
++  slot[8] FREE next=0x00000484 fill_nonzero=false
++  slot[9] FREE next=0x00000492 fill_nonzero=false
++  slot[10] FREE next=0x000004a0 fill_nonzero=false
++  slot[11] FREE next=0x000004ae fill_nonzero=false
++  slot[12] FREE next=0x000004bc fill_nonzero=false
++  slot[13] FREE next=0x000004ca fill_nonzero=false
++  slot[14] FREE next=0x000004d8 fill_nonzero=false
++  slot[15] FREE next=0x000004e6 fill_nonzero=false
++  slot[16] FREE next=0x000004f4 fill_nonzero=false
++  slot[17] FREE next=0x00000502 fill_nonzero=false
++  slot[18] FREE next=0x00000510 fill_nonzero=false
++  slot[19] FREE next=0x0000051e fill_nonzero=false
++  slot[20] FREE next=0x0000052c fill_nonzero=false
++  slot[21] FREE next=0x0000053a fill_nonzero=false
++  slot[22] FREE next=0x00000548 fill_nonzero=false
++  slot[23] FREE next=0x00000556 fill_nonzero=false
++  slot[24] FREE next=0x00000564 fill_nonzero=false
++  slot[25] FREE next=0x00000572 fill_nonzero=false
++  slot[26] FREE next=0x00000580 fill_nonzero=false
++  slot[27] FREE next=0x0000058e fill_nonzero=false
++  slot[28] FREE next=0x0000059c fill_nonzero=false
++  slot[29] FREE next=0x000005aa fill_nonzero=false
++  slot[30] FREE next=0x000005b8 fill_nonzero=false
++  slot[31] FREE next=0x000005c6 fill_nonzero=false
++  slot[32] FREE next=0x000005d4 fill_nonzero=false
++  slot[33] FREE next=0x000005e2 fill_nonzero=false
++  slot[34] FREE next=0x000005f0 fill_nonzero=false
++  slot[35] FREE next=0x00000606 fill_nonzero=false
+ page 6 RETIRED tag=0x4500 logical=4 stamp=24
+   retired next=0x0000000a
+ page 7 RETIRED tag=0x4500 logical=8 stamp=24
+@@ -207,47 +242,12 @@
+   slot[33] FREE next=0x00000be2 fill_nonzero=false
+   slot[34] FREE next=0x00000bf0 fill_nonzero=false
+   slot[35] FREE next=0x00001206 fill_nonzero=false
+-page 9 ORPHAN tag=0x8000 logical=6 stamp=40
+-  orphan bytes=506
++page 9 INDEX(key=0x00) tag=0x8000 logical=6 stamp=42
++  leftmost=raw=0x00000000 tag=0x00 logical=0 rightmost=NOWHERE entries=0
+ page 10 RETIRED tag=0x4500 logical=10 stamp=24
+   retired next=0x00000008
+-page 11 DATA tag=0x4400 logical=2 stamp=32839
+-  slot[0] LIVE marker=1 body=010000000100000000000000
+-  slot[1] FREE next=0x00000422 fill_nonzero=false
+-  slot[2] FREE next=0x00000430 fill_nonzero=false
+-  slot[3] FREE next=0x0000043e fill_nonzero=false
+-  slot[4] FREE next=0x0000044c fill_nonzero=false
+-  slot[5] FREE next=0x0000045a fill_nonzero=false
+-  slot[6] FREE next=0x00000468 fill_nonzero=false
+-  slot[7] FREE next=0x00000476 fill_nonzero=false
+-  slot[8] FREE next=0x00000484 fill_nonzero=false
+-  slot[9] FREE next=0x00000492 fill_nonzero=false
+-  slot[10] FREE next=0x000004a0 fill_nonzero=false
+-  slot[11] FREE next=0x000004ae fill_nonzero=false
+-  slot[12] FREE next=0x000004bc fill_nonzero=false
+-  slot[13] FREE next=0x000004ca fill_nonzero=false
+-  slot[14] FREE next=0x000004d8 fill_nonzero=false
+-  slot[15] FREE next=0x000004e6 fill_nonzero=false
+-  slot[16] FREE next=0x000004f4 fill_nonzero=false
+-  slot[17] FREE next=0x00000502 fill_nonzero=false
+-  slot[18] FREE next=0x00000510 fill_nonzero=false
+-  slot[19] FREE next=0x0000051e fill_nonzero=false
+-  slot[20] FREE next=0x0000052c fill_nonzero=false
+-  slot[21] FREE next=0x0000053a fill_nonzero=false
+-  slot[22] FREE next=0x00000548 fill_nonzero=false
+-  slot[23] FREE next=0x00000556 fill_nonzero=false
+-  slot[24] FREE next=0x00000564 fill_nonzero=false
+-  slot[25] FREE next=0x00000572 fill_nonzero=false
+-  slot[26] FREE next=0x00000580 fill_nonzero=false
+-  slot[27] FREE next=0x0000058e fill_nonzero=false
+-  slot[28] FREE next=0x0000059c fill_nonzero=false
+-  slot[29] FREE next=0x000005aa fill_nonzero=false
+-  slot[30] FREE next=0x000005b8 fill_nonzero=false
+-  slot[31] FREE next=0x000005c6 fill_nonzero=false
+-  slot[32] FREE next=0x000005d4 fill_nonzero=false
+-  slot[33] FREE next=0x000005e2 fill_nonzero=false
+-  slot[34] FREE next=0x000005f0 fill_nonzero=false
+-  slot[35] FREE next=0x00000606 fill_nonzero=false
++page 11 ORPHAN tag=0x4400 logical=2 stamp=32839
++  orphan bytes=506
+ page 12 DATA tag=0x4400 logical=9 stamp=32791
+   slot[0] FREE next=0x00001214 fill_nonzero=false
+   slot[1] FREE next=0x00001222 fill_nonzero=false
+@@ -285,9 +285,8 @@
+   slot[33] FREE next=0x000013e2 fill_nonzero=false
+   slot[34] FREE next=0x000013f0 fill_nonzero=false
+   slot[35] FREE next=NOWHERE fill_nonzero=false
+-page 13 INDEX(key=0x00) tag=0x8000 logical=6 stamp=41
+-  leftmost=NOWHERE rightmost=NOWHERE entries=1
+-  entry[0] key=01000000 (1) head=0x00000406 tail=none child=raw=0x00000000 tag=0x00 logical=0
++page 13 ORPHAN tag=0x8000 logical=6 stamp=41
++  orphan bytes=506
+ page 14 ORPHAN tag=0x8000 logical=7 stamp=10
+   orphan bytes=506
+ page 15 RETIRED tag=0x4500 logical=1 stamp=134

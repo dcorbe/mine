@@ -1,0 +1,58 @@
+reclen 12, pagesize 512, unique 4-byte key. Same tree round 1/3 built:
+insert 1..120 (a 5-leaf, depth-2 tree), then delete 120,119,...,1 in
+strict descending order -- the full drain, not just the top half round 3
+stopped at.
+
+By delete 42 (79 deletes in, 41 records left), the cascading merges
+already documented in rounds 1/3 have consumed every leaf but two: the
+interior root (logical 7) holds exactly ONE entry (key 21), leftmost
+child = logical 6 (keys 1-20), rightmost child = logical 4 (keys 22-41).
+The retired-page free list already holds three entries from that same
+cascade: FCR+0x98 (INDEX_FREE_V6) -> 10 -> 8 -> 1 -> NOWHERE.
+-> 1-interior-root-one-entry.dat
+
+delete(41): key 41 lives in leaf 4 (the root's rightmost, and therefore
+edge, child); deleting it underflows leaf 4 (19 < half_entries 20). Leaf
+4's only neighbour, leaf 6, is at exactly half_entries (20, not more) --
+by the established rule this MERGES rather than redistributes: leaf 4 is
+absorbed into leaf 6 and its own logical id (4) is retired, exactly the
+ordinary leaf-merge mechanism every earlier round already recorded. But
+leaf 4's parent (the root) has only this ONE entry, so removing it
+empties the root entirely -- and in the SAME operation the engine drops
+the tree a level: leaf 6 (which absorbed leaf 4's survivors AND the
+root's own key 21) BECOMES the new root directly. The FCR's root_page
+pointer moves from 7 to 6 -- the SURVIVING CHILD's own logical id, not a
+content copy into the old root's id.
+
+TWO pages are retired by this single delete, not one: the vacated
+interior root (logical 7) AND the absorbed leaf (logical 4), chained
+together in the order they were retired within this same operation --
+FCR+0x98 (INDEX_FREE_V6) becomes 7 (the root, retired last within this
+op); 7's own stored link names 4 (the leaf, retired just before it in
+the same op); 4's own link names 10 -- the chain's head from BEFORE this
+delete. Full chain after: 7 -> 4 -> 10 -> 8 -> 1 -> NOWHERE. Nothing
+about the retirement mechanism distinguishes an interior page from a
+leaf -- it is simply another page pushed onto the same free list.
+-> 2-collapsed-to-single-level.dat
+
+Continuing the drain (39 more deletes) empties the now-single-level tree
+down to one record -- a genuine, populated one-entry leaf, no different
+in shape from any other single-record file.
+-> 3-single-level-one-record.dat
+
+delete(1), the file's last record: the root (still logical 6, from the
+collapse -- never renumbered again) reverts to the EXACT virgin shape
+`delete-to-empty` recorded (entries=0, leftmost=0x00000000, rightmost=
+NOWHERE) -- with one difference worth naming explicitly: the logical id
+occupying the root role (6) is NOT the file's original root id (1, back
+at file creation) -- the virgin SHAPE is identical, the identity is not.
+-> 4-drained-to-empty.dat
+
+Not attempted: a SECOND level-shrink (draining a genuine depth-3 tree,
+where the top root's last two INTERIOR children merge into one). Round
+1 measured that depth-3 needs ~944 records before the interior root
+itself first splits; building that plus draining it back down would cost
+on the order of 1,800+ single-op wine invocations (~5-6 minutes) for a
+result this recording has high mechanistic confidence would just repeat
+the same rule one level up (nothing observed here special-cases by
+level) -- named as the untested extension rather than guessed at.
