@@ -131,6 +131,13 @@ fn apply_op(label: &str, path: &Path, op: ReplayOp) -> Result<(), String> {
 /// Every live record's whole bytes, in KEY 0's order -- "walk order" and
 /// "census" for Gate B, read the same way `Block::records()` reads them for
 /// any real `Get`/`Step` sequence a module could issue.
+///
+/// `Records::ordered_len` returns `None` only when key index 0 itself does
+/// not exist (every fixture here has exactly one key, index 0) -- a
+/// **structural** problem, not "zero records." That case is a hard error
+/// here, not `.unwrap_or(0)`: silently treating "no such key" as "an empty
+/// walk" would let two broken reads that both hit this path agree with
+/// each other (`vec![] == vec![]`) and be reported as a Gate-B pass.
 fn ordered_bytes(label: &str, path: &Path) -> Result<Vec<Vec<u8>>, String> {
     let mut mem = FlatMem::new(64 * 1024);
     let mut heap = FlatHeap::new(0x100);
@@ -140,7 +147,9 @@ fn ordered_bytes(label: &str, path: &Path) -> Result<Vec<Vec<u8>>, String> {
     let at = btrieve.open(&mut mem, &mut heap, label, path, geometry, maxlen)?;
     let block = btrieve.block_mut(at)?;
     let records = block.records().map_err(|e| e.to_string())?;
-    let n = records.ordered_len(0).unwrap_or(0);
+    let n = records
+        .ordered_len(0)
+        .ok_or_else(|| "key index 0 does not exist on this file (every fixture here has one key)".to_string())?;
     let out = (0..n).map(|i| records.ordered(0, i).expect("index in range").bytes.clone()).collect();
     let _ = btrieve.close(&mut mem, &mut heap, at);
     Ok(out)
@@ -148,11 +157,19 @@ fn ordered_bytes(label: &str, path: &Path) -> Result<Vec<Vec<u8>>, String> {
 
 /// One step's outcome: Gate A cleared outright, Gate B cleared as the floor
 /// (carrying its own byte-diff description, per this task's "no silent
-/// downgrades" rule), or neither.
+/// downgrades" rule), neither (but the ops themselves applied), or the ops
+/// themselves failed to apply.
+///
+/// [`Verdict::Aborted`] is its own variant, distinct from [`Verdict::Red`],
+/// specifically so [`run_sequence`] can decide whether to skip the rest of
+/// a sequence by matching on the *variant* rather than sniffing an error
+/// message's own wording -- a message can be reworded for clarity without
+/// silently breaking that decision.
 enum Verdict {
     GateA,
     GateB(String),
     Red(String),
+    Aborted(String),
 }
 
 /// Gate B: our own output round-trips cleanly, AND a fresh open of both our
@@ -186,6 +203,28 @@ fn gate_b(scratch_path: &Path, scratch_label: &str, expect_bytes: &[u8], expect_
         Err(e) => return (false, format!("recorded snapshot is not readable by this crate's own engine: {e}")),
     };
 
+    // Two empty walks trivially satisfy `ours == theirs` without proving
+    // anything -- every fixture in this corpus holds live records, so an
+    // empty walk on EITHER side here means something upstream already went
+    // wrong (a mis-copied scratch file, an op that silently deleted
+    // everything, ...). Gate B must never launder that into a pass; a
+    // genuinely empty recorded snapshot, if this corpus ever grows one,
+    // needs its own named case here, not a silent `vec![] == vec![]`.
+    if theirs.is_empty() {
+        return (
+            false,
+            "recorded snapshot's key-0 walk is empty -- refusing to call an empty match a pass; \
+             an intentionally empty fixture needs its own explicit case here"
+                .to_string(),
+        );
+    }
+    if ours.is_empty() {
+        return (
+            false,
+            "our own output's key-0 walk is empty while the recorded snapshot's is not".to_string(),
+        );
+    }
+
     if ours == theirs {
         (true, format!("{} records, key-order and content identical", ours.len()))
     } else {
@@ -210,7 +249,7 @@ fn first_diff(a: &[u8], b: &[u8]) -> usize {
 fn run_step(working_path: &Path, working_label: &str, step: &Step) -> Verdict {
     for op in &step.ops {
         if let Err(e) = apply_op(working_label, working_path, *op) {
-            return Verdict::Red(format!("op application failed: {e}"));
+            return Verdict::Aborted(format!("op application failed: {e}"));
         }
     }
 
@@ -485,14 +524,14 @@ fn run_sequence(seq: &Sequence, report: &mut Vec<(String, String, Verdict)>) {
                     .map(|s| s.to_string())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "panicked with a non-string payload".to_string());
-                Verdict::Red(format!("panicked applying this step's op(s): {msg}"))
+                Verdict::Aborted(format!("panicked applying this step's op(s): {msg}"))
             }
         };
 
-        if let Verdict::Red(ref msg) = verdict {
-            if msg.starts_with("op application failed") || msg.starts_with("panicked applying") {
-                aborted = Some(msg.clone());
-            }
+        // Classified by variant, not by matching the message text -- see
+        // `Verdict::Aborted`'s own doc comment.
+        if let Verdict::Aborted(ref msg) = verdict {
+            aborted = Some(msg.clone());
         }
         report.push((seq.name.to_string(), step.label.to_string(), verdict));
     }
@@ -528,6 +567,10 @@ fn the_oracle_replay_contract() {
                 gate_b_only.push(format!("{seq} :: {step} -- {detail}"));
             }
             Verdict::Red(detail) => {
+                eprintln!("[RED]     {seq} :: {step} -- {detail}");
+                reds.push(format!("{seq} :: {step} -- {detail}"));
+            }
+            Verdict::Aborted(detail) => {
                 eprintln!("[RED]     {seq} :: {step} -- {detail}");
                 reds.push(format!("{seq} :: {step} -- {detail}"));
             }
