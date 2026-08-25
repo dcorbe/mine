@@ -206,12 +206,15 @@ impl PageCache {
 mod tests {
     use super::*;
 
-    /// Serialises every test in this module that reads
-    /// [`crate::testing::page_fetches`] -- [`super::super::PAGE_FETCHES`] is
-    /// one process-global counter and the default test harness runs
-    /// `#[test]`s in parallel threads, so two windows open at once would
-    /// each see the other's fetches. Same reasoning, same shape, as
-    /// `tests/write_cost.rs`'s own `MEASURE_LOCK`.
+    /// Serialises every test in this module that can move
+    /// [`super::super::PAGE_FETCHES`] -- not just the ones that assert on
+    /// it. [`PageCache::page`]/[`PageCache::page_mut`] increment that one
+    /// process-global counter on any real fetch, whether or not the test
+    /// calling them cares about the count, and the default test harness runs
+    /// `#[test]`s in parallel threads -- so a test that only touches the
+    /// counter as a side effect can still flip another test's read of it.
+    /// Same reasoning, same shape, as `tests/write_cost.rs`'s own
+    /// `MEASURE_LOCK`.
     static MEASURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A 3-page, 512-byte-per-page scratch file with a distinct fill byte
@@ -288,6 +291,10 @@ mod tests {
     /// being evicted.
     #[test]
     fn mark_clean_keeps_the_write_and_clears_dirty() {
+        // Doesn't assert on page_fetches() itself, but page_mut()/page()
+        // below still increment it on their first, real fetch -- see
+        // MEASURE_LOCK's own doc comment for why that alone requires the lock.
+        let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = three_page_file("cache-mark-clean");
         let mut c = PageCache::open(&path, 512).expect("opens");
 
