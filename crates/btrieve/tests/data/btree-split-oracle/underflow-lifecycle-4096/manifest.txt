@@ -1,0 +1,14 @@
+reclen 12, pagesize 4096, unique 4-byte key (max_entries 340, half_entries
+170 -- EVEN, so ceil(340/2) == half_entries exactly, unlike the 512-byte
+odd-max_entries case).
+
+1. create; insert 1..512 ascending -> two splits, a 3-leaf depth-2 tree:
+   leftmost = logical 6 (keys 1-170, 170 entries)
+   middle   = logical 4 (keys 172-341, 170 entries == half_entries exactly)
+   rightmost= logical 1 (keys 343-512, 170 entries)
+   root     = logical 7 (entries [171 -> child 4], [342 -> placeholder])
+   -> snapshot 1-pristine.dat
+2. delete key 172 (middle: 170 -> 169 entries, BELOW half_entries on the
+   FIRST delete -- because it started exactly AT the threshold, unlike the
+   512-byte case's 21) -> merges into the right sibling, vacated page
+   retagged 0x4500 -> snapshot 2-merged.dat

@@ -1,0 +1,17 @@
+reclen 12, pagesize 512, unique key. Same 3-leaf tree as
+underflow-lifecycle-512's step 1, THEN the right sibling (logical 1) is
+topped up from 20 to 40 entries (insert 65..84) so a full merge of it with
+an underflowing middle leaf (up to 21 more entries) would exceed
+max_entries (41) and cannot happen.
+
+1. create; insert 1..64; insert 65..84 (right sibling: 45..84, 40 entries,
+   1 below its own 42-entry split trigger) -> snapshot 1-topped-up.dat
+2. delete key 23, delete key 24 (middle: 21 -> 20 -> 19 entries, below
+   half_entries) -> merging into the right sibling would need 19 + 40 = 59
+   entries, over max_entries (41), so instead of switching to the LEFT
+   sibling (which has room), Btrieve REDISTRIBUTES with the RIGHT sibling
+   anyway: the old separator (44) moves down into the middle leaf, and the
+   right sibling's own lowest entry (45) moves up to become the new
+   separator (44 -> 45). Root entry count unchanged; the right-sibling
+   preference holds even when redistributing rather than merging.
+   -> snapshot 2-redistributed.dat

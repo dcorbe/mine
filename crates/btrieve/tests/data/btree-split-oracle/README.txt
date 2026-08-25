@@ -55,3 +55,39 @@ crtprobe.exe (create/insert/delete) and snapshots the file after every
 operation; tools/btrieve-oracle/curate.py finds the size-changing ops in a
 long run; crates/btrieve/src/bin/dump-v6.rs decodes a snapshot with this
 crate's own read::file.
+
+## Round 2 (underflow threshold, merge/redistribute, 0x4500 reclamation)
+
+Added 2026-08-25, closing the three gaps the first round left open (see
+docs/2026-08-25-btree-split-oracle.md's "Round 2" section). Same method:
+`tools/btrieve-oracle/split_oracle.py`'s `Recorder`, one op per snapshot.
+New here: `tools/btrieve-oracle/rawscan.py`, a second, tolerant, from-scratch
+decoder used ONLY for files `dump-v6` refuses (an 0x4500-tagged page) --
+crates/btrieve's own reader is never loosened to make this easier to read.
+
+  underflow-lifecycle-512/     -- threshold, right-sibling merge, and
+                                   0x4500 reclamation, one 4-snapshot run,
+                                   odd max_entries (41).
+  underflow-lifecycle-4096/    -- the same threshold question at an EVEN
+                                   max_entries (340), which crosses on the
+                                   first delete instead of the second --
+                                   see manifest.txt for why that is NOT a
+                                   contradiction.
+  underflow-edge-rightmost/    -- the rightmost leaf underflows (no right
+                                   sibling): redistributes left, does not
+                                   merge.
+  underflow-edge-leftmost/     -- the leftmost leaf underflows (no left
+                                   sibling): redistributes right.
+  underflow-no-room-redistribute/ -- the right sibling is topped up so a
+                                   merge would exceed max_entries: Btrieve
+                                   redistributes with it anyway rather than
+                                   switching to the left sibling.
+
+Each directory's own `manifest.txt` gives the exact op sequence in prose
+(this round's fixtures were built by short, one-off scripts rather than
+`split_oracle.py`'s CLI experiments, so there is no `manifest.tsv`/
+`geometry.txt` pair the way round 1's directories have one). `*.txt` next to
+each `.dat` is either `dump-v6`'s output or, when that refuses (an 0x4500
+page present), rawscan.py's `fcr`+`alloc` output appended after the refusal
+message -- both are in the same file so a reader always sees WHY the
+fallback was needed.

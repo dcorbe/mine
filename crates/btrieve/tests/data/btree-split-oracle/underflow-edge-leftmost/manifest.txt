@@ -1,0 +1,12 @@
+reclen 12, pagesize 512, unique key. Same 3-leaf tree as
+underflow-lifecycle-512's step 1, fresh file.
+
+1. create; insert 1..64 -> snapshot 1-pristine.dat
+2. delete key 1, delete key 2 (the LEFTMOST leaf's own lowest keys:
+   21 -> 20 -> 19 entries, below half_entries on the second delete; this
+   leaf has NO left sibling) -> REDISTRIBUTES with its right neighbour
+   (the middle leaf, logical 4): the old separator (22) moves down to
+   become the leftmost leaf's new highest entry, and the middle leaf's own
+   lowest entry (23) moves up to become the new separator (22 -> 23).
+   Both leaves survive; root entry count unchanged.
+   -> snapshot 2-redistributed.dat

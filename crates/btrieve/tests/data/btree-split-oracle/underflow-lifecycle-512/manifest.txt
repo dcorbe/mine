@@ -1,0 +1,19 @@
+reclen 12, pagesize 512, unique 4-byte key (max_entries 41, half_entries 20).
+
+1. create; insert 1..64 ascending -> two splits, a 3-leaf depth-2 tree:
+   leftmost = logical 6 (keys 1-21, 21 entries)
+   middle   = logical 4 (keys 23-43, 21 entries)
+   rightmost= logical 1 (keys 45-64, 20 entries)
+   root     = logical 7 (entries [22 -> child 4], [44 -> placeholder])
+   -> snapshot 1-pristine.dat
+2. delete key 23 (middle: 21 -> 20 entries == half_entries; no structural
+   change) -> snapshot 2-at-threshold.dat
+3. delete key 24 (middle: 20 -> 19 entries, BELOW half_entries) -> the
+   middle leaf is merged into the RIGHT sibling (logical 1) and removed
+   from the root; the vacated physical page is retagged 0x4500
+   -> snapshot 3-merged.dat
+4. insert 65, insert 66 (right sibling, now holding the merged content,
+   grows from 40 to 42 entries and splits again) -> the split's LEFT child
+   reclaims logical id 4 (the one retagged 0x4500 in step 3), marker flips
+   back from 0x4500 to 0x8000; no new logical id is allocated
+   -> snapshot 4-reclaimed.dat
