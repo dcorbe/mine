@@ -244,28 +244,52 @@ fn delete_merges_an_underflowing_leaf_rather_than_leaving_it_sparse() {
     );
 }
 
-/// **The gap this recording exposed, pinned rather than worked around:**
-/// `read::file` cannot decode the AFTER file at all. An emptied leaf is
-/// retagged `0x4500` (not `0x8000`, the ordinary index-page tag this crate
-/// knows), and `read::v6_walk_index_trees` refuses any claimed page whose
-/// tag it does not recognise rather than guessing -- correctly, but it
-/// means this crate cannot yet read a v6 file that has had a leaf emptied
-/// by deletion. `docs/2026-08-25-btree-split-oracle.md`'s gap list says the
-/// same thing in prose; this is that gap as a live, reproducible failure so
-/// it cannot go stale. Whoever teaches the reader about `0x4500` should
-/// watch this test start passing (or being replaced by a stronger one) and
-/// update it rather than deleting it.
+/// **Tag `0x4500` support (Task 6), replacing the refusal this test used to
+/// pin:** the AFTER file decodes now -- the root shrinks from four leaves
+/// to one (the other half of `delete_merges_an_underflowing_leaf_rather_
+/// than_leaving_it_sparse`'s fact), and the three emptied leaves are retired
+/// into exactly the free list `docs/2026-08-25-btree-split-rules.md` §8
+/// measured directly against this same fixture: `FCR+152 -> logical 10 ->
+/// logical 8 -> logical 1 -> NOWHERE`.
 #[test]
-fn the_reader_refuses_a_file_with_an_emptied_leaf_pending_tag_0x4500_support() {
+fn a_retired_page_decodes_into_the_measured_free_list_chain() {
     let bytes = fs::read(fixture("underflow512u/merge-on-delete/after.dat")).unwrap();
-    let err = btrieve::read::file(&bytes).expect_err(
-        "if this now succeeds, the reader learned tag 0x4500 -- replace this test with \
-         real assertions about the merged tree, the way the other tests in this file check \
-         the split fixtures",
+    let after = btrieve::read::file(&bytes)
+        .unwrap_or_else(|e| panic!("the reader must accept tag 0x4500 now: {}", e.why));
+
+    let root = index_page(&after, root_logical(&after));
+    assert_eq!(
+        root.index.as_ref().unwrap().entries.len(),
+        1,
+        "the merge collapses the root from four leaves to one"
     );
-    assert!(
-        err.why.contains("0x4500") || err.why.contains("TAG_TEMPLATE or unrecognized"),
-        "a different refusal than the one this test recorded: {}",
-        err.why
-    );
+
+    let page_size = after.id.page_size as usize;
+    let Control::Shadowed { live_is_page, .. } = &after.control else {
+        panic!("every fixture here is v6");
+    };
+    let live_start = live_is_page * page_size;
+    let head_at = live_start + btrieve::pages::fcr::INDEX_FREE_V6;
+    let head = btrieve::pages::long(&bytes[head_at..head_at + 4]);
+
+    let retired: Vec<&V6Page> = after.v6_pages.iter().filter(|p| p.retired.is_some()).collect();
+    assert_eq!(retired.len(), 3, "three leaves were merged away");
+
+    let mut chain: Vec<Option<u16>> = Vec::new();
+    let mut next = head;
+    loop {
+        if next == 0xffff_ffff {
+            chain.push(None);
+            break;
+        }
+        let logical = u16::try_from(next).expect("a logical id fits a u16 on this fixture");
+        chain.push(Some(logical));
+        let page = retired
+            .iter()
+            .find(|p| p.logical == logical)
+            .unwrap_or_else(|| panic!("free list names logical {logical}, no retired page carries it"));
+        let body = page.retired.as_ref().expect("filtered on retired.is_some()");
+        next = btrieve::pages::long(&body[2..6]);
+    }
+    assert_eq!(chain, vec![Some(10), Some(8), Some(1), None]);
 }

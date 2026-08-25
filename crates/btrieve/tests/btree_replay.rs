@@ -537,14 +537,14 @@ fn run_sequence(seq: &Sequence, report: &mut Vec<(String, String, Verdict)>) {
     }
 }
 
-/// The replay contract itself. `#[ignore]`d because the current engine
-/// full-rebuilds on every write and cannot match per-op snapshots -- see
-/// this file's own module doc. Un-ignore once Task 6 lands incremental
-/// split/merge maintenance; every line this prints under `RED` is a case
-/// that change must fix, and every `GateA`/`GateB` line already holding
-/// today is worth knowing about before that work starts.
+/// The replay contract itself. Un-ignored as of Task 6, which landed
+/// `insert_v6`/`update_v6`/`delete_v6` maintaining each key's B-tree
+/// incrementally per `docs/2026-08-25-btree-split-rules.md` -- see
+/// `docs/btrieve-unproven.md` §6 for the standing register of every step
+/// that clears only Gate B (all 20, today) and why. A standing regression:
+/// any future change that turns a Gate-A/Gate-B pass red must fix it or
+/// re-register it there, never silently downgrade it.
 #[test]
-#[ignore = "un-ignored by Task 6: the current engine full-rebuilds and cannot match per-op snapshots"]
 fn the_oracle_replay_contract() {
     let mut report: Vec<(String, String, Verdict)> = Vec::new();
     for seq in sequences() {
