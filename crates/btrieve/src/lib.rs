@@ -2678,6 +2678,7 @@ impl<M: Mem> Block<M> {
                 &old_value,
                 position,
                 index_free_head,
+                None,
             )?;
             index_free_head = free_head_after_delete;
             if let Some(root) = root_after_delete {
@@ -2893,6 +2894,23 @@ impl<M: Mem> Block<M> {
 
         let mut content = store.page(physical as usize).map_err(&fail)?.to_vec();
 
+        // Every duplicate-permitting key's own `[prev][next]` pair for this
+        // exact slot, read *before* the zero-fill below erases it. The
+        // B-tree loop further down needs `position`'s own chain neighbours
+        // to splice a partial-chain delete around, and by the time it runs
+        // this slot has already been wiped and relocated -- `v6_tree_delete`
+        // reading it fresh at that point would only find zeros.
+        let own_chain_pairs: Vec<Option<(u32, u32)>> = self
+            .keys
+            .iter()
+            .map(|k| {
+                k.chain.map(|offset| {
+                    let at = within + usize::from(offset);
+                    (pages::long(&content[at..at + 4]), pages::long(&content[at + 4..at + 8]))
+                })
+            })
+            .collect();
+
         // Zero the whole slot -- marker included -- and then write the
         // forwarding link over the front of the body. Zeroing first rather
         // than only writing the link is what leaves the measured shape: the
@@ -2914,7 +2932,7 @@ impl<M: Mem> Block<M> {
         let mut key_roots: Vec<(usize, u32)> = Vec::new();
         let mut index_free_head =
             pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
-        for key in &self.keys {
+        for (key_index, key) in self.keys.iter().enumerate() {
             let len = records_clone.ordered_len(key.number).ok_or_else(|| {
                 fail(format!(
                     "key {}: not among the keys the loaded records were ordered by",
@@ -2935,6 +2953,7 @@ impl<M: Mem> Block<M> {
                 &value,
                 position,
                 index_free_head,
+                own_chain_pairs[key_index],
             )?;
             index_free_head = next_free_head;
             if let Some(root) = new_root {
@@ -3292,10 +3311,14 @@ impl<M: Mem> Block<M> {
     /// free list's own head first when it is non-empty rather than growing
     /// the file -- this crate's own resolution of the split rules' open
     /// "preference among multiple simultaneously-vacated candidates"
-    /// question (§8): a LIFO free list only ever offers ONE candidate (its
-    /// own head), so there is no multi-candidate choice to make here,
-    /// exactly the shape `underflow-lifecycle-512/4-reclaimed.dat` (the
-    /// only recorded reclaim) measured. Falls back to
+    /// question (§8): LIFO, the most-recently-retired page reclaimed
+    /// first, per the `retired-page-reclaim-order` recording (two
+    /// retirements, chain `12 -> 10`, reclaimed back in that same order --
+    /// see `docs/btrieve-unproven.md` §6.1.3). Three or more candidates on
+    /// the list at once, and a reclaim separated from its own retirement
+    /// by intervening writes, are still unrecorded; this stack-shaped
+    /// implementation is indifferent to either, but that is extrapolation,
+    /// not measurement -- named in the same place. Falls back to
     /// [`v6::Map::claim`] (mechanism 1, marker-zero) only once the free
     /// list is empty.
     ///
@@ -3374,28 +3397,72 @@ impl<M: Mem> Block<M> {
         Ok((promoted, Self::v6_decorate(left_logical, tag), new_free_head))
     }
 
-    /// Thread a newly-inserted record onto an existing duplicate-value
-    /// group's chain: the new record's own `[prev][next]` pair becomes
-    /// `[old_tail, NOWHERE]`, and the old tail's own `next` half (the
-    /// pair's second four bytes) now names the new record. `head` never
-    /// moves (`docs/2026-08-25-btree-split-rules.md` §1/§9) -- only these
-    /// two records' own slots change, never the index.
+    /// Apply one or more `[prev][next]` duplicate-chain field edits to
+    /// member records' own slots -- shared by every place this engine's
+    /// insert/delete paths thread a chain link, batched by logical page so
+    /// two edits landing on the same physical page cost one relocate, not
+    /// two.
     ///
-    /// Resolves both records' logical pages through `store` itself
-    /// (`v6::Map::read(store, ...)`, not [`Self::v6_resolve_logical`]):
-    /// the new record's own page was already relocated earlier in this
-    /// same op ([`Self::v6_pop_free`]/[`Self::v6_claim_threaded_page`]),
-    /// before this call, and only `store` -- not the block's own
-    /// [`Self::cache`], which is not written through until the whole
-    /// operation commits -- has seen that move yet.
+    /// Each edit is `(position, new_prev, new_next)`; `None` leaves that
+    /// half of the pair exactly as it already reads (a middle-of-chain
+    /// relink only ever touches one half of each of its two neighbours).
     ///
-    /// Batches both writes onto one relocate when the new record and the
-    /// old tail share a physical page, rather than relocating it twice.
+    /// Resolves every logical page through `store` itself (`v6::Map::
+    /// read(store, ...)`, not [`Self::v6_resolve_logical`]): a record this
+    /// same op already relocated earlier (a new insert's own data page, or
+    /// this same key's own leaf) has only been seen by `store` so far --
+    /// [`Self::cache`] is not written through until the whole operation
+    /// commits.
     ///
     /// # Errors
     ///
-    /// If either position is not on a slot boundary, or its logical page
-    /// is claimed by nothing.
+    /// If any position is not on a slot boundary, or its logical page is
+    /// claimed by nothing.
+    fn v6_write_chain_edits(
+        &self,
+        store: &mut v6::Store,
+        layout: pages::Layout,
+        offset: usize,
+        edits: &[(u32, Option<u32>, Option<u32>)],
+    ) -> Result<(), String> {
+        let page_size = self.geometry.page;
+        let mut per_logical: std::collections::BTreeMap<u32, Vec<(usize, Option<u32>, Option<u32>)>> =
+            std::collections::BTreeMap::new();
+        for &(position, prev, next) in edits {
+            let (logical, slot) = layout
+                .slot_of(position)
+                .ok_or_else(|| format!("record position {position} is not on a slot boundary"))?;
+            let within = layout.position(0, slot) as usize + offset;
+            per_logical.entry(logical).or_default().push((within, prev, next));
+        }
+        for (logical, writes) in per_logical {
+            let physical = v6::Map::read(store, page_size)?
+                .physical(logical)
+                .ok_or_else(|| format!("logical page {logical} is claimed by nothing"))?;
+            let mut content = store.page(physical as usize)?.to_vec();
+            for (within, prev, next) in writes {
+                if let Some(p) = prev {
+                    content[within..within + 4].copy_from_slice(&pages::to_long(p));
+                }
+                if let Some(n) = next {
+                    content[within + 4..within + 8].copy_from_slice(&pages::to_long(n));
+                }
+            }
+            v6::Map::relocate(store, page_size, logical, &content, [0x00, 0x44])?;
+        }
+        Ok(())
+    }
+
+    /// Thread a newly-inserted record onto an existing duplicate-value
+    /// group's chain: the new record's own `[prev][next]` pair becomes
+    /// `[old_tail, NOWHERE]`, and the old tail's own `next` half now names
+    /// the new record. `head` never moves (`docs/2026-08-25-btree-split-
+    /// rules.md` §1/§9) -- only these two records' own slots change, never
+    /// the index.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::v6_write_chain_edits`].
     fn v6_write_dup_chain_extend(
         &self,
         store: &mut v6::Store,
@@ -3404,44 +3471,38 @@ impl<M: Mem> Block<M> {
         old_tail: u32,
         new_position: u32,
     ) -> Result<(), String> {
-        let page_size = self.geometry.page;
+        self.v6_write_chain_edits(
+            store,
+            layout,
+            offset,
+            &[(new_position, Some(old_tail), Some(pages::NOWHERE)), (old_tail, None, Some(new_position))],
+        )
+    }
 
-        let (new_logical, new_slot) = layout.slot_of(new_position).ok_or_else(|| {
-            format!("record position {new_position} is not on a slot boundary")
-        })?;
-        let new_within = layout.position(0, new_slot) as usize + offset;
-        let (old_logical, old_slot) = layout
-            .slot_of(old_tail)
-            .ok_or_else(|| format!("record position {old_tail} is not on a slot boundary"))?;
-        let old_within = layout.position(0, old_slot) as usize + offset;
-
-        let resolve = |store: &mut v6::Store, logical: u32| -> Result<u32, String> {
-            v6::Map::read(store, page_size)?.physical(logical).ok_or_else(|| {
-                format!("logical page {logical} is claimed by nothing")
-            })
-        };
-
-        if new_logical == old_logical {
-            let physical = resolve(store, new_logical)?;
-            let mut content = store.page(physical as usize)?.to_vec();
-            content[new_within..new_within + 4].copy_from_slice(&pages::to_long(old_tail));
-            content[new_within + 4..new_within + 8].copy_from_slice(&pages::to_long(pages::NOWHERE));
-            content[old_within + 4..old_within + 8].copy_from_slice(&pages::to_long(new_position));
-            v6::Map::relocate(store, page_size, new_logical, &content, [0x00, 0x44])?;
-            return Ok(());
-        }
-
-        let new_physical = resolve(store, new_logical)?;
-        let mut new_content = store.page(new_physical as usize)?.to_vec();
-        new_content[new_within..new_within + 4].copy_from_slice(&pages::to_long(old_tail));
-        new_content[new_within + 4..new_within + 8].copy_from_slice(&pages::to_long(pages::NOWHERE));
-        v6::Map::relocate(store, page_size, new_logical, &new_content, [0x00, 0x44])?;
-
-        let old_physical = resolve(store, old_logical)?;
-        let mut old_content = store.page(old_physical as usize)?.to_vec();
-        old_content[old_within + 4..old_within + 8].copy_from_slice(&pages::to_long(new_position));
-        v6::Map::relocate(store, page_size, old_logical, &old_content, [0x00, 0x44])?;
-        Ok(())
+    /// Read one duplicate-chain member's own `[prev][next]` pair off its
+    /// slot, resolved through `store` itself the same way
+    /// [`Self::v6_write_chain_edits`] writes it.
+    ///
+    /// # Errors
+    ///
+    /// If `position` is not on a slot boundary, or its logical page is
+    /// claimed by nothing.
+    fn v6_read_chain_pair(
+        &self,
+        store: &mut v6::Store,
+        layout: pages::Layout,
+        offset: usize,
+        position: u32,
+    ) -> Result<(u32, u32), String> {
+        let (logical, slot) = layout
+            .slot_of(position)
+            .ok_or_else(|| format!("record position {position} is not on a slot boundary"))?;
+        let physical = v6::Map::read(store, self.geometry.page)?
+            .physical(logical)
+            .ok_or_else(|| format!("logical page {logical} is claimed by nothing"))?;
+        let within = layout.position(0, slot) as usize + offset;
+        let content = store.page(physical as usize)?;
+        Ok((pages::long(&content[within..within + 4]), pages::long(&content[within + 4..within + 8])))
     }
 
     /// Insert `position` under `key`'s own extracted `value`, maintaining
@@ -3594,12 +3655,124 @@ impl<M: Mem> Block<M> {
         Ok((Some(Self::v6_decorate(new_root_logical, tag)), free_head))
     }
 
+    /// Delete a key whose value lives only as a promoted interior separator
+    /// -- `docs/2026-08-25-btree-split-rules.md`'s own open item, settled by
+    /// the `interior-separator-delete` recording: replaced with its
+    /// in-order PREDECESSOR (the left subtree's own maximum, pulled up
+    /// from the leaf that held it), wholesale (key, head, and tail all
+    /// move together, the same "genuine B-tree, never recomputed" fact §0
+    /// already establishes for a promotion or a redistribute). The
+    /// deleted separator's own record is freed by the ordinary data-page
+    /// free-list code that already ran before `Block::delete_v6` reached
+    /// this, unconditionally of B-tree shape -- nothing more to do for it
+    /// here.
+    ///
+    /// Scoped to the recorded case: the predecessor's own leaf must not
+    /// underflow when its maximum entry is removed (`>= half_entries`
+    /// afterward, the only shape any recording exercises -- the fixture's
+    /// own left leaf goes `21 -> 20`, landing exactly at `half_entries`,
+    /// not under it). If it would underflow, this refuses by name rather
+    /// than extending the merge/redistribute cascade into an interaction
+    /// nothing measures: the cascade's own right-sibling-first check could
+    /// reach the very separator being replaced (its right subtree is
+    /// exactly the predecessor's own path's right sibling one level up),
+    /// consuming it in a merge before this function gets to overwrite it.
+    /// Successor preference (the right subtree's own minimum) under a
+    /// missing/empty left subtree is equally unrecorded, named the same
+    /// way per the coordinator's own phase-2 ruling -- this engine never
+    /// builds an interior entry with no left child at all, so that shape
+    /// cannot arise from this engine's own writes, only conceivably from a
+    /// foreign file.
+    ///
+    /// # Errors
+    ///
+    /// If the predecessor's own removal would underflow its leaf, or the
+    /// left-subtree descent/relocate itself fails.
+    #[allow(clippy::too_many_arguments)]
+    fn v6_delete_interior_separator(
+        &self,
+        store: &mut v6::Store,
+        cache: &std::cell::RefCell<cache::PageCache>,
+        layout: pages::Layout,
+        key: &keys::Key,
+        shape: pages::Shape,
+        tag: [u8; 2],
+        key_tag_byte: u8,
+        located: &nav::Located,
+        free_head: u32,
+    ) -> Result<(Option<u32>, u32), BtvError> {
+        let name = self.name.clone();
+        let fail = |why: String| BtvError { file: name.clone(), why };
+        let page_size = self.geometry.page;
+        let max_entries = shape.capacity(page_size);
+        let half_entries = max_entries / 2;
+
+        let sep_level = located.path.len() - 1;
+        let sep_frame = &located.path[sep_level];
+        let mut resolve = |logical: u32| self.v6_resolve_logical(logical);
+
+        // Rightmost descent from the separator's own left child -- the
+        // left subtree's own maximum, wherever it bottoms out.
+        let mut pending = nav::children_of(&sep_frame.page)[located.at];
+        let (pred_logical, pred_page) = loop {
+            let page = nav::fetch_one(cache, &mut resolve, shape, key_tag_byte, pending).map_err(&fail)?;
+            let logical = pending & pages::fcr::ROOT_PAGE;
+            if page.leaf() {
+                break (logical, page);
+            }
+            pending = page.rightmost;
+        };
+
+        let mut pred_entries = Self::entries_from_page(&pred_page, &pred_page.tails);
+        let predecessor = pred_entries
+            .pop()
+            .expect("a real B-tree leaf on the predecessor path has at least one entry");
+        if pred_entries.len() < half_entries {
+            return Err(fail(format!(
+                "key {}: the in-order predecessor's own leaf would underflow \
+                 ({} entries, half_entries {half_entries}) if its maximum entry \
+                 is removed -- no recording exercises an interior-separator \
+                 delete whose predecessor removal cascades, so this refuses \
+                 rather than guessing how the cascade interacts with the \
+                 separator being replaced",
+                key.number,
+                pred_entries.len()
+            )));
+        }
+        let pred_stamp = pred_page.stamp.wrapping_add(1);
+        let pred_image = pages::encode_v6_index_page(layout, shape, pred_stamp, &pred_entries, &[]);
+        v6::Map::relocate(store, page_size, pred_logical, &pred_image, tag).map_err(&fail)?;
+
+        let mut sep_entries = Self::entries_from_page(&sep_frame.page, &sep_frame.page.tails);
+        sep_entries[located.at] = predecessor;
+        let sep_children = nav::children_of(&sep_frame.page);
+        let sep_stamp = sep_frame.page.stamp.wrapping_add(1);
+        let sep_image = pages::encode_v6_index_page(layout, shape, sep_stamp, &sep_entries, &sep_children);
+        v6::Map::relocate(store, page_size, sep_frame.logical, &sep_image, tag).map_err(&fail)?;
+
+        Ok((None, free_head))
+    }
+
     /// Delete `position` (whose value under `key` is `value`) from `key`'s
     /// B-tree incrementally, per `docs/2026-08-25-btree-split-rules.md`
     /// §4-§8: no underflow leaves the touched leaf's own stamp advanced and
     /// nothing else touched; an underflow redistributes with or merges
     /// into a sibling (donor-slack is the sole discriminator, §6), possibly
     /// cascading into the parent (never past the root -- see Errors).
+    /// A value found only as an interior separator delegates to
+    /// [`Self::v6_delete_interior_separator`]; one member of an active
+    /// duplicate-value group is pure chain surgery (see the `head != tail`
+    /// branch below), never touching the B-tree at all except when the
+    /// removed member is the group's own head or tail.
+    ///
+    /// `own_chain` is `position`'s own `[prev][next]` pair, read *before*
+    /// a caller that already zeroed and relocated `position`'s slot did so
+    /// ([`Self::delete_v6`]'s unconditional pre-write free -- by the time
+    /// this runs, [`Self::v6_read_chain_pair`] would read back zeros, not
+    /// the chain this delete needs to splice around). `None` says the slot
+    /// is still intact and this reads it fresh instead ([`Self::update_v6`]'s
+    /// delete-then-insert composition never touches the chain bytes, only
+    /// the record body ahead of them, so its own call always passes `None`).
     ///
     /// # Returns
     ///
@@ -3608,18 +3781,18 @@ impl<M: Mem> Block<M> {
     ///
     /// # Errors
     ///
-    /// Three refusals this task's own rulings require, named with their
+    /// Refusals this task's own rulings require, named with their
     /// predicate rather than silently guessed at: **root-level underflow**
-    /// (never recorded -- "out of scope" in the rules doc); **a node with
-    /// neither a left nor a right sibling** at its own level (an
-    /// unexpected tree shape); and **one member of an active 2+-record
-    /// duplicate-value group** (`head != tail`), since §4's own "Open" item
-    /// says no recording exercises a partial chain removal and this crate
-    /// will not fabricate the mechanism. Also if `key` has no tree, the
-    /// value is not found at all (a model/tree disagreement), it is found
-    /// at an interior level (ordinary delete's "shift entries down" rule is
-    /// only measured at the leaf; an interior removal needs a successor
-    /// swap this task does not implement), or any relocate/retire fails.
+    /// and **multi-level root collapse** (an interior root losing its own
+    /// last entry to a cascade -- never recorded, "out of scope" in the
+    /// rules doc; a leaf-root's own last record emptying is a *different*,
+    /// now-supported shape, see [`Self::v6_delete_interior_separator`]'s
+    /// sibling case below); **a node with neither a left nor a right
+    /// sibling** at its own level (an unexpected tree shape); and **an
+    /// underflow deeper than `half_entries - 1`** (every recorded crossing
+    /// lands exactly there). Also if `key` has no tree, the value is not
+    /// found at all (a model/tree disagreement), or any relocate/retire/
+    /// reclaim fails.
     #[allow(clippy::too_many_lines)]
     fn v6_tree_delete(
         &self,
@@ -3631,6 +3804,7 @@ impl<M: Mem> Block<M> {
         value: &[u8],
         position: u32,
         free_head: u32,
+        own_chain: Option<(u32, u32)>,
     ) -> Result<(Option<u32>, u32), BtvError> {
         let name = self.name.clone();
         let fail = |why: String| BtvError { file: name.clone(), why };
@@ -3656,25 +3830,71 @@ impl<M: Mem> Block<M> {
         let leaf_idx = located.path.len() - 1;
         let frame = &located.path[leaf_idx];
         if !frame.page.leaf() {
-            return Err(fail(format!(
-                "key {}: the deleted record's value is an interior separator -- \
-                 removing it needs a B-tree successor swap this task does not \
-                 implement (no recording exercises an ordinary delete at the \
-                 interior level)",
-                key.number
-            )));
+            return self.v6_delete_interior_separator(
+                store,
+                cache,
+                layout,
+                key,
+                shape,
+                tag,
+                key_tag_byte,
+                &located,
+                free_head,
+            );
         }
         let head = frame.page.entries[located.at].1;
         let tail = frame.page.tails.get(located.at).copied().unwrap_or(head);
         if head != tail {
-            return Err(fail(format!(
-                "key {}: this value's entry spans a 2+-record duplicate chain \
-                 (head {head} != tail {tail}) -- deleting one member of an \
-                 active chain is docs/2026-08-25-btree-split-rules.md §4's own \
-                 unmeasured 'Open' item; refusing rather than guessing at the \
-                 mechanism",
-                key.number
-            )));
+            // An active 2+-member duplicate chain: pure chain surgery
+            // (`dup-chain-partial-delete`, recorded round 2). The deleted
+            // member's own (still-live-at-this-point) `[prev][next]` names
+            // its neighbours; only the head or tail deletion ever touches
+            // the leaf entry at all, and only its own head/tail field --
+            // no split, no underflow, both unreachable since the entry
+            // count never changes. A middle deletion touches no index
+            // page whatsoever, only its two neighbours' own chain fields.
+            let chain_offset = usize::from(key.chain.ok_or_else(|| {
+                fail(format!("key {}: permits duplicates but names no chain offset", key.number))
+            })?);
+            let (prev, next) = match own_chain {
+                Some(pair) => pair,
+                None => {
+                    self.v6_read_chain_pair(store, layout, chain_offset, position).map_err(&fail)?
+                }
+            };
+
+            if position == head {
+                let mut entries = Self::entries_from_page(&frame.page, &frame.page.tails);
+                entries[located.at].head = next;
+                let children = nav::children_of(&frame.page);
+                let stamp = frame.page.stamp.wrapping_add(1);
+                let image = pages::encode_v6_index_page(layout, shape, stamp, &entries, &children);
+                v6::Map::relocate(store, page_size, frame.logical, &image, tag).map_err(&fail)?;
+                self.v6_write_chain_edits(store, layout, chain_offset, &[(next, Some(pages::NOWHERE), None)])
+                    .map_err(&fail)?;
+                return Ok((None, free_head));
+            }
+            if position == tail {
+                let mut entries = Self::entries_from_page(&frame.page, &frame.page.tails);
+                entries[located.at].tail = prev;
+                let children = nav::children_of(&frame.page);
+                let stamp = frame.page.stamp.wrapping_add(1);
+                let image = pages::encode_v6_index_page(layout, shape, stamp, &entries, &children);
+                v6::Map::relocate(store, page_size, frame.logical, &image, tag).map_err(&fail)?;
+                self.v6_write_chain_edits(store, layout, chain_offset, &[(prev, None, Some(pages::NOWHERE))])
+                    .map_err(&fail)?;
+                return Ok((None, free_head));
+            }
+            // A middle member: relink the two neighbours directly, the
+            // leaf entry itself untouched.
+            self.v6_write_chain_edits(
+                store,
+                layout,
+                chain_offset,
+                &[(prev, None, Some(next)), (next, Some(prev), None)],
+            )
+            .map_err(&fail)?;
+            return Ok((None, free_head));
         }
         if head != position {
             return Err(fail(format!(
@@ -3699,18 +3919,44 @@ impl<M: Mem> Block<M> {
             // The root is never subject to the half_entries floor at all --
             // it has no sibling to redistribute or merge with, which is
             // exactly why genuine Btrieve's own underflow trigger (§5) is
-            // never observed to fire there. The only root-level shape this
-            // task refuses is the one the rules doc actually names "out of
-            // scope": the root collapsing to zero entries (one child,
-            // ready to become the new root, mirroring how a split grows
-            // one) -- not merely a root that is thinner than half_entries.
+            // never observed to fire there.
             if level == 0 {
                 if cur_entries.is_empty() {
+                    if cur_children.is_empty() {
+                        // Deleting a key's last remaining record (the root
+                        // IS the leaf, no children at all) -- genuine
+                        // Btrieve allows this (status OK,
+                        // `delete-to-empty/manifest.txt`): the emptied root
+                        // reverts to the exact virgin-file shape, not a
+                        // distinct "emptied" state -- `leftmost = 0`
+                        // (**not** NOWHERE, the one field
+                        // `encode_v6_index_page`'s ordinary leaf case does
+                        // not produce), `rightmost = NOWHERE`, `entries =
+                        // 0`. Same logical id, same stamp-then-relocate
+                        // discipline as any other rewrite; nothing retires
+                        // and nothing new claims.
+                        let stamp = cur_stamp.wrapping_add(1);
+                        let mut image =
+                            pages::encode_v6_index_page(layout, shape, stamp, &cur_entries, &cur_children);
+                        image[12..16].copy_from_slice(&pages::to_long(0));
+                        v6::Map::relocate(store, page_size, cur_logical, &image, tag).map_err(&fail)?;
+                        return Ok((None, free_head));
+                    }
+                    // An interior root (children.len() > 1 before this)
+                    // that lost its own last entry to a merge cascading
+                    // from below -- the tree would need to shrink a level
+                    // (the surviving child becoming the new root), which
+                    // no recording settles (`docs/2026-08-25-btree-split-
+                    // rules.md`'s own "out of scope" list, and the
+                    // coordinator's own phase-2 ruling: this refusal
+                    // stands, distinct from the leaf-is-root case
+                    // `delete-to-empty` settled above).
                     return Err(fail(format!(
-                        "key {}: the root would collapse to zero entries (one \
-                         child) after this delete -- tree-shrinking-a-level is \
-                         never recorded (docs/2026-08-25-btree-split-rules.md's \
-                         own 'out of scope' list names it explicitly)",
+                        "key {}: the root would collapse to zero entries with \
+                         more than one child remaining -- multi-level tree \
+                         shrink is never recorded (docs/2026-08-25-btree-split-\
+                         rules.md's own 'out of scope' list names it \
+                         explicitly)",
                         key.number
                     )));
                 }

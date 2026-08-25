@@ -946,7 +946,6 @@ impl Map {
                     physical.insert(first + entry as u32 + 1, u32::from(claimed_page));
                 }
             }
-
         }
 
         Ok(Self { physical })
