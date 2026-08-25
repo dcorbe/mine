@@ -613,6 +613,36 @@ impl Key {
         }
         Ordering::Equal
     }
+
+    /// Compare two values already in [`Self::extract`]'s own layout --
+    /// segments concatenated from offset `0`, not a record's.
+    ///
+    /// [`Self::compare_value`] treats one side as a record and the other as
+    /// this laid-out shape; a B-tree's own index entries store the
+    /// *extracted* value on both sides that need comparing (an entry's key
+    /// bytes against a caller's search value), so both operands need the
+    /// laid-out offset, not just one. Segment-by-segment, honouring each
+    /// segment's own type, direction and ACS table exactly as
+    /// [`Self::compare`]/[`Self::compare_value`] do -- `nav::TreeCursor`'s
+    /// own binary search needs this to agree with the order the tree was
+    /// actually built in, which a plain byte comparison does not for a key
+    /// that collates through an alternate sequence (measured directly:
+    /// `ELWWDOBJ.DAT` key 0 is exactly such a key, and a raw-byte search
+    /// missed a record its own tree holds).
+    pub(crate) fn compare_extracted(&self, a: &[u8], b: &[u8]) -> Ordering {
+        let mut at = 0u16;
+        for segment in &self.segments {
+            let laid_out = Segment {
+                offset: at,
+                ..*segment
+            };
+            match laid_out.order(laid_out.of(a), laid_out.of(b), self.acs.as_deref()) {
+                Ordering::Equal => at += segment.length,
+                other => return other,
+            }
+        }
+        Ordering::Equal
+    }
 }
 
 /// Read a file's key definitions out of its file control record.

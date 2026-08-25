@@ -62,6 +62,7 @@ pub mod format;
 pub mod keys;
 pub mod mem;
 pub mod model;
+mod nav;
 mod ops;
 pub mod pages;
 pub mod read;
@@ -2327,6 +2328,81 @@ impl<M: Mem> Block<M> {
         }
 
         Ok(u32::from(claimed_page))
+    }
+
+    /// Everything [`nav::TreeCursor::seek`] needs for `key`'s tree: the FCR
+    /// root (still tag-decorated, see [`nav::root_of`]), the key's shape,
+    /// what a duplicate-permitting key's chain walk needs (`None` for a
+    /// unique key), this block's own page cache, and a resolver bound to it.
+    ///
+    /// `None` when `key` currently has no tree at all -- a virgin file, or
+    /// (per `format::fcr::key_descriptor`'s own doc) an `ANOSEG` continuation
+    /// definition; both read a bare `0` at [`pages::fcr::KEY_ROOT`].
+    ///
+    /// Not yet called from anywhere but this crate's own tests -- wiring a
+    /// real `Get`/`Query` through [`nav::TreeCursor`] is a later task.
+    ///
+    /// # Errors
+    ///
+    /// If `key` names no key this block has, this block has no v6 page cache
+    /// attached (a v5 file, or a test-built `Block` that skipped
+    /// [`Self::open`]), the live file control record cannot be read, the
+    /// stored root does not carry the v6 marker bit
+    /// ([`pages::fcr::ROOT_PAGE`]'s doc comment), or the key permits
+    /// duplicates but names no chain offset.
+    #[allow(dead_code)] // exercised by nav.rs's own differential test only, for now
+    fn nav_root(
+        &self,
+        key: u16,
+    ) -> Result<
+        Option<(
+            u32,
+            pages::Shape,
+            Option<nav::Duplicates>,
+            &std::cell::RefCell<cache::PageCache>,
+            Box<dyn FnMut(u32) -> Result<u32, String> + '_>,
+        )>,
+        String,
+    > {
+        let found = self
+            .keys
+            .iter()
+            .find(|k| k.number == key)
+            .ok_or_else(|| format!("{}: no such key: {key}", self.name))?;
+        let cache = self.cache.as_ref().ok_or_else(|| {
+            format!(
+                "{}: no v6 page cache attached -- not a v6 file, or a test build \
+                 that skipped Self::open",
+                self.name
+            )
+        })?;
+        let mut store = v6::Store::attach(cache, &self.path, self.geometry.page)?;
+        let fcr = self.v6_live_fcr(&mut store)?;
+        let Some(root) = nav::root_of(&fcr, usize::from(found.definition))? else {
+            return Ok(None);
+        };
+        let shape = found.shape();
+        let dup = if found.duplicates {
+            let offset = usize::from(found.chain.ok_or_else(|| {
+                format!(
+                    "{}: key {key} permits duplicates but names no chain offset",
+                    self.name
+                )
+            })?);
+            Some(nav::Duplicates {
+                layout: pages::Layout {
+                    page: self.geometry.page,
+                    physical: self.geometry.physical,
+                    pages: self.geometry.pages,
+                },
+                offset,
+            })
+        } else {
+            None
+        };
+        let resolve: Box<dyn FnMut(u32) -> Result<u32, String> + '_> =
+            Box::new(move |logical: u32| self.v6_resolve_logical(logical));
+        Ok(Some((root, shape, dup, &**cache, resolve)))
     }
 
     /// A v6 record's page, and where its slot starts inside that page.
