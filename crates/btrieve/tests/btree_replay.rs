@@ -22,7 +22,7 @@
 //! `update_v6`/`delete_v6` locate the touched entry and edit only the pages
 //! a split/merge/redistribute needs, per `docs/2026-08-25-btree-split-
 //! rules.md`, rather than calling `v6_reindex` -- a full per-key rebuild --
-//! on any per-op path). Today's own per-step map: **0 Gate-A, 20 Gate-B,
+//! on any per-op path). Today's own per-step map: **0 Gate-A, 33 Gate-B,
 //! 0 red** -- every step's own live records and key order already agree
 //! with the recording exactly, but no step reaches Gate A. Two reasons,
 //! neither a disagreement about the B-tree's own shape: the FCR's own
@@ -34,6 +34,10 @@
 //! abandoned-twin availability from that same unreplayed history. Both are
 //! demonstrated on real rows, with concrete byte-level diffs, in
 //! `docs/btrieve-unproven.md` §6 -- not merely inferred from file sizes.
+//! The last thirteen steps are Phase 2's own recordings: partial duplicate-
+//! chain deletion, an interior-separator delete, delete-to-empty (the root
+//! reverting to its virgin shape), and free-list reclaim order -- see
+//! `docs/btrieve-unproven.md` §6 for what remains unmeasured beyond them.
 //!
 //! This test is a standing regression, not `#[ignore]`d: any future change
 //! that turns a currently-green step red, or silently downgrades a
@@ -72,11 +76,16 @@ fn fixture(rel: &str) -> PathBuf {
 }
 
 /// One write, in the shape the recorder's own manifest logs it: an insert's
-/// `(key, insertion-order tag)`, or a delete's bare key.
+/// `(key, insertion-order tag)`, a delete's bare key, or -- for a
+/// duplicate-permitting key, where several records share one key value --
+/// a delete naming which specific member by its own insertion-order tag
+/// (`dup-chain-partial-delete`'s own recipe: `delete_nth(key, n)`, tags
+/// assigned in insertion order so tag `n+1` names the same member).
 #[derive(Clone, Copy)]
 enum ReplayOp {
     Insert { key: u32, tag: u32 },
     Delete { key: u32 },
+    DeleteTagged { key: u32, tag: u32 },
 }
 
 /// `key`(4B LE) + `tag`(4B LE) + zero padding to `reclen` -- see this file's
@@ -120,6 +129,22 @@ fn apply_op(label: &str, path: &Path, op: ReplayOp) -> Result<(), String> {
                         (r.bytes.len() >= 4 && r.bytes[0..4] == want).then_some(r.position)
                     })
                     .ok_or_else(|| format!("key {key} not present in {}", path.display()))?
+            };
+            btrieve.block_mut(at)?.delete(position).map_err(|e| e.to_string())?;
+        }
+        ReplayOp::DeleteTagged { key, tag } => {
+            let position = {
+                let block = btrieve.block_mut(at)?;
+                let records = block.records().map_err(|e| e.to_string())?;
+                let want_key = key.to_le_bytes();
+                let want_tag = tag.to_le_bytes();
+                (0..records.len())
+                    .find_map(|i| {
+                        let r = records.physical(i)?;
+                        (r.bytes.len() >= 8 && r.bytes[0..4] == want_key && r.bytes[4..8] == want_tag)
+                            .then_some(r.position)
+                    })
+                    .ok_or_else(|| format!("key {key} tag {tag} not present in {}", path.display()))?
             };
             btrieve.block_mut(at)?.delete(position).map_err(|e| e.to_string())?;
         }
@@ -173,9 +198,25 @@ enum Verdict {
     Aborted(String),
 }
 
+/// Whether `step_label`, within `seq_name`, is recorded as a genuinely empty
+/// walk -- the one named exception [`gate_b`]'s own doc comment reserves,
+/// rather than a blanket `vec![] == vec![]`. `delete_to_empty`'s first step
+/// deletes a single-level key's only record; genuine Btrieve answers OK and
+/// the root reverts to the virgin shape (`docs/2026-08-25-btree-split-
+/// rules.md` §7) -- an intentionally empty key, not a broken read.
+fn expects_empty_census(seq_name: &str, step_label: &str) -> bool {
+    seq_name == "delete_to_empty" && step_label == "delete the key's only record -- root reverts to virgin shape"
+}
+
 /// Gate B: our own output round-trips cleanly, AND a fresh open of both our
 /// output and the recorded snapshot see the same key-ordered record bytes.
-fn gate_b(scratch_path: &Path, scratch_label: &str, expect_bytes: &[u8], expect_copy_path: &Path) -> (bool, String) {
+fn gate_b(
+    scratch_path: &Path,
+    scratch_label: &str,
+    expect_bytes: &[u8],
+    expect_copy_path: &Path,
+    expect_empty: bool,
+) -> (bool, String) {
     let scratch_bytes = match fs::read(scratch_path) {
         Ok(b) => b,
         Err(e) => return (false, format!("cannot re-read our own scratch output: {e}")),
@@ -205,13 +246,16 @@ fn gate_b(scratch_path: &Path, scratch_label: &str, expect_bytes: &[u8], expect_
     };
 
     // Two empty walks trivially satisfy `ours == theirs` without proving
-    // anything -- every fixture in this corpus holds live records, so an
-    // empty walk on EITHER side here means something upstream already went
-    // wrong (a mis-copied scratch file, an op that silently deleted
-    // everything, ...). Gate B must never launder that into a pass; a
-    // genuinely empty recorded snapshot, if this corpus ever grows one,
-    // needs its own named case here, not a silent `vec![] == vec![]`.
+    // anything -- every fixture in this corpus holds live records except
+    // the one `expect_empty` names, so an empty walk elsewhere means
+    // something upstream already went wrong (a mis-copied scratch file, an
+    // op that silently deleted everything, ...). Gate B must never launder
+    // that into a pass on its own say-so; only the named, recorded-as-empty
+    // case gets to treat `vec![] == vec![]` as agreement.
     if theirs.is_empty() {
+        if expect_empty && ours.is_empty() {
+            return (true, "0 records both sides -- the key's last record was deleted, and the recorded snapshot agrees the tree is genuinely empty".to_string());
+        }
         return (
             false,
             "recorded snapshot's key-0 walk is empty -- refusing to call an empty match a pass; \
@@ -247,7 +291,7 @@ fn first_diff(a: &[u8], b: &[u8]) -> usize {
 /// Apply `step`'s ops to `working_path` (which already holds the prior
 /// step's -- or the sequence's starting -- state) and score the result
 /// against `step.expect`.
-fn run_step(working_path: &Path, working_label: &str, step: &Step) -> Verdict {
+fn run_step(working_path: &Path, working_label: &str, seq_name: &str, step: &Step) -> Verdict {
     for op in &step.ops {
         if let Err(e) = apply_op(working_label, working_path, *op) {
             return Verdict::Aborted(format!("op application failed: {e}"));
@@ -264,7 +308,8 @@ fn run_step(working_path: &Path, working_label: &str, step: &Step) -> Verdict {
 
     let diff_at = first_diff(&ours, &theirs);
     let expect_copy = working_path.with_file_name("expect-compare.dat");
-    let (ok, detail) = gate_b(working_path, working_label, &theirs, &expect_copy);
+    let expect_empty = expects_empty_census(seq_name, step.label);
+    let (ok, detail) = gate_b(working_path, working_label, &theirs, &expect_copy, expect_empty);
     if ok {
         Verdict::GateB(format!(
             "first byte diff at {diff_at:#x} (ours {} bytes, recorded {} bytes); {detail}",
@@ -300,6 +345,10 @@ fn insert(key: u32, tag: u32) -> ReplayOp {
 
 fn delete(key: u32) -> ReplayOp {
     ReplayOp::Delete { key }
+}
+
+fn delete_tagged(key: u32, tag: u32) -> ReplayOp {
+    ReplayOp::DeleteTagged { key, tag }
 }
 
 /// Every sequence this corpus can replay -- one entry per committed
@@ -489,6 +538,112 @@ fn sequences() -> Vec<Sequence> {
                 },
             ],
         },
+        // --- Phase 2 (review-driven): partial dup-chain delete, interior-
+        // separator delete, delete-to-empty, multi-candidate reclaim order.
+        Sequence {
+            name: "dup_chain_partial_delete",
+            start: fixture("dup-chain-partial-delete/00-baseline-all-groups.dat"),
+            file_label: "SPLDUPPD.DAT",
+            steps: vec![
+                Step {
+                    ops: vec![delete_tagged(100, 1)],
+                    expect: fixture("dup-chain-partial-delete/01-head-deleted-group100.dat"),
+                    label: "delete the head (tag 1) of group 100",
+                },
+                Step {
+                    ops: vec![delete_tagged(200, 2)],
+                    expect: fixture("dup-chain-partial-delete/02-middle-deleted-group200.dat"),
+                    label: "delete the middle (tag 2) of group 200",
+                },
+                Step {
+                    ops: vec![delete_tagged(300, 3)],
+                    expect: fixture("dup-chain-partial-delete/03-tail-deleted-group300.dat"),
+                    label: "delete the tail (tag 3) of group 300",
+                },
+                Step {
+                    ops: vec![delete_tagged(400, 1)],
+                    expect: fixture("dup-chain-partial-delete/04-group400-3-to-2.dat"),
+                    label: "group 400: 3 members -> 2 (delete the head)",
+                },
+                Step {
+                    ops: vec![delete_tagged(400, 2)],
+                    expect: fixture("dup-chain-partial-delete/05-group400-2-to-1-solo.dat"),
+                    label: "group 400: 2 members -> 1 solo (delete the new head)",
+                },
+                Step {
+                    ops: vec![delete_tagged(400, 3)],
+                    expect: fixture("dup-chain-partial-delete/06-group400-eliminated.dat"),
+                    label: "group 400: solo -> eliminated, like any unique key's last record",
+                },
+            ],
+        },
+        Sequence {
+            name: "interior_separator_delete",
+            start: fixture("interior-separator-delete/before.dat"),
+            file_label: "SPLISEPD.DAT",
+            steps: vec![Step {
+                ops: vec![delete(22)],
+                expect: fixture("interior-separator-delete/after.dat"),
+                label: "delete 22 (an interior separator; replaced by predecessor 21)",
+            }],
+        },
+        Sequence {
+            name: "delete_to_empty",
+            start: fixture("delete-to-empty/1-one-record.dat"),
+            file_label: "SPLEMPTY.DAT",
+            steps: vec![
+                Step {
+                    ops: vec![delete(1)],
+                    expect: fixture("delete-to-empty/2-emptied.dat"),
+                    label: "delete the key's only record -- root reverts to virgin shape",
+                },
+                Step {
+                    ops: vec![insert(2, 2)],
+                    expect: fixture("delete-to-empty/3-reinserted.dat"),
+                    label: "re-insert -- reuses the same root logical id",
+                },
+            ],
+        },
+        Sequence {
+            name: "retired_page_reclaim_order_retire",
+            start: fixture("retired-page-reclaim-order/1-none-retired.dat"),
+            file_label: "SPLRECL1.DAT",
+            steps: vec![Step {
+                ops: vec![delete(63)],
+                expect: fixture("retired-page-reclaim-order/2-leaf10-retired.dat"),
+                label: "delete 63 (leaf 10 underflows and retires)",
+            }],
+        },
+        Sequence {
+            name: "retired_page_reclaim_order_retire_second",
+            start: fixture("retired-page-reclaim-order/3-before-leaf12-retirement.dat"),
+            file_label: "SPLRECL2.DAT",
+            steps: vec![Step {
+                ops: vec![delete(130)],
+                expect: fixture("retired-page-reclaim-order/4-both-retired.dat"),
+                label: "delete 130 (leaf 12 underflows and retires too -- LIFO chain 12 -> 10)",
+            }],
+        },
+        Sequence {
+            name: "retired_page_reclaim_order_reclaim_first",
+            start: fixture("retired-page-reclaim-order/5-before-first-reclaim.dat"),
+            file_label: "SPLRECL3.DAT",
+            steps: vec![Step {
+                ops: vec![insert(155, 155)],
+                expect: fixture("retired-page-reclaim-order/6-leaf12-reclaimed-first.dat"),
+                label: "insert 155 (forces a split; reclaims 12, the LIFO head, first)",
+            }],
+        },
+        Sequence {
+            name: "retired_page_reclaim_order_reclaim_second",
+            start: fixture("retired-page-reclaim-order/7-before-second-reclaim.dat"),
+            file_label: "SPLRECL4.DAT",
+            steps: vec![Step {
+                ops: vec![insert(177, 177)],
+                expect: fixture("retired-page-reclaim-order/8-leaf10-reclaimed-second.dat"),
+                label: "insert 177 (forces another split; reclaims 10, the only one left)",
+            }],
+        },
     ]
 }
 
@@ -516,7 +671,8 @@ fn run_sequence(seq: &Sequence, report: &mut Vec<(String, String, Verdict)>) {
             continue;
         }
 
-        let outcome = panic::catch_unwind(AssertUnwindSafe(|| run_step(&working_path, seq.file_label, step)));
+        let outcome =
+            panic::catch_unwind(AssertUnwindSafe(|| run_step(&working_path, seq.file_label, seq.name, step)));
         let verdict = match outcome {
             Ok(v) => v,
             Err(payload) => {
@@ -598,11 +754,11 @@ fn the_oracle_replay_contract() {
     assert!(
         reds.is_empty(),
         "{} of {} steps are RED (neither gate cleared) -- see stderr above (rerun with \
-         `-- --ignored --nocapture` to see it) for the full per-step map. Expected today: \
-         `insert_v6`/`update_v6`/`delete_v6` all call `v6_reindex` unconditionally, a full \
-         rebuild that does not reproduce genuine Btrieve's incremental split/merge/redistribute \
-         behaviour -- this test is #[ignore]d for exactly that reason. Un-ignore it once Task 6 \
-         lands incremental maintenance.",
+         `-- --nocapture` to see it) for the full per-step map. This is a standing \
+         regression, not an expected failure: `insert_v6`/`update_v6`/`delete_v6` all \
+         maintain their B-tree incrementally (Task 6), and every step here has already \
+         been measured to clear at least Gate B. A red step means something that used to \
+         match the recording no longer does.",
         reds.len(),
         report.len(),
     );
