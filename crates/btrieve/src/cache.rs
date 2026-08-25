@@ -33,13 +33,24 @@ struct CachedPage {
 /// write, [`Self::mark_clean`] says a flush succeeded, and
 /// [`Self::drop_dirty`] is the abort path -- it throws every unflushed
 /// change away so a caller that gives up mid-operation leaves disk exactly
-/// as it found it.
+/// as it found it, `total_pages()` included: see `original_total_pages`
+/// below for how that count is rolled back.
 pub(crate) struct PageCache {
     path: PathBuf,
     file: File,
     page_size: usize,
     pages: HashMap<u32, CachedPage>,
     total_pages: u32,
+    /// `total_pages` as [`Self::open`] found it -- the disk-backed count,
+    /// fixed for this cache's whole lifetime because this cache never
+    /// writes to disk itself (a caller does, then calls [`Self::mark_clean`]
+    /// to say so). [`Self::drop_dirty`] never lets `total_pages` fall below
+    /// this: an extension `put` created is only real once something outside
+    /// this cache has actually flushed it, and an abort must undo exactly
+    /// the part that never happened. A second `open`-time `stat` would answer
+    /// the same question, but this field costs nothing to keep and needs no
+    /// extra syscall to consult.
+    original_total_pages: u32,
 }
 
 impl PageCache {
@@ -80,6 +91,7 @@ impl PageCache {
             page_size,
             pages: HashMap::new(),
             total_pages,
+            original_total_pages: total_pages,
         })
     }
 
@@ -180,11 +192,27 @@ impl PageCache {
     /// disk from scratch -- correct because disk was never written to for a
     /// page this cache never flushed.
     ///
+    /// Also rolls [`Self::total_pages`] back to [`Self::original_total_pages`]
+    /// past whatever extension `put` pages this call just evicted -- a `put`
+    /// that only ever lived in this cache's memory never grew the real file,
+    /// so an abort has to shrink the count back along with the pages
+    /// themselves, or a caller reading `total_pages()` to pick the next free
+    /// page would allocate past a hole nothing ever occupied on disk. Walks
+    /// back one page at a time rather than jumping straight to
+    /// `original_total_pages`, so a page that was extended, flushed for
+    /// real and marked clean earlier this operation survives the rollback --
+    /// only the trailing run of just-evicted, never-flushed extensions does.
+    ///
     /// Returns how many pages were dropped.
     pub(crate) fn drop_dirty(&mut self) -> usize {
         let dirty: Vec<u32> = self.pages.iter().filter(|(_, p)| p.dirty).map(|(&n, _)| n).collect();
         for physical in &dirty {
             self.pages.remove(physical);
+        }
+        while self.total_pages > self.original_total_pages
+            && !self.pages.contains_key(&(self.total_pages - 1))
+        {
+            self.total_pages -= 1;
         }
         dirty.len()
     }
@@ -280,6 +308,37 @@ mod tests {
 
         c.put(3, vec![0u8; 512]);
 
+        assert_eq!(c.total_pages(), 4);
+        assert_eq!(c.dirty_pages(), vec![3]);
+    }
+
+    /// A `put` that extends the file, then aborted: `drop_dirty` must roll
+    /// `total_pages` back to what disk actually has, not leave it at the
+    /// stale extended count -- otherwise a caller picking "the next free
+    /// page" from `total_pages()` would allocate past a hole no page ever
+    /// occupied on disk.
+    #[test]
+    fn drop_dirty_restores_total_pages_to_the_disk_count() {
+        let path = three_page_file("cache-drop-dirty-total-pages");
+        let mut c = PageCache::open(&path, 512).expect("opens");
+        assert_eq!(c.total_pages(), 3);
+
+        c.put(3, vec![0u8; 512]);
+        assert_eq!(c.total_pages(), 4, "put past the end extends total_pages");
+        assert_eq!(c.dirty_pages(), vec![3]);
+
+        assert_eq!(c.drop_dirty(), 1, "the one dirty page this put created");
+        assert_eq!(
+            c.total_pages(),
+            3,
+            "aborting the put that extended the file must roll total_pages back \
+             to what disk actually has"
+        );
+
+        // A subsequent put must extend from the restored count, not the stale
+        // extended one, or a caller allocating "the next page" would open a
+        // physical gap at index 3.
+        c.put(3, vec![0xAB; 512]);
         assert_eq!(c.total_pages(), 4);
         assert_eq!(c.dirty_pages(), vec![3]);
     }
