@@ -609,6 +609,16 @@ fn shut_down<A: Abi>(
             who.0
         ),
     }
+
+    // After the modules' own shutdown, not before -- a `finrou` still has
+    // its files open to write through, and `close_btrieve` reindexes
+    // whatever a module leaves dirty rather than assuming every module
+    // closed everything itself.
+    match host.close_btrieve() {
+        Ok(n) => eprintln!("mbbs-server: shutdown[m{}]: {n} btrieve block(s) closed", who.0),
+        Err(e) => eprintln!("mbbs-server: shutdown[m{}]: closing btrieve blocks failed: {e}", who.0),
+    }
+
     report_notes(host);
 }
 

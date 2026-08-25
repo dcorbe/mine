@@ -4812,19 +4812,15 @@ impl<M: Mem> Btrieve<M> {
             why,
         };
 
-        if self.open[index].pre_image.is_some() {
-            return Err(fail(
-                "has been written to inside a transaction that has not yet ended or \
-                 aborted -- closing it now would take its rollback out of a later abort's \
-                 reach, so this refuses rather than let that happen silently"
-                    .to_owned(),
-            ));
-        }
-
         let filnam_at = M::ptr_offset(at, Layout::of::<M>().filnam);
         let bytes = M::resolve(filnam_at, mem, M::PTR_WIDTH)
             .map_err(|e| fail(e.to_string()))?;
         let filnam = M::ptr_from_bytes(bytes);
+
+        // The file-side half: refuse on an outstanding pre-image, reindex
+        // if dirty, drop the `Block`. Shared with `close_all_files` so
+        // there is one reindex-on-dirty implementation, not two.
+        let block = self.close_file(index)?;
 
         // `bb->filnam=NULL` -- still written, and still before anything is
         // freed, exactly where `PLBTVSTF.C:639` writes it. A module that
@@ -4833,6 +4829,44 @@ impl<M: Mem> Btrieve<M> {
         // to decide whether there was a file to close.
         M::write(filnam_at, mem, &M::ptr_to_bytes(M::null_ptr()))
             .map_err(|e| fail(e.to_string()))?;
+
+        heap.free(block.key).map_err(fail)?;
+        heap.free(block.data).map_err(fail)?;
+        heap.free(filnam).map_err(fail)?;
+        heap.free(block.block).map_err(fail)?;
+
+        Ok(true)
+    }
+
+    /// The file-side half of closing the block at `self.open[index]`:
+    /// refuse if a transaction pre-image is outstanding, reindex it if
+    /// [`Block::dirty`], then drop it from [`Self::open`] and release every
+    /// lock it held. Returns the removed `Block` so a caller that also owns
+    /// module memory (`close`) can free what this half never touches.
+    ///
+    /// Shared by [`Self::close`] and [`Self::close_all_files`] so the
+    /// reindex-on-dirty rule -- and the pre-image refusal ahead of it --
+    /// exist in exactly one place.
+    ///
+    /// # Errors
+    /// If the block has an outstanding transaction pre-image (see
+    /// [`Self::close`]'s doc comment), or if a dirty block's
+    /// [`Block::reindex`] fails.
+    fn close_file(&mut self, index: usize) -> Result<Block<M>, BtvError> {
+        let name = self.open[index].name.clone();
+        let fail = |why: String| BtvError {
+            file: name.clone(),
+            why,
+        };
+
+        if self.open[index].pre_image.is_some() {
+            return Err(fail(
+                "has been written to inside a transaction that has not yet ended or \
+                 aborted -- closing it now would take its rollback out of a later abort's \
+                 reach, so this refuses rather than let that happen silently"
+                    .to_owned(),
+            ));
+        }
 
         // The flush point. A block that was never written is never
         // reindexed -- which is not merely tidy, it is load-bearing:
@@ -4855,12 +4889,30 @@ impl<M: Mem> Btrieve<M> {
         // this close forgot to release would sit in the table forever
         // regardless).
         self.locks.release_all_for(block.id());
-        heap.free(block.key).map_err(fail)?;
-        heap.free(block.data).map_err(fail)?;
-        heap.free(filnam).map_err(fail)?;
-        heap.free(block.block).map_err(fail)?;
+        Ok(block)
+    }
 
-        Ok(true)
+    /// Close every open file the way host shutdown needs to: the file-side
+    /// half of [`Self::close`] (flush/reindex-if-dirty, drop the `Block`)
+    /// for each entry in [`Self::open`], with no `mem`/`heap` parameters --
+    /// the machine is being torn down, so the module memory `close` would
+    /// otherwise reach into (the `bb->filnam` write, the four heap frees)
+    /// is going away with it and there is nothing left to free it into.
+    ///
+    /// Returns how many files were closed. Idempotent: called again with
+    /// nothing left open, it returns `Ok(0)`.
+    ///
+    /// # Errors
+    /// The first block [`Self::close_file`] refuses or fails to reindex
+    /// aborts the sweep and is returned as-is; that block and everything
+    /// after it in [`Self::open`] stay open.
+    pub fn close_all_files(&mut self) -> Result<usize, BtvError> {
+        let mut closed = 0;
+        while !self.open.is_empty() {
+            self.close_file(0)?;
+            closed += 1;
+        }
+        Ok(closed)
     }
 
     /// Take `lock` at `at`'s current position, once a positioning call has
@@ -9456,6 +9508,46 @@ mod tests {
             .expect("closes without ever asking to reindex");
         let after = std::fs::read(&clean_path).expect("read after");
         assert_eq!(before, after, "a clean close never touches the file");
+    }
+
+    /// Task 1: host shutdown must close every block still in `self.open`,
+    /// not just the one a module happens to hand `close`. Same fixture
+    /// shape as `close_reindexes_a_dirty_block_but_never_a_clean_one` -- one
+    /// dirty block, one clean one alongside it -- through
+    /// `close_all_files`, which takes no `mem`/`heap`: the machine tearing
+    /// down owns that memory, so there is nothing left to write `bb->filnam`
+    /// into or free the four allocations back to.
+    #[test]
+    fn close_all_files_settles_every_dirty_block_and_empties_the_open_list() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::default();
+
+        let dirty_path = seed_indexed(&crate::testing::scratch("btrieve-close-all-dirty"));
+        let dirty = open_indexed(&mut mem, &mut heap, &mut btrieve, dirty_path.clone());
+        btrieve
+            .block_mut(dirty)
+            .expect("open")
+            .insert(&record(1))
+            .expect("insert");
+        // Same observable as `close_reindexes_a_dirty_block_but_never_a_clean_one`:
+        // an insert alone never touches the key's index page -- only
+        // `reindex` does -- so the root page changing is what proves the
+        // dirty block was flushed on the way out, not merely dropped.
+        let root_before_close = root_page(&dirty_path);
+
+        let clean_path = seed_indexed(&crate::testing::scratch("btrieve-close-all-clean"));
+        open_indexed(&mut mem, &mut heap, &mut btrieve, clean_path);
+
+        let closed = btrieve.close_all_files().expect("closes");
+        assert_eq!(closed, 2);
+        assert!(btrieve.is_empty(), "every block left self.open");
+        assert_ne!(
+            root_page(&dirty_path),
+            root_before_close,
+            "the dirty block was reindexed on the way out, same as a direct close"
+        );
+        assert_eq!(btrieve.close_all_files().expect("idempotent"), 0);
     }
 
     /// C5: the re-entrancy guard used to be `bb->filnam != NULL`, read out of

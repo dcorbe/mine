@@ -5152,6 +5152,27 @@ impl<A: Abi> Host<A> {
         Ok(None)
     }
 
+    /// Close every Btrieve file still open, for host shutdown: delegates to
+    /// [`btrieve::Btrieve::close_all_files`], which needs no module memory
+    /// because the machine holding it is being torn down.
+    ///
+    /// Unlike [`shims::btrieve::clsbtv`], this never writes `bb->filnam` --
+    /// there is no module left to read it back. It exists so `finalize`'s
+    /// caller (module shutdown) can be followed by *engine* shutdown: every
+    /// block a module opened and never closed itself still gets reindexed
+    /// if dirty, rather than left on disk with a stale index.
+    ///
+    /// Returns how many files were closed.
+    ///
+    /// # Errors
+    /// If any block refuses to close -- see
+    /// [`btrieve::Btrieve::close_all_files`].
+    pub fn close_btrieve(&mut self) -> Result<usize, String> {
+        self.btrieve
+            .close_all_files()
+            .map_err(|e| format!("close_btrieve: {e}"))
+    }
+
     /// Generic since Task 12.
     ///
     /// # Errors
