@@ -529,10 +529,54 @@ fn version(bytes: &[u8]) -> Option<Version> {
 /// alone cannot see an open-per-page caller collapse to an open-per-operation
 /// one -- only the open count moves. Linux exposes no per-process `open(2)`
 /// counter of its own (that needs ptrace or an audit rule, both out of reach
-/// for a std-only crate), so every `std::fs::File::open` performed to serve a
-/// Btrieve read is counted right here instead: [`read_head`], [`read_at`],
-/// [`v6::Store::open`], and [`Block::v6_resolve_logical`].
+/// for a std-only crate), so this is counted here instead.
+///
+/// **Reads only.** [`open_for_read`] and [`read_whole`] are the only two
+/// places in this crate's non-test code allowed to call
+/// `std::fs::File::open`/`std::fs::read` directly --
+/// `tests/file_opens_guard.rs` fails the build if a third one appears
+/// outside a `#[cfg(test)]` module. A write open (`std::fs::OpenOptions`, in
+/// [`pages`], [`variable`] and this file) is a separate question this
+/// counter does not answer: the live defect this counter was built to catch
+/// was a read-per-page pattern, a write already touches exactly the pages it
+/// changes by construction, and folding writes in here would make a bound
+/// written against reads silently start describing something else.
 pub(crate) static FILE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Open `path` for reading, counting the open in [`FILE_OPENS`].
+///
+/// The only place in this crate's non-test code allowed to call
+/// `std::fs::File::open` -- every other read-serving site opens through
+/// this function, or through [`read_whole`], so the count in [`FILE_OPENS`]
+/// can never miss one. `tests/file_opens_guard.rs` enforces that mechanically.
+///
+/// # Errors
+///
+/// Whatever `std::fs::File::open` returns.
+pub(crate) fn open_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(file)
+}
+
+/// The whole contents of `path`, counting the open in [`FILE_OPENS`].
+///
+/// Built on [`open_for_read`] rather than `std::fs::read` directly, so the
+/// crate has exactly one place that calls `std::fs::File::open` and none
+/// that calls `std::fs::read` -- the second half of what
+/// `tests/file_opens_guard.rs` checks.
+///
+/// # Errors
+///
+/// Whatever [`open_for_read`] or the read itself returns.
+pub(crate) fn read_whole(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = open_for_read(path)?;
+    let mut out = Vec::new();
+    file.read_to_end(&mut out)?;
+    Ok(out)
+}
 
 /// The first `len` bytes of a file, or fewer if it is shorter.
 ///
@@ -544,8 +588,7 @@ pub(crate) static FILE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// the same file within one operation should hold its own `File` and call
 /// [`read_head_open`] instead; see that function's own doc comment for why.
 fn read_head(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
-    FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut file = open_for_read(path)?;
     read_head_open(&mut file, len)
 }
 
@@ -583,8 +626,7 @@ fn read_head_open(file: &mut std::fs::File, len: usize) -> std::io::Result<Vec<u
 /// board's `WCCMP002.DAT` (`docs/2026-08-24-btrieve-write-cost-baseline.md`'s
 /// follow-up); it now opens once per operation and calls [`read_at_open`].
 pub(crate) fn read_at(path: &Path, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
-    FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut file = open_for_read(path)?;
     read_at_open(&mut file, offset, len)
 }
 
@@ -649,7 +691,7 @@ fn acs_tables(
             // Open-time only, not `Block::update()`'s hot path -- reads the
             // whole file, same as before, wrapped in a `Store` only so
             // `v6::Map::read` stays one implementation.
-            let whole = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let whole = read_whole(path).map_err(|e| format!("{}: {e}", path.display()))?;
             let mut store = v6::Store::from_bytes(&whole, geometry.page)?;
             let map = v6::Map::read(&mut store, geometry.page)?;
             let mut resolved: Vec<(u32, u32)> = map.entries().collect();
@@ -1177,7 +1219,7 @@ impl<M: Mem> Block<M> {
         if !self.txn_active || self.pre_image.is_some() {
             return Ok(());
         }
-        let bytes = std::fs::read(&self.path).map_err(|e| BtvError {
+        let bytes = read_whole(&self.path).map_err(|e| BtvError {
             file: self.name.clone(),
             why: format!("{}: reading a transaction pre-image: {e}", self.path.display()),
         })?;
@@ -2035,8 +2077,7 @@ impl<M: Mem> Block<M> {
         // One handle for both shadow halves, not one `read_at` open apiece:
         // this used to cost two `openat`s per record write for a resolution
         // that needs exactly two `read`s and no more.
-        let mut file = std::fs::File::open(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
-        FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut file = open_for_read(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
         let mut page_at = |physical: usize| -> Result<Vec<u8>, String> {
             let page = read_at_open(&mut file, physical * page_size, page_size)
                 .map_err(|e| format!("{}: {e}", self.path.display()))?;
@@ -3486,7 +3527,7 @@ impl<M: Mem> Block<M> {
 
         let mut slot = vec![0u8; physical];
         {
-            let mut file = std::fs::File::open(&self.path)
+            let mut file = open_for_read(&self.path)
                 .map_err(|e| format!("{}: {e}", self.path.display()))?;
             file.seek(SeekFrom::Start(u64::from(position)))
                 .and_then(|_| file.read_exact(&mut slot))

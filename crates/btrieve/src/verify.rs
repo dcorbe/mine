@@ -95,7 +95,7 @@ use crate::{emit, read};
 ///   file's own bytes -- reported at the first differing offset, together
 ///   with the field [`crate::canvas::Emitted::owner_of`] says owns that byte.
 pub fn written(path: &Path) -> Result<(), String> {
-    let on_disk = std::fs::read(path)
+    let on_disk = crate::read_whole(path)
         .map_err(|e| format!("{}: reading the file this write just produced: {e}", path.display()))?;
 
     let model = read::file(&on_disk).map_err(|why| {

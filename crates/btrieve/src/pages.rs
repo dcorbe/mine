@@ -648,7 +648,7 @@ pub fn write_chain(
 pub fn free_head(path: &std::path::Path) -> Result<Option<u32>, String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = crate::open_for_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut bytes = [0u8; 4];
     file.seek(SeekFrom::Start(fcr::FREE as u64))
         .and_then(|_| file.read_exact(&mut bytes))
@@ -670,7 +670,7 @@ pub fn free_head(path: &std::path::Path) -> Result<Option<u32>, String> {
 pub fn data_pages(path: &std::path::Path, layout: Layout) -> Result<Vec<u32>, String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = crate::open_for_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut header = [0u8; HEADER as usize];
     let mut out = Vec::new();
     for number in 1..layout.pages {
@@ -1091,7 +1091,7 @@ pub fn walk(
 ) -> Result<Walk, String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = crate::open_for_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     walk_with(root, shape, |number| {
         if number == 0 || number >= layout.pages {
             return Err(format!(
@@ -1525,7 +1525,7 @@ pub fn append_page(path: &std::path::Path, layout: Layout) -> Result<u32, String
 pub fn page_header(path: &std::path::Path, layout: Layout, number: u32) -> Result<Header, String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = crate::open_for_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut header = [0u8; HEADER as usize];
     file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
         .and_then(|_| file.read_exact(&mut header))

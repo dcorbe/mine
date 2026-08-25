@@ -465,8 +465,13 @@ fn wccmp002_update_cost_today() {
     // After the fix, a v6 write opens the file at most twice: once in
     // `Block::v6_resolve_logical` (both shadow allocation-table halves
     // through one handle) and once in `v6::Store::open` (every page touched
-    // after that reads through the same handle). `4` gives headroom without
-    // hiding a regression back toward one open per page.
+    // after that reads through the same handle). Measured: 2. `4` gives
+    // headroom without hiding a regression back toward one open per page.
+    //
+    // `FILE_OPENS` now counts every read-serving open in this crate's
+    // non-test code, not just these two (`open_for_read`/`read_whole` in
+    // `src/lib.rs`, enforced by `tests/file_opens_guard.rs`) -- this warm
+    // path just does not happen to reach any of the others.
     assert!(
         cost.opens <= 4,
         "update() on a warm WCCMP002.DAT opened its file {} times -- expected at most 4 \
@@ -530,10 +535,14 @@ fn wccmp002_update_cost_today_cold() {
 
     // Same reasoning as `wccmp002_update_cost_today`'s own `opens` bound: a
     // cold update pays one extra whole-file read for `records()` to prime
-    // from (`walk_v6` -- `std::fs::read`, one `open` of its own, not routed
-    // through `FILE_OPENS`), on top of the warm update's own opens. `5`
-    // gives that one extra open room without hiding a regression back
-    // toward one open per page.
+    // from (`records::walk_v6`, through `read_whole` -- one `open` of its
+    // own). Measured: 3 (the warm update's own 2, plus this one). `walk_v6`
+    // used to open the file with a bare `std::fs::read`, invisible to
+    // `FILE_OPENS`, so this bound stayed 5 across a fix that actually moved
+    // the true count from 2 to 3 -- the exact overclaim `tests/
+    // file_opens_guard.rs` now exists to stop happening again. `5` still
+    // gives one open of headroom without hiding a regression back toward
+    // one open per page.
     assert!(
         cost.opens <= 5,
         "a cold update() on WCCMP002.DAT opened its file {} times -- expected at most 5, not \

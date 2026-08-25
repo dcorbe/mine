@@ -1059,7 +1059,7 @@ impl Pages for FilePages<'_> {
                 self.pages
             ));
         }
-        let mut file = std::fs::File::open(self.path)
+        let mut file = crate::open_for_read(self.path)
             .map_err(|e| format!("{}: {e}", self.path.display()))?;
         let at = u64::from(number) * u64::from(self.page_len);
         file.seek(SeekFrom::Start(at))

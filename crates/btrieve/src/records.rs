@@ -658,7 +658,7 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
 /// A page's own number *is* its physical position for v5, so this is a
 /// linear scan of `1..geometry.pages` -- no allocation table, no logical ids.
 fn walk_v5(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
-    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = crate::open_for_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let size = u32::try_from(
         file.metadata()
             .map_err(|e| e.to_string())?
@@ -849,7 +849,7 @@ fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
     // shrink): the saving Stage B makes elsewhere is that a *write* no
     // longer pays this cost too, not that this walk can avoid it. Wrapped in
     // a `Store` only so `v6::Map::read` has one implementation, not two.
-    let file = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let file = crate::read_whole(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let size = u32::try_from(file.len())
         .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
 

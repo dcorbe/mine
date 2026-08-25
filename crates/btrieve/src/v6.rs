@@ -284,8 +284,7 @@ impl Store {
         if page_size_usize == 0 {
             return Err("a v6 file's page size cannot be zero".to_owned());
         }
-        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        super::FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = super::open_for_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let len = file
             .metadata()
             .map_err(|e| format!("{}: {e}", path.display()))?
