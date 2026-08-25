@@ -158,6 +158,21 @@ pub mod v6 {
     /// fixed page the way v5's single block is (harvest 4 SS6a) -- a v6 file
     /// may carry more than one (`MULTIACS.DAT`'s two, harvest 4 SS6c).
     pub const TAG_ACS: u16 = 0x4100;
+    /// `0x4500`: a page an underflow merge/redistribute has retired from a
+    /// key's own B-tree -- an allocation-table marker change **in place**,
+    /// not a relocation (`docs/2026-08-25-btree-split-rules.md` §8). The
+    /// allocation table still claims the page (its marker's high byte is
+    /// `0x45`, not zero), so it is not an orphan; it is threaded into a
+    /// singly-linked free list instead, its own repurposed `rightmost`
+    /// field (offset `0x08`) holding the next hop and the file control
+    /// record's own `+0x98` field (`fcr::INDEX_FREE_V6`) holding the head --
+    /// the next split that needs a fresh left-side id reclaims it rather
+    /// than growing the file. Verified across two fixture families and two
+    /// page sizes (§8's own citations); `read::file` used to refuse any file
+    /// carrying one at all (`btree_split_oracle.rs`'s own pinned
+    /// `the_reader_refuses_a_file_with_an_emptied_leaf_pending_tag_0x4500_
+    /// support`, flipped once this crate learned the tag).
+    pub const TAG_RETIRED: u16 = 0x4500;
 
     /// Every named field of the six-byte v6 header, cited.
     #[must_use]

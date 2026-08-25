@@ -396,6 +396,27 @@ fn write_v6_orphan_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault>
     Ok(())
 }
 
+/// Write every retired v6 page's whole body back verbatim (`V6Page::
+/// retired`, Task 6), for every page whose model carries one. The claimed-
+/// but-untreed counterpart to [`write_v6_orphan_pages`]: `write_v6_page`
+/// already wrote the six-byte header (tag `TAG_RETIRED`, this page's own
+/// logical id, its stamp); this writes back everything past it -- including
+/// the repurposed `rightmost` field this crate's own write path reads as
+/// the free list's next hop -- exactly as `read::file` captured it.
+///
+/// # Errors
+///
+/// See [`Canvas::put`].
+fn write_v6_retired_pages(canvas: &mut Canvas, model: &File) -> Result<(), Fault> {
+    let page_size = model.id.page_size as usize;
+    for p in &model.v6_pages {
+        let Some(body) = &p.retired else { continue };
+        let at = p.physical_page as usize * page_size;
+        canvas.put(at + page::v6::LEN, body, v6_page_owner("retired_body", p.physical_page))?;
+    }
+    Ok(())
+}
+
 /// Write every orphan page's whole body back verbatim (`Page::orphan`, Task
 /// 13), for every page whose model carries one (`Some` only for
 /// `PageKind::Orphan`). Written as one opaque block past the header, exactly
@@ -612,9 +633,11 @@ fn v6_page_owner(field: &'static str, physical_page: u32) -> Owner {
 /// `write_v6_index_pages` instead), an ACS block (`V6Page::acs`, written by
 /// `write_v6_acs_blocks`), a fragment/overflow page (`V6Page::fragment`,
 /// Task 20, written by `write_v6_fragment_pages`), or an abandoned page
-/// (`V6Page::orphan`, Task 21, written by `write_v6_orphan_pages`), all four
-/// called separately by [`file`] right after this one. Only a page where
-/// **all five** of `content`/`index`/`acs`/`fragment`/`orphan` are `None`
+/// (`V6Page::orphan`, Task 21, written by `write_v6_orphan_pages`), or a
+/// retired page (`V6Page::retired`, Task 6, written by
+/// `write_v6_retired_pages`), all five called separately by [`file`] right
+/// after this one. Only a page where
+/// **all six** of `content`/`index`/`acs`/`fragment`/`orphan`/`retired` are `None`
 /// -- which `read::file` never actually produces, since it refuses rather
 /// than build a `V6Page` it cannot fully classify (`V6Page`'s own doc
 /// comment) -- would leave its body unwritten here, `Canvas::finish`
@@ -1055,6 +1078,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
         write_v6_acs_blocks(&mut canvas, model)?;
         write_v6_fragment_pages(&mut canvas, model)?;
         write_v6_orphan_pages(&mut canvas, model)?;
+        write_v6_retired_pages(&mut canvas, model)?;
 
         return canvas.finish();
     };

@@ -2379,6 +2379,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     acs: None,
                     fragment: None,
                     orphan: None,
+                    retired: None,
                 });
                 continue;
             }
@@ -2395,6 +2396,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     acs: Some(block),
                     fragment: None,
                     orphan: None,
+                    retired: None,
                 });
                 continue;
             }
@@ -2420,6 +2422,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     acs: None,
                     fragment: None,
                     orphan: None,
+                    retired: None,
                 });
                 continue;
             }
@@ -2443,6 +2446,35 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     acs: None,
                     fragment: Some(fragment),
                     orphan: None,
+                    retired: None,
+                });
+                continue;
+            }
+
+            // Task 6: a page an underflow merge/redistribute retired from a
+            // key's own B-tree -- still claimed (its marker's high byte is
+            // `0x45`, not zero, per `Map::read`'s own free-slot test), so it
+            // reaches here rather than the orphan loop below, but no key's
+            // walk attributes it to a tree any more (that walk is exactly
+            // what un-threaded it). Stored verbatim, the same "preserve
+            // rather than guess" discipline `orphan` already uses -- this
+            // crate's own write path is what interprets the repurposed
+            // `rightmost` field as the free list's next hop
+            // (`docs/2026-08-25-btree-split-rules.md` §8); the model makes
+            // no claim about it beyond round-tripping the bytes.
+            if tag == page::v6::TAG_RETIRED {
+                let body = bytes[page_start + page::v6::LEN..page_start + page_size].to_vec();
+                v6_pages.push(V6Page {
+                    physical_page: *physical_page,
+                    tag,
+                    logical,
+                    stamp,
+                    content: None,
+                    index: None,
+                    acs: None,
+                    fragment: None,
+                    orphan: None,
+                    retired: Some(body),
                 });
                 continue;
             }
@@ -2452,9 +2484,9 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     "identified as {:?}: physical page {physical_page} \
                      (logical {logical}, tag {tag:#06x}) is claimed by the \
                      allocation table but attributed to no key's B-tree and \
-                     is not TAG_ACS, TAG_DATA, or TAG_VARIABLE -- its tag is \
-                     TAG_TEMPLATE or unrecognized, neither of which this \
-                     crate decodes",
+                     is not TAG_ACS, TAG_DATA, TAG_VARIABLE, or TAG_RETIRED -- \
+                     its tag is TAG_TEMPLATE or unrecognized, neither of \
+                     which this crate decodes",
                     id.generation
                 ),
             });
@@ -2499,6 +2531,7 @@ pub fn file(bytes: &[u8]) -> Result<File, NotBtrieve> {
                     acs: None,
                     fragment: None,
                     orphan: Some(body),
+                    retired: None,
                 });
             }
         }
