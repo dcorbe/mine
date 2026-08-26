@@ -288,14 +288,19 @@ mod tests {
     /// [`OrderIndex::from_positions`]' sequence equals [`Records`]'s own
     /// physical order was never checked empirically -- only counts and
     /// individual positions were, through `Block::v6_physical_len`/
-    /// `Block::v6_physical_at`'s own callers. This is that check, over the
-    /// same corpus [`order_index_and_byte_fetch_match_records_over_the_v6_
-    /// corpus`] uses: for every fixed-length v6 file, `Block::v6_build_
-    /// physical_index`'s own `OrderIndex` (the allocation table plus each
-    /// claimed data page's own live-slot markers) must produce the
-    /// identical sequence, element by element, that `Records::physical`
-    /// already reads off the same file a different way (`records::
-    /// walk_v6`, a whole-file scan in ascending logical-then-slot order).
+    /// `Block::v6_physical_at`'s own callers. This is that check, drawn from
+    /// the same candidate list [`order_index_and_byte_fetch_match_records_
+    /// over_the_v6_corpus`] uses, though it clears fewer of them (143 of
+    /// 481, measured): both tests skip a candidate `Records::read` cannot
+    /// parse, and this one also skips a file with zero records outright
+    /// (`if records.is_empty() { continue; }`) since a physical order with
+    /// nothing in it has nothing to compare. For every fixed-length v6 file
+    /// that survives both, `Block::v6_build_physical_index`'s own
+    /// `OrderIndex` (the allocation table plus each claimed data page's own
+    /// live-slot markers) must produce the identical sequence, element by
+    /// element, that `Records::physical` already reads off the same file a
+    /// different way (`records::walk_v6`, a whole-file scan in ascending
+    /// logical-then-slot order).
     #[test]
     fn the_physical_order_index_matches_records_physical_order_over_the_v6_corpus() {
         let mut files_compared = 0usize;

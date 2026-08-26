@@ -979,9 +979,13 @@ pub struct Block<M: Mem> {
     /// data. Set by [`Self::insert`] and [`Self::update`], cleared by
     /// [`Self::reindex`].
     ///
-    /// The host never reads an index page -- `records()` page-walks and sorts
-    /// -- so nothing *needs* this flag to answer a module correctly. It exists
-    /// for the file itself: a real Btrieve or MBBSEmu could open it later, and
+    /// v5 still never reads an index page in production -- `records()`
+    /// page-walks and sorts. v6 fixed-length files differ: `nav::TreeCursor`/
+    /// `order::OrderIndex` read on-disk index pages as the production keyed-
+    /// lookup path (see [`Self::v6_fast_reads`]). Either way this flag's only
+    /// consumer is [`Self::reindex`], which is a no-op for v6 (its writes
+    /// maintain the index incrementally, in-op) -- so this flag exists for
+    /// the v5 file itself: a real Btrieve or MBBSEmu could open it later, and
     /// `clsbtv` calls `reindex` exactly when this is true so that a file
     /// leaving this host's reach never leaves with a stale index behind it.
     dirty: bool,
@@ -6433,12 +6437,16 @@ impl<M: Mem> Block<M> {
         // A v6 file has nothing deferred to rebuild here, and running this
         // function's v5 arithmetic over one would corrupt it.
         //
-        // [`Self::insert_v6`] maintains the index **inline**: it rebuilds the
-        // key's tree, relocates the root through the `"PP"` allocation table
-        // and rewrites the file control record's shadow pair, all before it
-        // returns. That is not an optimisation, it is forced -- every v6 write
-        // relocates the page it touches, so there is no way to write a record
-        // now and fix its index later.
+        // [`Self::insert_v6`]/[`Self::update_v6`]/[`Self::delete_v6`] all
+        // maintain the index **incrementally, in-op** (Task 6): each locates
+        // the touched entry with `nav::descend_for_write` and edits only the
+        // pages a split/merge/redistribute actually needs, relocating/
+        // claiming/retiring/reclaiming exactly those, all before the call
+        // returns. That is not an optimisation, it is forced -- every v6
+        // write relocates the page it touches, so there is no way to write a
+        // record now and fix its index later. `v6_reindex`, the from-scratch
+        // rebuild, has no production caller left; it stays only for
+        // create/repair/test use.
         //
         // Everything below this point assumes v5, in three separate places:
         // `KEY_ROOT` is read as a page number (a v6 root is
@@ -6455,13 +6463,10 @@ impl<M: Mem> Block<M> {
         // `dfaclose`, after the module had otherwise finished init.
         //
         // So this early return is a genuine no-op, not a gap papered over --
-        // and it stays one now that `update`/`delete` also write v6 files
-        // ([`Self::update_v6`], [`Self::delete_v6`]): both call
-        // [`Self::v6_reindex`] inline, the same discipline `insert_v6`
-        // established, so there is still nothing deferred to close time for
-        // this function to catch up on. If a future v6 write path ever
-        // defers index work to close time instead, this has to become a
-        // real v6 reindex.
+        // there is nothing deferred to close time for this function to catch
+        // up on, because v6 writes never defer index work in the first
+        // place. If a future v6 write path ever does defer index work to
+        // close time, this has to become a real v6 reindex.
         if self.geometry.version == Version::V6 {
             self.dirty = false;
             return Ok(());
