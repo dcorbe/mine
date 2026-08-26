@@ -1512,7 +1512,12 @@ impl<M: Mem> Block<M> {
 
     /// Replace this block's cache with a fresh one read straight off disk
     /// -- or drop it to `None` if even that fails -- because whatever is
-    /// currently resident may no longer agree with what disk holds.
+    /// currently resident may no longer agree with what disk holds. Also
+    /// clears [`Self::v6_order`] and [`Self::v6_physical`], for the
+    /// identical reason: both are built from whatever the page cache holds
+    /// *at the moment a read asks for them*, so a rank or position either
+    /// one has already cached can reflect exactly the same now-stale,
+    /// pre-invalidation content this function exists to throw away.
     ///
     /// Two callers, one problem: [`Btrieve::abort`] just overwrote the
     /// whole file with a pre-image, and any page a rolled-back
@@ -1524,6 +1529,18 @@ impl<M: Mem> Block<M> {
     /// `EIO`) can leave disk holding whatever an earlier phase already
     /// wrote for real while the cache still holds what was resident before
     /// the attempt, and nothing else reconciles that on the `Err` path.
+    /// [`Self::commit_deferred`]'s own failure path calls this too, for
+    /// the same reason -- `Btrieve::end` failing to flush a covered block
+    /// leaves that block in exactly the same "resident content may not
+    /// agree with disk" state a failed autocommit write does.
+    ///
+    /// Missed until a re-review of Task 7's own round 3: every existing
+    /// `abort_invalidates_the_v6_cache_*` test asserted on
+    /// `Block::v6_resolve_logical`/`records()`, never on a keyed or
+    /// physical read through `v6_order`/`v6_physical` themselves, so
+    /// nothing caught that this function cleared the page cache those two
+    /// indexes are built *from* without also clearing what they had
+    /// already cached from it.
     ///
     /// [`cache::PageCache`] has no "forget everything" primitive (Task 2's
     /// interface, consumed as declared); a fresh one, opened over the file
@@ -1533,7 +1550,10 @@ impl<M: Mem> Block<M> {
     /// cache is always safe, since every v6 read path falls back to
     /// reading disk directly when `Self::cache` is `None`.
     ///
-    /// A no-op for a v5 block, or any block that never had one.
+    /// A no-op for a v5 block, or any block that never had one -- clearing
+    /// `v6_order`/`v6_physical` costs nothing extra either way, since both
+    /// only ever hold entries for a v6 block with a cache in the first
+    /// place.
     fn invalidate_cache(&mut self) {
         let mut clear = false;
         if let Some(cache) = &self.cache {
@@ -1545,6 +1565,8 @@ impl<M: Mem> Block<M> {
         if clear {
             self.cache = None;
         }
+        self.v6_order.borrow_mut().clear();
+        *self.v6_physical.borrow_mut() = None;
     }
 
     /// The `struct btvblk` the module holds.
@@ -7144,6 +7166,17 @@ impl<M: Mem> Btrieve<M> {
                     if let Some(cache) = &block.cache {
                         cache.borrow_mut().drop_dirty();
                     }
+                    // Same reason `Block::invalidate_cache` clears these
+                    // on its own two callers' behalf: a keyed or physical
+                    // read made inside the transaction (this crate's own
+                    // read-your-own-writes contract) could have cached a
+                    // rank or position built from exactly the dirty pages
+                    // `drop_dirty` just discarded above. This branch never
+                    // goes through `invalidate_cache` -- there is no page
+                    // cache reopen to do, disk was never touched -- so it
+                    // clears them directly instead.
+                    block.v6_order.borrow_mut().clear();
+                    *block.v6_physical.borrow_mut() = None;
                     block.records = pre.records;
                     block.geometry = pre.geometry;
                     block.dirty = pre.dirty;
@@ -13456,6 +13489,149 @@ mod tests {
             restored.bytes[..4],
             *b"ABRT",
             "the aborted update's bytes must not survive on disk"
+        );
+    }
+
+    /// Re-review of round 3, Important 1: `Btrieve::abort` restores disk
+    /// and the in-memory model (the test above), but neither abort branch
+    /// -- the disk-rewrite path (`Block::invalidate_cache`) or the
+    /// deferred, disk-never-touched path (`PageCache::drop_dirty`) --
+    /// clears `Block::v6_order`/`Block::v6_physical`. Both caches are
+    /// built from whatever the block's page cache holds *at the moment a
+    /// read asks for them*, which inside a transaction is the in-flight,
+    /// not-yet-committed state (`ending_a_transaction_flushes_every_
+    /// deferred_v6_write_to_disk`'s own "visible before end" contract
+    /// relies on exactly this). Concretely reachable: `begin`, insert
+    /// (invalidates the affected key's cached order and the physical
+    /// index -- `Self::v6_invalidate_keys`/`Self::v6_invalidate_physical`),
+    /// a keyed or physical read *inside* the transaction (rebuilds and
+    /// caches an index reflecting the uncommitted insert), `abort` (cache
+    /// and disk both roll back, but the two indexes do not) -- the next
+    /// `Get`/`Step` then silently serves the rolled-back insert's rank or
+    /// position.
+    #[test]
+    fn abort_invalidates_the_v6_order_and_physical_indexes_not_just_disk_and_the_model() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+
+        let dir = crate::testing::scratch("txn-abort-invalidates-order-and-physical");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let path = dir.join("V6EMPTY1KEY.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        crate::testing::make_keys_modifiable(&path);
+
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let maxlen = geometry.reclen;
+        let at = btrieve
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, maxlen)
+            .expect("opens");
+        assert!(
+            btrieve.block(at).expect("open").cache.is_some(),
+            "a real v6 open attaches a cache -- this test is meaningless without one"
+        );
+
+        // One baseline record, written the ordinary autocommit way, before
+        // the transaction even starts.
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("baseline");
+
+        btrieve.begin().expect("begin");
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"BBBB")).expect("in-transaction insert");
+
+        // A keyed read and a physical read, both *inside* the transaction
+        // -- each builds and caches an index (`v6_order[0]`, `v6_physical`)
+        // that reflects the uncommitted insert, exactly the read-your-own-
+        // writes contract this crate's own deferred-transaction tests
+        // already rely on.
+        let mut locks = LockTable::default();
+        assert!(
+            btrieve
+                .block_mut(at)
+                .expect("open")
+                .query(0, Op::Equal, b"BBBB")
+                .expect("query"),
+            "the in-transaction insert must be visible to a keyed read before abort"
+        );
+        let last_in_txn = btrieve
+            .block_mut(at)
+            .expect("open")
+            .step(Step::Last, 0, &mut locks, maxlen)
+            .expect("step")
+            .expect("a last record exists");
+        assert_eq!(
+            &last_in_txn.bytes[..4],
+            b"BBBB",
+            "the in-transaction insert must be visible to a physical read before abort too"
+        );
+
+        btrieve.abort().expect("abort");
+
+        // The bug, made directly observable: a keyed read for the aborted
+        // insert's own value, through the same `Block`'s cached order.
+        // Before the fix, `v6_order[0]` still holds the two-record order
+        // the in-transaction read built and cached, so this still finds
+        // "BBBB" even though the insert was rolled back. After the fix,
+        // the cache was cleared and the next read rebuilds it from the
+        // restored file, so this correctly finds nothing.
+        let found_after_abort = btrieve
+            .block_mut(at)
+            .expect("open")
+            .query(0, Op::Equal, b"BBBB")
+            .expect("query");
+        assert!(
+            !found_after_abort,
+            "abort restored disk but not the cached key order -- a keyed read still found \
+             the rolled-back insert"
+        );
+
+        // Same bug, the physical side: before the fix, `v6_physical` still
+        // holds the two-position physical order the in-transaction read
+        // built and cached, so Step::Last still lands on "BBBB". After the
+        // fix, it lands back on the one record abort actually left.
+        let last_after_abort = btrieve
+            .block_mut(at)
+            .expect("open")
+            .step(Step::Last, 0, &mut locks, maxlen)
+            .expect("step")
+            .expect("a last record exists");
+        assert_eq!(
+            &last_after_abort.bytes[..4],
+            b"AAAA",
+            "abort restored disk but not the cached physical order -- Step::Last still \
+             landed on the rolled-back insert"
+        );
+
+        // And both must agree with a fresh, independent open of the same
+        // file -- nothing this `Block` has cached, resident or otherwise,
+        // may disagree with what a brand new reader of the same bytes
+        // sees.
+        let mut fresh_mem = FlatMem::new(64 * 1024);
+        let mut fresh_heap = FlatHeap::new(0x100);
+        let mut fresh = Btrieve::<Flat>::default();
+        let fresh_geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let fresh_at = fresh
+            .open(&mut fresh_mem, &mut fresh_heap, "V6EMPTY1KEY.DAT", &path, fresh_geometry, maxlen)
+            .expect("opens");
+        let mut fresh_locks = LockTable::default();
+        assert!(
+            !fresh
+                .block_mut(fresh_at)
+                .expect("open")
+                .query(0, Op::Equal, b"BBBB")
+                .expect("query"),
+            "a fresh independent open must not find the aborted insert either"
+        );
+        let fresh_last = fresh
+            .block_mut(fresh_at)
+            .expect("open")
+            .step(Step::Last, 0, &mut fresh_locks, maxlen)
+            .expect("step")
+            .expect("a last record exists");
+        assert_eq!(
+            &fresh_last.bytes[..4],
+            b"AAAA",
+            "a fresh independent open's own Step::Last must agree with the aborted block's"
         );
     }
 
