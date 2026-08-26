@@ -159,6 +159,20 @@ pub fn order_builds() -> u64 {
     crate::ORDER_BUILDS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Zero [`crate::RECORD_WALKS`] so a measurement window starts clean. Same
+/// role as [`reset_order_builds`], for [`crate::records::Records::read`]'s
+/// whole-file walk -- see that counter's own doc comment for why neither
+/// [`file_opens`] nor bytes read can discriminate it from an ordinary open.
+pub fn reset_record_walks() {
+    crate::RECORD_WALKS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How many times this process has run a full [`crate::records::Records::read`]
+/// walk since the last [`reset_record_walks`].
+pub fn record_walks() -> u64 {
+    crate::RECORD_WALKS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// A pointer into [`FlatMem`]: one number, no segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct FlatPtr(pub u32);

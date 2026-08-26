@@ -138,7 +138,7 @@ use mbbs_machine::ptr::ModulePtr;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
 use crate::btrieve::AbiMem;
-use crate::btrieve::{Btrieve, Cursor, Geometry};
+use crate::btrieve::{Btrieve, Geometry, Step};
 use crate::shims::ShimError;
 use crate::shims::btrieve as btv;
 
@@ -828,42 +828,13 @@ pub fn dfaStepLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi
         false => into,
     };
 
-    btv::load(host, block)?;
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    let count = file.records().map_err(|e| ShimError::Failed(e.to_string()))?.len();
-
-    let at = match (opt, file.cursor()) {
-        (33, _) => 0,
-        (34, _) if count > 0 => count - 1,
-        (34, _) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
-        (24, Cursor::Physical { at }) => at + 1,
-        (35, Cursor::Physical { at }) if at > 0 => at - 1,
-        (35, Cursor::Physical { .. }) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
-        (24 | 35, Cursor::Ordered { key, at }) => {
-            let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-            let physical = records
-                .ordered(key, at)
-                .and_then(|record| records.find_physical(record.position))
-                .ok_or_else(|| {
-                    ShimError::Failed(format!(
-                        "dfaStepLock({opt}) on {}: the ordered cursor (key {key}, {at}) \
-                         does not resolve to a physical record -- the file changed under it",
-                        file.name()
-                    ))
-                })?;
-            match opt {
-                24 => physical + 1,
-                _ if physical > 0 => physical - 1,
-                _ => return Ok(abi::Ret::Int(A::Int::from(0u16))),
-            }
-        }
-        (24 | 35, Cursor::Nowhere) => {
-            return Err(ShimError::Failed(format!(
-                "dfaStepLock({opt}) on {}, which is positioned Nowhere -- nothing has \
-                 positioned it yet, by a key or by a step",
-                file.name()
-            )));
-        }
+    // 33/34/24/35 are Btrieve's Step First/Last/Next/Previous -- see
+    // `btv::stpbtvl`'s own doc comment.
+    let step = match opt {
+        33 => Step::First,
+        34 => Step::Last,
+        24 => Step::Next,
+        35 => Step::Previous,
         _ => {
             return Err(ShimError::Failed(format!(
                 "dfaStepLock with option {opt}, which is none of 24, 33, 34 and 35"
@@ -871,10 +842,24 @@ pub fn dfaStepLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi
         }
     };
 
-    if at >= count {
+    btv::load(host, block)?;
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    let name = file.name().to_owned();
+
+    // `Block::step_position` (`crates/btrieve::ops`), not `Block::records()`
+    // -- see `btv::stpbtvl`'s own doc comment for why. This is the third
+    // copy of this exact positioning logic (`btv::stpbtvl`, `btv::stpbtv`,
+    // this one), and MajorMUD calls *this* one -- `dfaStepLock` is the
+    // `dfa*` name for the same operation `btv*`'s `stpbtvl` answers, and
+    // `WCCMMUD.DLL` uses the `dfa*` family throughout -- so the whole-file
+    // read this used to make on every step is the one of the three that
+    // was actually reachable from a live board.
+    let at = file
+        .step_position(step)
+        .map_err(|e| ShimError::Failed(format!("dfaStepLock({opt}) on {name}: {e}")))?;
+    if at.is_none() {
         return Ok(abi::Ret::Int(A::Int::from(0u16)));
     }
-    file.seek_to(Cursor::Physical { at });
     btv::take_lock(host, block, lock)?;
     btv::deliver(call, host, block, into)?;
     if lock != 0

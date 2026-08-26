@@ -187,7 +187,13 @@ use mbbs_machine::ptr::ModulePtr;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
 use crate::btrieve::AbiMem;
-use crate::btrieve::{Btrieve, Cursor, Geometry};
+use crate::btrieve::{Btrieve, Cursor, Geometry, Step};
+// Aliased: this file's own `Op` (below) is the BTVSTF.H opcode enum
+// `qrybtv`'s family parses from a module-supplied number, a different type
+// from the engine's -- they share variant names because both describe the
+// same nine Btrieve "get key" operations, not because they are the same
+// type.
+use crate::btrieve::Op as EngineOp;
 use crate::shims::ShimError;
 
 /// Read the next argument as a 16-bit signed `int`, [`Abi`]-generic.
@@ -834,9 +840,20 @@ pub fn clsbb<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 ///
 /// `PLBTVSTF.C` never computes this: it hands the record to Btrieve and reads
 /// back status 5 if the TSR already had one. This host has no TSR, so it asks
-/// the same question of the records already read into memory -- a record
-/// with this value is a collision if [`Records::seek`](crate::btrieve::Records::seek)
-/// lands on one that [`Records::matches`](crate::btrieve::Records::matches) it exactly.
+/// the engine the same question through [`Block::query`](crate::btrieve::Block::query)
+/// -- a record with this value is a collision if an `Op::Equal` search on the
+/// key finds one.
+///
+/// **Not `Block::records()`.** An earlier version asked
+/// [`Records::seek`](crate::btrieve::Records::seek)/
+/// [`Records::matches`](crate::btrieve::Records::matches) directly, which
+/// meant calling `Block::records()` first -- materialising this file's
+/// *entire* record model on every insert and update regardless of whether
+/// [`Block::v6_fast_reads`](crate::btrieve::Block) applies, exactly the
+/// per-operation whole-file read the page cache exists to make unnecessary.
+/// `Block::query` already rides that fast path; this is a read-only check,
+/// so the cursor `query` moves on a match is restored before returning,
+/// unconditionally, so a caller of this function never observes it moved.
 ///
 /// The caller is the one who notes it -- see [`note_duplicate_key`] -- because
 /// only the caller knows whether this is an insert or an update.
@@ -848,22 +865,30 @@ pub(crate) fn duplicate_key<A: Abi>(
 ) -> Result<Option<(u16, Vec<u8>)>, ShimError> {
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     let keys = file.keys().to_vec();
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+    let saved = file.cursor();
 
+    let mut collision = None;
     for key in &keys {
         if key.duplicates {
             continue;
         }
         let value = key.extract(bytes);
-        let at = records.seek(&keys, key.number, &value);
-        if !records.matches(&keys, key.number, at, &value) {
+        let found = file
+            .query(key.number, EngineOp::Equal, &value)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        if !found {
             continue;
         }
-        let existing = records.ordered(key.number, at).expect("just matched");
-        if Some(existing.position) == exclude {
+        let existing = file.get_position().map_err(|e| ShimError::Failed(e.to_string()))?;
+        if Some(existing) == exclude {
             continue;
         }
-        return Ok(Some((key.number, value)));
+        collision = Some((key.number, value));
+        break;
+    }
+    file.seek_to(saved);
+    if let Some((key, value)) = collision {
+        return Ok(Some((key, value)));
     }
     Ok(None)
 }
@@ -947,6 +972,25 @@ impl Op {
             self,
             Self::Equal | Self::Greater | Self::AtLeast | Self::Less | Self::AtMost
         )
+    }
+
+    /// The identical variant of the engine's own `Op` (`crate::btrieve::Op`,
+    /// aliased `EngineOp` in this file) -- this type exists to parse a
+    /// module-supplied opcode number into one of Btrieve's nine "get key"
+    /// operations, and the engine's `Block::query` is what actually answers
+    /// one; [`locate`] is the one place that needs both.
+    pub(crate) fn as_engine(self) -> EngineOp {
+        match self {
+            Self::Equal => EngineOp::Equal,
+            Self::Next => EngineOp::Next,
+            Self::Previous => EngineOp::Previous,
+            Self::Greater => EngineOp::Greater,
+            Self::AtLeast => EngineOp::AtLeast,
+            Self::Less => EngineOp::Less,
+            Self::AtMost => EngineOp::AtMost,
+            Self::Lowest => EngineOp::Lowest,
+            Self::Highest => EngineOp::Highest,
+        }
     }
 }
 
@@ -1146,60 +1190,14 @@ pub fn stpbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
         true => data_buffer(host, block)?,
         false => into,
     };
-    load(host, block)?;
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    let count = file.records().map_err(|e| ShimError::Failed(e.to_string()))?.len();
 
-    // Where the walk goes next, from where it is now.
-    let at = match (opt, file.cursor()) {
-        (33, _) => 0,
-        (34, _) if count > 0 => count - 1,
-        (34, _) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
-        (24, Cursor::Physical { at }) => at + 1,
-        (35, Cursor::Physical { at }) if at > 0 => at - 1,
-        (35, Cursor::Physical { .. }) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
-        // Stepping from a keyed position. **Correction, found driving
-        // character creation's real duplicate-name check against
-        // `WCCMMUD.DLL` (Task 12):** an earlier version of this arm treated
-        // this as a module bug and refused outright. Real Btrieve keeps
-        // exactly one cursor per open file, in *physical* terms, regardless
-        // of whether a keyed query or a step last moved it there -- a
-        // `qrybtv`/`gabbtvl` positions the file physically same as a step
-        // does, it just also remembers which key ordinal that physical slot
-        // was found at. So a step-family call (`stpbtvl`, "no key at all",
-        // this function's own doc comment) after a keyed one is not a module
-        // bug at all; it is the ordinary way a real board reads a few
-        // records by key and then walks the rest of the file by position.
-        // The translation is the one `obtbtvl`'s own `here` resolution
-        // already trusts for the opposite direction (an `Ordered` cursor
-        // read in a *different* key's order, above) -- the record a key
-        // ordinal names has a physical position like any other, found the
-        // same way.
-        (24 | 35, Cursor::Ordered { key, at }) => {
-            let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-            let physical = records
-                .ordered(key, at)
-                .and_then(|record| records.find_physical(record.position))
-                .ok_or_else(|| {
-                    ShimError::Failed(format!(
-                        "stpbtvl({opt}) on {}: the ordered cursor (key {key}, {at}) does \
-                         not resolve to a physical record -- the file changed under it",
-                        file.name()
-                    ))
-                })?;
-            match opt {
-                24 => physical + 1,
-                _ if physical > 0 => physical - 1,
-                _ => return Ok(abi::Ret::Int(A::Int::from(0u16))),
-            }
-        }
-        (24 | 35, Cursor::Nowhere) => {
-            return Err(ShimError::Failed(format!(
-                "stpbtvl({opt}) on {}, which is positioned Nowhere -- nothing has \
-                 positioned it yet, by a key or by a step",
-                file.name()
-            )));
-        }
+    // 33/34/24/35 are Btrieve's Step First/Last/Next/Previous -- see this
+    // function's own doc comment.
+    let step = match opt {
+        33 => Step::First,
+        34 => Step::Last,
+        24 => Step::Next,
+        35 => Step::Previous,
         _ => {
             return Err(ShimError::Failed(format!(
                 "stpbtvl with option {opt}, which is none of 24, 33, 34 and 35"
@@ -1207,10 +1205,38 @@ pub fn stpbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
         }
     };
 
-    if at >= count {
+    load(host, block)?;
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    let name = file.name().to_owned();
+
+    // `Block::step_position` (`crates/btrieve::ops`) is `Block::step`'s own
+    // positioning, fast-path-aware (`Block::v6_fast_reads`) and already
+    // measured oracle-correct for the keyed-cursor-to-physical translation
+    // this function used to compute by hand against `Block::records()` --
+    // Task 12's own correction (a `qrybtv`/`gabbtvl` positions the file
+    // physically too, so a step-family call after a keyed one continues
+    // from there rather than refusing) lives in `physical_of`
+    // (`crates/btrieve::ops`) now, exercised identically either way. Not
+    // `Block::step` itself: that also takes a lock and delivers a record,
+    // both of which need a `LockTable` this session keeps to itself (only
+    // `Btrieve::take_lock` reaches it) -- `step_position` is the same split
+    // `Block::cursor_for` already makes for `insert_record`/
+    // `update_variable`'s currency, so this function keeps its own
+    // `take_lock`/`deliver` calls below unchanged.
+    //
+    // **Not `Block::records()`.** This is how a module reads a whole file
+    // when key order does not matter (this function's own doc comment),
+    // which makes it the natural idiom for a mass migration that walks
+    // every record -- exactly `WCCMP002.DAT`'s own "Automatic Database
+    // Update" -- and `Block::records()` unconditionally, on every single
+    // step, is precisely the whole-file read the page cache exists to
+    // avoid paying more than once per open.
+    let at = file
+        .step_position(step)
+        .map_err(|e| ShimError::Failed(format!("stpbtvl({opt}) on {name}: {e}")))?;
+    if at.is_none() {
         return Ok(abi::Ret::Int(A::Int::from(0u16)));
     }
-    file.seek_to(Cursor::Physical { at });
     take_lock(host, block, lock)?;
     deliver(call, host, block, into)?;
     Ok(abi::Ret::Int(A::Int::from(1u16)))
@@ -1481,22 +1507,26 @@ pub(crate) fn absolute<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Posi
     let key = key_number(call, host, block, keynum)?;
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-    let Some(physical) = records.find_physical(position) else {
+    let name = file.name().to_owned();
+
+    // `Block::cursor_for` (`crates/btrieve::ops`) -- the same fast-path-
+    // aware position resolution `insert_record`/`update_variable`'s
+    // currency step rides -- not `Block::records()`, which this used to
+    // call on *every* `aabbtv`/`gabbtvl` (34 call sites for the latter
+    // alone, per this function's own doc comment), regardless of whether
+    // `Block::v6_fast_reads` applied. The position names a record; the key
+    // number says which order a later step should continue in, exactly
+    // what `cursor_for` answers.
+    let cursor = file
+        .cursor_for(key, position)
+        .map_err(|e| ShimError::Failed(format!("{who} on {name}: {e}")))?;
+    let Some(cursor) = cursor else {
         if fatal {
             return Err(ShimError::Failed(format!(
-                "{who} of {}, which has no record at file position {position}",
-                file.name()
+                "{who} of {name}, which has no record at file position {position}",
             )));
         }
         return Ok(false);
-    };
-
-    // The position names a record; the key number says which order a later
-    // step should continue in.
-    let cursor = match records.place_in(key, physical) {
-        Some(at) => Cursor::Ordered { key, at },
-        None => Cursor::Physical { at: physical },
     };
     file.seek_to(cursor);
     take_lock(host, block, lock)?;
@@ -1619,106 +1649,47 @@ pub(crate) fn locate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Reques
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     let name = file.name().to_owned();
-    let definitions = file.keys().to_vec();
-    let cursor = file.cursor();
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-    let count = records
-        .ordered_len(key)
-        .ok_or_else(|| ShimError::Failed(format!("{who} on {name} by key {key}, which it has not")))?;
 
-    // Where the file is now, in this key's order -- and **only** `Next` and
-    // `Previous` may ask, because they are the only two operations whose
-    // answer depends on where the file already is. A `Get Equal` does not
-    // care what the cursor holds, so it must not be refused for holding the
-    // wrong sort of cursor.
+    // `Block::query` (`crates/btrieve::ops`) is the engine's own 9-way `Op`
+    // dispatch -- fast-path-aware (`Block::v6_fast_reads`), and already
+    // measured against genuine Btrieve 6.15 for every corner this function
+    // used to reimplement by hand against `Block::records()`:
     //
-    // **A cursor from another key, or from a step, is refused rather than
-    // translated.** An earlier version translated one through
-    // `Records::place_in` on the reasoning that the two orders describe the
-    // same records. Genuine Btrieve 6.15 does not do that, measured in
-    // `crates/mbbs/tests/btrieve.rs::position_ops_oracle_scenarios`:
-    //
-    //   - `S6` -- `Get Equal` on key 0, then `Get Next` on key 1: status 7,
-    //     "different key number". Not an answer in key 1's order.
+    //   - `S6` -- `Get Equal` on key 0, then `Get Next` on key 1: refused
+    //     (`OpError::DifferentKey`, real Btrieve status 7), not translated
+    //     into key 1's order the way an earlier version of this function
+    //     did through `Records::place_in`.
     //   - `S4`/`S4b` -- `Step First`, then `Get Next` on *either* key:
-    //     status 8. A step establishes no key context at all.
+    //     refused (`OpError::NoKeyEstablished`, status 8) -- a step
+    //     establishes no key context at all.
+    //   - `S1`/`S1c` -- an unpositioned `Get Next` answers as `Get Lowest`
+    //     would (status 0); an unpositioned `Get Previous` answers "not
+    //     found" (status 9) rather than refusing either way.
     //
-    // Both are error statuses rather than the 4/9 this layer turns into a
-    // zero, so both stop the module, which is what `PLBTVSTF.C` does with a
-    // status it has no mapping for. Translating produced a *plausible*
-    // record instead, which is the worse failure: the module cannot tell it
-    // asked a question the original would have refused.
-    let here: Result<Option<usize>, String> = match cursor {
-        Cursor::Ordered { key: had, at } if had == key => Ok(Some(at)),
-        Cursor::Ordered { key: had, .. } => Err(format!(
-            "{who} asked {name} for the next record in key {key}'s order, but \
-             the file is positioned in key {had}'s. Real Btrieve refuses this \
-             with status 7, \"different key number\", rather than translating \
-             between the two orders -- measured, S6"
-        )),
-        Cursor::Physical { .. } => Err(format!(
-            "{who} asked {name} for the next record in key {key}'s order, but \
-             the file was positioned by a step, which establishes no key at \
-             all. Real Btrieve refuses this with status 8 -- measured, S4"
-        )),
-        Cursor::Nowhere => Ok(None),
-    };
-
-    let found = match op {
-        Op::Lowest => (count > 0).then_some(0),
-        Op::Highest => count.checked_sub(1),
-        Op::Equal => {
-            let at = records.seek(&definitions, key, &wanted);
-            records.matches(&definitions, key, at, &wanted).then_some(at)
-        }
-        Op::AtLeast => Some(records.seek(&definitions, key, &wanted)).filter(|at| *at < count),
-        Op::Greater => {
-            // Past every record equal to the value, which is not `seek + 1`:
-            // a duplicate key may have many.
-            let mut at = records.seek(&definitions, key, &wanted);
-            while records.matches(&definitions, key, at, &wanted) {
-                at += 1;
-            }
-            Some(at).filter(|at| *at < count)
-        }
-        Op::AtMost => {
-            let mut at = records.seek(&definitions, key, &wanted);
-            while records.matches(&definitions, key, at, &wanted) {
-                at += 1;
-            }
-            at.checked_sub(1)
-        }
-        Op::Less => records.seek(&definitions, key, &wanted).checked_sub(1),
-        Op::Next => match here.map_err(ShimError::Failed)? {
-            Some(at) => Some(at + 1).filter(|at| *at < count),
-            // **An unpositioned `Get Next` is not an error -- it answers.**
-            // `S1` measured genuine Btrieve returning status 0 and the
-            // *first* record for a `Get Next` on a freshly opened file that
-            // nothing has positioned: it behaves as `Get Lowest`.
-            //
-            // This used to refuse, which stopped the module. That is the
-            // most damaging shape a divergence can take here -- the other
-            // two in this function make the host more permissive than the
-            // original and merely lose a refusal, where this one invented a
-            // fatal error in a case the original answered normally.
-            None => (count > 0).then_some(0),
-        },
-        Op::Previous => match here.map_err(ShimError::Failed)? {
-            Some(at) => at.checked_sub(1),
-            // `S1c`: the mirror of `S1` is *not* symmetric. An unpositioned
-            // `Get Previous` measured status 9, "end of file" -- which this
-            // layer turns into a zero, an answer meaning "no such record",
-            // rather than into a refusal.
-            None => None,
-        },
-    };
+    // `Block::query` sets the cursor itself on a match (`Cursor::Ordered {
+    // key, at }`) and leaves it untouched on a miss -- the same "not found
+    // leaves the file where it was" contract this function's own callers
+    // depend on, so there is nothing left for this function to do with the
+    // position once `query` returns.
+    //
+    // **Not `Block::records()`.** The engine's own doc comment on
+    // `OpError::DifferentKey` names this exact function's *old* body as
+    // "the divergence [`here_for`] exists to avoid reproducing" -- this
+    // finishes that: reimplementing `Op`'s nine cases against the whole-file
+    // model here meant calling `Block::records()` regardless of
+    // `Block::v6_fast_reads`, on every `qrybtv`/`dfaQuery`/`obtbtvl`/
+    // `aabbtvl` call a module makes, which on a fixed-length v6 file with a
+    // page cache attached is exactly the whole-file read that fast path
+    // exists to avoid paying per operation.
+    let found = file
+        .query(key, op.as_engine(), &wanted)
+        .map_err(|e| ShimError::Failed(format!("{who} on {name}: {e}")))?;
 
     // Not found leaves the file where it was, which is what Btrieve does: a
     // failed Get Equal does not lose the position a successful one established.
-    let Some(at) = found else {
+    if !found {
         return Ok(false);
-    };
-    file.seek_to(Cursor::Ordered { key, at });
+    }
     take_lock(host, block, lock)?;
     answer_with_key(call, host, block, key)?;
 
@@ -1871,9 +1842,24 @@ pub(crate) fn key_length<A: Abi>(host: &Host<A>, block: A::Ptr, key: u16) -> Res
 /// against the file's own index pages -- see
 /// [`Records::ties`](crate::btrieve::Records::ties) -- so it is counted and
 /// reported rather than left silent.
+///
+/// **Skipped entirely on [`Block::fast_reads`].** This used to be
+/// unconditional but for `file.loaded().is_some()`, which answers "is
+/// `Block::records()` already cached" -- true only until the *next* write,
+/// because every insert/update/delete on a fast-path v6 block clears that
+/// cache deliberately (`Block::v6_invalidate_keys`), having never needed it
+/// in the first place. Every caller of this function (`stpbtvl`/`stpbtv`/
+/// `dfaStepLock`, `absolute`, `locate`) now positions through `Block::
+/// query`/`Block::step_position`/`Block::cursor_for` instead of `Block::
+/// records()`, so nothing downstream of this call needs the populate side
+/// effect any more either -- calling it here regardless of `fast_reads`
+/// would mean this diagnostic note alone reintroduces the whole-file read
+/// on every single write-then-position pair a mass update makes, which is
+/// exactly the defect this task found and every other function above this
+/// one was fixed to stop making.
 pub(crate) fn load<A: Abi>(host: &mut Host<A>, block: A::Ptr) -> Result<(), ShimError> {
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    if file.loaded().is_some() {
+    if file.loaded().is_some() || file.fast_reads() {
         return Ok(());
     }
     let name = file.name().to_owned();
@@ -2028,12 +2014,17 @@ pub(crate) fn insert_record<A: Abi>(
 
     // Currency on the record just inserted, key 0's order -- see
     // [`dinsbtv`]'s own doc comment for why key 0 specifically.
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-    let physical = records.find_physical(position).expect("insert just wrote this position");
-    let cursor = match records.place_in(0, physical) {
-        Some(at) => Cursor::Ordered { key: 0, at },
-        None => Cursor::Physical { at: physical },
-    };
+    //
+    // `Block::cursor_for` rather than `Block::records()`: the latter
+    // materialises this file's *entire* record model regardless of whether
+    // `Block::v6_fast_reads` applies, which turned every insert into a
+    // whole-file read -- exactly the per-operation cost the page cache
+    // exists to avoid paying more than once per open. `cursor_for` rides
+    // the same fast path `Block::query`/`Block::step` already do.
+    let cursor = file
+        .cursor_for(0, position)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .expect("insert just wrote this position");
     file.seek_to(cursor);
     Ok(true)
 }
@@ -2573,45 +2564,14 @@ pub fn stpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         true => data_buffer(host, block)?,
         false => into,
     };
-    load(host, block)?;
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    let count = file.records().map_err(|e| ShimError::Failed(e.to_string()))?.len();
 
-    // Verbatim from `stpbtvl` -- see that routine's own doc comment for why
-    // each arm answers the way it does, including the Task 12 correction on
-    // stepping off a keyed cursor.
-    let at = match (opt, file.cursor()) {
-        (33, _) => 0,
-        (34, _) if count > 0 => count - 1,
-        (34, _) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
-        (24, Cursor::Physical { at }) => at + 1,
-        (35, Cursor::Physical { at }) if at > 0 => at - 1,
-        (35, Cursor::Physical { .. }) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
-        (24 | 35, Cursor::Ordered { key, at }) => {
-            let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-            let physical = records
-                .ordered(key, at)
-                .and_then(|record| records.find_physical(record.position))
-                .ok_or_else(|| {
-                    ShimError::Failed(format!(
-                        "stpbtv({opt}) on {}: the ordered cursor (key {key}, {at}) does \
-                         not resolve to a physical record -- the file changed under it",
-                        file.name()
-                    ))
-                })?;
-            match opt {
-                24 => physical + 1,
-                _ if physical > 0 => physical - 1,
-                _ => return Ok(abi::Ret::Int(A::Int::from(0u16))),
-            }
-        }
-        (24 | 35, Cursor::Nowhere) => {
-            return Err(ShimError::Failed(format!(
-                "stpbtv({opt}) on {}, which is positioned Nowhere -- nothing has \
-                 positioned it yet, by a key or by a step",
-                file.name()
-            )));
-        }
+    // Same four codes `stpbtvl` parses -- see that routine's own doc
+    // comment.
+    let step = match opt {
+        33 => Step::First,
+        34 => Step::Last,
+        24 => Step::Next,
+        35 => Step::Previous,
         _ => {
             return Err(ShimError::Failed(format!(
                 "stpbtv with option {opt}, which is none of 24, 33, 34 and 35"
@@ -2619,10 +2579,22 @@ pub fn stpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         }
     };
 
-    if at >= count {
+    load(host, block)?;
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    let name = file.name().to_owned();
+
+    // `Block::step_position` -- see `stpbtvl`'s own doc comment for why,
+    // not `Block::records()`. `stpbtv` is unreachable for MajorMUD
+    // (`WCCMMUD.DLL` imports none of the eight plain routines this one
+    // belongs to), but it is the identical bug either way, and it is no
+    // longer a hand-duplicated body once both routines share the engine's
+    // own positioning.
+    let at = file
+        .step_position(step)
+        .map_err(|e| ShimError::Failed(format!("stpbtv({opt}) on {name}: {e}")))?;
+    if at.is_none() {
         return Ok(abi::Ret::Int(A::Int::from(0u16)));
     }
-    file.seek_to(Cursor::Physical { at });
     take_lock(host, block, 0)?;
     deliver(call, host, block, into)?;
     Ok(abi::Ret::Int(A::Int::from(1u16)))
@@ -2812,15 +2784,16 @@ pub(crate) fn update_variable<A: Abi>(
     // Currency maintenance, identical to `dupdbtv`'s own tail -- see that
     // routine's doc comment for why an `Ordered` cursor is re-derived rather
     // than carried forward, and why `Physical` needs no correction.
+    //
+    // `Block::cursor_for` rather than `Block::records()`: see
+    // `insert_record`'s identical tail for why -- the same whole-file read
+    // this update's own `duplicate_key` call above no longer pays for
+    // either.
     if let Cursor::Ordered { key, .. } = file.cursor() {
-        let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-        let physical = records
-            .find_physical(position)
+        let cursor = file
+            .cursor_for(key, position)
+            .map_err(|e| ShimError::Failed(e.to_string()))?
             .expect("update just wrote this position");
-        let cursor = match records.place_in(key, physical) {
-            Some(at) => Cursor::Ordered { key, at },
-            None => Cursor::Physical { at: physical },
-        };
         file.seek_to(cursor);
     }
     Ok(true)

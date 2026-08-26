@@ -152,6 +152,7 @@ impl Records {
         geometry: &Geometry,
         keys: &[Key],
     ) -> Result<Self, BtvError> {
+        crate::RECORD_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let fail = |why: String| BtvError {
             file: name.to_owned(),
             why,

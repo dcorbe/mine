@@ -592,6 +592,24 @@ pub(crate) static PAGE_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// "rebuilt" from "reused".
 pub(crate) static ORDER_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How many times this process has run [`records::Records::read`] (a full
+/// walk of *every* record in a file, rebuilding every key's order from
+/// scratch) since the last [`testing::reset_record_walks`].
+///
+/// This is the whole-file cost every fast-path v6 write ([`Block::
+/// v6_fast_reads`]) exists to make unnecessary -- a fixed-length v6 write
+/// with a page cache attached never needs `Records` at all, and the ordinary
+/// case is this counter staying at zero for the whole life of an insert- or
+/// update-heavy session. Neither [`FILE_OPENS`] nor [`PAGE_FETCHES`] can see
+/// a caller that reaches this walk anyway: `Records::read` opens through
+/// [`read_whole`], one `open` and a handful of `read`s regardless of file
+/// size, so a caller a layer above this crate that still asks
+/// [`Block::records`] for currency or a duplicate-key check on every write
+/// looks identical to a single, ordinary open on those two counters alone.
+/// This counts the walk itself, at its one call site, so a test can assert
+/// "never" rather than infer it from bytes.
+pub(crate) static RECORD_WALKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Open `path` for reading, counting the open in [`FILE_OPENS`].
 ///
 /// The only place in this crate's non-test code allowed to call
@@ -2941,6 +2959,19 @@ impl<M: Mem> Block<M> {
     /// explicit exception, the same shape as this method's own v5 exclusion.
     fn v6_fast_reads(&self) -> bool {
         self.geometry.version == Version::V6 && !self.geometry.variable && self.cache.is_some()
+    }
+
+    /// Whether this block's reads can be served without ever materialising
+    /// [`Self::records`] -- [`Self::v6_fast_reads`], public: a caller
+    /// outside this crate has no way to ask a `&mut Block` for anything
+    /// costed against this without first deciding whether asking is worth
+    /// it at all. `crates/mbbs`'s `shims::btrieve::load` is the one caller:
+    /// its own job (a one-time duplicate-key-neighbour note) is diagnostic,
+    /// not load-bearing, and calling [`Self::records`] to make it access the
+    /// whole-file model this predicate exists to let a write skip.
+    #[must_use]
+    pub fn fast_reads(&self) -> bool {
+        self.v6_fast_reads()
     }
 
     /// This key's [`order::OrderIndex`], built if it is not already cached.

@@ -1132,11 +1132,49 @@ impl<M: Mem> Block<M> {
         locks: &mut LockTable,
         offered: u16,
     ) -> Result<Option<Delivery>, OpError> {
+        let Some(cursor) = self.resolve_cursor(key, position)? else {
+            return Ok(None);
+        };
+        self.seek_to(cursor);
+        self.take_lock(lock, locks)?;
+        Ok(Some(self.deliver_current(Some(key), offered)?))
+    }
+
+    /// The [`Cursor`] `position` occupies in `key`'s order, or `None` if
+    /// `position` names no live record -- [`Self::acquire_absolute`]'s own
+    /// fast-path-first resolution, exposed standalone for a caller that only
+    /// wants the cursor computed, with no lock taken and no record
+    /// delivered alongside it.
+    ///
+    /// **Why this exists**: an insert or update already knows the position
+    /// it just wrote (`Block::insert`/`Block::update`'s own return value/
+    /// argument) and only needs currency on it -- `crates/mbbs`'s
+    /// `insert_record`/`update_variable` used to answer this by calling
+    /// `Block::records()` outright, which materialises this file's *entire*
+    /// record model regardless of `Block::v6_fast_reads`. That is the exact
+    /// per-operation whole-file read the page cache exists to avoid: this
+    /// method rides it (or the bounded v6 lookups it backs) the same way
+    /// `Block::query`/`Block::step` already do, instead of a second,
+    /// crate-external implementation reaching around them.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::NoSuchKey`] if `key` names no key this block has. If the
+    /// records cannot be read (non-fast-path files only).
+    pub fn cursor_for(&mut self, key: u16, position: u32) -> Result<Option<Cursor>, OpError> {
         if usize::from(key) >= self.keys().len() {
             return Err(OpError::NoSuchKey(key));
         }
+        self.resolve_cursor(key, position)
+    }
 
-        let cursor = if self.v6_fast_reads() {
+    /// Shared body of [`Self::acquire_absolute`] and [`Self::cursor_for`]:
+    /// the fast-path-first cursor resolution neither caller may skip the
+    /// `key` bounds check ahead of. `key` is trusted here -- both callers
+    /// check it first, and duplicating the check a second time here would
+    /// just be a second place for it to drift.
+    fn resolve_cursor(&mut self, key: u16, position: u32) -> Result<Option<Cursor>, OpError> {
+        if self.v6_fast_reads() {
             let found = self.v6_record_bytes_at(position).map_err(|why| {
                 OpError::Records(BtvError {
                     file: self.name().to_owned(),
@@ -1153,7 +1191,7 @@ impl<M: Mem> Block<M> {
             // eighteen files (every key indexes every record), kept
             // because a partial or freshly-narrowed key set is not
             // something this type refuses to represent elsewhere either.
-            match self.v6_rank_of(key, position)? {
+            Ok(Some(match self.v6_rank_of(key, position)? {
                 Some(at) => Cursor::Ordered { key, at },
                 None => {
                     let Some(physical) = self.v6_physical_rank_of(position)? else {
@@ -1161,7 +1199,7 @@ impl<M: Mem> Block<M> {
                     };
                     Cursor::Physical { at: physical }
                 }
-            }
+            }))
         } else {
             let Some(physical) = self.records()?.find_physical(position) else {
                 return Ok(None);
@@ -1174,14 +1212,11 @@ impl<M: Mem> Block<M> {
             // key indexes every record), kept because a partial or
             // freshly-narrowed key set is not something this type refuses to
             // represent elsewhere either.
-            match self.records()?.place_in(key, physical) {
+            Ok(Some(match self.records()?.place_in(key, physical) {
                 Some(at) => Cursor::Ordered { key, at },
                 None => Cursor::Physical { at: physical },
-            }
-        };
-        self.seek_to(cursor);
-        self.take_lock(lock, locks)?;
-        Ok(Some(self.deliver_current(Some(key), offered)?))
+            }))
+        }
     }
 
     /// Btrieve ops 24 and 33-35, `dfaStepLock` -- physical order, no key at
@@ -1220,6 +1255,37 @@ impl<M: Mem> Block<M> {
         locks: &mut LockTable,
         offered: u16,
     ) -> Result<Option<Delivery>, OpError> {
+        if self.step_position(step)?.is_none() {
+            return Ok(None);
+        }
+        self.take_lock(lock, locks)?;
+        Ok(Some(self.deliver_current(None, offered)?))
+    }
+
+    /// [`Self::step`]'s own positioning, on its own -- for a caller with no
+    /// [`LockTable`] of this `Block`'s to hand in (`crates/mbbs`'s
+    /// `Btrieve` session keeps its one [`LockTable`] to itself; only
+    /// [`crate::Btrieve::take_lock`] reaches it, not a `&mut` a caller could
+    /// pass here) and no record delivery to make either -- `stpbtvl`
+    /// (`shims/btrieve.rs`) positions with this, then takes its lock and
+    /// delivers through its own existing calls, exactly the split
+    /// [`Self::cursor_for`] already makes for [`Self::acquire_absolute`].
+    ///
+    /// Returns the physical position landed on, or `None` for the same two
+    /// reasons [`Self::step`] returns `Ok(None)`: a [`Step::Last`]/
+    /// [`Step::Previous`] on an empty range, or a landed position at or past
+    /// [`Self::v6_fast_reads`]'s (or [`Self::records`]'s) own count. Sets
+    /// [`Self::cursor`] to it on success; leaves the cursor untouched on
+    /// `None`, matching every other positioning method here.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::NotPositioned`] for [`Step::Next`]/[`Step::Previous`] with
+    /// nothing having positioned the file -- see [`Self::step`]'s own doc
+    /// comment for why this is kept as a refusal. [`OpError::CursorStale`]
+    /// if an ordered cursor's record no longer resolves to a physical one.
+    /// If the records cannot be read.
+    pub fn step_position(&mut self, step: Step) -> Result<Option<usize>, OpError> {
         let cursor = self.cursor();
         let count = if self.v6_fast_reads() {
             self.v6_physical_len()?
@@ -1254,8 +1320,7 @@ impl<M: Mem> Block<M> {
             return Ok(None);
         }
         self.seek_to(Cursor::Physical { at });
-        self.take_lock(lock, locks)?;
-        Ok(Some(self.deliver_current(None, offered)?))
+        Ok(Some(at))
     }
 
     /// This block's identity, for [`LockTable`] -- see [`BlockId`]'s own
