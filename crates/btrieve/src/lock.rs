@@ -117,7 +117,12 @@ impl Locks {
     /// `docs/lock-oracle-answer.md` measurement:
     ///
     /// 1. **Already held by `owner` itself is a no-op** (harmless
-    ///    re-lock, status 0).
+    ///    re-lock, status 0) -- **including when `raw` names a different
+    ///    mode than the one already stored.** The stored `raw`/mode is not
+    ///    updated in that case (mirrors [`crate::ops::LockTable::acquire`]'s
+    ///    identical rule 1, which the same way returns before ever looking
+    ///    at the new `raw`'s mode); see
+    ///    `a_same_owner_re_lock_does_not_change_the_stored_mode` below.
     /// 2. **Already held by a *different* owner refuses** -- status 84,
     ///    see [`LOCK_CONFLICT_STATUS`].
     /// 3. **A single lock (`raw < 300`) replaces whatever single lock this
@@ -191,6 +196,19 @@ impl Locks {
             .find(|h| h.block == block && h.position == position)
             .map(|h| h.owner)
     }
+
+    /// The raw `loktyp` stored for whoever holds `block` at `position`, if
+    /// anyone. Test/inspection surface, the same as [`Self::holder`] --
+    /// exists specifically to observe that a same-owner re-lock
+    /// ([`Self::acquire`]'s rule 1) does not update this even when the new
+    /// `raw` names a different mode.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn raw_at(&self, block: BlockId, position: u32) -> Option<i16> {
+        self.held
+            .iter()
+            .find(|h| h.block == block && h.position == position)
+            .map(|h| h.raw)
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +246,29 @@ mod tests {
         assert!(locks.acquire(b, 10, 100, 1));
         assert!(locks.acquire(b, 10, 100, 1), "re-locking your own record: status 0");
         assert_eq!(locks.holder(b, 10), Some(1));
+    }
+
+    /// Acquire's rule 1 (already held by `owner` itself) returns before
+    /// ever comparing modes -- so a same-owner re-lock that asks for a
+    /// *different* mode than the one already stored is still granted
+    /// (matching `ops::LockTable::acquire`'s identical rule 1), and the
+    /// stored `raw` is left exactly as it was, not updated to the new
+    /// mode. Checked the hard way: if `acquire` updated `raw` on this
+    /// path, `raw_at` would answer 300 here, not 100.
+    #[test]
+    fn a_same_owner_re_lock_does_not_change_the_stored_mode() {
+        let mut locks = Locks::default();
+        let b = block();
+        assert!(locks.acquire(b, 10, 100, 1), "single lock first");
+        assert!(
+            locks.acquire(b, 10, 300, 1),
+            "same owner, same record, now asking for multiple -- still a no-op grant"
+        );
+        assert_eq!(
+            locks.raw_at(b, 10),
+            Some(100),
+            "the stored mode is still the original single lock, not updated to 300"
+        );
     }
 
     #[test]

@@ -193,6 +193,30 @@
 //! conflict against -- untestable by construction, which is exactly what
 //! this task was told not to write.
 //!
+//! ### Reconciling this with `lock::Locks` (Task 9)
+//!
+//! **Two different senses of "owner" now exist in this crate, at two
+//! different granularities, and this section's reasoning above still holds
+//! for the one it is about.** The "second client" this section discusses is
+//! a second *Host*/process -- a second Btrieve connection entirely, the
+//! axis this table (`LockTable`) is shaped to extend along if that day
+//! comes. That question is still open exactly as written above: one `Host`
+//! still means one `LockTable`, still with no owner field, still
+//! session-wide, still answering nothing for a second *client* -- nothing
+//! below changes any of that.
+//!
+//! What Task 9 added (`crates/btrieve/src/lock.rs`) is a second, narrower
+//! axis this section never considered: *channels* -- players -- multiplexed
+//! onto the single `dfa*`-importing `Host` this project already runs, none
+//! of them a second Btrieve client by this section's own definition (one
+//! process, one connection, one `LockTable`). `lock::Locks` is a second,
+//! independent table, not an edit to this one -- see its own top-of-file
+//! doc comment for the two reasons it is not a field added here -- and it
+//! answers status 84 at *that* granularity, for the four `dfa*` calls only.
+//! A reader of this file alone should still conclude cross-*client* conflict
+//! is deferred, exactly as above; cross-*channel* conflict within one
+//! client is the separate thing `lock.rs` now implements.
+//!
 //! ## The oracle's transaction/wait-lock deadlock is not reproduced, and cannot be
 //!
 //! `docs/lock-oracle-answer.md` records that genuine Btrieve 6.15 hangs
