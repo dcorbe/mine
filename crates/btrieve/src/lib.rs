@@ -63,6 +63,7 @@ pub mod keys;
 pub mod mem;
 pub mod model;
 mod nav;
+mod order;
 mod ops;
 pub mod pages;
 pub mod read;
@@ -1022,6 +1023,15 @@ pub struct Block<M: Mem> {
     /// independent, reference-counted handle instead, with no lifetime tied
     /// to `self` at all.
     cache: Option<std::rc::Rc<std::cell::RefCell<cache::PageCache>>>,
+
+    /// Each key's [`order::OrderIndex`] this block has built since the last
+    /// write invalidated it wholesale (Task 7's ops cutover) -- `RefCell`
+    /// for the same reason [`Self::cache`] is one: [`Self::v6_ensure_
+    /// order`]/[`Self::current`] read (and lazily build) through this from
+    /// `&self`. Empty for a v5 block, a variable-length v6 one, or any
+    /// block that has not yet answered a keyed v6 read -- see
+    /// [`Self::v6_fast_reads`].
+    v6_order: std::cell::RefCell<std::collections::HashMap<u16, order::OrderIndex>>,
 }
 
 /// One block's state as it was the moment a transaction first wrote to it --
@@ -1572,12 +1582,33 @@ impl<M: Mem> Block<M> {
     }
 
     /// The record the cursor names, if it names one.
-    pub fn current(&self) -> Option<&Record> {
-        let records = self.records.as_ref()?;
+    ///
+    /// **Owned, not borrowed, since Task 7's ops cutover.** A v6 fixed-
+    /// length block's `Cursor::Ordered` case (`Self::v6_fast_reads`) fetches
+    /// bytes fresh through the page cache rather than indexing into a
+    /// resident [`Records`] -- there is no long-lived `&Record` for such a
+    /// fetch to hand back. Every existing caller only ever reads a returned
+    /// record's own fields (`.position`, `.bytes`), which compiles
+    /// identically whether the value is owned or borrowed, so this is not a
+    /// call-site-breaking change despite the signature moving.
+    ///
+    /// A genuine error partway through the v6 fast path (a resolve or page-
+    /// cache failure, not "this key does not index this record") answers
+    /// `None` here, the same as every other reason this method has always
+    /// been able to silently answer "nothing" for -- this method carries no
+    /// error channel of its own, and by the time a real caller reaches it
+    /// the position/key it names has normally already been validated by
+    /// whatever positioned the cursor in the first place.
+    pub fn current(&self) -> Option<Record> {
         match self.cursor {
             Cursor::Nowhere => None,
-            Cursor::Ordered { key, at } => records.ordered(key, at),
-            Cursor::Physical { at } => records.physical(at),
+            Cursor::Ordered { key, at } if self.v6_fast_reads() => {
+                let position = self.v6_position_at(key, at).ok().flatten()?;
+                let bytes = self.v6_record_bytes_at(position).ok().flatten()?;
+                Some(Record { position, bytes })
+            }
+            Cursor::Ordered { key, at } => self.records.as_ref()?.ordered(key, at).cloned(),
+            Cursor::Physical { at } => self.records.as_ref()?.physical(at).cloned(),
         }
     }
 
@@ -2072,20 +2103,44 @@ impl<M: Mem> Block<M> {
             self.v6_pop_free(&mut store, layout, head, &slot).map_err(&fail)?
         };
 
-        // The model, updated on a copy first: every key's index below is
-        // built from this, and nothing commits to `self.records` until the
-        // whole operation -- every key's index, the file control record,
-        // the disk write -- has succeeded. A write that fails partway must
-        // leave the model exactly where a fresh read of the untouched file
-        // would put it.
-        let mut records_clone = self
-            .records
-            .as_ref()
-            .expect("Self::insert calls Self::records() before this")
-            .clone();
-        records_clone
-            .insert(&self.keys, new_position, bytes.clone())
-            .map_err(|why| fail(format!("adding the new record to the model: {why}")))?;
+        // The model, updated on a copy first -- **except for Task 7's own
+        // fast path** (`Self::v6_fast_reads`): a fixed-length v6 block with
+        // a page cache never builds `records_clone` at all, because
+        // nothing downstream of this point needs it any more. What used to
+        // come from it: `shift` is a pure function of the version (v6 is
+        // always 2, `Records::read`'s own rule); each key's post-write
+        // count is the *live FCR's own pre-write count* (already in `fcr`,
+        // read once above) plus one, unless this key excludes the new
+        // record (`Key::excluded`) from its index entirely; the total
+        // record count is `self.geometry.records` (still the pre-write
+        // count at this point) plus one. Every one of those is exactly
+        // what `records_clone` would have answered, computed without
+        // reading a single other record's bytes.
+        //
+        // A write that fails partway still leaves the model exactly where
+        // a fresh read of the untouched file would put it either way: the
+        // slow path never stores `records_clone` back until the whole
+        // operation succeeds (see the tail of this function), and the fast
+        // path never touches `self.records` at all -- there is nothing to
+        // roll back.
+        let fast = self.v6_fast_reads();
+        let mut records_clone = if fast {
+            None
+        } else {
+            let mut rc = self
+                .records
+                .as_ref()
+                .expect("Self::insert calls Self::records() before this")
+                .clone();
+            rc.insert(&self.keys, new_position, bytes.clone())
+                .map_err(|why| fail(format!("adding the new record to the model: {why}")))?;
+            Some(rc)
+        };
+        let shift = if fast {
+            2
+        } else {
+            records_clone.as_ref().expect("just built").key_shift()
+        };
 
         // Task 6: every key's own B-tree, edited incrementally -- locate,
         // insert (extending a duplicate group's tail, or splitting a full
@@ -2095,23 +2150,39 @@ impl<M: Mem> Block<M> {
         // a page one key's split reclaims is gone by the time the next
         // key's split looks for one.
         let cache_rc = self.v6_tree_cache().map_err(&fail)?;
-        let shift = records_clone.key_shift();
         let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
         let mut key_roots: Vec<(usize, u32)> = Vec::new();
         let mut index_free_head =
             pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
         for key in &self.keys {
-            let len = records_clone.ordered_len(key.number).ok_or_else(|| {
-                fail(format!(
-                    "key {}: not among the keys the loaded records were ordered by",
-                    key.number
-                ))
-            })?;
             let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
-            key_record_counts
-                .push((definition + pages::fcr::KEY_RECORDS, u32::try_from(len).expect("far fewer records than u32::MAX")));
+            let keyed_bytes = records::keyed(shift, &bytes);
+            let len = if fast {
+                let at = definition + pages::fcr::KEY_RECORDS;
+                let before = pages::long(&fcr[at..at + 4]);
+                if key.excluded(&keyed_bytes) {
+                    before
+                } else {
+                    before.saturating_add(1)
+                }
+            } else {
+                u32::try_from(
+                    records_clone
+                        .as_ref()
+                        .expect("just built")
+                        .ordered_len(key.number)
+                        .ok_or_else(|| {
+                            fail(format!(
+                                "key {}: not among the keys the loaded records were ordered by",
+                                key.number
+                            ))
+                        })?,
+                )
+                .expect("far fewer records than u32::MAX")
+            };
+            key_record_counts.push((definition + pages::fcr::KEY_RECORDS, len));
 
-            let value = key.extract(&records::keyed(shift, &bytes));
+            let value = key.extract(&keyed_bytes);
             let (new_root, next_free_head) = self.v6_tree_insert(
                 &mut store,
                 &cache_rc,
@@ -2128,8 +2199,12 @@ impl<M: Mem> Block<M> {
             }
         }
 
-        let total_records =
-            u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
+        let total_records = if fast {
+            self.geometry.records.saturating_add(1)
+        } else {
+            u32::try_from(records_clone.as_ref().expect("just built").len())
+                .expect("far fewer records than u32::MAX")
+        };
         v6::write_fcr(
             &mut store,
             page_size,
@@ -2153,7 +2228,11 @@ impl<M: Mem> Block<M> {
 
         self.write_changed_pages(&mut store)?;
 
-        self.records = Some(records_clone);
+        if fast {
+            self.v6_invalidate_order();
+        } else {
+            self.records = records_clone.take();
+        }
         self.geometry.records = total_records;
         self.geometry.pages =
             u32::try_from(store.total_pages()).expect("a Btrieve file under four gigabytes of pages");
@@ -2555,8 +2634,9 @@ impl<M: Mem> Block<M> {
     /// (per `format::fcr::key_descriptor`'s own doc) an `ANOSEG` continuation
     /// definition; both read a bare `0` at [`pages::fcr::KEY_ROOT`].
     ///
-    /// Not yet called from anywhere but this crate's own tests -- wiring a
-    /// real `Get`/`Query` through [`nav::TreeCursor`] is a later task.
+    /// Called from [`Self::v6_build_order`] (Task 7's own ops cutover) as
+    /// well as `nav.rs`'s differential test -- both need the same five
+    /// things to drive a [`nav::TreeCursor`] against this key's real tree.
     ///
     /// # Errors
     ///
@@ -2566,7 +2646,6 @@ impl<M: Mem> Block<M> {
     /// stored root does not carry the v6 marker bit
     /// ([`pages::fcr::ROOT_PAGE`]'s doc comment), or the key permits
     /// duplicates but names no chain offset.
-    #[allow(dead_code)] // exercised by nav.rs's own differential test only, for now
     fn nav_root(
         &self,
         key: u16,
@@ -2619,6 +2698,250 @@ impl<M: Mem> Block<M> {
         let resolve: Box<dyn FnMut(u32) -> Result<u32, String> + '_> =
             Box::new(move |logical: u32| self.v6_resolve_logical(logical));
         Ok(Some((root, shape, dup, &**cache, resolve)))
+    }
+
+    /// Whether this block's v6 read ops can serve a key's order from
+    /// [`Self::v6_order`] instead of a full [`Records`] walk.
+    ///
+    /// **Fixed-length v6 only.** A variable-length v6 file stays on the old
+    /// `Self::records()`-based path: [`Self::v6_record_bytes_at`] reads a
+    /// slot's fixed part straight off its data page, and a variable-length
+    /// record's own body lives on a *separate* fragment chain
+    /// (`variable::Chain`) this fast path does not follow -- reading one
+    /// would need the same chain-following `records::walk_v6` already does,
+    /// which is a materially different (and already-proven) mechanism this
+    /// task did not have budget to duplicate for a shape none of MajorMUD's
+    /// own eighteen files use for a *keyed* file (`WCCTEXT`, this crate's
+    /// one variable-length v6 fixture, has no key at all). A narrower,
+    /// explicit exception, the same shape as this method's own v5 exclusion.
+    fn v6_fast_reads(&self) -> bool {
+        self.geometry.version == Version::V6 && !self.geometry.variable && self.cache.is_some()
+    }
+
+    /// This key's [`order::OrderIndex`], built if it is not already cached.
+    ///
+    /// Built **lazily**, one [`nav::TreeCursor`] walk (`Self::v6_build_
+    /// order`) the first time a read asks for this key since the last
+    /// write invalidated [`Self::v6_order`] wholesale (`Self::
+    /// v6_invalidate_order`) -- so an ordinary session pays one walk of one
+    /// key's *positions*, never a walk of the whole file's records, and
+    /// never more than once between writes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::v6_build_order`] refuses.
+    fn v6_ensure_order(&self, key: u16) -> Result<(), String> {
+        if self.v6_order.borrow().contains_key(&key) {
+            return Ok(());
+        }
+        let index = self.v6_build_order(key)?;
+        self.v6_order.borrow_mut().insert(key, index);
+        Ok(())
+    }
+
+    /// Build `key`'s [`order::OrderIndex`] fresh -- see [`Self::v6_ensure_
+    /// order`] for the caching this feeds.
+    ///
+    /// # Errors
+    ///
+    /// If `key` names no key this block has, or whatever [`Self::nav_root`]/
+    /// [`order::OrderIndex::build`] refuse.
+    fn v6_build_order(&self, key: u16) -> Result<order::OrderIndex, String> {
+        let Some((root, shape, dup, cache, mut resolve)) = self.nav_root(key)? else {
+            return Ok(order::OrderIndex::empty());
+        };
+        let definition = self
+            .keys
+            .iter()
+            .find(|k| k.number == key)
+            .ok_or_else(|| format!("{}: no such key: {key}", self.name))?;
+        let cmp = |a: &[u8], b: &[u8]| definition.compare_extracted(a, b);
+        order::OrderIndex::build(cache, &mut resolve, root, shape, dup, &cmp)
+    }
+
+    /// How many records `key` currently indexes -- [`Self::v6_ensure_
+    /// order`], then its length.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::v6_ensure_order`] refuses.
+    fn v6_order_len(&self, key: u16) -> Result<usize, BtvError> {
+        self.v6_ensure_order(key).map_err(|why| BtvError {
+            file: self.name.clone(),
+            why,
+        })?;
+        Ok(self.v6_order.borrow().get(&key).expect("just ensured").len())
+    }
+
+    /// The rank a fresh [`nav::TreeCursor`] seek (`bias`, `target`) lands
+    /// on, translated through `key`'s cached [`order::OrderIndex`] --
+    /// [`ops::Op::Equal`]/`AtLeast`/`Greater`/`Less`/`AtMost`'s own v6 fast
+    /// path.
+    ///
+    /// The seek itself answers a *position*; `nav::TreeCursor` has no rank
+    /// concept of its own (this module's doc comment on why a fresh
+    /// `TreeCursor` per op, not a cached one, is the only shape that works
+    /// at all). The rank a caller needs to store back into `ops::Cursor::
+    /// Ordered` comes from the *cached* index instead -- built in the same
+    /// order this same seek's own walk would produce (both drive the
+    /// identical `nav::TreeCursor`), so the two never disagree.
+    ///
+    /// # Errors
+    ///
+    /// If `key` names no key this block has, or whatever [`Self::v6_ensure_
+    /// order`]/[`nav::TreeCursor::seek`] refuse.
+    fn v6_seek_rank(&self, key: u16, bias: nav::Bias, target: &[u8]) -> Result<Option<usize>, BtvError> {
+        let fail = |why: String| BtvError {
+            file: self.name.clone(),
+            why,
+        };
+        self.v6_ensure_order(key).map_err(&fail)?;
+        let Some((root, shape, dup, cache, mut resolve)) = self.nav_root(key).map_err(&fail)? else {
+            return Ok(None);
+        };
+        let definition = self
+            .keys
+            .iter()
+            .find(|k| k.number == key)
+            .ok_or_else(|| fail(format!("no such key: {key}")))?;
+        let cmp = |a: &[u8], b: &[u8]| definition.compare_extracted(a, b);
+        let (_, found) =
+            nav::TreeCursor::seek(cache, &mut resolve, root, shape, Some(target), bias, dup, &cmp)
+                .map_err(&fail)?;
+        let Some(position) = found else {
+            return Ok(None);
+        };
+        let order = self.v6_order.borrow();
+        Ok(order.get(&key).expect("just ensured").rank_of(position))
+    }
+
+    /// The position at rank `at` in `key`'s order -- [`ops::Block::
+    /// current`]'s own v6 fast path for a [`Cursor::Ordered`] position, and
+    /// [`ops::physical_of`]'s v6 equivalent.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::v6_ensure_order`] refuses.
+    fn v6_position_at(&self, key: u16, at: usize) -> Result<Option<u32>, BtvError> {
+        self.v6_ensure_order(key).map_err(|why| BtvError {
+            file: self.name.clone(),
+            why,
+        })?;
+        Ok(self.v6_order.borrow().get(&key).expect("just ensured").position_at(at))
+    }
+
+    /// `position`'s own rank in `key`'s order, if this key indexes it --
+    /// [`ops::Block::insert_extended`]'s own v6 currency-establishing tail,
+    /// and [`ops::Block::acquire_absolute`]'s v6 fast path.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::v6_ensure_order`] refuses.
+    fn v6_rank_of(&self, key: u16, position: u32) -> Result<Option<usize>, BtvError> {
+        self.v6_ensure_order(key).map_err(|why| BtvError {
+            file: self.name.clone(),
+            why,
+        })?;
+        Ok(self.v6_order.borrow().get(&key).expect("just ensured").rank_of(position))
+    }
+
+    /// Throw away every key's cached [`order::OrderIndex`], and drop
+    /// `self.records` too -- called after any successful v6 fixed-length
+    /// write.
+    ///
+    /// `self.records` normally just stays `None` forever on the fast path
+    /// (nothing on it ever populates it), but it is not guaranteed to
+    /// still be `None` by the time a write reaches this: a straggler
+    /// caller with no fast path of its own yet (`Block::update_chunks`
+    /// unconditionally primes `self.records()` before calling
+    /// `Self::current`) can leave it `Some` from *before* this write, and
+    /// leaving it there would answer a later `self.records()` call with a
+    /// pre-write snapshot -- exactly the staleness bug this task's own
+    /// report records finding (`insert_inner`/`update_inner`/
+    /// `delete_inner`'s own unconditional priming, fixed the same way).
+    /// Clearing it here, unconditionally, is what makes that impossible
+    /// regardless of which caller left it populated.
+    ///
+    /// [`Self::v6_order`] itself is whole-map, not per-key: simplicity
+    /// first, per this task's own ruling -- a splice-on-write (insert at
+    /// the rank the tree insert determined, remove on delete) would save
+    /// the next read a rebuild, but a wrong splice is a wrong *rank*
+    /// silently handed back to a module, where a stale-then-rebuilt index
+    /// is merely a cost the next read after a write pays once. See this
+    /// task's own report for the measured size of that cost.
+    fn v6_invalidate_order(&mut self) {
+        self.v6_order.borrow_mut().clear();
+        self.records = None;
+    }
+
+    /// A v6 fixed-length record's own bytes, fetched through the block-
+    /// lifetime page cache by its position -- the read counterpart to
+    /// [`Self::v6_slot`]'s write-side resolution, and to [`records::
+    /// walk_v6`]'s own per-slot extraction (the identical marker-check-
+    /// then-slice logic, for one slot instead of every slot on every
+    /// claimed page).
+    ///
+    /// `Ok(None)` if the slot's own two-byte marker reads zero -- free, not
+    /// a record -- the same "nothing here, not an error" every other v6
+    /// read in this crate answers a free slot with.
+    ///
+    /// **Fixed-length only** -- see [`Self::v6_fast_reads`]'s own doc
+    /// comment for why a variable-length record's body (a separate
+    /// fragment chain) is out of scope for this fast path.
+    ///
+    /// # Errors
+    ///
+    /// If `position` is not on a slot boundary, the allocation table cannot
+    /// resolve its logical page or the page it names lies past the end of
+    /// the file, this block has no v6 page cache attached, or the physical
+    /// page's own tag does not say "record data".
+    fn v6_record_bytes_at(&self, position: u32) -> Result<Option<Vec<u8>>, String> {
+        let layout = pages::Layout {
+            page: self.geometry.page,
+            physical: self.geometry.physical,
+            pages: self.geometry.pages,
+        };
+        let (logical, slot) = layout.slot_of(position).ok_or_else(|| {
+            format!("position {position} is not on a slot boundary of this file's layout")
+        })?;
+        let physical_page = self.v6_resolve_logical(logical)?;
+        let cache = self.cache.as_ref().ok_or_else(|| {
+            format!(
+                "{}: no v6 page cache attached -- not a v6 file, or a test build \
+                 that skipped Self::open",
+                self.name
+            )
+        })?;
+        let buffer = {
+            let mut guard = cache.borrow_mut();
+            guard.page(physical_page)?.to_vec()
+        };
+        if buffer.len() < 2 || buffer[1] != 0x44 || !pages::Header::decode(&buffer).data {
+            return Err(format!(
+                "physical page {physical_page} (logical {logical}) does not carry the \
+                 record-data tag this position's own slot expects"
+            ));
+        }
+        let marker_at = layout.position(0, slot) as usize;
+        if marker_at + records::V6_SLOT_MARKER > buffer.len() {
+            return Err(format!(
+                "slot {slot} at logical page {logical} runs past its own {}-byte page",
+                buffer.len()
+            ));
+        }
+        if u16::from_le_bytes([buffer[marker_at], buffer[marker_at + 1]]) == 0 {
+            return Ok(None);
+        }
+        let start = marker_at + records::V6_SLOT_MARKER;
+        let content_len = usize::from(self.geometry.physical) - records::V6_SLOT_MARKER;
+        let reclen = usize::from(self.geometry.reclen);
+        if start + content_len > buffer.len() {
+            return Err(format!(
+                "slot {slot} at logical page {logical} runs past its own {}-byte page",
+                buffer.len()
+            ));
+        }
+        Ok(Some(buffer[start..start + content_len][..reclen].to_vec()))
     }
 
     /// A v6 record's page, and where its slot starts inside that page.
@@ -2737,14 +3060,25 @@ impl<M: Mem> Block<M> {
             within,
         } = self.v6_slot(position, layout).map_err(&fail)?;
 
-        let mut records_clone = self
-            .records
-            .as_ref()
-            .expect("Self::update calls Self::records() before this")
-            .clone();
-        records_clone
-            .update(&self.keys, position, bytes.to_vec())
-            .map_err(|why| fail(format!("updating the record in the model: {why}")))?;
+        // Task 7's ops cutover: a fixed-length v6 block with a page cache
+        // never builds `records_clone` -- see `Self::insert_v6`'s own doc
+        // comment on the identical fast path there for the full reasoning.
+        // `old_record`, below, already comes from the page itself, not from
+        // any in-memory model, so the fast path costs nothing extra to
+        // reach it.
+        let fast = self.v6_fast_reads();
+        let mut records_clone = if fast {
+            None
+        } else {
+            let mut rc = self
+                .records
+                .as_ref()
+                .expect("Self::update calls Self::records() before this")
+                .clone();
+            rc.update(&self.keys, position, bytes.to_vec())
+                .map_err(|why| fail(format!("updating the record in the model: {why}")))?;
+            Some(rc)
+        };
 
         let mut content = store.page(physical as usize).map_err(&fail)?.to_vec();
         let body = within + V6_SLOT_MARKER;
@@ -2801,22 +3135,50 @@ impl<M: Mem> Block<M> {
         // even though no oracle recording exercises a key-changing update
         // specifically (the replay corpus's own `ReplayOp` has no `Update`
         // variant at all).
-        let shift = records_clone.key_shift();
+        let shift = if fast {
+            2
+        } else {
+            records_clone.as_ref().expect("just built").key_shift()
+        };
         let cache_rc = self.v6_tree_cache().map_err(&fail)?;
         let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
         let mut key_roots: Vec<(usize, u32)> = Vec::new();
         let mut index_free_head =
             pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
         for key in &self.keys {
-            let len = records_clone.ordered_len(key.number).ok_or_else(|| {
-                fail(format!(
-                    "key {}: not among the keys the loaded records were ordered by",
-                    key.number
-                ))
-            })?;
             let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
-            key_record_counts
-                .push((definition + pages::fcr::KEY_RECORDS, u32::try_from(len).expect("far fewer records than u32::MAX")));
+            let len = if fast {
+                // An update changes the *total* record count for a key
+                // only when the value's own excluded-ness flips (`Key::
+                // excluded`, the same predicate `records.rs` filters
+                // `order[key]` by) -- an ordinary value change, key or not,
+                // leaves the count exactly where the live FCR already has
+                // it.
+                let at = definition + pages::fcr::KEY_RECORDS;
+                let before_count = pages::long(&fcr[at..at + 4]);
+                let was_excluded = key.excluded(&records::keyed(shift, &old_record));
+                let now_excluded = key.excluded(&records::keyed(shift, bytes));
+                match (was_excluded, now_excluded) {
+                    (false, true) => before_count.saturating_sub(1),
+                    (true, false) => before_count.saturating_add(1),
+                    _ => before_count,
+                }
+            } else {
+                u32::try_from(
+                    records_clone
+                        .as_ref()
+                        .expect("just built")
+                        .ordered_len(key.number)
+                        .ok_or_else(|| {
+                            fail(format!(
+                                "key {}: not among the keys the loaded records were ordered by",
+                                key.number
+                            ))
+                        })?,
+                )
+                .expect("far fewer records than u32::MAX")
+            };
+            key_record_counts.push((definition + pages::fcr::KEY_RECORDS, len));
 
             let before = records::keyed(shift, &old_record);
             let after = records::keyed(shift, bytes);
@@ -2882,8 +3244,14 @@ impl<M: Mem> Block<M> {
             }
         }
 
-        let total_records =
-            u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
+        // An update never changes how many records the file holds, fast
+        // path or slow.
+        let total_records = if fast {
+            self.geometry.records
+        } else {
+            u32::try_from(records_clone.as_ref().expect("just built").len())
+                .expect("far fewer records than u32::MAX")
+        };
         v6::write_fcr(
             &mut store,
             page_size,
@@ -2899,7 +3267,11 @@ impl<M: Mem> Block<M> {
         self.capture_for_journal()?;
         self.write_changed_pages(&mut store)?;
 
-        self.records = Some(records_clone);
+        if fast {
+            self.v6_invalidate_order();
+        } else {
+            self.records = records_clone.take();
+        }
         self.geometry.pages =
             u32::try_from(store.total_pages()).expect("a Btrieve file under four gigabytes of pages");
         self.dirty = true;
@@ -3007,8 +3379,23 @@ impl<M: Mem> Block<M> {
             within,
         } = self.v6_slot(position, layout).map_err(&fail)?;
 
-        let shift = self.records.as_ref().map_or(0, Records::key_shift);
-        let old_record = {
+        // Task 7's ops cutover: a fixed-length v6 block with a page cache
+        // never builds `records_clone`, and fetches the about-to-be-
+        // deleted record's own bytes straight through the page cache by
+        // position rather than through an in-memory model -- see
+        // `Self::insert_v6`'s own doc comment on the identical fast path
+        // there.
+        let fast = self.v6_fast_reads();
+        let shift = if fast {
+            2
+        } else {
+            self.records.as_ref().map_or(0, Records::key_shift)
+        };
+        let old_record = if fast {
+            self.v6_record_bytes_at(position)
+                .map_err(&fail)?
+                .ok_or_else(|| fail(format!("position {position} does not name a live record")))?
+        } else {
             let records = self
                 .records
                 .as_ref()
@@ -3019,14 +3406,18 @@ impl<M: Mem> Block<M> {
             records.physical(at).expect("just found").bytes.clone()
         };
 
-        let mut records_clone = self
-            .records
-            .as_ref()
-            .expect("Self::delete calls Self::records() before this")
-            .clone();
-        records_clone
-            .delete(&self.keys, position)
-            .map_err(|why| fail(format!("removing the record from the model: {why}")))?;
+        let mut records_clone = if fast {
+            None
+        } else {
+            let mut rc = self
+                .records
+                .as_ref()
+                .expect("Self::delete calls Self::records() before this")
+                .clone();
+            rc.delete(&self.keys, position)
+                .map_err(|why| fail(format!("removing the record from the model: {why}")))?;
+            Some(rc)
+        };
 
         let fcr = self.v6_live_fcr(&mut store).map_err(&fail)?;
         let free_head = pages::long(&fcr[pages::fcr::FREE_V6..pages::fcr::FREE_V6 + 4]);
@@ -3101,15 +3492,35 @@ impl<M: Mem> Block<M> {
         let mut index_free_head =
             pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
         for (key_index, key) in self.keys.iter().enumerate() {
-            let len = records_clone.ordered_len(key.number).ok_or_else(|| {
-                fail(format!(
-                    "key {}: not among the keys the loaded records were ordered by",
-                    key.number
-                ))
-            })?;
             let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
-            key_record_counts
-                .push((definition + pages::fcr::KEY_RECORDS, u32::try_from(len).expect("far fewer records than u32::MAX")));
+            let len = if fast {
+                // The deleted record's own excluded-ness under this key
+                // says whether its removal drops this key's count at all
+                // (`Key::excluded`, the same predicate `records.rs` filters
+                // `order[key]` by).
+                let at = definition + pages::fcr::KEY_RECORDS;
+                let before_count = pages::long(&fcr[at..at + 4]);
+                if key.excluded(&records::keyed(shift, &old_record)) {
+                    before_count
+                } else {
+                    before_count.saturating_sub(1)
+                }
+            } else {
+                u32::try_from(
+                    records_clone
+                        .as_ref()
+                        .expect("just built")
+                        .ordered_len(key.number)
+                        .ok_or_else(|| {
+                            fail(format!(
+                                "key {}: not among the keys the loaded records were ordered by",
+                                key.number
+                            ))
+                        })?,
+                )
+                .expect("far fewer records than u32::MAX")
+            };
+            key_record_counts.push((definition + pages::fcr::KEY_RECORDS, len));
 
             let value = key.extract(&records::keyed(shift, &old_record));
             let (new_root, next_free_head) = self.v6_tree_delete(
@@ -3129,8 +3540,12 @@ impl<M: Mem> Block<M> {
             }
         }
 
-        let total_records =
-            u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
+        let total_records = if fast {
+            self.geometry.records.saturating_sub(1)
+        } else {
+            u32::try_from(records_clone.as_ref().expect("just built").len())
+                .expect("far fewer records than u32::MAX")
+        };
         v6::write_fcr(
             &mut store,
             page_size,
@@ -3146,7 +3561,11 @@ impl<M: Mem> Block<M> {
         self.capture_for_journal()?;
         self.write_changed_pages(&mut store)?;
 
-        self.records = Some(records_clone);
+        if fast {
+            self.v6_invalidate_order();
+        } else {
+            self.records = records_clone.take();
+        }
         self.geometry.records = total_records;
         self.geometry.pages =
             u32::try_from(store.total_pages()).expect("a Btrieve file under four gigabytes of pages");
@@ -4830,7 +5249,17 @@ impl<M: Mem> Block<M> {
     /// the file holds variable-length records and is version 5, or the file
     /// cannot be written.
     fn insert_inner(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
-        self.records()?;
+        // A fixed-length v6 block with a page cache diverges to
+        // `Self::insert_v6` below before anything past this point ever
+        // touches `self.records` -- and `insert_v6`'s own fast path
+        // (`Self::v6_fast_reads`) never populates it either, so priming it
+        // here would be pure waste: exactly the whole-file walk Task 7's
+        // ops cutover exists to stop paying on every write. Every other
+        // shape (v5, or a variable-length v6 file) still needs it, same as
+        // always.
+        if !self.v6_fast_reads() {
+            self.records()?;
+        }
         let name = self.name.clone();
 
         // A variable-length record is **not** normalised. `reclen` is the
@@ -5009,7 +5438,10 @@ impl<M: Mem> Block<M> {
     /// cannot be read, `position` holds no record, or the file cannot be
     /// written.
     fn update_inner(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
-        self.records()?;
+        let fast = self.v6_fast_reads();
+        if !fast {
+            self.records()?;
+        }
         let name = self.name.clone();
 
         if self.geometry.version != Version::V6 {
@@ -5086,18 +5518,37 @@ impl<M: Mem> Block<M> {
             });
         }
 
-        let records = self.records.as_ref().expect("just loaded");
-        let Some(at) = records.find_physical(position) else {
-            return Err(BtvError {
-                file: name,
-                why: format!("position {position} holds no record"),
-            });
+        // The existing record's own bytes, needed only for
+        // `Self::unmodifiable_key_changed`'s before/after comparison below.
+        // The fast path fetches them straight through the page cache by
+        // position (`Self::v6_record_bytes_at`, the same "does this
+        // position hold a live record" check `Records::find_physical`
+        // answers on the old path) rather than needing `self.records`
+        // populated at all.
+        let existing = if fast {
+            self.v6_record_bytes_at(position)
+                .map_err(|why| BtvError {
+                    file: name.clone(),
+                    why,
+                })?
+                .ok_or_else(|| BtvError {
+                    file: name.clone(),
+                    why: format!("position {position} holds no record"),
+                })?
+        } else {
+            let records = self.records.as_ref().expect("just loaded");
+            let Some(at) = records.find_physical(position) else {
+                return Err(BtvError {
+                    file: name,
+                    why: format!("position {position} holds no record"),
+                });
+            };
+            records.physical(at).expect("just found").bytes.clone()
         };
 
         // Genuine Btrieve refuses this write outright, and so does this. See
         // `Self::unmodifiable_key_changed` for the measurement and for why the
         // refusal lives here rather than in each of the four callers.
-        let existing = records.physical(at).expect("just found").bytes.clone();
         if let Some(key) = self.unmodifiable_key_changed(&existing, bytes) {
             return Err(BtvError {
                 file: name,
@@ -5108,9 +5559,6 @@ impl<M: Mem> Block<M> {
                 ),
             });
         }
-
-        let records = self.records.as_ref().expect("still loaded");
-        let count = records.len() as u32;
 
         let layout = pages::Layout {
             page: self.geometry.page,
@@ -5124,6 +5572,11 @@ impl<M: Mem> Block<M> {
         if self.geometry.version == Version::V6 {
             return self.update_v6(position, bytes, layout);
         }
+
+        // v5-only from here -- `fast` is always false (`Self::v6_fast_reads`
+        // implies `Version::V6`), so `self.records` is always populated.
+        let records = self.records.as_ref().expect("just loaded");
+        let count = records.len() as u32;
 
         self.capture_for_journal()?;
         pages::write_record(&self.path, layout, pages::Slot::Existing(position), bytes, count)
@@ -5293,7 +5746,10 @@ impl<M: Mem> Block<M> {
     /// records and is version 5, `position` holds no record, or the file
     /// cannot be written.
     fn delete_inner(&mut self, position: u32) -> Result<(), BtvError> {
-        self.records()?;
+        let fast = self.v6_fast_reads();
+        if !fast {
+            self.records()?;
+        }
         if self.geometry.version != Version::V6 {
             self.writable()?;
         }
@@ -5314,14 +5770,33 @@ impl<M: Mem> Block<M> {
             });
         }
 
-        let records = self.records.as_ref().expect("just loaded");
-        if records.find_physical(position).is_none() {
-            return Err(BtvError {
-                file: name,
-                why: format!("position {position} holds no record"),
-            });
+        // Existence check -- the fast path asks the page cache directly by
+        // position (`Self::v6_record_bytes_at`) rather than needing
+        // `self.records` populated at all; see `Self::update_inner`'s
+        // identical reasoning.
+        if fast {
+            if self
+                .v6_record_bytes_at(position)
+                .map_err(|why| BtvError {
+                    file: name.clone(),
+                    why,
+                })?
+                .is_none()
+            {
+                return Err(BtvError {
+                    file: name,
+                    why: format!("position {position} holds no record"),
+                });
+            }
+        } else {
+            let records = self.records.as_ref().expect("just loaded");
+            if records.find_physical(position).is_none() {
+                return Err(BtvError {
+                    file: name,
+                    why: format!("position {position} holds no record"),
+                });
+            }
         }
-        let count = records.len() as u32 - 1;
 
         let layout = pages::Layout {
             page: self.geometry.page,
@@ -5336,6 +5811,12 @@ impl<M: Mem> Block<M> {
         if self.geometry.version == Version::V6 {
             return self.delete_v6(position, layout);
         }
+
+        // v5-only from here -- `fast` is always false (`Self::
+        // v6_fast_reads` implies `Version::V6`), so `self.records` is
+        // always populated.
+        let records = self.records.as_ref().expect("just loaded");
+        let count = records.len() as u32 - 1;
 
         // The last point before this write actually changes anything -- see
         // `Self::capture_for_journal`'s doc comment for why it is taken here
@@ -6025,6 +6506,7 @@ impl<M: Mem> Btrieve<M> {
             // its cost, and only in a debug build; see `Self::verify_write`.
             verify_writes: cfg!(debug_assertions),
             cache,
+            v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
         });
         Ok(block)
     }
@@ -7387,6 +7869,7 @@ mod tests {
             // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
+            v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -8538,6 +9021,7 @@ mod tests {
             // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
+            v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -10598,6 +11082,7 @@ mod tests {
             // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
+            v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -10853,6 +11338,7 @@ mod tests {
             // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
+            v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -11357,6 +11843,7 @@ mod tests {
             // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
+            v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -12700,12 +13187,37 @@ mod tests {
         assert_eq!(WROTE.with(std::cell::Cell::get), 0, "a deferred update must not touch disk");
 
         // Visible in-session before `end`, the same contract
-        // `an_insert_made_after_begin_is_visible_before_end` pins for v5.
+        // `an_insert_made_after_begin_is_visible_before_end` pins for v5 --
+        // through `Block::acquire_absolute` (Task 7's own v6 fast path,
+        // `Block::v6_record_bytes_at`/`Block::v6_rank_of`), not
+        // `self.records()`: a fixed-length v6 block never populates that
+        // any more (`Block::v6_fast_reads`), and calling it here would do
+        // exactly what this test is about to prove does not have to happen
+        // -- a whole-file disk read that, mid-transaction, would only see
+        // the pre-transaction baseline (`records::walk_v6` reads straight
+        // off disk, bypassing the cache these deferred writes are staged
+        // in). Reading through the same cache the writes staged into is
+        // the point.
+        let mut locks = LockTable::default();
         {
             let block = btrieve.block_mut(at).expect("open");
-            let model = block.records().expect("in-memory model before end");
-            assert!(model.find_physical(first).is_some());
-            assert!(model.find_physical(second).is_some());
+            assert!(
+                block.acquire_absolute(first, 0, 0, &mut locks, maxlen).expect("resolves").is_some(),
+                "the first deferred insert is visible before end"
+            );
+            assert!(
+                block.acquire_absolute(second, 0, 0, &mut locks, maxlen).expect("resolves").is_some(),
+                "the second deferred insert is visible before end"
+            );
+            let delivered = block
+                .acquire_absolute(first, 0, 0, &mut locks, maxlen)
+                .expect("resolves")
+                .expect("still there");
+            assert_eq!(
+                &delivered.bytes[..4],
+                b"CCCC",
+                "the deferred update's own value is visible before end too"
+            );
         }
 
         btrieve.end().expect("end");
@@ -12726,6 +13238,104 @@ mod tests {
         assert!(reread.find_physical(second).is_some(), "the second deferred insert reached disk");
         let updated = at_position(&reread, first).expect("still there");
         assert_eq!(&updated.bytes[..4], b"CCCC", "the deferred update's own value reached disk");
+    }
+
+    /// Task 7's ops cutover, exercised through a *real* cache-backed v6
+    /// `Block` (`Btrieve::open`, not a hand-built fixture) rather than only
+    /// through the corpus differential (`order::tests::order_index_and_
+    /// byte_fetch_match_records_over_the_v6_corpus`, which proves the
+    /// position/rank/byte machinery agrees with `Records` but never calls
+    /// `Block::query`/`Block::get` at all): five records, five key values,
+    /// every keyed `Op` this crate's own ops test suite pins by literal
+    /// rank for v5 -- `Cursor::Ordered { key, at }`'s `at` staying a stable,
+    /// literal rank is the whole point of Task 7's controller ruling
+    /// ("keep the rank model, kill the bytes"), so this checks the exact
+    /// same literal values a v5 fixture of this shape would produce.
+    #[test]
+    fn v6_fast_path_query_and_get_match_the_v5_rank_contract() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+
+        let dir = crate::testing::scratch("v6-fast-path-query-and-get");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let path = dir.join("V6EMPTY1KEY.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        crate::testing::make_keys_modifiable(&path);
+
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let maxlen = geometry.reclen;
+        let at = btrieve
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, maxlen)
+            .expect("opens");
+        assert!(
+            btrieve.block(at).expect("open").cache.is_some(),
+            "a real v6 open attaches a cache -- this test is meaningless without one"
+        );
+
+        // Inserted out of key order on purpose -- `AAAA/BBBB/CCCC/DDDD/EEEE`
+        // sort ascending by value, not by insertion order, so a rank that
+        // happened to just track insertion order would not be caught.
+        for tag in [b"CCCC", b"AAAA", b"EEEE", b"BBBB", b"DDDD"] {
+            btrieve.block_mut(at).expect("open").insert(&v6_record(tag)).expect("insert");
+        }
+
+        let mut locks = LockTable::default();
+        let block = btrieve.block_mut(at).expect("open");
+
+        assert!(block.query(0, Op::Lowest, &[]).expect("query"));
+        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 0 });
+        assert_eq!(&block.current().expect("positioned").bytes[..4], b"AAAA");
+
+        assert!(block.query(0, Op::Highest, &[]).expect("query"));
+        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 4 });
+        assert_eq!(&block.current().expect("positioned").bytes[..4], b"EEEE");
+
+        assert!(block.query(0, Op::Equal, b"CCCC").expect("query"));
+        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 2 });
+
+        assert!(block.query(0, Op::Next, &[]).expect("query"));
+        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 3 });
+        assert_eq!(&block.current().expect("positioned").bytes[..4], b"DDDD");
+
+        assert!(block.query(0, Op::Previous, &[]).expect("query"));
+        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 2 });
+        assert_eq!(&block.current().expect("positioned").bytes[..4], b"CCCC");
+
+        assert!(block.query(0, Op::Greater, b"CCCC").expect("query"));
+        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 3 });
+
+        assert!(block.query(0, Op::AtLeast, b"CCCC").expect("query"));
+        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 2 });
+
+        assert!(block.query(0, Op::Less, b"CCCC").expect("query"));
+        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 1 });
+
+        assert!(block.query(0, Op::AtMost, b"CCCC").expect("query"));
+        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 2 });
+
+        let miss = block.query(0, Op::Equal, b"ZZZZ").expect("query, not found");
+        assert!(!miss, "a value nothing holds is not found, not an error");
+
+        let delivery = block
+            .get(0, Op::Equal, b"BBBB", 0, &mut locks, maxlen)
+            .expect("get")
+            .expect("found");
+        assert_eq!(&delivery.bytes[..4], b"BBBB");
+
+        assert_eq!(
+            block.get_by_percentage(ops::PercentageBasis::Key(0), 5_000, 0, &mut locks, maxlen).unwrap().bytes[..4],
+            *b"CCCC",
+            "50% of 5 records lands on the middle one"
+        );
+        assert_eq!(
+            block
+                .find_percentage(&ops::FindBasis::Key { key: 0, value: b"CCCC".to_vec() })
+                .expect("find percentage"),
+            4_000,
+            "CCCC sits at rank 2 of 5 -- 2/5 = 40.00%"
+        );
     }
 
     /// Reproduces `xactprobe`'s `fail_inside` scenario indirectly: `end`

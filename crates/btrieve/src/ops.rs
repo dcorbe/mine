@@ -215,7 +215,7 @@ use std::fmt;
 use crate::mem::Mem;
 
 use super::keys::Key;
-use super::{Block, BtvError, Cursor, Version};
+use super::{nav, Block, BtvError, Cursor, Version};
 
 /// The nine comparisons Btrieve's Query (55-63) and Get (5-13) families both
 /// make -- the same nine, fifty apart, per `BTVSTF.H`'s `q*btv` macros and
@@ -922,9 +922,11 @@ impl<M: Mem> Block<M> {
     /// [`here_for`]. If the records cannot be read.
     pub fn query(&mut self, key: u16, op: Op, value: &[u8]) -> Result<bool, OpError> {
         let cursor = self.cursor();
-        let definitions: Vec<Key> = self.keys().to_vec();
 
-        let found = {
+        let found = if self.v6_fast_reads() {
+            self.v6_query_rank(cursor, key, op, value)?
+        } else {
+            let definitions: Vec<Key> = self.keys().to_vec();
             let records = self.records()?;
             let count = records
                 .ordered_len(key)
@@ -980,6 +982,44 @@ impl<M: Mem> Block<M> {
         };
         self.seek_to(Cursor::Ordered { key, at });
         Ok(true)
+    }
+
+    /// [`Block::query`]'s v6 fast path (`Block::v6_fast_reads`): the
+    /// identical nine-way match, served from `Block::v6_order_len`/
+    /// `Block::v6_seek_rank` instead of a materialised [`Records`]. `Next`/
+    /// `Previous` stay pure rank arithmetic either way -- neither needs a
+    /// seek, only the count and (for `Next`, continuing) `here_for` -- so
+    /// they are not routed through `Block::v6_seek_rank` at all.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::NoSuchKey`] if `key` names no key this block has (checked
+    /// explicitly, first, so this answers the identical error the
+    /// `Records`-based path's `ordered_len(key).ok_or(...)` gives -- nothing
+    /// downstream of this point ever sees an unknown key). Whatever
+    /// [`here_for`] or the v6 lookups themselves refuse otherwise.
+    fn v6_query_rank(&mut self, cursor: Cursor, key: u16, op: Op, value: &[u8]) -> Result<Option<usize>, OpError> {
+        if !self.keys().iter().any(|k| k.number == key) {
+            return Err(OpError::NoSuchKey(key));
+        }
+        let count = self.v6_order_len(key)?;
+        Ok(match op {
+            Op::Lowest => (count > 0).then_some(0),
+            Op::Highest => count.checked_sub(1),
+            Op::Equal => self.v6_seek_rank(key, nav::Bias::Equal, value)?,
+            Op::AtLeast => self.v6_seek_rank(key, nav::Bias::AtLeast, value)?,
+            Op::Greater => self.v6_seek_rank(key, nav::Bias::Greater, value)?,
+            Op::AtMost => self.v6_seek_rank(key, nav::Bias::AtMost, value)?,
+            Op::Less => self.v6_seek_rank(key, nav::Bias::Less, value)?,
+            Op::Next => match here_for(cursor, key)? {
+                Some(at) => Some(at + 1).filter(|at| *at < count),
+                None => (count > 0).then_some(0),
+            },
+            Op::Previous => match here_for(cursor, key)? {
+                Some(at) => at.checked_sub(1),
+                None => None,
+            },
+        })
     }
 
     /// Btrieve ops 5-13, `dfaGetLock`/`dfaAcqLock` -- the same nine
@@ -1068,20 +1108,51 @@ impl<M: Mem> Block<M> {
             return Err(OpError::NoSuchKey(key));
         }
 
-        let Some(physical) = self.records()?.find_physical(position) else {
-            return Ok(None);
-        };
+        let cursor = if self.v6_fast_reads() {
+            let found = self.v6_record_bytes_at(position).map_err(|why| {
+                OpError::Records(BtvError {
+                    file: self.name().to_owned(),
+                    why,
+                })
+            })?;
+            if found.is_none() {
+                return Ok(None);
+            }
+            // The position names a record; the key says which order a
+            // later Get Next should continue in. A physical cursor is the
+            // fallback for a key `Block::v6_rank_of` cannot resolve the
+            // position through -- not reachable for MajorMUD's own
+            // eighteen files (every key indexes every record), kept
+            // because a partial or freshly-narrowed key set is not
+            // something this type refuses to represent elsewhere either
+            // (the same rare fallback `Block::insert_extended`'s own v6
+            // path takes, straight to a fresh `Records` read since the v6
+            // fast path keeps no physical order of its own).
+            match self.v6_rank_of(key, position)? {
+                Some(at) => Cursor::Ordered { key, at },
+                None => {
+                    let Some(physical) = self.records()?.find_physical(position) else {
+                        return Ok(None);
+                    };
+                    Cursor::Physical { at: physical }
+                }
+            }
+        } else {
+            let Some(physical) = self.records()?.find_physical(position) else {
+                return Ok(None);
+            };
 
-        // The position names a record; the key says which order a later
-        // Get Next should continue in. A physical cursor is the fallback
-        // for a key `Records::place_in` cannot resolve the position
-        // through -- not reachable for MajorMUD's own eighteen files (every
-        // key indexes every record), kept because a partial or
-        // freshly-narrowed key set is not something this type refuses to
-        // represent elsewhere either.
-        let cursor = match self.records()?.place_in(key, physical) {
-            Some(at) => Cursor::Ordered { key, at },
-            None => Cursor::Physical { at: physical },
+            // The position names a record; the key says which order a later
+            // Get Next should continue in. A physical cursor is the fallback
+            // for a key `Records::place_in` cannot resolve the position
+            // through -- not reachable for MajorMUD's own eighteen files (every
+            // key indexes every record), kept because a partial or
+            // freshly-narrowed key set is not something this type refuses to
+            // represent elsewhere either.
+            match self.records()?.place_in(key, physical) {
+                Some(at) => Cursor::Ordered { key, at },
+                None => Cursor::Physical { at: physical },
+            }
         };
         self.seek_to(cursor);
         self.take_lock(lock, locks)?;
@@ -1804,7 +1875,15 @@ impl<M: Mem> Block<M> {
         if self.geometry().version != Version::V6 {
             return Err(OpError::PreV6Chunk);
         }
-        self.records()?;
+        // `Block::current`'s own v6 fast path (`Block::v6_fast_reads`)
+        // fetches through the page cache directly and needs nothing primed
+        // here; priming it anyway would be exactly the whole-file walk
+        // Task 7's ops cutover exists to stop paying. A variable-length v6
+        // file (excluded from the fast path) still needs it, same as
+        // always.
+        if !self.v6_fast_reads() {
+            self.records()?;
+        }
         let record = self.current().ok_or(OpError::NotPositioned)?;
         let position = record.position;
         let mut bytes = record.bytes.clone();
@@ -1994,6 +2073,9 @@ impl<M: Mem> Block<M> {
     /// that side effect: refusing to insert a record must not move the
     /// cursor toward the record it collided with.
     fn key_exists(&mut self, key: u16, value: &[u8]) -> Result<bool, OpError> {
+        if self.v6_fast_reads() {
+            return Ok(self.v6_seek_rank(key, nav::Bias::Equal, value)?.is_some());
+        }
         let definitions: Vec<Key> = self.keys().to_vec();
         let records = self.records()?;
         let at = records.seek(&definitions, key, value);
@@ -2093,16 +2175,58 @@ impl<M: Mem> Block<M> {
         }
 
         if let Some(&last) = inserted.last() {
-            let physical = match self.records() {
-                Ok(r) => r.find_physical(last).expect("just inserted"),
-                Err(error) => return Err(InsertExtendedError { inserted, error: OpError::from(error) }),
-            };
-            let cursor = match self.records() {
-                Ok(r) => match r.place_in(key, physical) {
-                    Some(at) => Cursor::Ordered { key, at },
-                    None => Cursor::Physical { at: physical },
-                },
-                Err(error) => return Err(InsertExtendedError { inserted, error: OpError::from(error) }),
+            let cursor = if self.v6_fast_reads() {
+                match self.v6_rank_of(key, last) {
+                    Ok(Some(at)) => Cursor::Ordered { key, at },
+                    // This key excludes the just-inserted record from its
+                    // index (`Key::excluded`) -- not reachable for any of
+                    // MajorMUD's own eighteen files (every key indexes
+                    // every record, see `Block::acquire_absolute`'s own
+                    // doc comment for the same fact), and the v6 fast path
+                    // keeps no "physical order" of its own to answer
+                    // `Cursor::Physical` from. Falling back to a fresh
+                    // `Records` read for this one rare case, rather than
+                    // building a second index nothing exercises.
+                    Ok(None) => match self.records() {
+                        Ok(r) => match r.find_physical(last) {
+                            Some(physical) => Cursor::Physical { at: physical },
+                            None => {
+                                return Err(InsertExtendedError {
+                                    inserted,
+                                    error: OpError::Records(BtvError {
+                                        file: self.name().to_owned(),
+                                        why: format!(
+                                            "position {last} was just inserted but a fresh read \
+                                             does not find it"
+                                        ),
+                                    }),
+                                })
+                            }
+                        },
+                        Err(error) => {
+                            return Err(InsertExtendedError { inserted, error: OpError::from(error) })
+                        }
+                    },
+                    Err(error) => {
+                        return Err(InsertExtendedError { inserted, error: OpError::from(error) })
+                    }
+                }
+            } else {
+                let physical = match self.records() {
+                    Ok(r) => r.find_physical(last).expect("just inserted"),
+                    Err(error) => {
+                        return Err(InsertExtendedError { inserted, error: OpError::from(error) })
+                    }
+                };
+                match self.records() {
+                    Ok(r) => match r.place_in(key, physical) {
+                        Some(at) => Cursor::Ordered { key, at },
+                        None => Cursor::Physical { at: physical },
+                    },
+                    Err(error) => {
+                        return Err(InsertExtendedError { inserted, error: OpError::from(error) })
+                    }
+                }
             };
             self.seek_to(cursor);
         }
@@ -2224,7 +2348,14 @@ impl<M: Mem> Block<M> {
         let percentage = usize::from(percentage.min(10_000));
         match basis {
             PercentageBasis::Key(key) => {
-                let count = self.records()?.ordered_len(key).ok_or(OpError::NoSuchKey(key))?;
+                let count = if self.v6_fast_reads() {
+                    if !self.keys().iter().any(|k| k.number == key) {
+                        return Err(OpError::NoSuchKey(key));
+                    }
+                    self.v6_order_len(key)?
+                } else {
+                    self.records()?.ordered_len(key).ok_or(OpError::NoSuchKey(key))?
+                };
                 if count == 0 {
                     return Err(OpError::EndOfFile);
                 }
@@ -2289,6 +2420,23 @@ impl<M: Mem> Block<M> {
     pub fn find_percentage(&mut self, basis: &FindBasis) -> Result<u16, OpError> {
         match basis {
             FindBasis::Key { key, value } => {
+                if self.v6_fast_reads() {
+                    if !self.keys().iter().any(|k| k.number == *key) {
+                        return Err(OpError::NoSuchKey(*key));
+                    }
+                    let count = self.v6_order_len(*key)?;
+                    if count == 0 {
+                        return Err(OpError::EndOfFile);
+                    }
+                    // The lower-bound rank itself, not filtered to `None`
+                    // the way `Op::AtLeast` is: a value past every entry
+                    // this key holds still has a well-defined percentage
+                    // (100%), which is exactly what `Bias::AtLeast`
+                    // answering `None` (nothing found *at or after* it)
+                    // means here -- the lower bound is `count`.
+                    let at = self.v6_seek_rank(*key, nav::Bias::AtLeast, value)?.unwrap_or(count);
+                    return Ok(((at as u64 * 10_000) / count as u64) as u16);
+                }
                 let definitions: Vec<Key> = self.keys().to_vec();
                 let records = self.records()?;
                 let count = records.ordered_len(*key).ok_or(OpError::NoSuchKey(*key))?;
@@ -2568,6 +2716,7 @@ mod tests {
             // Same reasoning: a test-only fixture never goes through
             // `Block::open`, the only place that builds one.
             cache: None,
+            v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2625,6 +2774,7 @@ mod tests {
             // Same reasoning: a test-only fixture never goes through
             // `Block::open`, the only place that builds one.
             cache: None,
+            v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2671,6 +2821,7 @@ mod tests {
             // Same reasoning: a test-only fixture never goes through
             // `Block::open`, the only place that builds one.
             cache: None,
+            v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
