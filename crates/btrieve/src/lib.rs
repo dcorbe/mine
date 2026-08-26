@@ -13694,6 +13694,229 @@ mod tests {
         assert_eq!(&updated.bytes[..4], b"CCCC", "the deferred update's own value reached disk");
     }
 
+    /// Review Important 3: `Store::for_commit`'s positional shadow-pair
+    /// reconstruction, exercised on a file with *two* allocation-table
+    /// blocks rather than one -- `PP2BLOCK.DAT`, whose block 1 (pair at
+    /// physical 2/3) is already full (126 of 126 entries, confirmed by a
+    /// throwaway probe against this fixture) and whose block 2 (pair at
+    /// 130/131) has 114 free.
+    ///
+    /// A brand new *third* block is not something this test can force: v6
+    /// insert always lands in "the first allocation-table block that has a
+    /// free entry" ([`v6::Map::claim`]'s own doc comment), so with block 1
+    /// full every insert here lands in block 2 -- and claiming a block past
+    /// the last one that exists is a refusal this crate states outright,
+    /// "growing a new block is not implemented" (`Map::claim`'s own error
+    /// text). That is a scope boundary Task 7 did not introduce and this
+    /// test does not attempt to lift.
+    ///
+    /// What this fixture *does* give, for free: block 1's own pair turns
+    /// out not to be a bystander here. Every insert and the update both
+    /// relocate key 0's B-tree node (`Map::relocate`'s "twin" alternation,
+    /// measured against genuine 6.15 in that function's own doc comment --
+    /// a written page's *index* alternates physical homes on every touch,
+    /// not only on a split), and that node's own logical id resolves into
+    /// block 1. So a transaction of five inserts (each claiming a new
+    /// entry in block 2) plus one update (which claims nothing new, but
+    /// still relocates the key 0 node) dirties **both** existing blocks'
+    /// shadow pairs -- confirmed below by generation, not assumed.
+    ///
+    /// The proof is what a naive "accumulate every per-op flip and replay
+    /// them" model would get wrong and `for_commit`'s positional
+    /// reconstruction gets right: six independent per-op commits (the
+    /// `deferred: false` reference run below) flip each touched pair once
+    /// *per op*, so on an even number of touches both physical halves end
+    /// up rewritten; one batched commit (the `deferred: true` run) still
+    /// only has to reach the same *final* live content, and collapses to a
+    /// single flip -- exactly one physical half of every touched pair
+    /// stays byte-identical to the original file. That collapse is checked
+    /// directly, plus the total bytes an actual `write(2)` put down
+    /// (`WROTE`), plus that both runs land at the same logical result
+    /// (record count, every new record's bytes present and correct at its
+    /// own physical position, the update's value in place) despite the
+    /// different bytes.
+    ///
+    /// Logical equality is checked by physical position
+    /// ([`Block::v6_physical_at`]/[`Block::v6_record_bytes_at`]), not by
+    /// `Block::get(Op::Equal, ...)`: chasing this test down, `get`/`query`
+    /// with `Op::Equal` turned out unable to find *any* record in
+    /// `PP2BLOCK.DAT` by its key -- not the five new ones, not the lowest
+    /// or highest pre-existing key, and not even with zero writes at all,
+    /// on both this crate's fast (`Btrieve::open`) and slow
+    /// (`block_from_file`) paths alike. The identical failure on both
+    /// paths against an untouched file rules out anything Task 7 added;
+    /// the same check against a local `WCCMP002.DAT` (also real, also
+    /// multi-block, an 8-byte key rather than `PP2BLOCK.DAT`'s 4-byte one)
+    /// finds both its lowest and highest key correctly, which rules out
+    /// "any multi-block file" as the trigger. This is a pre-existing,
+    /// unreported defect in equal-seek, `Op::Equal`-shaped and possibly
+    /// key-width-shaped, outside this task's scope to fix -- see the
+    /// fix report for the reproduction and why it does not block Task 7.
+    #[test]
+    fn deferred_writes_across_two_allocation_table_blocks_collapse_to_one_flip_each() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/btrieve-oracle/fixtures/PP2BLOCK.DAT");
+        let original = std::fs::read(&source).expect("reads the committed fixture");
+
+        let deferred_dir = crate::testing::scratch("v6-multi-block-deferred");
+        let deferred_path = deferred_dir.join("PP2BLOCK.DAT");
+        std::fs::copy(&source, &deferred_path).expect("copies");
+
+        let reference_dir = crate::testing::scratch("v6-multi-block-reference");
+        let reference_path = reference_dir.join("PP2BLOCK.DAT");
+        std::fs::copy(&source, &reference_path).expect("copies");
+
+        // Five new key values, all landing in block 2 (block 1's own 126
+        // entries are already full), plus one update to a pre-existing
+        // record. `PP2BLOCK.DAT`'s only key is a 4-byte unsigned value at
+        // record offset 2 with no duplicates -- these are far above
+        // anything 1,500 sequential records already hold.
+        let new_keys: [u32; 5] = [90_000_001, 90_000_002, 90_000_003, 90_000_004, 90_000_005];
+
+        fn open_it(path: &Path) -> (Btrieve<Flat>, FlatPtr, FlatMem, FlatHeap) {
+            let mut mem = FlatMem::new(64 * 1024);
+            let mut heap = FlatHeap::new(0x100);
+            let mut btrieve = Btrieve::<Flat>::default();
+            let geometry = Geometry::read("PP2BLOCK.DAT", path).expect("reads");
+            let maxlen = geometry.reclen;
+            let at = btrieve
+                .open(&mut mem, &mut heap, "PP2BLOCK.DAT", path, geometry, maxlen)
+                .expect("opens");
+            (btrieve, at, mem, heap)
+        }
+
+        fn make_record(reclen: usize, key: u32) -> Vec<u8> {
+            let mut record = vec![0u8; reclen];
+            record[2..6].copy_from_slice(&key.to_le_bytes());
+            record
+        }
+
+        // Runs the same five inserts, then one update, either inside one
+        // deferred transaction or as six ordinary autocommit writes.
+        // Returns the updated record's position and the total bytes a real
+        // `write(2)` put down for the whole sequence.
+        fn run(path: &Path, new_keys: &[u32], deferred: bool) -> (u32, usize) {
+            let (mut btrieve, at, _mem, _heap) = open_it(path);
+            assert!(
+                btrieve.block(at).expect("open").v6_fast_reads(),
+                "PP2BLOCK.DAT is fixed-length v6 -- meaningless if this is not the fast path"
+            );
+            let reclen = usize::from(btrieve.block(at).expect("open").geometry.reclen);
+
+            let target = btrieve
+                .block_mut(at)
+                .expect("open")
+                .v6_physical_at(0)
+                .expect("physical lookup")
+                .expect("a first record exists");
+
+            WROTE.with(|wrote| wrote.set(0));
+            if deferred {
+                btrieve.begin().expect("begin");
+            }
+
+            for &key in new_keys {
+                btrieve.block_mut(at).expect("open").insert(&make_record(reclen, key)).expect("insert");
+            }
+            let mut updated = btrieve
+                .block_mut(at)
+                .expect("open")
+                .v6_record_bytes_at(target)
+                .expect("fetch")
+                .expect("still live");
+            updated.resize(reclen, 0);
+            let last = updated.len() - 1;
+            updated[last] = 0xAB;
+            btrieve.block_mut(at).expect("open").update(target, &updated).expect("update");
+
+            if deferred {
+                btrieve.end().expect("end");
+            }
+            (target, WROTE.with(std::cell::Cell::get))
+        }
+
+        let (deferred_target, deferred_wrote) = run(&deferred_path, &new_keys, true);
+        let (reference_target, reference_wrote) = run(&reference_path, &new_keys, false);
+        assert_eq!(deferred_target, reference_target, "both runs update the same physical record");
+
+        let deferred_bytes = std::fs::read(&deferred_path).expect("reads");
+        let reference_bytes = std::fs::read(&reference_path).expect("reads");
+        assert_eq!(
+            deferred_bytes.len(),
+            reference_bytes.len(),
+            "deferred and undeferred runs must grow the file by the same amount"
+        );
+
+        // The collapse: for every structural pair either run actually
+        // touched (the control record, block 1, block 2), the deferred
+        // transaction's single combined commit leaves one physical half
+        // byte-identical to the original file -- it was never written even
+        // once -- while the reference run's six independent commits wrote
+        // both halves at least once each, so neither survives untouched.
+        const PAGE: usize = 512;
+        let unchanged_halves = |bytes: &[u8], first: usize, second: usize| -> usize {
+            let mut count = 0;
+            for page in [first, second] {
+                if bytes[page * PAGE..(page + 1) * PAGE] == original[page * PAGE..(page + 1) * PAGE] {
+                    count += 1;
+                }
+            }
+            count
+        };
+        for &(first, second, label) in &[(0usize, 1usize, "the control record"), (2, 3, "block 1"), (130, 131, "block 2")]
+        {
+            assert_eq!(
+                unchanged_halves(&deferred_bytes, first, second),
+                1,
+                "{label}: a batched transaction must leave exactly one physical half                  untouched by never having to write it"
+            );
+            assert_eq!(
+                unchanged_halves(&reference_bytes, first, second),
+                0,
+                "{label}: six independent commits must have written both physical halves                  at least once between them -- this is the baseline the batched commit                  improves on, not a bug in the reference run"
+            );
+        }
+
+        // The same collapse, measured directly in bytes actually put down
+        // by `write(2)`, not inferred from which pages moved.
+        assert!(
+            deferred_wrote < reference_wrote,
+            "one combined commit across two allocation-table blocks must write fewer bytes              than six independent ones -- deferred {deferred_wrote}, reference {reference_wrote}"
+        );
+
+        // Both runs must still agree on what the file *means*, despite
+        // disagreeing on its bytes: same record count, every new key
+        // readable, the update's value in place.
+        let (mut fresh_deferred, fresh_deferred_at, _mem, _heap) = open_it(&deferred_path);
+        let (mut fresh_reference, fresh_reference_at, _mem2, _heap2) = open_it(&reference_path);
+        let deferred_count = fresh_deferred.block_mut(fresh_deferred_at).expect("open").v6_physical_len().expect("count");
+        let reference_count =
+            fresh_reference.block_mut(fresh_reference_at).expect("open").v6_physical_len().expect("count");
+        assert_eq!(deferred_count, 1_505, "1,500 original records plus five new ones");
+        assert_eq!(deferred_count, reference_count, "both runs must agree on the final record count");
+
+        for (btrieve, at) in [(&mut fresh_deferred, fresh_deferred_at), (&mut fresh_reference, fresh_reference_at)] {
+            let block = btrieve.block_mut(at).expect("open");
+            let physical_len = block.v6_physical_len().expect("count");
+            let mut found: Vec<u32> = Vec::new();
+            for i in 0..physical_len {
+                let position = block.v6_physical_at(i).expect("lookup").expect("within range");
+                if let Some(bytes) = block.v6_record_bytes_at(position).expect("fetch") {
+                    let k = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+                    if new_keys.contains(&k) {
+                        found.push(k);
+                    }
+                }
+            }
+            found.sort_unstable();
+            let mut expected = new_keys.to_vec();
+            expected.sort_unstable();
+            assert_eq!(found, expected, "every new record's own key is present and correct somewhere in the file");
+
+            let reread_target = block.v6_record_bytes_at(deferred_target).expect("fetch").expect("still live");
+            assert_eq!(*reread_target.last().expect("nonempty"), 0xAB, "the update reached disk");
+        }
+    }
+
     /// Task 7's ops cutover, exercised through a *real* cache-backed v6
     /// `Block` (`Btrieve::open`, not a hand-built fixture) rather than only
     /// through the corpus differential (`order::tests::order_index_and_
