@@ -2728,6 +2728,9 @@ mod tests {
             // `Block::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
             // Same reasoning: a test-only fixture never goes through
+            // `Block::open`, the only place that captures a mode at all.
+            mode: crate::PRIMBV,
+            // Same reasoning: a test-only fixture never goes through
             // `Block::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -2787,6 +2790,9 @@ mod tests {
             // `Block::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
             // Same reasoning: a test-only fixture never goes through
+            // `Block::open`, the only place that captures a mode at all.
+            mode: crate::PRIMBV,
+            // Same reasoning: a test-only fixture never goes through
             // `Block::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -2834,6 +2840,9 @@ mod tests {
             // A test-only fixture, not `Block::open` -- see
             // `Block::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
+            // Same reasoning: a test-only fixture never goes through
+            // `Block::open`, the only place that captures a mode at all.
+            mode: crate::PRIMBV,
             // Same reasoning: a test-only fixture never goes through
             // `Block::open`, the only place that builds one.
             cache: None,

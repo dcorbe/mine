@@ -880,6 +880,21 @@ const BBSTSZ: usize = 10;
 /// doc comment for why `dfa`/`dfastk` are never aliases of `bb`/`bbstk`.
 const DFSTSZ: usize = 10;
 
+/// The five `opnbtv`/`dfaOpen` modes, `DFAAPI.H:29-33` (`BTVSTF.H:41-45`
+/// names the identical five values for `omdbtv`). What each does to a
+/// [`Block`] opened under it is Task 8's own subject -- see [`Btrieve::open`]
+/// for where `mode` is captured onto the block, [`Block::insert`]/
+/// [`Block::update`]/[`Block::delete`] for [`RONLBV`], the block's own
+/// `verify_writes` field for [`VERFBV`], [`Btrieve::open`] again for
+/// [`EXCLBV`], and [`Block::write_changed_pages_attempt`] for [`ACCLBV`].
+/// A mode outside these five (`dfaMode` stores one unchecked, unlike
+/// `omdbtv`) matches none of the checks below and behaves as [`PRIMBV`].
+const PRIMBV: i16 = 0;
+const ACCLBV: i16 = -1;
+const RONLBV: i16 = -2;
+const VERFBV: i16 = -3;
+const EXCLBV: i16 = -4;
+
 /// Where a file is positioned: the cursor Btrieve keeps in its position block.
 ///
 /// Not in the module's memory. Btrieve kept it in `posblk`, which is 128 opaque
@@ -1009,10 +1024,30 @@ pub struct Block<M: Mem> {
     /// `debug_assertions` alone, with no opt-in, turned 37 of those tests
     /// red -- every one of them a `NotBtrieve` refusal of a fixture that was
     /// never trying to be a complete file. [`Self::open`] -- the one path a
-    /// real module's `opnbtv` reaches -- sets this to `cfg!(debug_assertions)`;
-    /// every test-only `Block` literal in this crate leaves it `false` unless
-    /// a test is deliberately exercising verification itself.
+    /// real module's `opnbtv` reaches -- sets this to `cfg!(debug_assertions)
+    /// || mode == VERFBV` (Task 8): the debug default is unchanged, and a
+    /// block opened under `VERFBV` (`-3`, read-after-write) gets the same
+    /// check even in a release build, because that mode is the caller
+    /// asking for it by name. Every test-only `Block` literal in this crate
+    /// leaves it `false` unless a test is deliberately exercising
+    /// verification itself.
     verify_writes: bool,
+
+    /// The mode this block was opened under -- `opnbtv`/`dfaOpen`'s
+    /// `Btrieve::mode()` at the moment [`Self::open`] pushed it, one of the
+    /// five `DFAAPI.H:29-33` constants (`PRIMBV`/`ACCLBV`/`RONLBV`/`VERFBV`/
+    /// `EXCLBV`) or, since neither `omdbtv` nor `dfaMode` can be trusted to
+    /// have refused an out-of-range value first (`dfaMode` stores one
+    /// unchecked), anything else at all -- which then matches none of the
+    /// five checks below and behaves as `PRIMBV`.
+    ///
+    /// Captured once, at open, not read live off `Btrieve::mode()` on every
+    /// write: the real engine's mode governs the *open*, not calls made
+    /// against an already-open file after a later `omdbtv`/`dfaMode`
+    /// changed what the *next* open will use -- a file opened read-only
+    /// stays read-only for its own lifetime regardless of what the module
+    /// tells the next `opnbtv` to do.
+    mode: i16,
 
     /// A v6 file's page cache, attached for this block's whole open
     /// lifetime -- `None` for a v5 file (no allocation table to re-walk)
@@ -1365,6 +1400,12 @@ thread_local! {
     /// counters include every other test's I/O and the measurement test
     /// failed whenever it was not run alone.
     pub(crate) static WROTE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// `sync_all` calls [`Block::write_changed_pages_attempt`] or
+    /// [`Block::write_changed_pages_single_phase`] has made -- Task 8's own
+    /// evidence that `ACCLBV` flushes once where every other mode flushes
+    /// up to three times. Thread-local for the identical reason [`WROTE`] is.
+    pub(crate) static FLUSHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1395,6 +1436,19 @@ impl<M: Mem> Block<M> {
     /// What the file is indexed by.
     pub fn keys(&self) -> &[Key] {
         &self.keys
+    }
+
+    /// The mode this block was opened under, captured once by
+    /// [`Btrieve::open`] -- see the `mode` field's own doc comment.
+    /// `btrcall::insert`/`update`/`delete` read this to answer `RONLBV`'s
+    /// status 46 as a typed [`crate::btrcall::Status`] rather than routing
+    /// it through [`Self::insert`]/[`Self::update`]/[`Self::delete`]'s own
+    /// [`BtvError`] refusal, which this dispatcher has no way to tell apart
+    /// from any other write refusal -- the same reason
+    /// [`Self::would_change_unmodifiable_key`] exists as its own check
+    /// rather than being inferred from `update`'s error string.
+    pub fn mode(&self) -> i16 {
+        self.mode
     }
 
     /// A record's bytes, padded so a key's own `offset` lands where it was
@@ -1928,6 +1982,16 @@ impl<M: Mem> Block<M> {
     fn write_changed_pages_attempt(&self, store: &mut v6::Store) -> Result<(), BtvError> {
         use std::io::{Seek, SeekFrom, Write};
 
+        // `ACCLBV` (Task 8): the caller has asked to waive crash
+        // consistency in exchange for fewer writes and one flush instead
+        // of three -- see [`Self::write_changed_pages_single_phase`]'s own
+        // doc comment for exactly what that gives up. Every other mode
+        // (including `PRIMBV`, what the differential/replay suite runs
+        // under) takes the three-phase path below, unchanged.
+        if self.mode == ACCLBV {
+            return self.write_changed_pages_single_phase(store);
+        }
+
         let fail = |why: String| BtvError {
             file: self.name.clone(),
             why,
@@ -1953,6 +2017,8 @@ impl<M: Mem> Block<M> {
                 .map_err(|e| fail(format!("{}: writing at {at}: {e}", self.path.display())))
         };
         let flush = |out: &std::fs::File| -> Result<(), BtvError> {
+            #[cfg(test)]
+            FLUSHES.with(|flushes| flushes.set(flushes.get() + 1));
             out.sync_all()
                 .map_err(|e| fail(format!("{}: flushing: {e}", self.path.display())))
         };
@@ -2000,6 +2066,92 @@ impl<M: Mem> Block<M> {
         // `Flip` struct above. One `cache_mark_clean` at the end, not one
         // per `cache_put`: see that method's own doc comment for why
         // clearing dirty state cache-wide is still correct here.
+        for &number in &content {
+            let bytes = store.current(number).to_vec();
+            store.cache_put(number, bytes);
+        }
+        for flip in &flips {
+            store.cache_put(flip.page, flip.image.clone());
+        }
+        store.cache_mark_clean();
+
+        Ok(())
+    }
+
+    /// `ACCLBV`'s write: every changed page -- content and structural alike
+    /// -- goes down with its final, live bytes in one pass, then one flush.
+    /// No held-back generation, no separate flip pass.
+    ///
+    /// # What this gives up
+    ///
+    /// [`Self::write_changed_pages_attempt`]'s own doc comment explains why
+    /// the three-phase path holds a shadow pair's generation back and
+    /// flips it only after its body is durable: so a crash mid-write can
+    /// only ever leave the file reading as its old self or its new self,
+    /// never a mix. Writing `flip.image` -- which already carries the
+    /// *final* generation, [`Flip`]'s own field -- in the same pass as
+    /// every content page removes exactly that guarantee: an interruption
+    /// here can land a shadow pair's generation and a still-incomplete
+    /// body in the same write, or land some flips and not others, with no
+    /// phase boundary to recover from. `ACCLBV` -- Btrieve's own
+    /// "accelerated" mode, `DFAAPI.H:30` -- is documented as the caller
+    /// asking for exactly that trade, so this reproduces the trade rather
+    /// than the crash. `PRIMBV`, the default every other mode and the
+    /// differential/replay suite runs under, never reaches this function.
+    ///
+    /// # What is measurably different
+    ///
+    /// One `sync_all` instead of up to three, and -- for any write that
+    /// touches at least one shadow pair, which every v6 write does (the
+    /// file control record's own pair, at minimum) -- two fewer bytes
+    /// written per pair: the three-phase path's phase 3 re-writes each
+    /// flip's two generation bytes a second time after phase 2's held-back
+    /// write; this writes them once. Both are visible to this module's own
+    /// `#[cfg(test)]` counters, `WROTE` (bytes) and `FLUSHES` (`sync_all`
+    /// calls) -- see
+    /// `tests::acclbv_commits_in_a_single_phase_with_fewer_writes_and_one_flush`.
+    fn write_changed_pages_single_phase(&self, store: &mut v6::Store) -> Result<(), BtvError> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let fail = |why: String| BtvError {
+            file: self.name.clone(),
+            why,
+        };
+        let page = usize::from(self.geometry.page);
+        let (content, flips) = diff_changed_pages(store);
+
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| fail(format!("{}: {e}", self.path.display())))?;
+
+        let put = |out: &mut std::fs::File, at: u64, bytes: &[u8]| -> Result<(), BtvError> {
+            #[cfg(test)]
+            WROTE.with(|wrote| wrote.set(wrote.get() + bytes.len()));
+            out.seek(SeekFrom::Start(at))
+                .and_then(|_| out.write_all(bytes))
+                .map_err(|e| fail(format!("{}: writing at {at}: {e}", self.path.display())))
+        };
+
+        // Content, then every shadow pair's FINAL image -- `flip.image`
+        // already carries `flip.generation`, the live value, unlike the
+        // three-phase path's `held` copy. One combined pass, no ordering
+        // between the two loops to preserve: neither can be observed by a
+        // reader until the flush below lands.
+        for &number in &content {
+            put(&mut out, (number * page) as u64, store.current(number))?;
+        }
+        for flip in &flips {
+            put(&mut out, (flip.page * page) as u64, &flip.image)?;
+        }
+
+        #[cfg(test)]
+        FLUSHES.with(|flushes| flushes.set(flushes.get() + 1));
+        out.sync_all()
+            .map_err(|e| fail(format!("{}: flushing: {e}", self.path.display())))?;
+
+        // Same cache write-through as the three-phase path -- see that
+        // function's own tail comment for why.
         for &number in &content {
             let bytes = store.current(number).to_vec();
             store.cache_put(number, bytes);
@@ -5419,18 +5571,23 @@ impl<M: Mem> Block<M> {
     /// offset and field it found wrong, exactly as [`verify::written`]'s own
     /// doc comment describes.
     ///
-    /// Two gates, not one, because they answer different questions.
-    /// `debug_assertions` is what makes the cost -- a full read plus a full
-    /// re-emit, see [`verify::written`]'s doc comment -- paid in precisely
-    /// zero of the builds a board actually runs, the same way `debug_assert!`
-    /// does. `verify_writes` is what keeps that check from running at all
-    /// against a `Block` this crate's own tests built directly, with a
-    /// synthetic geometry [`crate::read::file`] was never meant to parse --
-    /// see [`Self::verify_writes`]'s own doc comment for the 37 tests that
-    /// went red the one time this was tried without it.
+    /// Two gates, not one, because they answer different questions. Whether
+    /// `crate::verify::written` runs *at all* costs nothing to check --
+    /// `self.verify_writes` is a plain bool read -- but doing the check is
+    /// a full read plus a full re-emit, see [`verify::written`]'s doc
+    /// comment, and that cost is what `self.verify_writes` gates. It is
+    /// `cfg!(debug_assertions)` by default -- so a normal release board
+    /// pays nothing beyond the one bool read, same as when this was a
+    /// compile-time `#[cfg(debug_assertions)]` -- **except** when
+    /// [`Self::open`] captured `VERFBV` (Task 8): then it is `true`
+    /// regardless of the build, because that mode is the caller asking for
+    /// read-after-write verification by name, and a compile-time gate could
+    /// not have honoured that in a release build no matter what the module
+    /// asked for. See [`Self::verify_writes`]'s own doc comment for the 37
+    /// tests that went red the one time the check ran with no opt-in at
+    /// all.
     fn verify_write<T>(&self, result: Result<T, BtvError>) -> Result<T, BtvError> {
         let value = result?;
-        #[cfg(debug_assertions)]
         if self.verify_writes {
             if let Err(why) = crate::verify::written(&self.path) {
                 return Err(BtvError {
@@ -5442,19 +5599,45 @@ impl<M: Mem> Block<M> {
         Ok(value)
     }
 
+    /// `RONLBV` (Task 8): refuse a write outright on a block opened
+    /// read-only, before either the write itself or [`Self::verify_write`]
+    /// ever runs.
+    ///
+    /// Measured against genuine Btrieve 6.15 under Wine: a file opened
+    /// `RONLBV` (-2) and then written to (insert, update or delete alike)
+    /// answers status 46, "Access To File Denied" --
+    /// `docs/mirrors/github-syntax53-Nightmare-Redux/modBtrieve.bas:183-184`.
+    /// See task-8-report.md for the probe transcript.
+    fn refuse_if_read_only(&self) -> Result<(), BtvError> {
+        if self.mode == RONLBV {
+            return Err(BtvError {
+                file: self.name.clone(),
+                why: "refused -- this file is open read-only (RONLBV), and a write to it \
+                      is status 46, Access To File Denied, measured against genuine \
+                      Btrieve 6.15 under Wine"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Add a record, choosing its slot and writing it. See
     /// [`Self::insert_inner`] for the algorithm; this wrapper only adds the
-    /// post-write verification described on [`Self::verify_write`].
+    /// read-only refusal ([`Self::refuse_if_read_only`]) and the post-write
+    /// verification described on [`Self::verify_write`].
     ///
     /// # Errors
     ///
-    /// If the records cannot be read, the file holds variable-length
-    /// records and `bytes` is shorter than the fixed part every record has,
-    /// the file holds variable-length records and is version 5 (see
-    /// [`Self::insert_v6`]'s own doc comment for what a version 6
-    /// variable-length file still refuses), the file cannot be written, or
-    /// (debug builds only) the written file fails [`Self::verify_write`].
+    /// If this block is open `RONLBV` (status 46, see
+    /// [`Self::refuse_if_read_only`]), the records cannot be read, the file
+    /// holds variable-length records and `bytes` is shorter than the fixed
+    /// part every record has, the file holds variable-length records and is
+    /// version 5 (see [`Self::insert_v6`]'s own doc comment for what a
+    /// version 6 variable-length file still refuses), the file cannot be
+    /// written, or [`Self::verify_write`] finds the write did not do what
+    /// it claims.
     pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
+        self.refuse_if_read_only()?;
         let result = self.insert_inner(bytes);
         self.verify_write(result)
     }
@@ -5631,18 +5814,22 @@ impl<M: Mem> Block<M> {
     }
 
     /// Replace the record at `position`. See [`Self::update_inner`] for the
-    /// algorithm; this wrapper only adds the post-write verification
+    /// algorithm; this wrapper only adds the read-only refusal
+    /// ([`Self::refuse_if_read_only`]) and the post-write verification
     /// described on [`Self::verify_write`].
     ///
     /// # Errors
     ///
-    /// If the file holds fixed-length records and `bytes` is not exactly
-    /// `reclen` long, the file holds variable-length records and the write
-    /// is not an in-place, same-length, single-fragment rewrite (see
-    /// [`Self::update_inner`]'s own doc comment), the records cannot be
-    /// read, `position` holds no record, the file cannot be written, or
-    /// (debug builds only) the written file fails [`Self::verify_write`].
+    /// If this block is open `RONLBV` (status 46, see
+    /// [`Self::refuse_if_read_only`]), the file holds fixed-length records
+    /// and `bytes` is not exactly `reclen` long, the file holds
+    /// variable-length records and the write is not an in-place,
+    /// same-length, single-fragment rewrite (see [`Self::update_inner`]'s
+    /// own doc comment), the records cannot be read, `position` holds no
+    /// record, the file cannot be written, or [`Self::verify_write`] finds
+    /// the write did not do what it claims.
     pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
+        self.refuse_if_read_only()?;
         let result = self.update_inner(position, bytes);
         self.verify_write(result)
     }
@@ -5927,17 +6114,21 @@ impl<M: Mem> Block<M> {
     }
 
     /// Remove the record at `position`. See [`Self::delete_inner`] for the
-    /// algorithm; this wrapper only adds the post-write verification
+    /// algorithm; this wrapper only adds the read-only refusal
+    /// ([`Self::refuse_if_read_only`]) and the post-write verification
     /// described on [`Self::verify_write`].
     ///
     /// # Errors
     ///
-    /// If the records cannot be read, the file holds variable-length
-    /// records and is version 5 (see [`Self::delete_v6`]'s own doc comment
-    /// for what a version 6 variable-length file still refuses),
-    /// `position` holds no record, the file cannot be written, or (debug
-    /// builds only) the written file fails [`Self::verify_write`].
+    /// If this block is open `RONLBV` (status 46, see
+    /// [`Self::refuse_if_read_only`]), the records cannot be read, the file
+    /// holds variable-length records and is version 5 (see
+    /// [`Self::delete_v6`]'s own doc comment for what a version 6
+    /// variable-length file still refuses), `position` holds no record, the
+    /// file cannot be written, or [`Self::verify_write`] finds the write
+    /// did not do what it claims.
     pub fn delete(&mut self, position: u32) -> Result<(), BtvError> {
+        self.refuse_if_read_only()?;
         let result = self.delete_inner(position);
         self.verify_write(result)
     }
@@ -6487,7 +6678,8 @@ pub struct Btrieve<M: Mem> {
     stack: [M::Ptr; BBSTSZ],
 
     /// `bbomode`: the mode the next `opnbtv` opens in. `PRIMBV`, which is zero,
-    /// until `omdbtv` says otherwise.
+    /// until `omdbtv` says otherwise. Consumed by [`Self::open`] (Task 8),
+    /// which captures it onto the [`Block`] being pushed.
     mode: i16,
 
     /// Whether a transaction begun by [`Self::begin`] is in progress.
@@ -6621,7 +6813,7 @@ impl<M: Mem> Default for Btrieve<M> {
         Self {
             open: Vec::new(),
             stack: [M::null_ptr(); BBSTSZ],
-            mode: 0,
+            mode: PRIMBV,
             transaction: false,
             locks: ops::LockTable::default(),
             dfa_current: M::null_ptr(),
@@ -6666,6 +6858,38 @@ impl<M: Mem> Btrieve<M> {
         geometry: Geometry,
         maxlen: u16,
     ) -> Result<M::Ptr, String> {
+        // `EXCLBV` (Task 8): refused before any of the work below, the same
+        // way a real conflict is refused before the engine has read anything
+        // -- measured against genuine Btrieve 6.15 under Wine, two separate
+        // `wine btrvprobe.exe serve` clients against one shared
+        // `W32MKDE.EXE` (the same setup `docs/lock-oracle-answer.md` used):
+        // an exclusive open against a path any block already has open, in
+        // EITHER direction (the exclusive open arrives first and something
+        // else opens next, or something else is already open and an
+        // exclusive open arrives), answers status 88 -- "Incompatible Mode
+        // Error", `docs/mirrors/github-syntax53-Nightmare-Redux/modBtrieve.bas:233`
+        // -- both directions, read-only or normal on the other side, closing
+        // the first opener releases it. `DFAAPI.C:153-164`'s own `dfaOpen`
+        // expects status 85 here and *loops* on it rather than refusing --
+        // that is a different, older status this project has no live
+        // engine old enough to reproduce; 88 is what the engine this host
+        // is measured against actually answers, and looping forever on a
+        // single-threaded host would hang the board rather than open a
+        // file, so this refuses instead. See task-8-report.md for the full
+        // probe transcript.
+        let mode = self.mode;
+        if self.open.iter().any(|b| {
+            b.path == path && (mode == EXCLBV || b.mode == EXCLBV)
+        }) {
+            return Err(format!(
+                "{name}: refused -- {} is already open under an incompatible mode \
+                 (status 88, Incompatible Mode Error): an exclusive open excludes \
+                 every other open of the same path, and an exclusive open is itself \
+                 excluded by any other open already in progress",
+                path.display()
+            ));
+        }
+
         // The key definitions come out of the same first page the geometry did,
         // and they are read at open time rather than with the records because
         // `clckln()` -- which sizes the key buffer below -- is part of what
@@ -6758,8 +6982,10 @@ impl<M: Mem> Btrieve<M> {
             pre_image: None,
             // A real module's `opnbtv` reached this constructor -- the only
             // one that did -- so this is the one place verification is worth
-            // its cost, and only in a debug build; see `Self::verify_write`.
-            verify_writes: cfg!(debug_assertions),
+            // its cost, in a debug build by default, and unconditionally
+            // when the module asked for `VERFBV` -- see `Self::verify_write`.
+            verify_writes: cfg!(debug_assertions) || mode == VERFBV,
+            mode,
             cache,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
             v6_physical: std::cell::RefCell::new(None),
@@ -6844,6 +7070,19 @@ impl<M: Mem> Btrieve<M> {
     }
 
     /// The mode the next `dfaOpen` will use.
+    ///
+    /// Task 8 made [`Self::open`] consume [`Self::mode`] -- the `omdbtv`/
+    /// `opnbtv` field this one is deliberately independent of, see this
+    /// field's own doc comment -- for `RONLBV`/`VERFBV`/`EXCLBV`/`ACCLBV`.
+    /// `dfaOpen` still calls that same [`Self::open`], and still passes it
+    /// no mode of its own, so this value is stored and reported here but
+    /// not yet consumed by anything: a module that reaches its Btrieve
+    /// files through `dfa*` rather than `btv*` does not get mode
+    /// enforcement from this task. `WCCMMUD.DLL`, the one 16-bit module
+    /// this host runs end-to-end, never calls a `dfa*` routine at all (see
+    /// [`Self::dfa_current`]'s own doc comment), so this gap has no
+    /// currently-live caller; closing it is future work, not a silent
+    /// omission.
     pub fn dfa_mode(&self) -> i16 {
         self.dfa_mode
     }
@@ -6959,6 +7198,10 @@ impl<M: Mem> Btrieve<M> {
     }
 
     /// The mode the next `opnbtv` will use.
+    ///
+    /// Task 8: [`Self::open`] now captures this onto the new [`Block`] it
+    /// pushes, and `RONLBV`/`VERFBV`/`EXCLBV`/`ACCLBV` each change that
+    /// block's behaviour from there -- see [`Block`]'s own `mode` field.
     pub fn mode(&self) -> i16 {
         self.mode
     }
@@ -8134,6 +8377,9 @@ mod tests {
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
             // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that captures a mode at all.
+            mode: PRIMBV,
+            // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -9287,6 +9533,9 @@ mod tests {
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
             // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that captures a mode at all.
+            mode: PRIMBV,
+            // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -9599,6 +9848,127 @@ mod tests {
         block.insert(&record).expect("a verified insert");
 
         assert_eq!(crate::verify::written(&path), Ok(()));
+    }
+
+    /// Task 8: `VERFBV` forces [`Block::verify_writes`] on for the block it
+    /// opens -- and, unlike before this task, that check is no longer
+    /// wrapped in `#[cfg(debug_assertions)]` at all, so nothing about a
+    /// `--release` build can compile it away. This test cannot flip
+    /// `cfg!(debug_assertions)` itself (`cargo test` always builds with it
+    /// on), so it proves the release-shaped claim the only way a single
+    /// test binary can: by showing `Self::verify_write`'s *runtime* gate is
+    /// `self.verify_writes` alone, with nothing else standing between it
+    /// and [`crate::verify::written`] -- exactly the gate a `--release`
+    /// build still evaluates. (This test's own name was additionally
+    /// confirmed under a real `--release` build for task-8-report.md; see
+    /// that report for the transcript.)
+    #[test]
+    fn a_verify_mode_open_reaches_verify_written_in_release_shape() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+        let (name, path) = create_scratch_v5("verfbv-forces-verification");
+        let geometry = Geometry::read(&name, &path).expect("reads");
+        let maxlen = geometry.reclen;
+
+        btrieve.set_mode(VERFBV);
+        let at = btrieve
+            .open(&mut mem, &mut heap, &name, &path, geometry, maxlen)
+            .expect("opens");
+        {
+            let block = btrieve.block(at).expect("open");
+            assert_eq!(block.mode(), VERFBV);
+            assert!(
+                block.verify_writes,
+                "VERFBV must force verify_writes on for this block, in any build"
+            );
+        }
+
+        // Corrupt the file behind the block's back -- one appended byte, so
+        // `crate::verify::written`'s own first check (rebuilt length versus
+        // on-disk length) is what catches it, rather than depending on
+        // which byte ranges this model treats as opaque. Then call
+        // `Block::verify_write` directly with an already-successful inner
+        // result and confirm it still turns that `Ok` into an `Err`: proof
+        // this runs, not merely that the flag reads `true`.
+        let mut corrupted = std::fs::read(&path).expect("read the file back");
+        corrupted.push(0xff);
+        std::fs::write(&path, &corrupted).expect("corrupt the file on disk");
+
+        let block = btrieve.block(at).expect("open");
+        let result: Result<(), BtvError> = block.verify_write(Ok(()));
+        assert!(
+            result.is_err(),
+            "a VERFBV block's verify_write must catch the corruption -- no compile-time \
+             debug_assertions gate stands between self.verify_writes and \
+             crate::verify::written any more"
+        );
+    }
+
+    /// Task 8: `ACCLBV` writes every changed page -- content and structural
+    /// alike -- in one pass, with the shadow pair's FINAL generation
+    /// already baked in, and flushes once. Every other mode, `PRIMBV`
+    /// included, holds a shadow pair's generation back, writes its body
+    /// separately, and flips it in a third pass -- three flushes, and two
+    /// extra bytes per pair (the generation, written twice: held-back, then
+    /// final).
+    ///
+    /// Two fresh copies of the same fixture, the identical insert against
+    /// each -- one block left at the open default (`PRIMBV`), the other's
+    /// `mode` set to `ACCLBV` directly (this test is about
+    /// `write_changed_pages_attempt`'s own branch, not about `Self::open`,
+    /// which Task 8's other tests already cover) -- isolate exactly the
+    /// write-path difference, with nothing else able to explain it: same
+    /// file, same bytes in, same bytes the model produces.
+    #[test]
+    fn acclbv_commits_in_a_single_phase_with_fewer_writes_and_one_flush() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/V6DUP.DAT");
+
+        let run = |tag: &str, mode: i16| -> (usize, usize) {
+            let dir = crate::testing::scratch(tag);
+            let path = dir.join("V6DUP.DAT");
+            std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+
+            let mut block = block_from_file(path.clone(), "V6DUP.DAT");
+            block.mode = mode;
+            let reclen = usize::from(block.geometry.reclen);
+            let mut record = vec![0u8; reclen];
+            record[..4].copy_from_slice(&999_999u32.to_le_bytes());
+
+            WROTE.with(|wrote| wrote.set(0));
+            FLUSHES.with(|flushes| flushes.set(0));
+            block.insert(&record).expect("an insert, either mode");
+
+            (
+                WROTE.with(std::cell::Cell::get),
+                FLUSHES.with(std::cell::Cell::get),
+            )
+        };
+
+        let (primbv_bytes, primbv_flushes) = run("acclbv-evidence-primbv", PRIMBV);
+        let (acclbv_bytes, acclbv_flushes) = run("acclbv-evidence-acclbv", ACCLBV);
+
+        // Phase 1 and phase 2 each flush once, unconditionally; phase 3
+        // flushes once after its first flip (this fixture's insert always
+        // relocates at least the file control record's own pair -- v6
+        // relocates a written key's root, and the FCR, on every write) and
+        // once more at the end -- four, not three, once there is any flip
+        // at all to trigger the first.
+        assert_eq!(primbv_flushes, 4, "PRIMBV's three-phase commit flushes four times here");
+        assert_eq!(acclbv_flushes, 1, "ACCLBV's single-phase commit flushes once");
+        assert!(
+            acclbv_bytes < primbv_bytes,
+            "ACCLBV should write fewer bytes than PRIMBV for the identical insert -- \
+             PRIMBV wrote {primbv_bytes}, ACCLBV wrote {acclbv_bytes}"
+        );
+        assert_eq!(
+            primbv_bytes - acclbv_bytes,
+            4,
+            "the only byte-count difference should be phase 3's two-byte-per-flip \
+             re-write, which the single-phase path never does at all -- measured at \
+             two flips for this fixture's insert (the file control record's own pair, \
+             plus its one key's root, relocated on every v6 write), 2 bytes each"
+        );
     }
 
     /// **A v6 variable-length record can be updated.** Task 6: closes the
@@ -11564,6 +11934,9 @@ mod tests {
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
             // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that captures a mode at all.
+            mode: PRIMBV,
+            // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -11820,6 +12193,9 @@ mod tests {
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
+            // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that captures a mode at all.
+            mode: PRIMBV,
             // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
@@ -12326,6 +12702,9 @@ mod tests {
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
+            // Same reasoning: a test-only fixture never goes through
+            // `Self::open`, the only place that captures a mode at all.
+            mode: PRIMBV,
             // Same reasoning: a test-only fixture never goes through
             // `Self::open`, the only place that builds one.
             cache: None,
@@ -13064,6 +13443,109 @@ mod tests {
         let mut btrieve = btrieve_with(vec![]);
         let e = btrieve.abort().expect_err("nothing was begun");
         assert_eq!(e, TransactionError::NoneActive);
+    }
+
+    // Task 8: `EXCLBV`. `open_indexed`'s own shortcut hand-builds a `Block`
+    // and pushes it directly onto `self.open`, which never runs
+    // `Self::open`'s own body at all -- so it cannot exercise a check that
+    // lives there. These tests go through `Self::open` for real, over a
+    // fresh v5 file [`create`] builds, exactly the way `btrcall.rs`'s own
+    // `scratch_file` does.
+
+    /// A fresh, valid, single-key v5 file `Self::open` can actually open --
+    /// see this section's own header comment for why `open_indexed` cannot
+    /// stand in here.
+    fn create_scratch_v5(tag: &str) -> (String, PathBuf) {
+        let name = "SCRATCH.DAT".to_owned();
+        let path = crate::testing::scratch(tag).join(&name);
+        let spec = FileSpec {
+            record_length: 8,
+            page_size: 512,
+            keys: vec![KeySpec {
+                segments: vec![SegmentSpec {
+                    offset: 0,
+                    length: 4,
+                    kind: 0x0e, // DFAST_UNSIGNED_BINARY
+                    descending: false,
+                }],
+                duplicates: false,
+                modifiable: false,
+            }],
+        };
+        create(&path, &spec).expect("creates a scratch Btrieve file");
+        (name, path)
+    }
+
+    /// Measured against genuine Btrieve 6.15 under Wine: an exclusive open
+    /// (-4) holding a path, and a second open of the same path arriving
+    /// while it is held, answers status 88, "Incompatible Mode Error" --
+    /// task-8-report.md carries the probe transcript.
+    #[test]
+    fn an_exclusive_open_refuses_a_second_open_with_status_88() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+        let (name, path) = create_scratch_v5("exclbv-refuses-second-open");
+        let geometry = Geometry::read(&name, &path).expect("reads");
+        let maxlen = geometry.reclen;
+
+        btrieve.set_mode(EXCLBV);
+        btrieve
+            .open(&mut mem, &mut heap, &name, &path, geometry, maxlen)
+            .expect("the exclusive open itself succeeds");
+
+        btrieve.set_mode(PRIMBV);
+        let err = btrieve
+            .open(&mut mem, &mut heap, &name, &path, geometry, maxlen)
+            .expect_err("a second open while the first is exclusive is refused");
+        assert!(err.contains("88"), "expected status 88 named in the refusal: {err}");
+    }
+
+    /// The other direction of the same rule: an exclusive open ARRIVING
+    /// second, while any other open of the path already exists (normal
+    /// mode here), is refused too -- not just the reverse order. Measured
+    /// the same way, same status.
+    #[test]
+    fn an_exclusive_open_is_itself_refused_while_any_other_open_of_the_path_exists() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+        let (name, path) = create_scratch_v5("exclbv-refuses-arriving-second");
+        let geometry = Geometry::read(&name, &path).expect("reads");
+        let maxlen = geometry.reclen;
+
+        btrieve.set_mode(PRIMBV);
+        btrieve
+            .open(&mut mem, &mut heap, &name, &path, geometry, maxlen)
+            .expect("a normal open succeeds");
+
+        btrieve.set_mode(EXCLBV);
+        let err = btrieve
+            .open(&mut mem, &mut heap, &name, &path, geometry, maxlen)
+            .expect_err("an exclusive open arriving second is refused too");
+        assert!(err.contains("88"), "expected status 88 named in the refusal: {err}");
+    }
+
+    /// Guards against an over-broad check that refuses on `mode == EXCLBV`
+    /// alone, regardless of path: `EXCLBV` excludes conflicting opens of
+    /// the SAME path, not every other open in the session.
+    #[test]
+    fn an_exclusive_open_does_not_refuse_a_different_path() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+        let (name_a, path_a) = create_scratch_v5("exclbv-independent-a");
+        let (name_b, path_b) = create_scratch_v5("exclbv-independent-b");
+        let geometry_a = Geometry::read(&name_a, &path_a).expect("reads");
+        let geometry_b = Geometry::read(&name_b, &path_b).expect("reads");
+
+        btrieve.set_mode(EXCLBV);
+        btrieve
+            .open(&mut mem, &mut heap, &name_a, &path_a, geometry_a, geometry_a.reclen)
+            .expect("first file opens exclusive");
+        btrieve
+            .open(&mut mem, &mut heap, &name_b, &path_b, geometry_b, geometry_b.reclen)
+            .expect("a second, DIFFERENT file still opens exclusive -- EXCLBV is per-path");
     }
 
     /// Reproduces `xactprobe`'s `nested` scenario past its first `abort`:

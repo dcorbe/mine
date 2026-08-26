@@ -967,10 +967,17 @@ pub fn dfaDelete<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
 /// `DFAAPI.C:179-184`: `dfaomode=mode;`, unconditional -- no validation at
 /// all, unlike [`btv::omdbtv`]'s own refusal of a value outside the five
 /// `PRIMBV`/`ACCLBV`/`RONLBV`/`VERFBV`/`EXCLBV` constants. Reproduced rather
-/// than tightened: `dfaMode` genuinely stores whatever it is given, and
-/// nothing reads it back until a `dfaOpen` -- which, like `opnbtv`, does not
-/// yet do anything with the mode beyond keeping it (see `omdbtv`'s own doc
-/// comment for why).
+/// than tightened: `dfaMode` genuinely stores whatever it is given.
+///
+/// The value is now read -- but on the *other* side of the family. Task 8
+/// made `Btrieve::open` consume `Btrieve::mode()`, the mode `omdbtv` sets
+/// and `opnbtv` opens under, so a file `opnbtv` opens `RONLBV`/`VERFBV`/
+/// `EXCLBV`/`ACCLBV` is now enforced accordingly. `dfaOpen` calls that same
+/// `Btrieve::open`, but still passes it no mode of its own, so `dfa_mode`
+/// (what this function sets) is stored and reported
+/// (`Btrieve::dfa_mode`) but still not consumed by anything -- see that
+/// method's own doc comment for why, and for why this is not a currently-
+/// live gap: `WCCMMUD.DLL` never calls a `dfa*` routine at all.
 pub fn dfaMode<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let mode = btv::i16_arg::<A>(call.int());
     host.btrieve.dfa_set_mode(mode);

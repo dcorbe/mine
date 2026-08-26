@@ -519,9 +519,17 @@ fn step_op<M: Mem>(
 /// after an insert sees wherever the file was positioned before it, not the
 /// new record. No test in this task exercises that difference; it is a
 /// known gap, not a decision.
+///
+/// `RONLBV` (Task 8): checked first, the same way [`update`] checks key
+/// modifiability first -- answers status 46 rather than falling through to
+/// [`crate::Block::insert`]'s stringly-typed [`crate::BtvError`], which this
+/// dispatcher has no way to distinguish from any other insert refusal.
 fn insert<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
     let at = handle_of::<M>(call.posblk);
     let index = session.find(at).map_err(|why| Gap { what: why })?;
+    if session.open[index].mode() == crate::RONLBV {
+        return Ok(Status(46));
+    }
     let len = usize::try_from(*call.datalen).unwrap_or(0).min(call.databuf.len());
 
     match session.open[index].insert(&call.databuf[..len]) {
@@ -545,10 +553,14 @@ fn insert<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Sta
 /// Btrieve does -- refuse before touching the file -- and answers status 10
 /// rather than falling through to [`crate::Block::update`]'s stringly-typed
 /// [`crate::BtvError`], which this dispatcher has no way to distinguish from
-/// any other update refusal.
+/// any other update refusal. `RONLBV` (Task 8) is checked first of all, for
+/// the identical reason: status 46, not a fall-through.
 fn update<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
     let at = handle_of::<M>(call.posblk);
     let index = session.find(at).map_err(|why| Gap { what: why })?;
+    if session.open[index].mode() == crate::RONLBV {
+        return Ok(Status(46));
+    }
     let Some(position) = session.open[index].current().map(|r| r.position) else {
         return Ok(Status(8));
     };
@@ -581,9 +593,15 @@ fn update<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Sta
 /// a measurement, because what real Btrieve leaves current after a delete
 /// was never put to the Wine oracle. This dispatch follows the same
 /// decision so a deleted record does not stay reachable as "current".
+///
+/// `RONLBV` (Task 8) is checked before currency, same as [`update`]: status
+/// 46.
 fn delete<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
     let at = handle_of::<M>(call.posblk);
     let index = session.find(at).map_err(|why| Gap { what: why })?;
+    if session.open[index].mode() == crate::RONLBV {
+        return Ok(Status(46));
+    }
     let Some(position) = session.open[index].current().map(|r| r.position) else {
         return Ok(Status(8));
     };
@@ -1078,6 +1096,168 @@ mod tests {
         )
         .expect("Get Equal is modelled");
         assert_eq!(status, Status(4), "the deleted record is gone");
+    }
+
+    /// Task 8: a file opened `RONLBV` (-2, read-only) refuses every write
+    /// with status 46, "Access To File Denied" -- measured against genuine
+    /// Btrieve 6.15 under Wine (task-8-report.md carries the probe
+    /// transcript). Answered as a typed [`Status`], not a [`Gap`]: this is
+    /// a real Btrieve answer, not a hole in this engine, and a `Gap` here
+    /// would let a differential harness score a refusal as an unmodelled
+    /// operation instead of the behaviour it actually is.
+    #[test]
+    fn a_read_only_open_refuses_update_with_status_46() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("read-only-refuses-writes");
+
+        // A normal-mode open first, so the read-only reopen below has a
+        // real record on disk to establish currency on.
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+        let mut databuf = vec![7, 0, 0, 0, 1, 2, 3, 4];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 2,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Insert is modelled");
+        assert_eq!(status, Status::OK, "the baseline record was inserted");
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 1,
+                posblk: &mut posblk,
+                databuf: &mut Vec::new(),
+                datalen: &mut 0,
+                keybuf: &mut Vec::new(),
+                keylen: 0,
+                keynum: 0,
+            },
+        )
+        .expect("Close is modelled");
+        assert_eq!(status, Status::OK, "the normal-mode open closed cleanly");
+
+        // Reopen the same path `RONLBV` -- `session.set_mode` stands in for
+        // what a real `omdbtv(-2)` call leaves behind for the next `opnbtv`.
+        session.set_mode(crate::RONLBV);
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+        assert_eq!(
+            session.block(handle_of::<Flat>(&posblk)).expect("open").mode(),
+            crate::RONLBV,
+            "the block captured the mode that was current at its own open"
+        );
+
+        // Currency, established with a plain Get Equal -- not itself a
+        // write, and not refused.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![7, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status::OK, "a read-only open still reads");
+
+        // Update: refused.
+        let mut databuf = vec![7, 0, 0, 0, 9, 9, 9, 9];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 3,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Update is modelled, as a Status rather than a Gap");
+        assert_eq!(status, Status(46), "a write to a read-only open is Access To File Denied");
+
+        // Insert: also refused, same status -- not something only `update`
+        // checks.
+        let mut databuf = vec![8, 0, 0, 0, 1, 1, 1, 1];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 2,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Insert is modelled");
+        assert_eq!(status, Status(46), "insert is refused identically to update");
+
+        // Delete: also refused, and the record Get Equal found is still
+        // there afterward -- the refusal actually stopped the write rather
+        // than merely answering the wrong status for one that landed.
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 4,
+                posblk: &mut posblk,
+                databuf: &mut Vec::new(),
+                datalen: &mut 0,
+                keybuf: &mut Vec::new(),
+                keylen: 0,
+                keynum: 0,
+            },
+        )
+        .expect("Delete is modelled");
+        assert_eq!(status, Status(46), "delete is refused identically to update");
+
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![7, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status::OK, "the refused delete left the record in place");
+        assert_eq!(databuf, vec![7, 0, 0, 0, 1, 2, 3, 4], "and unchanged -- the refused update never landed either");
     }
 
     /// Task 7b: real Btrieve refuses an update that would change a key that
