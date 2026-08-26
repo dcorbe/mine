@@ -580,6 +580,30 @@ fn wccmp002_update_cost_today() {
     let cost = measure_one_update("WCCMP002.DAT", &big_path);
     report("WCCMP002.DAT (warm -- records() primed before the window)", big_len, &cost);
 
+    // Task 7's own bound, on `wchar`: one update on WCCMP002.DAT (55.7 MB,
+    // 13,607 pages) may write the touched data page, the root-to-leaf index
+    // path each key's tree edit disturbs, and the allocation-table/FCR
+    // shadow pages that edit's own claims/relocations touch. This scenario's
+    // own flip (`bytes[0] ^= 0xff`) lands on this file's one key, so this is
+    // a key-changing update (delete-then-insert, `Block::update_v6`'s own
+    // doc comment) -- measured today at 16,388 bytes, real margin under this
+    // bound (the same-leaf, no-key-change case `v6_update_writes_only_the_
+    // pages_it_changed` in `lib.rs` measures lower still, 12,292 B). See this
+    // bound's own baseline-doc entry for the argument that it discriminates
+    // (reverting to a whole-tree rebuild measured 499,742 B before Task 6,
+    // ~30-40x either figure). Unlike `cost.rchar` below, this runs in *both*
+    // build profiles: `verify_writes` re-reads and re-parses the file on top
+    // of the write (Task 1's own cost), it does not write anything extra, so
+    // `wchar` is not inflated by debug assertions the way `rchar` is.
+    assert!(
+        cost.wchar <= 65_536,
+        "update() on a warm WCCMP002.DAT wrote {} bytes -- expected at most 65,536 \
+         (measured today: 16,388 B for this key-changing scenario, 12,292 B for a \
+         same-leaf non-key-changing one), not something that scales back toward a \
+         whole-tree rebuild (499,742 B, before Task 6)",
+        cost.wchar
+    );
+
     // A second update on the same open Block must resolve its FULL PAGES
     // from the cache: a record's data/index pages, and whichever
     // allocation-table page `Block::v6_resolve_logical`/`v6::Store::attach`

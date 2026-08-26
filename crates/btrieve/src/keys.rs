@@ -1598,6 +1598,86 @@ mod tests {
         assert_eq!(key.compare_value(&record, b"abb\0\x07\x00"), Ordering::Greater);
     }
 
+    /// [`Key::compare_extracted`] is `nav::TreeCursor`'s own comparator --
+    /// both operands are already in [`Key::extract`]'s laid-out shape
+    /// (segments concatenated from offset 0), unlike [`Key::compare_value`]
+    /// (one record, one laid-out value) or [`Key::compare`] (two records).
+    /// Only corpus-indirect coverage existed before this test (the nav
+    /// differential's 4M-check sweep over `archive/`'s real files) -- this
+    /// is its dedicated unit test, over the same two-segment shape
+    /// [`a_key_value_the_module_supplies_is_laid_out_as_the_segments_are`]
+    /// already uses, so a regression here does not have to wait for the
+    /// differential's own run to be caught.
+    #[test]
+    fn compare_extracted_orders_two_laid_out_values_by_the_segments_own_types() {
+        let key = Key {
+            number: 0,
+            definition: 0,
+            segments: vec![
+                Segment {
+                    offset: 10,
+                    length: 4,
+                    kind: Kind::Text,
+                    descending: false,
+                },
+                Segment {
+                    offset: 20,
+                    length: 2,
+                    kind: Kind::Signed,
+                    descending: false,
+                },
+            ],
+            duplicates: true,
+            modifiable: true,
+            chain: Some(6),
+            acs: None,
+            null: None,
+        };
+
+        // Both laid out from offset 0 -- neither is a record, so a
+        // comparator that read the record's own 10/20 offsets (the way
+        // `compare` does) would read past a 6-byte buffer entirely.
+        assert_eq!(
+            key.compare_extracted(b"abc\0\x07\x00", b"abc\0\x07\x00"),
+            Ordering::Equal
+        );
+        // Second segment decides numerically when the first ties.
+        assert_eq!(
+            key.compare_extracted(b"abc\0\x02\x00", b"abc\0\x0a\x00"),
+            Ordering::Less
+        );
+        // First segment decides when it does not tie, and the second is
+        // never consulted.
+        assert_eq!(
+            key.compare_extracted(b"abc\0\x0a\x00", b"abd\0\x02\x00"),
+            Ordering::Less
+        );
+    }
+
+    /// The same alternate-collating-sequence fold [`Key::compare`] already
+    /// proves ([`an_alternate_sequence_folds_case_for_an_equality_lookup`]),
+    /// checked on [`Key::compare_extracted`] specifically: a B-tree built
+    /// over an ACS key (measured on `ELWWDOBJ.DAT` key 0, this function's
+    /// own doc comment) is only found correctly if this comparator folds
+    /// case the same way the tree was built, not by raw bytes.
+    #[test]
+    fn compare_extracted_honours_an_alternate_collating_sequence() {
+        let plain = text_key(None);
+        let folded = text_key(Some(case_fold_acs()));
+
+        // A raw byte compare puts uppercase before lowercase ('B' < 'a').
+        assert_eq!(
+            plain.compare_extracted(b"Bravo\0\0\0", b"alpha\0\0\0"),
+            Ordering::Less
+        );
+        // Folded to one case, "bravo" > "alpha" -- the order the ACS's own
+        // tree is actually built in.
+        assert_eq!(
+            folded.compare_extracted(b"Bravo\0\0\0", b"alpha\0\0\0"),
+            Ordering::Greater
+        );
+    }
+
     fn case_fold_acs() -> Arc<Acs> {
         let mut table = [0u8; 256];
         for (i, slot) in table.iter_mut().enumerate() {
