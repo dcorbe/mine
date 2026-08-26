@@ -969,15 +969,21 @@ pub fn dfaDelete<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
 /// `PRIMBV`/`ACCLBV`/`RONLBV`/`VERFBV`/`EXCLBV` constants. Reproduced rather
 /// than tightened: `dfaMode` genuinely stores whatever it is given.
 ///
-/// The value is now read -- but on the *other* side of the family. Task 8
-/// made `Btrieve::open` consume `Btrieve::mode()`, the mode `omdbtv` sets
-/// and `opnbtv` opens under, so a file `opnbtv` opens `RONLBV`/`VERFBV`/
-/// `EXCLBV`/`ACCLBV` is now enforced accordingly. `dfaOpen` calls that same
-/// `Btrieve::open`, but still passes it no mode of its own, so `dfa_mode`
-/// (what this function sets) is stored and reported
-/// (`Btrieve::dfa_mode`) but still not consumed by anything -- see that
-/// method's own doc comment for why, and for why this is not a currently-
-/// live gap: `WCCMMUD.DLL` never calls a `dfa*` routine at all.
+/// A mode is now read -- but on the *other* side of the family, and not
+/// this one. Task 8 made `Btrieve::open` consume `Btrieve::mode()`, the
+/// mode `omdbtv` sets and `opnbtv` opens under, so a file `opnbtv` opens
+/// `RONLBV`/`VERFBV`/`EXCLBV`/`ACCLBV` is now enforced accordingly.
+/// `dfaOpen` calls that same `Btrieve::open`, but still passes it no mode
+/// of its own, so `dfa_mode` (what this function sets) is stored and
+/// reported (`Btrieve::dfa_mode`) but still not consumed by anything.
+///
+/// **This is a real, live gap, not a dormant one.** The 32-bit PE
+/// `WCCMMUD.DLL` imports this very symbol (`_dfaMode`, one of 17 `dfa*`
+/// imports from `WGSERVER.EXE`) and calls it with `0` at boot on the live
+/// board -- see `Btrieve::dfa_current`'s own doc comment for the measured
+/// import list. A module on that path calling `dfaMode(RONLBV)` today
+/// gets no enforcement at all: see `Btrieve::dfa_mode`'s own doc comment
+/// for the named follow-up this is filed under.
 pub fn dfaMode<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let mode = btv::i16_arg::<A>(call.int());
     host.btrieve.dfa_set_mode(mode);

@@ -6705,9 +6705,22 @@ pub struct Btrieve<M: Mem> {
     /// `dfa`: DFAAPI.C's own current-file pointer, the `dfa*` family's
     /// counterpart to `bb` above and entirely independent of it -- opening a
     /// file with `dfaOpen` never changes what `opnbtv` left current, and vice
-    /// versa. `WCCMMUD.DLL` (16-bit, the one module this host has run
-    /// end-to-end) never calls a `dfa*` routine at all; the family is what
-    /// the 32-bit modules in the corpus survey import instead.
+    /// versa.
+    ///
+    /// **This is a real, live caller, not a hypothetical one.** The 16-bit
+    /// `WCCMMUD.DLL` this host has run end-to-end genuinely does not import
+    /// `dfa*` at all -- but the 32-bit PE `WCCMMUD.DLL` (`archive/modules/
+    /// majormud-nt/*/out/wccmmud.dll`) does: its own import table names 17
+    /// `dfa*` symbols from `WGSERVER.EXE` (`_dfaOpen`, `_dfaMode`,
+    /// `_dfaClose`, `_dfaQuery`, `_dfaInsertV`, `_dfaInsertDup`,
+    /// `_dfaUpdateDup`, `_dfaDelete`, `_dfaCountRec`, `_dfaAbs`, `_dfaSetBlk`,
+    /// `_dfaRstBlk`, `_dfaQueryNP`, `_dfaGetAbsLock`, `_dfaAcqLock`,
+    /// `_dfaAcqAbsLock`, `_dfaStepLock`; measured directly with `objdump -p`
+    /// against `wccnt8pj/out/wccmmud.dll`, not inferred), and `dfaMode(0)` is
+    /// observed being called at boot on the live board. So this family's own
+    /// mode field, [`Btrieve::dfa_mode`], is stored on a path a real,
+    /// currently-running module reaches -- see that method's own doc
+    /// comment for what is and is not done with it yet.
     ///
     /// **Kept here, not in module memory.** `BTVSTF.H:36` declares
     /// `extern struct btvblk *bb;`, which is what lets [`crate::globals`]
@@ -7076,13 +7089,23 @@ impl<M: Mem> Btrieve<M> {
     /// field's own doc comment -- for `RONLBV`/`VERFBV`/`EXCLBV`/`ACCLBV`.
     /// `dfaOpen` still calls that same [`Self::open`], and still passes it
     /// no mode of its own, so this value is stored and reported here but
-    /// not yet consumed by anything: a module that reaches its Btrieve
-    /// files through `dfa*` rather than `btv*` does not get mode
-    /// enforcement from this task. `WCCMMUD.DLL`, the one 16-bit module
-    /// this host runs end-to-end, never calls a `dfa*` routine at all (see
-    /// [`Self::dfa_current`]'s own doc comment), so this gap has no
-    /// currently-live caller; closing it is future work, not a silent
-    /// omission.
+    /// **not yet consumed by anything**.
+    ///
+    /// **This is an open, live enforcement gap, not a settled non-issue.**
+    /// The 32-bit PE `WCCMMUD.DLL` imports 17 `dfa*` symbols from
+    /// `WGSERVER.EXE` and `dfaMode(0)` is observed called at boot on the
+    /// live board -- see [`Self::dfa_current`]'s own doc comment for the
+    /// measured import list. A module on that path that called
+    /// `dfaMode(RONLBV)` (or `VERFBV`/`EXCLBV`/`ACCLBV`) today would get
+    /// **no enforcement at all**: `dfaOpen`'s blocks are still governed by
+    /// whatever `self.mode` (`omdbtv`/`opnbtv`'s field) happens to hold,
+    /// never by this one. Filed as a named follow-up -- "wire `dfaOpen` to
+    /// consume `dfa_mode` the way `opnbtv` now consumes `mode`" -- for
+    /// whichever task next touches the `dfa*` write path, not closed here:
+    /// Task 8's own brief scoped the mode-enforcement work to
+    /// `Btrieve::mode()`/`set_mode()` specifically, and the coordinator
+    /// ruled that deferral legitimate rather than asking it be wired up
+    /// in this round.
     pub fn dfa_mode(&self) -> i16 {
         self.dfa_mode
     }
