@@ -259,6 +259,71 @@ fn measure_one_update(label: &str, path: &Path) -> Cost {
     }
 }
 
+/// Open `path` as a genuine Btrieve file, then time a single `insert()` of a
+/// new record with a fresh key value.
+///
+/// `records()` is primed before the window, same as [`measure_one_update`]:
+/// a real `dfaInsert` sequence has already opened the file (and typically
+/// probed a key first), so the model being loaded is not part of what an
+/// insert itself costs. What happens *inside* `insert()` is what this
+/// measures -- the mass-write workload this crate's own write-cost baseline
+/// is silent on, since every existing bound here covers `update()` only.
+///
+/// The new record clones the file's own record 0, so it is guaranteed to be
+/// `reclen` bytes, and then overwrites the key's own bytes with `marker`
+/// (four bytes at the front of the record, past `make_keys_modifiable`'s own
+/// reach) so a repeated call inserts a distinct key each time rather than
+/// refusing on a duplicate.
+///
+/// # Panics
+///
+/// If the file cannot be opened or read, or if `insert()` itself refuses or
+/// fails.
+fn measure_one_insert(label: &str, path: &Path, marker: u32) -> Cost {
+    let mut mem = FlatMem::new(64 * 1024);
+    let mut heap = FlatHeap::new(0x100);
+    let mut btrieve = Btrieve::<Flat>::default();
+
+    let geometry = Geometry::read(label, path).unwrap_or_else(|e| panic!("{label}: {e}"));
+    assert!(!geometry.variable, "{label}: this measurement is the fixed-length write path");
+    let maxlen = geometry.reclen;
+
+    let at = btrieve
+        .open(&mut mem, &mut heap, label, path, geometry, maxlen)
+        .unwrap_or_else(|e| panic!("{label}: open: {e}"));
+
+    let mut bytes = {
+        let block = btrieve.block_mut(at).expect("just opened");
+        let records = block.records().unwrap_or_else(|e| panic!("{label}: records: {e}"));
+        assert!(!records.is_empty(), "{label}: this file has no records to clone the shape of");
+        records.physical(0).expect("index 0 of a non-empty Records").bytes.clone()
+    };
+    bytes[..4].copy_from_slice(&marker.to_le_bytes());
+
+    let (r0, w0, sc0) = proc_io();
+    btrieve::testing::reset_file_opens();
+    btrieve::testing::reset_page_fetches();
+    reset_peak();
+    let start = Instant::now();
+    btrieve
+        .block_mut(at)
+        .expect("still open")
+        .insert(&bytes)
+        .unwrap_or_else(|e| panic!("{label}: insert: {e}"));
+    let wall = start.elapsed();
+    let (r1, w1, sc1) = proc_io();
+
+    Cost {
+        rchar: r1.saturating_sub(r0),
+        wchar: w1.saturating_sub(w0),
+        syscr: sc1.saturating_sub(sc0),
+        opens: file_opens(),
+        page_fetches: btrieve::testing::page_fetches(),
+        peak: peak_growth_since_reset(),
+        wall,
+    }
+}
+
 /// The same measurement as [`measure_one_update`], but *cold*: nothing on
 /// the `Block` under test has called `records()`, `Get`, or `Step` before
 /// `update()` does its own internal `self.records()?` -- the real precondition
@@ -811,6 +876,87 @@ fn wccmp002_update_cost_today() {
         "update() on a warm WCCMP002.DAT opened its file {} times -- expected at most 4 \
          (one for Block::v6_resolve_logical, one for v6::Store::open), not something that \
          scales with how many pages the write touches",
+        cost.opens
+    );
+}
+
+/// One `insert()` against the exact same `WCCMP002.DAT` -- the mass-write
+/// workload every bound above is silent about. The live board's own boot-time
+/// "Automatic Database Update" is insert-heavy (populating a virgin
+/// character file record by record), and nothing in this file measured that
+/// shape before: every bound above times `update()`, never `insert()`.
+///
+/// # The regression this bound is written against
+///
+/// A serial A/B against `main-code` (pre-page-cache) measured this branch's
+/// mass-write workload reading 83x more bytes overall (2.5 GB to 207.6 GB)
+/// and finishing 39% slower wall-clock despite far fewer read syscalls --
+/// average bytes *per* syscall went up, not down, which is the signature of
+/// a large read replacing many small ones rather than the reverse. A live
+/// `strace` against the branch binary mid-update found a second file handle
+/// (not the resident page cache's own) repeating, once per write op: one
+/// read of the file's *entire current length* from offset 0 (a whole number
+/// of pages, growing in step with the file itself), then dozens of 8-byte
+/// probes at high offsets. `insert()`'s own fast path
+/// (`Block::v6_fast_reads`) is supposed to make this file's every write
+/// answer from the page cache alone, the same as `update()`'s already-bounded
+/// path above -- this test is the bound that would have caught the fast
+/// path not actually being taken.
+#[test]
+#[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+fn wccmp002_insert_cost_today() {
+    let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(source) = std::env::var("WCCMP002") else {
+        eprintln!("set WCCMP002=/path/to/wccmp002.vir to run this");
+        return;
+    };
+
+    let insert_dir = scratch("write-cost-insert");
+    let insert_path = insert_dir.join("WCCMP002.DAT");
+    std::fs::copy(&source, &insert_path).unwrap_or_else(|e| panic!("copying {source}: {e}"));
+    make_keys_modifiable(&insert_path);
+    let insert_len = std::fs::metadata(&insert_path).expect("metadata").len();
+    assert_eq!(insert_len, 55_734_272, "this is the exact file the plan measured defect #2 against");
+
+    let cost = measure_one_insert("WCCMP002.DAT", &insert_path, 0xefbe_adde);
+    report("WCCMP002.DAT (insert -- records() primed before the window)", insert_len, &cost);
+
+    // `verify_writes` (debug builds only) re-reads and re-parses the whole
+    // file on top of the write itself -- Task 1's own cost, not this bound's
+    // to make. Asserted only in `--release`, same as `wccmp002_update_cost_today`.
+    if cfg!(debug_assertions) {
+        eprintln!("write_cost: verify_writes is on in this build; not bounding its extra read");
+        return;
+    }
+
+    // Same shape as `wccmp002_update_cost_today`'s own warm `rchar` bound:
+    // a small multiple of the page size, not something that scales with the
+    // file's 55,734,272 bytes. An insert that falls off the fast path and
+    // back onto `records()`/`records::walk_v6` reads the *whole file* -- this
+    // bound is what makes that regression fail loudly instead of merely
+    // running slower.
+    let page_size = 4096u64;
+    let bound = 300 * page_size;
+    assert!(
+        cost.rchar <= bound,
+        "insert() on WCCMP002.DAT read {} bytes -- expected at most {bound} ({bound} = 300 \
+         pages of {page_size}), a small multiple of the page size, not something that scales \
+         with the file's {insert_len} bytes (a whole-file read here is exactly the regression \
+         this bound exists to catch)",
+        cost.rchar
+    );
+
+    assert!(
+        cost.syscr <= 300,
+        "insert() on WCCMP002.DAT issued {} read(2) syscalls -- expected at most 300, a small \
+         multiple of the pages a write actually touches",
+        cost.syscr
+    );
+
+    assert!(
+        cost.opens <= 4,
+        "insert() on WCCMP002.DAT opened its file {} times -- expected at most 4, not something \
+         that scales with how many pages the write touches",
         cost.opens
     );
 }
