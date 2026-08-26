@@ -867,19 +867,38 @@ pub(crate) fn duplicate_key<A: Abi>(
     let keys = file.keys().to_vec();
     let saved = file.cursor();
 
+    // Both fallible calls in the loop below report their own error into
+    // `outcome` and `break` rather than using `?` directly -- an early
+    // return from inside the loop would skip the `file.seek_to(saved)`
+    // after it, leaving the cursor wherever the last successful `query`
+    // left it. Restoring only on the loop's normal exit was exactly that
+    // bug (found in this task's own re-review): a `Block::query`/`Block::
+    // get_position` failure mid-scan moved this read-only check's cursor
+    // and never put it back.
     let mut collision = None;
+    let mut outcome = Ok(());
     for key in &keys {
         if key.duplicates {
             continue;
         }
         let value = key.extract(bytes);
-        let found = file
-            .query(key.number, EngineOp::Equal, &value)
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        let found = match file.query(key.number, EngineOp::Equal, &value) {
+            Ok(found) => found,
+            Err(e) => {
+                outcome = Err(ShimError::Failed(e.to_string()));
+                break;
+            }
+        };
         if !found {
             continue;
         }
-        let existing = file.get_position().map_err(|e| ShimError::Failed(e.to_string()))?;
+        let existing = match file.get_position() {
+            Ok(existing) => existing,
+            Err(e) => {
+                outcome = Err(ShimError::Failed(e.to_string()));
+                break;
+            }
+        };
         if Some(existing) == exclude {
             continue;
         }
@@ -887,10 +906,8 @@ pub(crate) fn duplicate_key<A: Abi>(
         break;
     }
     file.seek_to(saved);
-    if let Some((key, value)) = collision {
-        return Ok(Some((key, value)));
-    }
-    Ok(None)
+    outcome?;
+    Ok(collision)
 }
 
 /// Say that a duplicate-key collision made a write answer 0 instead of

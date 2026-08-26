@@ -1162,18 +1162,28 @@ impl<M: Mem> Block<M> {
     /// [`OpError::NoSuchKey`] if `key` names no key this block has. If the
     /// records cannot be read (non-fast-path files only).
     pub fn cursor_for(&mut self, key: u16, position: u32) -> Result<Option<Cursor>, OpError> {
-        if usize::from(key) >= self.keys().len() {
-            return Err(OpError::NoSuchKey(key));
-        }
         self.resolve_cursor(key, position)
     }
 
     /// Shared body of [`Self::acquire_absolute`] and [`Self::cursor_for`]:
-    /// the fast-path-first cursor resolution neither caller may skip the
-    /// `key` bounds check ahead of. `key` is trusted here -- both callers
-    /// check it first, and duplicating the check a second time here would
-    /// just be a second place for it to drift.
+    /// the fast-path-first cursor resolution.
+    ///
+    /// **The `key` bounds check is this function's own first statement**,
+    /// not each caller's -- an earlier version left it to the callers and
+    /// only [`Self::cursor_for`] carried one, so [`Self::acquire_absolute`]
+    /// let an out-of-range `key` fall all the way into the fast/slow split
+    /// below. On the fast path that surfaced as `OpError::Records` (a
+    /// generic, run-halting failure) instead of the ordinary status-6
+    /// [`OpError::NoSuchKey`]; on the slow path the refusal (when one
+    /// happened at all) came back only after [`Self::acquire_absolute`]
+    /// had already called [`Self::seek_to`]/[`Self::take_lock`], so a call
+    /// that must refuse cleanly moved the cursor -- and could take a lock
+    /// -- first. Checking here, before either branch, is what makes both
+    /// callers refuse identically and before anything else runs.
     fn resolve_cursor(&mut self, key: u16, position: u32) -> Result<Option<Cursor>, OpError> {
+        if usize::from(key) >= self.keys().len() {
+            return Err(OpError::NoSuchKey(key));
+        }
         if self.v6_fast_reads() {
             let found = self.v6_record_bytes_at(position).map_err(|why| {
                 OpError::Records(BtvError {
@@ -2940,6 +2950,24 @@ mod tests {
         }
     }
 
+    /// [`fixture_v6_real`], with a real [`crate::cache::PageCache`]
+    /// attached -- the one difference between the two that
+    /// [`Block::v6_fast_reads`] actually checks (`self.cache.is_some()`),
+    /// so this is what a caller needs to exercise the fast path rather
+    /// than the `self.records()` one every other v6 fixture in this test
+    /// module takes. `Block::open` builds this exact `cache` field for any
+    /// real v6 file; this constructs it by hand for the same reason
+    /// [`fixture_v6_real`] constructs the rest of `Block` by hand -- no
+    /// `Btrieve`/heap/memory machinery needed for a test that only calls a
+    /// `Block` method directly.
+    fn fixture_v6_real_cached(name: &str) -> Block<Flat> {
+        let mut block = fixture_v6_real(name);
+        let cache = crate::cache::PageCache::open(&block.path, block.geometry.page)
+            .expect("the same file fixture_v6_real just confirmed readable");
+        block.cache = Some(std::rc::Rc::new(std::cell::RefCell::new(cache)));
+        block
+    }
+
     /// A 20-byte record shaped for `V6EMPTY1KEY.DAT`: `key` at bytes 0..4,
     /// `0xEE` filler for the rest -- the same shape `lib.rs`'s own
     /// `v6_record` uses on the same fixture.
@@ -3243,6 +3271,36 @@ mod tests {
             b.acquire_absolute(position, 2, 0, &mut locks, RECLEN).expect_err("only keys 0 and 1 exist"),
             OpError::NoSuchKey(2)
         );
+    }
+
+    /// The cached-v6 (fast-path) sibling of the refusal above --
+    /// **failing-first for the bug this task's re-review found.**
+    /// `resolve_cursor` used to trust its two callers to bounds-check
+    /// `key` first, and `Block::acquire_absolute` did not: on a cached v6
+    /// block an out-of-range key fell straight into
+    /// `Block::v6_record_bytes_at`, which surfaces as a generic
+    /// `OpError::Records` (a run-halting failure one layer up), not this
+    /// file's ordinary status-6 `OpError::NoSuchKey`. On the slow path
+    /// (the test above) the same missing check meant the refusal, when it
+    /// happened at all, came from `Block::deliver_current` -- after
+    /// `Block::acquire_absolute` had already called `Block::seek_to`/
+    /// `Block::take_lock`. Reverting `resolve_cursor`'s bounds check (this
+    /// commit's own fix) reproduces both: this assertion fails with
+    /// `OpError::Records(..)` instead of `OpError::NoSuchKey(1)`.
+    #[test]
+    fn acquire_absolute_on_a_cached_v6_block_refuses_an_out_of_range_key_before_touching_anything() {
+        let mut b = fixture_v6_real_cached("acquire_absolute_cached_refuses_out_of_range_key");
+        assert!(b.v6_fast_reads(), "this fixture must exercise the fast path, not the one above's");
+        let mut locks = LockTable::default();
+        let before = b.cursor();
+
+        let err = b
+            .acquire_absolute(0, 1, 100, &mut locks, RECLEN)
+            .expect_err("V6EMPTY1KEY.DAT has one key, numbered 0 -- key 1 does not exist");
+        assert_eq!(err, OpError::NoSuchKey(1));
+
+        assert_eq!(b.cursor(), before, "a refused Acquire Absolute must not move the cursor");
+        assert!(locks.is_empty(), "a refused Acquire Absolute must not take a lock either");
     }
 
     // -- Locking: the state machine, `docs/lock-oracle-answer.md` --
