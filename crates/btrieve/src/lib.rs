@@ -60,6 +60,7 @@ mod create;
 pub mod emit;
 pub mod format;
 pub mod keys;
+mod lock;
 pub mod mem;
 pub mod model;
 mod nav;
@@ -6702,6 +6703,11 @@ pub struct Btrieve<M: Mem> {
     /// one [`Block`].
     locks: ops::LockTable,
 
+    /// The `dfa*` surface's cross-channel lock ownership -- see
+    /// [`lock::Locks`]'s own doc comment for why this is a second table
+    /// rather than an owner field on [`Self::locks`].
+    dfa_locks: lock::Locks,
+
     /// `dfa`: DFAAPI.C's own current-file pointer, the `dfa*` family's
     /// counterpart to `bb` above and entirely independent of it -- opening a
     /// file with `dfaOpen` never changes what `opnbtv` left current, and vice
@@ -6829,6 +6835,7 @@ impl<M: Mem> Default for Btrieve<M> {
             mode: PRIMBV,
             transaction: false,
             locks: ops::LockTable::default(),
+            dfa_locks: lock::Locks::default(),
             dfa_current: M::null_ptr(),
             dfa_stack: [M::null_ptr(); DFSTSZ],
             dfa_mode: 0,
@@ -7650,6 +7657,9 @@ impl<M: Mem> Btrieve<M> {
         // this close forgot to release would sit in the table forever
         // regardless).
         self.locks.release_all_for(block.id());
+        // The `dfa*` surface's own lock ownership, same measurement, same
+        // `BlockId` -- see [`lock::Locks::release_all_for_block`].
+        self.dfa_locks.release_all_for_block(block.id());
         Ok(block)
     }
 
@@ -7720,6 +7730,46 @@ impl<M: Mem> Btrieve<M> {
         self.open[index]
             .take_lock(lock, &mut self.locks)
             .map_err(|e| e.to_string())
+    }
+
+    /// The `dfa*` surface's own lock-taking: on top of whatever
+    /// [`Self::take_lock`] already recorded in the session-wide, unowned
+    /// [`ops::LockTable`] (still runs first -- `shims/dfa.rs`'s four
+    /// lock-taking calls all reach that table exactly as `btv*` does,
+    /// through the same `locate`/`absolute`/`take_lock` call sequence --
+    /// see [`lock::Locks`]'s own doc comment for why this is a second,
+    /// independent check rather than a change to that one), this attributes
+    /// the lock to `owner` and refuses a *different* owner already holding
+    /// the exact same record.
+    ///
+    /// Callers run this only once positioning (and, for the three calls
+    /// that deliver a record, delivery) has already succeeded -- the same
+    /// "an operation that fails takes no lock" precondition
+    /// [`ops::Block::take_lock`] documents. `lock == 0` is always granted.
+    ///
+    /// Returns whether the lock was granted; `Ok(false)` is a real refusal
+    /// (status 84, see [`lock::LOCK_CONFLICT_STATUS`]), not an error --
+    /// callers treat it exactly as `DFAAPI.C`'s own `dfaWasLocked()`
+    /// convention does, folding it into whatever "not found" already means
+    /// for that call.
+    ///
+    /// # Errors
+    /// If `at` names no open file.
+    pub fn dfa_take_lock(&mut self, at: M::Ptr, lock: i16, owner: u32) -> Result<bool, String> {
+        let index = self.find(at)?;
+        if lock == 0 {
+            return Ok(true);
+        }
+        // Defensive, not reachable through the four callers: each already
+        // positioned successfully (and, for `dfaAcqLock`/`dfaAcqAbsLock`/
+        // `dfaGetAbsLock`/`dfaStepLock` alike, delivered) before calling
+        // this. Granting rather than refusing matches `ops::Block::
+        // take_lock`'s own defensive branch for the identical shape.
+        let Some(position) = self.open[index].current().map(|r| r.position) else {
+            return Ok(true);
+        };
+        let id = self.open[index].id();
+        Ok(self.dfa_locks.acquire(id, position, lock, owner))
     }
 
     /// The raw lock type this session holds at `at`'s current position, if
@@ -12995,6 +13045,50 @@ mod tests {
         assert_eq!(btrieve.close_all_files().expect("idempotent"), 0);
     }
 
+    /// Task 9: `close`/`close_file` must release the `dfa*` surface's own
+    /// cross-channel lock ownership ([`lock::Locks`]), not just
+    /// `ops::LockTable`'s -- measured (`docs/lock-oracle-answer.md`):
+    /// "closing a file releases every lock it held, immediately." Checked
+    /// the hard way: `dfa_locks.holder` is read directly rather than
+    /// inferred from a second open reusing the position, because a fresh
+    /// open always gets a fresh `BlockId` regardless of whether this close
+    /// released anything -- see `lock::Locks::release_all_for_block`'s own
+    /// doc comment.
+    #[test]
+    fn closing_a_block_releases_the_dfa_locks_surface_too() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::default();
+
+        let path = seed_indexed(&crate::testing::scratch("btrieve-close-dfa-locks"));
+        let at = open_indexed(&mut mem, &mut heap, &mut btrieve, path);
+        let block = btrieve.block_mut(at).expect("open");
+        block.insert(&record(1)).expect("insert");
+        assert!(
+            block.query(0, Op::Equal, &1u16.to_le_bytes()).expect("query"),
+            "positioned on the record just inserted"
+        );
+        let id = block.id();
+        let position = block.current().expect("positioned").position;
+
+        assert!(
+            btrieve.dfa_take_lock(at, 100, 1).expect("granted"),
+            "owner 1 takes a single lock"
+        );
+        assert_eq!(
+            btrieve.dfa_locks.holder(id, position),
+            Some(1),
+            "recorded before close"
+        );
+
+        btrieve.close(&mut mem, &mut heap, at).expect("closes");
+        assert_eq!(
+            btrieve.dfa_locks.holder(id, position),
+            None,
+            "closing released the dfa* surface's own lock, not just ops::LockTable's"
+        );
+    }
+
     /// Controller ruling 2026-08-25: shutdown's close sweep is best-effort,
     /// not fail-fast -- maximum data settled wins over stopping at the
     /// first problem. A block with an outstanding transaction pre-image
@@ -13433,6 +13527,7 @@ mod tests {
             mode: 0,
             transaction: false,
             locks: ops::LockTable::default(),
+            dfa_locks: lock::Locks::default(),
             // The dfa facade's own current-block and stack, empty here: these
             // tests are about `begin`/`end`/`abort`, and a hand-written struct
             // literal is exactly what stops compiling when the struct grows,

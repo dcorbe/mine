@@ -142,6 +142,27 @@ use crate::btrieve::{Btrieve, Cursor, Geometry};
 use crate::shims::ShimError;
 use crate::shims::btrieve as btv;
 
+/// The owner token this task's cross-channel lock table uses -- the
+/// channel/user number currently running, per `usrnum`
+/// ([`Host::current_channel_mem`]). `crates/btrieve` is `Mem`-agnostic and
+/// knows nothing of [`crate::chan::Chan`], so this is where a `Chan`
+/// becomes the raw `u32` [`crate::btrieve::Btrieve::dfa_take_lock`] takes.
+///
+/// `None` when `usrnum` does not currently name a channel -- `MAJORBBS.C:882`
+/// sets it to `-1` before any module's init runs, and a `dfa*` lock taken
+/// from outside any channel's own turn (module init loading its own data,
+/// for one) is not taken *on behalf of* a channel at all. There is nothing
+/// for such a lock to conflict with by definition, so callers skip the
+/// cross-channel check entirely on `None` rather than refuse the whole call
+/// over a channel that was never current to begin with.
+fn current_owner<A: Abi>(call: &mut Call<A>, host: &Host<A>) -> Option<u32> {
+    let chan = host.current_channel_mem(call.mem()).ok()?;
+    // `Chan::number` is always non-negative -- it is only ever constructed
+    // from `Terms::chan`/`Terms::all`, both bounds-checked against a
+    // channel count -- so this cast never wraps.
+    Some(chan.number() as u32)
+}
+
 /// The file `dfa*` routines currently work on, refusing if none is.
 ///
 /// For the routines `DFAAPI.C` never guards at all (see the module doc
@@ -527,6 +548,20 @@ pub fn dfaGetLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
 /// the whole `dfa*` family (37 of 71 surveyed modules).
 ///
 /// **Explicit guard** (`:372-376`), quiet `FALSE` with no file current.
+///
+/// # Cross-channel: a different channel already holding this record
+///
+/// `btv::locate` already took `lock` in the session-wide, unowned
+/// `ops::LockTable` (mode-mixing bookkeeping, shared with `btv*`,
+/// unchanged). Once that -- and delivery -- have already succeeded, this
+/// also attributes the lock to the channel currently running
+/// ([`current_owner`]) through
+/// [`crate::btrieve::Btrieve::dfa_take_lock`]. A *different* channel
+/// already holding the exact record found is folded into `found = false`
+/// here, which is exactly the `dfaWasLocked()` -> quiet `FALSE` case
+/// `DFAAPI.C:404-411` already describes for status 84/85 -- so this needs
+/// no new branch below, only a `found` that can now also come back `false`
+/// for this reason.
 pub fn dfaAcqLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let Some(block) = dfa_positioned(host, "dfaAcqLock")? else {
         btv::note_no_file(host, "dfaAcqLock");
@@ -562,6 +597,13 @@ pub fn dfaAcqLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
             lock,
         },
     )?;
+    let found = match (found && lock != 0, current_owner(call, host)) {
+        (true, Some(owner)) => host
+            .btrieve
+            .dfa_take_lock(block, lock, owner)
+            .map_err(ShimError::Failed)?,
+        (true, None) | (false, _) => found,
+    };
     if found {
         note_len(host, block);
     }
@@ -643,6 +685,16 @@ pub fn dfaAbs<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// `note_len` stays here rather than moving into the core: `dfa->lastlen` is
 /// this side's bookkeeping and the `btv*` spellings have no such field.
 ///
+/// # Cross-channel: a different channel already holding this record
+///
+/// Same rule [`dfaAcqLock`]'s own doc comment states, folded into `found`
+/// here for the identical reason: `dfaAcqAbsLock` already treats any
+/// nonzero status as `false` (`DFAAPI.C:496-503`, `return(status == 0)`),
+/// and `dfaGetAbsLock` already refuses whenever this returns `false`
+/// (`:467-469`) -- so making a cross-channel conflict just another way to
+/// come back `false` gets both callers' already-divergent handling right
+/// with no extra code in either.
+///
 /// # Errors
 ///
 /// A negative key number, no `dfa` file current, or whatever
@@ -674,6 +726,13 @@ fn dfa_acq_abs<A: Abi>(
             keynum,
         },
     )?;
+    let found = match (found && loktyp != 0, current_owner(call, host)) {
+        (true, Some(owner)) => host
+            .btrieve
+            .dfa_take_lock(block, loktyp, owner)
+            .map_err(ShimError::Failed)?,
+        (true, None) | (false, _) => found,
+    };
     if found {
         note_len(host, block);
     }
@@ -746,6 +805,15 @@ pub fn dfaGetAbsLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<a
 /// dereferences `bb` twice before anything is checked, which is why
 /// `btv::stpbtvl`/`btv::stpbtv` both refuse on a missing file rather than
 /// answering quietly. `dfaStepLock` genuinely does check first.
+///
+/// # Cross-channel: a different channel already holding this record
+///
+/// `DFAAPI.C:521-527` has its own `dfaWasLocked()` -> quiet `FALSE`
+/// exception for `dfaStepLock`, same as `dfaAcqLock`'s. Once positioning
+/// and delivery have already succeeded, this attributes the lock to the
+/// channel currently running ([`current_owner`]); a different channel
+/// already holding the landed-on record overrides the `TRUE` this would
+/// otherwise return.
 pub fn dfaStepLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let Some(block) = dfa_positioned(host, "dfaStepLock")? else {
         btv::note_no_file(host, "dfaStepLock");
@@ -809,6 +877,18 @@ pub fn dfaStepLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi
     file.seek_to(Cursor::Physical { at });
     btv::take_lock(host, block, lock)?;
     btv::deliver(call, host, block, into)?;
+    if lock != 0
+        && let Some(owner) = current_owner(call, host)
+        && !host
+            .btrieve
+            .dfa_take_lock(block, lock, owner)
+            .map_err(ShimError::Failed)?
+    {
+        // A different channel already holds the record this landed on --
+        // `DFAAPI.C:521-527`'s own `dfaWasLocked()` case, quiet `FALSE`
+        // rather than the `TRUE` a successful step otherwise returns.
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
     note_len(host, block);
     Ok(abi::Ret::Int(A::Int::from(1u16)))
 }
@@ -1173,12 +1253,21 @@ pub fn dfaUnlock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
 /// own "record locked by another user" and "file locked by another process"
 /// statuses.
 ///
-/// **Always `FALSE`.** This host is single-process by construction (see,
-/// among several others, [`crate::btrieve::Btrieve::begin`]'s own doc
-/// comment), so there is never a second session to hold a conflicting lock
-/// -- statuses 84/85 describe a condition this host cannot produce, not one
-/// it has chosen not to reproduce. `FALSE` is the honestly-derived answer
-/// here, not a placeholder standing in for future work.
+/// **Always `FALSE`, but no longer because status 84/85 is unproducible.**
+/// Task 9 gave `dfaAcqLock`/`dfaAcqAbsLock`/`dfaGetAbsLock`/`dfaStepLock` a
+/// real cross-channel conflict (`crate::btrieve::Btrieve::dfa_take_lock`,
+/// status 84 -- one channel already holding a record refuses a different
+/// one), so this host genuinely can produce the condition `DFAAPI.C:852-856`
+/// names now. What is still missing is a place to remember *which* of the
+/// two reasons the last dfa* call answered "not found" for: real Btrieve's
+/// own `status` is a single global every `btvu()` call updates and every
+/// routine, `dfaWasLocked` included, reads directly; this host has no
+/// equivalent slot, and adding one is a bigger change than this task's four
+/// named calls -- see the final report's own concerns. `FALSE` here is
+/// consequently still every answer, not a chosen one -- register the gap
+/// rather than guess at it. Not blocking today's one surveyed caller:
+/// `_dfaWasLocked` is absent from `WCCMMUD.DLL`'s own 32-bit import list
+/// (`crate::btrieve::Btrieve::dfa_current`'s doc comment).
 pub fn dfaWasLocked<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
@@ -2156,6 +2245,190 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Task 9: cross-channel lock ownership. Two owners, one file, contending
+    // for the same record -- the scenario this task exists for: a lock one
+    // channel holds across polls is mutual exclusion between *players*.
+    // -----------------------------------------------------------------
+
+    /// A host with two channels to contend with each other, over the same
+    /// checked-in `tests/data` -- everything else `Fixture::new` sets up.
+    fn two_channel_fixture() -> Fixture {
+        Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2))
+    }
+
+    /// Point `usrnum` at channel `n`, the way [`crate::Host::point_curusr`]
+    /// would -- read back by [`current_owner`] the same way a real dfa*
+    /// call reads it.
+    fn as_channel(f: &mut Fixture, n: i16) {
+        f.host
+            .globals()
+            .write(&mut f.machine, "usrnum", &n.to_le_bytes())
+            .expect("usrnum placed");
+    }
+
+    #[test]
+    fn dfaacqlock_refuses_a_record_a_different_channel_already_holds() {
+        let mut f = two_channel_fixture();
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        as_channel(&mut f, 0);
+        assert!(acquire(&mut f, Some(5), 0, 5, 100), "channel 0 locks key 5");
+
+        as_channel(&mut f, 1);
+        assert!(
+            !acquire(&mut f, Some(5), 0, 5, 100),
+            "channel 1 must be refused -- status 84, channel 0 still holds key 5"
+        );
+        assert!(
+            acquire(&mut f, Some(6), 0, 5, 100),
+            "channel 1 can still lock an unrelated record: this is not a blanket refusal"
+        );
+    }
+
+    #[test]
+    fn dfaacqlock_lets_the_same_channel_reacquire_its_own_lock() {
+        let mut f = two_channel_fixture();
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        as_channel(&mut f, 0);
+        assert!(acquire(&mut f, Some(5), 0, 5, 100), "first acquire");
+        assert!(
+            acquire(&mut f, Some(5), 0, 5, 100),
+            "re-locking your own record is a harmless no-op, not a conflict with yourself"
+        );
+    }
+
+    #[test]
+    fn dfaacqlock_grants_a_record_a_different_channel_already_released() {
+        let mut f = two_channel_fixture();
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        as_channel(&mut f, 0);
+        assert!(acquire(&mut f, Some(5), 0, 5, 100), "channel 0 locks key 5");
+        // Auto-release: `docs/lock-oracle-answer.md` -- taking a second
+        // single-record lock releases the first, now scoped to the owner
+        // that took it.
+        assert!(acquire(&mut f, Some(6), 0, 5, 100), "channel 0 moves its single lock to key 6");
+
+        as_channel(&mut f, 1);
+        assert!(
+            acquire(&mut f, Some(5), 0, 5, 100),
+            "key 5 is free once channel 0's own auto-release let go of it"
+        );
+    }
+
+    #[test]
+    fn dfaacqabslock_refuses_a_position_a_different_channel_already_holds() {
+        let mut f = two_channel_fixture();
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        as_channel(&mut f, 0);
+        assert!(acquire(&mut f, Some(6), 0, 5, 100), "positioned on key 6");
+        let Ret::U32(position) = f.invoke(dfaAbs, &[]).expect("position") else {
+            panic!("dfaAbs returns a long");
+        };
+        assert_eq!(
+            f.invoke(dfaAcqAbsLock, &[0, 0, position as u16, (position >> 16) as u16, 0, 100])
+                .expect("acquires"),
+            Ret::U16(1),
+            "channel 0 takes an abs lock on the same position"
+        );
+
+        as_channel(&mut f, 1);
+        assert_eq!(
+            f.invoke(dfaAcqAbsLock, &[0, 0, position as u16, (position >> 16) as u16, 0, 100])
+                .expect("answers"),
+            Ret::U16(0),
+            "channel 1 refused -- channel 0 still holds this position"
+        );
+    }
+
+    /// `dfaGetAbsLock` has no quiet-false convention at all
+    /// (`dfagetabslock_refuses_at_the_identical_position_dfaacqabslock_answers_quietly`,
+    /// above) -- a cross-channel conflict is exactly the same kind of
+    /// refusal `DFAAPI.C:467-469` sends to `dfaPosError`, so this refuses by
+    /// name rather than answering `0`.
+    #[test]
+    fn dfagetabslock_refuses_via_hard_error_on_a_cross_channel_conflict() {
+        let mut f = two_channel_fixture();
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        as_channel(&mut f, 0);
+        assert!(acquire(&mut f, Some(6), 0, 5, 100), "positioned on key 6");
+        let Ret::U32(position) = f.invoke(dfaAbs, &[]).expect("position") else {
+            panic!("dfaAbs returns a long");
+        };
+        assert_eq!(
+            f.invoke(dfaAcqAbsLock, &[0, 0, position as u16, (position >> 16) as u16, 0, 100])
+                .expect("acquires"),
+            Ret::U16(1)
+        );
+
+        as_channel(&mut f, 1);
+        let e = f
+            .invoke(dfaGetAbsLock, &[0, 0, position as u16, (position >> 16) as u16, 0, 100])
+            .expect_err("dfaGetAbsLock has no quiet-false exception, cross-channel included");
+        assert!(e.to_string().contains("dfaGetAbsLock"), "{e}");
+    }
+
+    #[test]
+    fn dfasteplock_refuses_a_position_a_different_channel_already_holds() {
+        let mut f = two_channel_fixture();
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        as_channel(&mut f, 0);
+        assert_eq!(
+            f.invoke(dfaStepLock, &[0, 0, 33, 100]).expect("first"),
+            Ret::U16(1),
+            "channel 0 steps to the first physical record and locks it"
+        );
+
+        as_channel(&mut f, 1);
+        assert_eq!(
+            f.invoke(dfaStepLock, &[0, 0, 33, 100]).expect("answers"),
+            Ret::U16(0),
+            "channel 1 lands on the identical first physical record -- refused"
+        );
+        // Physically the second record, not the first -- unaffected by
+        // channel 0's hold on the first.
+        assert_eq!(
+            f.invoke(dfaStepLock, &[0, 0, 24, 100]).expect("answers"),
+            Ret::U16(1),
+            "a different physical position is unaffected by the conflict above"
+        );
+    }
+
+    #[test]
+    fn closing_the_dfa_file_releases_a_different_channels_hold_too() {
+        let mut f = two_channel_fixture();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+
+        as_channel(&mut f, 0);
+        assert!(acquire(&mut f, Some(5), 0, 5, 100), "channel 0 locks key 5");
+
+        assert_eq!(
+            f.invoke(dfaClose, &[block.offset, block.selector]).expect("closes"),
+            Ret::Void
+        );
+
+        // Reopening gives a fresh file (and a fresh `BlockId` underneath
+        // it), so a lock channel 1 can now take here proves nothing on its
+        // own -- see `closing_a_block_releases_the_dfa_locks_surface_too`
+        // (`crates/btrieve/src/lib.rs`) for the same fact checked directly
+        // against the table `close` releases. This is the shim-level
+        // observable: the module can reopen and use the file normally,
+        // which a lock leaked past close would not change either -- kept as
+        // an end-to-end smoke test of the wiring, not the release proof
+        // itself.
+        open(&mut f, "SAMPLE.DAT", 64);
+        as_channel(&mut f, 1);
+        assert!(
+            acquire(&mut f, Some(5), 0, 5, 100),
+            "the reopened file's key 5 is free to lock"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Insert/update/delete, including the V and Dup variants.
     // -----------------------------------------------------------------
 
@@ -2434,13 +2707,12 @@ mod tests {
     // dfaCountRec/dfaRecLen, dfaVirgin, dfaCreate/dfaCreateSpec.
     // -----------------------------------------------------------------
 
-    /// This host is single-process by construction (`Btrieve::begin`'s own
-    /// doc comment), so Btrieve statuses 84/85 ("locked by another
-    /// user/process") describe a condition it cannot produce. `FALSE` here
-    /// is the honestly-derived answer, not a stand-in for unimplemented
-    /// locking -- which is why this test also checks right after the one
-    /// case a module would plausibly go looking for a lock conflict, and
-    /// gets the same answer.
+    /// Status 84 ("locked by another user") is a real, producible outcome
+    /// as of Task 9 (`dfaacqlock_refuses_a_record_a_different_channel_
+    /// already_holds`, above) -- but `dfaWasLocked` still has nowhere to
+    /// read that reason back from (see its own doc comment), so it still
+    /// answers `FALSE` unconditionally, including right after the one case
+    /// a module would plausibly go looking for a lock conflict.
     #[test]
     fn dfawaslocked_always_answers_false() {
         let mut f = Fixture::new();
