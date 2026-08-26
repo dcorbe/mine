@@ -144,6 +144,21 @@ pub fn page_fetches() -> u64 {
     crate::PAGE_FETCHES.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Zero [`crate::ORDER_BUILDS`] so a measurement window starts clean. Same
+/// role as [`reset_page_fetches`], for a v6 key's `OrderIndex` rebuild
+/// instead of a page cache miss -- see that counter's own doc comment for
+/// why [`page_fetches`] cannot tell a rebuild apart from a reuse once the
+/// pages either would touch are already warm.
+pub fn reset_order_builds() {
+    crate::ORDER_BUILDS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How many times this process has rebuilt a v6 key's `OrderIndex` since
+/// the last [`reset_order_builds`].
+pub fn order_builds() -> u64 {
+    crate::ORDER_BUILDS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// A pointer into [`FlatMem`]: one number, no segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct FlatPtr(pub u32);

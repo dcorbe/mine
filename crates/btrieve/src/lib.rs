@@ -575,6 +575,22 @@ pub(crate) static FILE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// this is incremented from.
 pub(crate) static PAGE_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How many times this process has run [`order::OrderIndex::build`] (a
+/// full walk of one key's tree, positions only) since the last
+/// [`testing::reset_order_builds`].
+///
+/// [`PAGE_FETCHES`] cannot tell a real rebuild apart from a cheap reuse
+/// once every page either would touch is already resident in the same
+/// [`cache::PageCache`] -- a `Block`'s cache never evicts, so a key's whole
+/// tree stays warm for the rest of that block's open lifetime after the
+/// first walk, and a *second* walk over the same warm pages costs zero new
+/// fetches too, even though it re-does the same O(records) work. This
+/// counts the walk itself, at its one call site
+/// ([`Block::v6_build_order`]), so a test proving `Self::v6_invalidate_
+/// keys`'s per-key selectivity has something that actually discriminates
+/// "rebuilt" from "reused".
+pub(crate) static ORDER_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Open `path` for reading, counting the open in [`FILE_OPENS`].
 ///
 /// The only place in this crate's non-test code allowed to call
@@ -1024,14 +1040,32 @@ pub struct Block<M: Mem> {
     /// to `self` at all.
     cache: Option<std::rc::Rc<std::cell::RefCell<cache::PageCache>>>,
 
-    /// Each key's [`order::OrderIndex`] this block has built since the last
-    /// write invalidated it wholesale (Task 7's ops cutover) -- `RefCell`
-    /// for the same reason [`Self::cache`] is one: [`Self::v6_ensure_
-    /// order`]/[`Self::current`] read (and lazily build) through this from
-    /// `&self`. Empty for a v5 block, a variable-length v6 one, or any
-    /// block that has not yet answered a keyed v6 read -- see
-    /// [`Self::v6_fast_reads`].
+    /// Each key's [`order::OrderIndex`] this block currently has cached,
+    /// keyed by key number -- `RefCell` for the same reason [`Self::cache`]
+    /// is one: [`Self::v6_ensure_order`]/[`Self::current`] read (and lazily
+    /// build) through this from `&self`. Empty for a v5 block, a
+    /// variable-length v6 one, or any block that has not yet answered a
+    /// keyed v6 read -- see [`Self::v6_fast_reads`].
+    ///
+    /// Invalidated **per key**, not wholesale: [`Self::v6_invalidate_keys`]
+    /// drops only the keys whose own extracted value actually changed (or
+    /// whose [`keys::Key::excluded`] status flipped) -- an update that
+    /// touches no key at all (the majority of live write traffic --
+    /// health, gold, position) leaves every key's cached order exactly as
+    /// it was, so the next keyed read after it costs nothing extra. See
+    /// `docs/2026-08-24-btrieve-write-cost-baseline.md`'s own measurement
+    /// of what whole-map invalidation used to cost such an update.
     v6_order: std::cell::RefCell<std::collections::HashMap<u16, order::OrderIndex>>,
+
+    /// Every claimed, live position in this file, ascending -- the
+    /// physical-order counterpart to [`Self::v6_order`], answering what
+    /// [`records::Records::physical`]/[`records::Records::find_physical`]
+    /// answer for `Cursor::Physical`/[`ops::Step`] without a single
+    /// record's bytes. `None` until the first physical read since the last
+    /// insert or delete invalidated it ([`Self::v6_invalidate_physical`]);
+    /// an update never invalidates this -- it changes a record's bytes,
+    /// never which positions exist.
+    v6_physical: std::cell::RefCell<Option<order::OrderIndex>>,
 }
 
 /// One block's state as it was the moment a transaction first wrote to it --
@@ -1607,6 +1641,11 @@ impl<M: Mem> Block<M> {
                 let bytes = self.v6_record_bytes_at(position).ok().flatten()?;
                 Some(Record { position, bytes })
             }
+            Cursor::Physical { at } if self.v6_fast_reads() => {
+                let position = self.v6_physical_at(at).ok().flatten()?;
+                let bytes = self.v6_record_bytes_at(position).ok().flatten()?;
+                Some(Record { position, bytes })
+            }
             Cursor::Ordered { key, at } => self.records.as_ref()?.ordered(key, at).cloned(),
             Cursor::Physical { at } => self.records.as_ref()?.physical(at).cloned(),
         }
@@ -2152,6 +2191,11 @@ impl<M: Mem> Block<M> {
         let cache_rc = self.v6_tree_cache().map_err(&fail)?;
         let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
         let mut key_roots: Vec<(usize, u32)> = Vec::new();
+        // Every key this insert actually gave a new index entry to -- fed
+        // to `Self::v6_invalidate_keys` below so a key this record excludes
+        // (`Key::excluded`) keeps its cached `OrderIndex`, not just every
+        // key that changed count.
+        let mut changed_keys: Vec<u16> = Vec::new();
         let mut index_free_head =
             pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
         for key in &self.keys {
@@ -2163,6 +2207,7 @@ impl<M: Mem> Block<M> {
                 if key.excluded(&keyed_bytes) {
                     before
                 } else {
+                    changed_keys.push(key.number);
                     before.saturating_add(1)
                 }
             } else {
@@ -2229,7 +2274,8 @@ impl<M: Mem> Block<M> {
         self.write_changed_pages(&mut store)?;
 
         if fast {
-            self.v6_invalidate_order();
+            self.v6_invalidate_keys(&changed_keys);
+            self.v6_invalidate_physical();
         } else {
             self.records = records_clone.take();
         }
@@ -2747,6 +2793,7 @@ impl<M: Mem> Block<M> {
     /// If `key` names no key this block has, or whatever [`Self::nav_root`]/
     /// [`order::OrderIndex::build`] refuse.
     fn v6_build_order(&self, key: u16) -> Result<order::OrderIndex, String> {
+        ORDER_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some((root, shape, dup, cache, mut resolve)) = self.nav_root(key)? else {
             return Ok(order::OrderIndex::empty());
         };
@@ -2862,16 +2909,188 @@ impl<M: Mem> Block<M> {
     /// Clearing it here, unconditionally, is what makes that impossible
     /// regardless of which caller left it populated.
     ///
-    /// [`Self::v6_order`] itself is whole-map, not per-key: simplicity
-    /// first, per this task's own ruling -- a splice-on-write (insert at
-    /// the rank the tree insert determined, remove on delete) would save
-    /// the next read a rebuild, but a wrong splice is a wrong *rank*
+    /// Drop the cached [`order::OrderIndex`] for exactly the keys in
+    /// `changed`, and `self.records` unconditionally.
+    ///
+    /// **Per key, not whole-map**: a write's own caller already knows
+    /// which keys' *values* actually changed (`Self::insert_v6`/`Self::
+    /// update_v6`/`Self::delete_v6` each compute this from `Key::excluded`
+    /// or `Key::compare` before this is called) -- an update that touches
+    /// no key at all (health, gold, position: the majority of live write
+    /// traffic) passes an empty `changed` and leaves every key's cached
+    /// order exactly as it was, so the next keyed read after it costs
+    /// nothing extra. A splice-on-write (insert at the rank the tree
+    /// insert determined, remove on delete) would save even the *touched*
+    /// keys' next read a rebuild, but a wrong splice is a wrong *rank*
     /// silently handed back to a module, where a stale-then-rebuilt index
-    /// is merely a cost the next read after a write pays once. See this
-    /// task's own report for the measured size of that cost.
-    fn v6_invalidate_order(&mut self) {
-        self.v6_order.borrow_mut().clear();
+    /// is merely a cost the next read after a write pays once -- simplicity
+    /// first for the keys that do change, per this task's own ruling. See
+    /// `docs/2026-08-24-btrieve-write-cost-baseline.md` for the measured
+    /// cost this replaces (whole-map invalidation on every write,
+    /// regardless of which keys changed).
+    ///
+    /// `self.records` clears regardless of `changed`: it is not guarded by
+    /// [`Self::v6_fast_reads`] anywhere a write reaches this, and a
+    /// straggler caller with no fast path of its own yet (`Block::
+    /// update_chunks`'s old, now-removed unconditional prime; a rare
+    /// `Key::excluded` fallback in `ops::Block::acquire_absolute`/
+    /// `ops::Block::insert_extended`) can still leave it `Some` from
+    /// *before* this write -- leaving it there would answer a later
+    /// `self.records()` call with a pre-write snapshot, exactly the
+    /// staleness bug this task's own report records finding. The clear
+    /// itself is a plain `Option` write, not a cost worth gating.
+    fn v6_invalidate_keys(&mut self, changed: &[u16]) {
+        if !changed.is_empty() {
+            let mut order = self.v6_order.borrow_mut();
+            for &key in changed {
+                order.remove(&key);
+            }
+        }
         self.records = None;
+    }
+
+    /// Drop the cached physical-order index -- called only when the
+    /// position *set* changes (insert claims a new position, delete frees
+    /// one). An update never calls this: it changes a record's bytes,
+    /// never which positions exist, so [`Self::v6_physical`] stays valid
+    /// across it.
+    fn v6_invalidate_physical(&mut self) {
+        *self.v6_physical.borrow_mut() = None;
+    }
+
+    /// This file's [`order::OrderIndex`] over every claimed, live position,
+    /// built if it is not already cached -- the physical-order counterpart
+    /// to [`Self::v6_ensure_order`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::v6_build_physical_index`] refuses.
+    fn v6_ensure_physical(&self) -> Result<(), String> {
+        if self.v6_physical.borrow().is_some() {
+            return Ok(());
+        }
+        let index = self.v6_build_physical_index()?;
+        *self.v6_physical.borrow_mut() = Some(index);
+        Ok(())
+    }
+
+    /// Build the physical-order index fresh: every claimed (logical,
+    /// physical) pair the allocation table names ([`v6::Map::read`],
+    /// bounded by allocation-table blocks, not by record count), sorted by
+    /// logical id -- [`pages::Layout::position`]'s own formula is
+    /// monotonic in `(logical, slot)`, so this ascending walk produces
+    /// ascending *position* order directly, the identical order
+    /// [`records::walk_v6`] already produces and [`records::Records::
+    /// physical`] already answers from. Each claimed page is fetched once
+    /// through the page cache; a page whose own tag is not "record data"
+    /// (a B-tree index node, also claimed through the same allocation
+    /// table) is skipped, and within a data page, each slot's own
+    /// two-byte marker says whether it holds a live record -- the same
+    /// checks [`Self::v6_record_bytes_at`] makes for one slot, run here
+    /// for every slot on every claimed data page.
+    ///
+    /// # Errors
+    ///
+    /// If this block has no v6 page cache attached, whatever
+    /// [`v6::Map::read`] refuses, or the number of live positions found
+    /// does not match [`Self::geometry`]'s own record count (the same
+    /// acceptance check [`records::Records::read`] makes).
+    fn v6_build_physical_index(&self) -> Result<order::OrderIndex, String> {
+        let cache = self.cache.as_ref().ok_or_else(|| {
+            format!(
+                "{}: no v6 page cache attached -- not a v6 file, or a test build                  that skipped Self::open",
+                self.name
+            )
+        })?;
+        let page_size = self.geometry.page;
+        let mut store = v6::Store::attach(cache, &self.path, page_size)?;
+        let map = v6::Map::read(&mut store, page_size)?;
+        drop(store);
+
+        let layout = pages::Layout {
+            page: page_size,
+            physical: self.geometry.physical,
+            pages: self.geometry.pages,
+        };
+        let per_page = layout.per_page();
+
+        let mut claimed: Vec<(u32, u32)> = map.entries().collect();
+        claimed.sort_unstable_by_key(|&(logical, _)| logical);
+
+        let mut positions = Vec::with_capacity(self.geometry.records as usize);
+        for (logical, physical_page) in claimed {
+            let buffer = {
+                let mut guard = cache.borrow_mut();
+                guard.page(physical_page)?.to_vec()
+            };
+            if buffer.len() < 2 || buffer[1] != 0x44 || !pages::Header::decode(&buffer).data {
+                continue;
+            }
+            for slot in 0..per_page {
+                let marker_at = layout.position(0, slot) as usize;
+                if marker_at + 2 > buffer.len() {
+                    continue;
+                }
+                if u16::from_le_bytes([buffer[marker_at], buffer[marker_at + 1]]) == 0 {
+                    continue;
+                }
+                positions.push(layout.position(logical, slot));
+            }
+        }
+
+        if positions.len() as u32 != self.geometry.records {
+            return Err(format!(
+                "{}: the header says {} records and walking the claimed pages found {}",
+                self.name,
+                self.geometry.records,
+                positions.len()
+            ));
+        }
+
+        Ok(order::OrderIndex::from_positions(positions))
+    }
+
+    /// How many records this file holds in physical order -- always
+    /// [`Self::geometry`]'s own record count, but resolved through
+    /// [`Self::v6_ensure_physical`] so a caller that also wants a position
+    /// pays for the walk at most once.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::v6_ensure_physical`] refuses.
+    fn v6_physical_len(&self) -> Result<usize, BtvError> {
+        self.v6_ensure_physical().map_err(|why| BtvError {
+            file: self.name.clone(),
+            why,
+        })?;
+        Ok(self.v6_physical.borrow().as_ref().expect("just ensured").len())
+    }
+
+    /// The position at physical rank `at`, or `None` past the end.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::v6_ensure_physical`] refuses.
+    fn v6_physical_at(&self, at: usize) -> Result<Option<u32>, BtvError> {
+        self.v6_ensure_physical().map_err(|why| BtvError {
+            file: self.name.clone(),
+            why,
+        })?;
+        Ok(self.v6_physical.borrow().as_ref().expect("just ensured").position_at(at))
+    }
+
+    /// `position`'s own rank in physical order, or `None` if it names no
+    /// live record.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::v6_ensure_physical`] refuses.
+    fn v6_physical_rank_of(&self, position: u32) -> Result<Option<usize>, BtvError> {
+        self.v6_ensure_physical().map_err(|why| BtvError {
+            file: self.name.clone(),
+            why,
+        })?;
+        Ok(self.v6_physical.borrow().as_ref().expect("just ensured").rank_of(position))
     }
 
     /// A v6 fixed-length record's own bytes, fetched through the block-
@@ -3143,6 +3362,13 @@ impl<M: Mem> Block<M> {
         let cache_rc = self.v6_tree_cache().map_err(&fail)?;
         let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
         let mut key_roots: Vec<(usize, u32)> = Vec::new();
+        // Every key whose own extracted value actually changed (or whose
+        // `Key::excluded` status flipped) -- fed to `Self::v6_invalidate_
+        // keys` below. A key this update never touches keeps its cached
+        // `OrderIndex`, which is the whole point for the majority of live
+        // write traffic (health, gold, position) that changes no key at
+        // all.
+        let mut changed_keys: Vec<u16> = Vec::new();
         let mut index_free_head =
             pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
         for key in &self.keys {
@@ -3185,6 +3411,7 @@ impl<M: Mem> Block<M> {
             if key.compare(&before, &after) == std::cmp::Ordering::Equal {
                 continue;
             }
+            changed_keys.push(key.number);
             let old_value = key.extract(&before);
             let new_value = key.extract(&after);
 
@@ -3268,7 +3495,7 @@ impl<M: Mem> Block<M> {
         self.write_changed_pages(&mut store)?;
 
         if fast {
-            self.v6_invalidate_order();
+            self.v6_invalidate_keys(&changed_keys);
         } else {
             self.records = records_clone.take();
         }
@@ -3489,6 +3716,10 @@ impl<M: Mem> Block<M> {
         let cache_rc = self.v6_tree_cache().map_err(&fail)?;
         let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
         let mut key_roots: Vec<(usize, u32)> = Vec::new();
+        // Every key the deleted record was actually indexed under -- fed
+        // to `Self::v6_invalidate_keys` below, so a key that excluded this
+        // record (`Key::excluded`) keeps its cached `OrderIndex`.
+        let mut changed_keys: Vec<u16> = Vec::new();
         let mut index_free_head =
             pages::long(&fcr[pages::fcr::INDEX_FREE_V6..pages::fcr::INDEX_FREE_V6 + 4]);
         for (key_index, key) in self.keys.iter().enumerate() {
@@ -3503,6 +3734,7 @@ impl<M: Mem> Block<M> {
                 if key.excluded(&records::keyed(shift, &old_record)) {
                     before_count
                 } else {
+                    changed_keys.push(key.number);
                     before_count.saturating_sub(1)
                 }
             } else {
@@ -3562,7 +3794,8 @@ impl<M: Mem> Block<M> {
         self.write_changed_pages(&mut store)?;
 
         if fast {
-            self.v6_invalidate_order();
+            self.v6_invalidate_keys(&changed_keys);
+            self.v6_invalidate_physical();
         } else {
             self.records = records_clone.take();
         }
@@ -6507,6 +6740,7 @@ impl<M: Mem> Btrieve<M> {
             verify_writes: cfg!(debug_assertions),
             cache,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v6_physical: std::cell::RefCell::new(None),
         });
         Ok(block)
     }
@@ -7870,6 +8104,7 @@ mod tests {
             // `Self::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v6_physical: std::cell::RefCell::new(None),
         }
     }
 
@@ -9022,6 +9257,7 @@ mod tests {
             // `Self::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v6_physical: std::cell::RefCell::new(None),
         }
     }
 
@@ -9080,6 +9316,221 @@ mod tests {
                 .len();
             assert_eq!(count, expected, "round {round}: record count on disk");
         }
+    }
+
+    /// The identical run [`a_run_of_v6_writes_on_a_real_file_reads_back_
+    /// every_time`] makes, but through a real [`Self::open`] (a page cache
+    /// attached, `Self::v6_fast_reads` true) rather than [`block_from_file`]
+    /// -- review Important 1: every other real-`$WCCMP002` test builds a
+    /// hand-`Block` with `cache: None`, which cannot exercise a single line
+    /// of this task's own fast path (`Self::v6_fast_reads` requires
+    /// `cache.is_some()`), so nothing proved the incremental FCR-count
+    /// arithmetic (`saturating_add`/`saturating_sub` gated on `Key::
+    /// excluded` transitions) over a sustained sequence of writes against a
+    /// large file.
+    ///
+    /// Same shape as the sibling: six rounds of update-then-insert, each
+    /// round finding its own target record and verifying the new count
+    /// through an *independent, freshly reopened* `Btrieve` -- never
+    /// trusting the model (or the fast path's own cached indexes) the write
+    /// just updated, since that is exactly the half a bad write would leave
+    /// looking right.
+    ///
+    /// Ignored: needs a real `WCCMP002.DAT`, named by `$WCCMP002`.
+    #[test]
+    #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+    fn a_run_of_v6_writes_on_a_real_file_through_the_fast_path_reads_back_every_time() {
+        let Ok(source) = std::env::var("WCCMP002") else {
+            eprintln!("set WCCMP002=/path/to/WCCMP002.DAT to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v6-real-write-run-fast-path");
+        let path = dir.join("WCCMP002.DAT");
+        std::fs::copy(&source, &path).expect("the file copies into scratch");
+
+        // A fresh `Btrieve`, `Self::open`ed on `path` -- a real page cache,
+        // never a hand-built fixture. `mem`/`heap` are scoped to this
+        // function only: nothing after `open` returns ever resolves a
+        // module-memory pointer, so they do not need to outlive it.
+        fn open_fresh(path: &Path) -> (Btrieve<Flat>, FlatPtr) {
+            let mut mem = FlatMem::new(64 * 1024);
+            let mut heap = FlatHeap::new(0x100);
+            let mut btrieve = Btrieve::<Flat>::default();
+            let geometry = Geometry::read("WCCMP002.DAT", path).expect("reads");
+            let maxlen = geometry.reclen;
+            let at = btrieve
+                .open(&mut mem, &mut heap, "WCCMP002.DAT", path, geometry, maxlen)
+                .expect("opens");
+            (btrieve, at)
+        }
+
+        let (mut btrieve, at) = open_fresh(&path);
+        assert!(
+            btrieve.block(at).expect("open").cache.is_some(),
+            "a real Self::open attaches a cache -- this test is meaningless without one"
+        );
+        assert!(
+            btrieve.block(at).expect("open").v6_fast_reads(),
+            "WCCMP002.DAT is fixed-length v6 -- this test is meaningless if it is not              actually driving Self::v6_fast_reads"
+        );
+        let reclen = usize::from(btrieve.block(at).expect("open").geometry.reclen);
+        let mut expected = btrieve.block(at).expect("open").v6_physical_len().expect("physical count");
+
+        for round in 0..6u8 {
+            // A record "in the first few", found through the fast physical
+            // index itself rather than `self.records()` -- key 0 is not
+            // modifiable on this file, so an update carrying some other
+            // record's key is refused before it ever reaches the writer
+            // this is testing, same as the sibling test's own reasoning.
+            let (target, mut bytes) = {
+                let block = btrieve.block_mut(at).expect("open");
+                let position = block
+                    .v6_physical_at(usize::from(round) % 8)
+                    .expect("physical lookup")
+                    .expect("a record in the first few");
+                let bytes = block
+                    .v6_record_bytes_at(position)
+                    .expect("fetch")
+                    .expect("still live");
+                (position, bytes)
+            };
+            bytes.resize(reclen, 0);
+            let last = bytes.len() - 1;
+            bytes[last] = round;
+            btrieve.block_mut(at).expect("open").update(target, &bytes).expect("an update");
+
+            let mut record = vec![0u8; reclen];
+            record[..4].copy_from_slice(&(900_000u32 + u32::from(round)).to_le_bytes());
+            btrieve.block_mut(at).expect("open").insert(&record).expect("an insert");
+            expected += 1;
+
+            // Reopened from disk every round, a brand new `Btrieve` and
+            // page cache: a write that corrupted the file and left the
+            // fast path's own cached indexes intact would otherwise sail
+            // through.
+            let (fresh, fresh_at) = open_fresh(&path);
+            let count = fresh
+                .block(fresh_at)
+                .unwrap_or_else(|e| panic!("round {round}: the file no longer opens: {e}"))
+                .v6_physical_len()
+                .unwrap_or_else(|e| panic!("round {round}: the file no longer reads: {e}"));
+            assert_eq!(count, expected, "round {round}: record count on disk");
+        }
+    }
+
+    /// Review Important 4: whole-map `OrderIndex` invalidation on an
+    /// update that touches no key at all -- health, gold, position, the
+    /// majority of live write traffic -- used to force the next keyed read
+    /// to pay a full rebuild it had no reason to. `Self::v6_invalidate_
+    /// keys` fixes this by invalidating only the keys a write's own
+    /// `Key::compare`/`Key::excluded` check found actually changed; this
+    /// measures the before/after directly, on the real `WCCMP002.DAT` this
+    /// task's own cost baseline is judged against, where a rebuild is
+    /// large enough to be worth measuring at all.
+    ///
+    /// Ignored: needs a real `WCCMP002.DAT`, named by `$WCCMP002`.
+    #[test]
+    #[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+    fn a_non_key_update_leaves_the_order_index_cached_a_key_changing_one_does_not() {
+        let Ok(source) = std::env::var("WCCMP002") else {
+            eprintln!("set WCCMP002=/path/to/WCCMP002.DAT to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v6-selective-order-invalidation");
+        let path = dir.join("WCCMP002.DAT");
+        std::fs::copy(&source, &path).expect("the file copies into scratch");
+        crate::testing::make_keys_modifiable(&path);
+
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+        let geometry = Geometry::read("WCCMP002.DAT", &path).expect("reads");
+        let maxlen = geometry.reclen;
+        let at = btrieve
+            .open(&mut mem, &mut heap, "WCCMP002.DAT", &path, geometry, maxlen)
+            .expect("opens");
+        assert!(btrieve.block(at).expect("open").v6_fast_reads(), "meaningless without the fast path");
+
+        let reclen = usize::from(maxlen);
+        let (position, original) = {
+            let block = btrieve.block_mut(at).expect("open");
+            let position = block.v6_physical_at(0).expect("physical lookup").expect("a first record");
+            let bytes = block.v6_record_bytes_at(position).expect("fetch").expect("still live");
+            (position, bytes)
+        };
+
+        // Prime key 0's `OrderIndex` -- a `Get Equal` for the record's own
+        // (unmodified) key value, first read since open, so this pays
+        // whatever a full rebuild costs. `WCCMP002.DAT`'s one key lives at
+        // byte 0 of each record (`write_cost.rs`'s own `bytes[0] ^= 0xff`
+        // targets it for the identical reason). `page_fetches` here (a
+        // cold cache -- nothing has read this file yet this session) is
+        // the genuine cost one full `OrderIndex` rebuild pays, reported in
+        // `docs/2026-08-24-btrieve-write-cost-baseline.md`'s own
+        // measurement of what selective invalidation now avoids.
+        crate::testing::reset_page_fetches();
+        let mut locks = LockTable::default();
+        assert!(
+            btrieve.block_mut(at).expect("open").get(0, Op::Equal, &original[..8], 0, &mut locks, maxlen)
+                .expect("get")
+                .is_some(),
+            "the record's own original key value must still be found"
+        );
+
+        let cold_build_fetches = crate::testing::page_fetches();
+
+        // A non-key update: only the record's *last* byte changes.
+        // `key.compare` on an unchanged first four bytes must find no
+        // change at all, so `Self::v6_invalidate_keys` receives an empty
+        // `changed_keys` and key 0's cached order survives.
+        let mut non_key_bytes = original.clone();
+        non_key_bytes[reclen - 1] ^= 0xff;
+        btrieve.block_mut(at).expect("open").update(position, &non_key_bytes).expect("a non-key update");
+
+        crate::testing::reset_order_builds();
+        assert!(
+            btrieve.block_mut(at).expect("open").get(0, Op::Equal, &original[..8], 0, &mut locks, maxlen)
+                .expect("get")
+                .is_some(),
+            "the key value is unchanged, so it must still be found"
+        );
+        let reuse_builds = crate::testing::order_builds();
+
+        // Contrast: a key-changing update on a *different* record (so the
+        // value this test keeps searching for stays findable) invalidates
+        // key 0's cached order for real.
+        let (other_position, mut other_bytes) = {
+            let block = btrieve.block_mut(at).expect("open");
+            let position = block.v6_physical_at(1).expect("physical lookup").expect("a second record");
+            let bytes = block.v6_record_bytes_at(position).expect("fetch").expect("still live");
+            (position, bytes)
+        };
+        other_bytes[0] ^= 0xff;
+        btrieve.block_mut(at).expect("open").update(other_position, &other_bytes).expect("a key-changing update");
+
+        crate::testing::reset_order_builds();
+        assert!(
+            btrieve.block_mut(at).expect("open").get(0, Op::Equal, &original[..8], 0, &mut locks, maxlen)
+                .expect("get")
+                .is_some(),
+            "still found -- this update touched a different record's key, not this one"
+        );
+        let rebuild_builds = crate::testing::order_builds();
+
+        eprintln!(
+            "a_non_key_update_leaves_the_order_index_cached: cold_build_fetches={cold_build_fetches} \
+             reuse_builds={reuse_builds} rebuild_builds={rebuild_builds}"
+        );
+        assert_eq!(
+            reuse_builds, 0,
+            "a non-key update must leave key 0's cached OrderIndex untouched -- the next \
+             read rebuilt it {reuse_builds} time(s) instead of reusing what was already there"
+        );
+        assert_eq!(
+            rebuild_builds, 1,
+            "a key-changing update must actually invalidate key 0's cached OrderIndex -- \
+             the next read rebuilt it {rebuild_builds} time(s), not exactly once"
+        );
     }
 
     /// The healthy path: insert, update and delete against a real,
@@ -11083,6 +11534,7 @@ mod tests {
             // `Self::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v6_physical: std::cell::RefCell::new(None),
         }
     }
 
@@ -11339,6 +11791,7 @@ mod tests {
             // `Self::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v6_physical: std::cell::RefCell::new(None),
         }
     }
 
@@ -11844,6 +12297,7 @@ mod tests {
             // `Self::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v6_physical: std::cell::RefCell::new(None),
         }
     }
 

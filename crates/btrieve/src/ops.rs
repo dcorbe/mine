@@ -894,6 +894,10 @@ fn here_for(cursor: Cursor, key: u16) -> Result<Option<usize>, OpError> {
 /// back. So [`Block::step`] keeps it; only [`here_for`] (the reverse
 /// direction Task 12 never tested) does not.
 fn physical_of<M: Mem>(block: &Block<M>, key: u16, at: usize) -> Result<usize, OpError> {
+    if block.v6_fast_reads() {
+        let position = block.v6_position_at(key, at)?.ok_or(OpError::CursorStale)?;
+        return block.v6_physical_rank_of(position)?.ok_or(OpError::CursorStale);
+    }
     let records = block.loaded().expect("Block::step already loaded the records");
     records
         .ordered(key, at)
@@ -1124,14 +1128,11 @@ impl<M: Mem> Block<M> {
             // position through -- not reachable for MajorMUD's own
             // eighteen files (every key indexes every record), kept
             // because a partial or freshly-narrowed key set is not
-            // something this type refuses to represent elsewhere either
-            // (the same rare fallback `Block::insert_extended`'s own v6
-            // path takes, straight to a fresh `Records` read since the v6
-            // fast path keeps no physical order of its own).
+            // something this type refuses to represent elsewhere either.
             match self.v6_rank_of(key, position)? {
                 Some(at) => Cursor::Ordered { key, at },
                 None => {
-                    let Some(physical) = self.records()?.find_physical(position) else {
+                    let Some(physical) = self.v6_physical_rank_of(position)? else {
                         return Ok(None);
                     };
                     Cursor::Physical { at: physical }
@@ -1196,7 +1197,11 @@ impl<M: Mem> Block<M> {
         offered: u16,
     ) -> Result<Option<Delivery>, OpError> {
         let cursor = self.cursor();
-        let count = self.records()?.len();
+        let count = if self.v6_fast_reads() {
+            self.v6_physical_len()?
+        } else {
+            self.records()?.len()
+        };
 
         let at = match (step, cursor) {
             (Step::First, _) => 0,
@@ -2182,27 +2187,22 @@ impl<M: Mem> Block<M> {
                     // index (`Key::excluded`) -- not reachable for any of
                     // MajorMUD's own eighteen files (every key indexes
                     // every record, see `Block::acquire_absolute`'s own
-                    // doc comment for the same fact), and the v6 fast path
-                    // keeps no "physical order" of its own to answer
-                    // `Cursor::Physical` from. Falling back to a fresh
-                    // `Records` read for this one rare case, rather than
-                    // building a second index nothing exercises.
-                    Ok(None) => match self.records() {
-                        Ok(r) => match r.find_physical(last) {
-                            Some(physical) => Cursor::Physical { at: physical },
-                            None => {
-                                return Err(InsertExtendedError {
-                                    inserted,
-                                    error: OpError::Records(BtvError {
-                                        file: self.name().to_owned(),
-                                        why: format!(
-                                            "position {last} was just inserted but a fresh read \
-                                             does not find it"
-                                        ),
-                                    }),
-                                })
-                            }
-                        },
+                    // doc comment for the same fact). The physical index
+                    // still answers this the same fast way.
+                    Ok(None) => match self.v6_physical_rank_of(last) {
+                        Ok(Some(physical)) => Cursor::Physical { at: physical },
+                        Ok(None) => {
+                            return Err(InsertExtendedError {
+                                inserted,
+                                error: OpError::Records(BtvError {
+                                    file: self.name().to_owned(),
+                                    why: format!(
+                                        "position {last} was just inserted but the physical \
+                                         index does not find it"
+                                    ),
+                                }),
+                            })
+                        }
                         Err(error) => {
                             return Err(InsertExtendedError { inserted, error: OpError::from(error) })
                         }
@@ -2365,7 +2365,11 @@ impl<M: Mem> Block<M> {
                 self.deliver_current(Some(key), offered)
             }
             PercentageBasis::Physical => {
-                let count = self.records()?.len();
+                let count = if self.v6_fast_reads() {
+                    self.v6_physical_len()?
+                } else {
+                    self.records()?.len()
+                };
                 if count == 0 {
                     return Err(OpError::EndOfFile);
                 }
@@ -2447,6 +2451,16 @@ impl<M: Mem> Block<M> {
                 Ok(((at as u64 * 10_000) / count as u64) as u16)
             }
             FindBasis::Physical(position) => {
+                if self.v6_fast_reads() {
+                    let count = self.v6_physical_len()?;
+                    if count == 0 {
+                        return Err(OpError::EndOfFile);
+                    }
+                    let at = self
+                        .v6_physical_rank_of(*position)?
+                        .ok_or(OpError::InvalidRecordAddress)?;
+                    return Ok(((at as u64 * 10_000) / count as u64) as u16);
+                }
                 let records = self.records()?;
                 let count = records.len();
                 if count == 0 {
@@ -2717,6 +2731,7 @@ mod tests {
             // `Block::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v6_physical: std::cell::RefCell::new(None),
         }
     }
 
@@ -2775,6 +2790,7 @@ mod tests {
             // `Block::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v6_physical: std::cell::RefCell::new(None),
         }
     }
 
@@ -2822,6 +2838,7 @@ mod tests {
             // `Block::open`, the only place that builds one.
             cache: None,
             v6_order: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v6_physical: std::cell::RefCell::new(None),
         }
     }
 

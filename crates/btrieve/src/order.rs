@@ -77,6 +77,26 @@ impl OrderIndex {
         self.rank.get(&position).map(|&at| at as usize)
     }
 
+    /// Build directly from an already-ordered list of positions -- the
+    /// physical-order counterpart to [`Self::build`], for
+    /// [`super::lib::Block::v6_build_physical_index`]: there is no per-key
+    /// tree to walk for "every claimed position, file-wide", only the
+    /// allocation table plus each claimed page's own live-slot markers, so
+    /// that caller assembles `positions` itself and this just builds the
+    /// reverse lookup over it.
+    ///
+    /// # Panics
+    ///
+    /// If `positions` holds more than `u32::MAX` entries -- not a real
+    /// Btrieve file's shape.
+    pub(crate) fn from_positions(positions: Vec<u32>) -> Self {
+        let mut rank = HashMap::with_capacity(positions.len());
+        for (at, &position) in positions.iter().enumerate() {
+            rank.insert(position, u32::try_from(at).expect("far fewer records than u32::MAX"));
+        }
+        Self { order: positions, rank }
+    }
+
     /// Build by walking `root`'s whole tree once, [`nav::Bias::Lowest`] to
     /// the end -- the same cursor [`super::lib::Block::nav_root`] hands a
     /// caller already positioned, just driven to exhaustion instead of
