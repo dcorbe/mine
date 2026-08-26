@@ -14093,6 +14093,58 @@ mod tests {
         }
     }
 
+    /// Repro for the `Op::Equal` defect found while building Task 7's
+    /// multi-block `for_commit` test (the one above): registered in
+    /// `docs/btrieve-unproven.md`'s own "known defect" section, not just
+    /// described in prose there, so a follow-up owner starts from a
+    /// running test.
+    ///
+    /// Minimal: zero writes. `PP2BLOCK.DAT` is opened exactly as it ships,
+    /// its own lowest key found through `query(Lowest)` (already proven
+    /// correct -- a full ascending walk reaches every record), then looked
+    /// up by that same value through `get(Op::Equal, ...)`. Genuine
+    /// Btrieve behaviour for `B_GET_EQUAL` on a key value the tree
+    /// demonstrably holds is "found" -- there is nothing else it could
+    /// mean. This currently fails: `get` reports "not found" for a key
+    /// this same file's own ascending walk just delivered.
+    ///
+    /// Reproduces identically on the slow path too (`block_from_file`,
+    /// `cache: None`, forcing the pre-Task-7 `Records`-backed `get`) --
+    /// see the fix report for that cross-check; not repeated here, so this
+    /// one test stays the single thing a follow-up runs to see the bug.
+    #[test]
+    #[ignore = "pre-existing keyed-lookup defect on PP2BLOCK.DAT-shaped files; see docs/btrieve-unproven.md"]
+    fn get_equal_finds_pp2blocks_own_lowest_key() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+
+        let dir = crate::testing::scratch("pp2block-op-equal-repro");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/btrieve-oracle/fixtures/PP2BLOCK.DAT");
+        let path = dir.join("PP2BLOCK.DAT");
+        std::fs::copy(&source, &path).expect("copies");
+
+        let geometry = Geometry::read("PP2BLOCK.DAT", &path).expect("reads");
+        let maxlen = geometry.reclen;
+        let at = btrieve
+            .open(&mut mem, &mut heap, "PP2BLOCK.DAT", &path, geometry, maxlen)
+            .expect("opens");
+        let block = btrieve.block_mut(at).expect("open");
+
+        assert!(block.query(0, Op::Lowest, &[]).expect("query"), "the file has at least one record");
+        let lowest_key = block.current().expect("positioned").bytes[2..6].to_vec();
+
+        let mut locks = LockTable::default();
+        let found = block
+            .get(0, Op::Equal, &lowest_key, 0, &mut locks, maxlen)
+            .expect("get must not error, only find or not find");
+        assert!(
+            found.is_some(),
+            "Op::Equal must find a key value this same file's own ascending walk just \
+             delivered -- key {lowest_key:?} is demonstrably present"
+        );
+    }
+
     /// Task 7's ops cutover, exercised through a *real* cache-backed v6
     /// `Block` (`Btrieve::open`, not a hand-built fixture) rather than only
     /// through the corpus differential (`order::tests::order_index_and_
