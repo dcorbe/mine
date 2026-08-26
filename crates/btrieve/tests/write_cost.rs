@@ -79,7 +79,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use btrieve::testing::{make_keys_modifiable, scratch, Flat, FlatHeap, FlatMem};
-use btrieve::{Btrieve, Geometry};
+use btrieve::{Btrieve, Geometry, LockTable, Step};
 
 // --- peak-heap tracking --------------------------------------------------
 
@@ -317,6 +317,62 @@ fn measure_one_update_cold(label: &str, path: &Path) -> Cost {
         .unwrap_or_else(|e| panic!("{label}: update: {e}"));
     let wall = start.elapsed();
     let (r1, w1, sc1) = proc_io();
+
+    Cost {
+        rchar: r1.saturating_sub(r0),
+        wchar: w1.saturating_sub(w0),
+        syscr: sc1.saturating_sub(sc0),
+        opens: file_opens(),
+        page_fetches: btrieve::testing::page_fetches(),
+        peak: peak_growth_since_reset(),
+        wall,
+    }
+}
+
+/// Review Important 2's own measurement: what a cold physical-order read
+/// costs now that `Block::step`'s `Cursor::Physical` count comes from the
+/// physical-order index (the allocation table plus each claimed page's own
+/// live-slot markers, `order::OrderIndex::from_positions`) instead of
+/// `self.records()` -- the materialised, byte-holding model every keyed
+/// read already stopped paying for in round 2.
+///
+/// Shaped like [`measure_one_update_cold`], not [`measure_one_update`]:
+/// nothing on this `Block` has read anything yet, so this is the real
+/// precondition a board's first `Step`/`Get Position`/percentage-basis
+/// call after `Btrieve::open` faces. `Step::First` through the public
+/// `Block::step` is what is measured, not a private accessor: it is the
+/// same call `Cursor::Physical`'s count comes from, and the one-time cost
+/// worth measuring is the physical index's own construction -- every
+/// `Step` after this one is `O(1)` arithmetic into it.
+///
+/// # Panics
+///
+/// If the file cannot be opened or read, or the first step finds no
+/// record.
+fn measure_physical_step_cold(label: &str, path: &Path) -> Cost {
+    let mut mem = FlatMem::new(64 * 1024);
+    let mut heap = FlatHeap::new(0x100);
+    let mut btrieve = Btrieve::<Flat>::default();
+    let geometry = Geometry::read(label, path).unwrap_or_else(|e| panic!("{label}: {e}"));
+    let maxlen = geometry.reclen;
+    let at = btrieve
+        .open(&mut mem, &mut heap, label, path, geometry, maxlen)
+        .unwrap_or_else(|e| panic!("{label}: open: {e}"));
+    let mut locks = LockTable::default();
+
+    let (r0, w0, sc0) = proc_io();
+    btrieve::testing::reset_file_opens();
+    btrieve::testing::reset_page_fetches();
+    reset_peak();
+    let start = Instant::now();
+    let found = btrieve
+        .block_mut(at)
+        .expect("still open")
+        .step(Step::First, 0, &mut locks, maxlen)
+        .unwrap_or_else(|e| panic!("{label}: step: {e}"));
+    let wall = start.elapsed();
+    let (r1, w1, sc1) = proc_io();
+    assert!(found.is_some(), "{label}: this file has no records to step through");
 
     Cost {
         rchar: r1.saturating_sub(r0),
@@ -826,5 +882,82 @@ fn wccmp002_update_cost_today_cold() {
         "a cold update() on WCCMP002.DAT opened its file {} times -- expected at most 5, not \
          something that scales with how many pages the write touches",
         cost.opens
+    );
+}
+
+/// Review Important 2: what a cold `Step`/`Cursor::Physical` read costs on
+/// `WCCMP002.DAT` now that it is served by the physical-order index instead
+/// of `self.records()`. Before this task's own fix, this call and
+/// [`wccmp002_update_cost_today_cold`]'s `records()`-priming read were the
+/// *same* cost (`Cursor::Physical`'s count came from `self.records()` too)
+/// -- round 2 collapsed the keyed path and left this one paying the old
+/// whole-file price, which is what made it look disproportionately
+/// expensive by comparison rather than a new regression.
+///
+/// **Measured first, asserted second**: an earlier version of this test
+/// bounded `rchar` the same way `wccmp002_update_cost_today`'s page-scoped
+/// writes are bounded, and that bound was wrong -- run against this file,
+/// it read 55,636,311 bytes, essentially the whole 55,734,272-byte file
+/// (13,583 of 13,607 pages). That is not a defect: enumerating every live
+/// position file-wide with no separate free/live bitmap has to visit
+/// nearly every claimed page, exactly the reasoning `wccmp002_update_cost_
+/// today_cold`'s own doc comment already gives for `records()`'s identical
+/// full-file cost. `v6_build_physical_index`'s bytes-read bound is
+/// therefore the *same* shape as that test's: `file_len + 300 * page_size`.
+///
+/// What genuinely changed, and is worth a real bound, is **peak heap**:
+/// `records()` cold on this same file measured 210,634,528 bytes (this
+/// task's own round-2 table); the physical-order index measured
+/// 56,852,912 bytes for the identical page traffic -- both cache the same
+/// pages, but the physical index keeps `u32` positions, not a `Vec<Record>`
+/// of owned, reclen-sized byte clones plus their own bookkeeping. That
+/// ~3.7x reduction, not a bytes-read collapse, is this measurement's real
+/// claim, and the peak-heap bound below is written to catch a regression
+/// back toward `records()`'s cost, not to claim the read itself got cheap.
+#[test]
+#[ignore = "needs a real WCCMP002.DAT, named by $WCCMP002"]
+fn wccmp002_physical_step_cost_today_cold() {
+    let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(source) = std::env::var("WCCMP002") else {
+        eprintln!("set WCCMP002=/path/to/wccmp002.vir to run this");
+        return;
+    };
+
+    let dir = scratch("v6-physical-step-cost-cold");
+    let path = dir.join("WCCMP002.DAT");
+    std::fs::copy(&source, &path).unwrap_or_else(|e| panic!("copying {source}: {e}"));
+    let len = std::fs::metadata(&path).expect("metadata").len();
+    assert_eq!(len, 55_734_272, "this is the exact file the plan measured defect #2 against");
+
+    let cost = measure_physical_step_cold("WCCMP002.DAT", &path);
+    report("WCCMP002.DAT (cold Step::First, physical-order index)", len, &cost);
+
+    // Same shape as `wccmp002_update_cost_today_cold`'s own bound: this
+    // operation must visit nearly every claimed page (inherent to the
+    // format, not a regression to chase), so the bound is the whole file
+    // plus the ordinary per-operation remainder, not a small constant.
+    let page_size = 4096u64;
+    let bound = len + 300 * page_size;
+    assert!(
+        cost.rchar <= bound,
+        "a cold Step::First on WCCMP002.DAT read {} bytes -- expected at most {bound} \
+         (the whole file, once, the same inherent cost records() already pays to \
+         enumerate every live position)",
+        cost.rchar,
+    );
+
+    // The real claim: peak heap stays well under records()'s own
+    // measured 210,634,528 bytes for the identical file and page count --
+    // half of it is a generous margin over the 56,852,912 bytes measured
+    // when this test was written, without pinning today's exact figure.
+    let records_cold_peak_heap = 210_634_528u64;
+    let heap_bound = records_cold_peak_heap / 2;
+    assert!(
+        u64::try_from(cost.peak).unwrap_or(u64::MAX) <= heap_bound,
+        "a cold Step::First on WCCMP002.DAT grew peak heap by {} bytes -- expected at most \
+         {heap_bound} (half of records()'s own {records_cold_peak_heap}-byte cost on this \
+         same file), which is the actual improvement this task's physical-order index makes \
+         over Cursor::Physical's old self.records() path",
+        cost.peak,
     );
 }
