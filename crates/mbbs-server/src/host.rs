@@ -516,6 +516,25 @@ fn census_interval() -> Option<Duration> {
 ///
 /// The census is taken on every reporting turn and dropped between them, so
 /// the numbers describe the interval just ended rather than all of time.
+///
+/// # The two lines are gated separately, on purpose
+///
+/// An earlier version returned before either `eprintln!` when `census.polls`
+/// was zero -- reasonable for the *poll* line, which has nothing to divide
+/// by at that point, but it silently dropped the *driver-turn* line too,
+/// which answers a completely different question and is never undefined:
+/// `turns`/`worst_turn` come from `life`'s own loop, not from
+/// `mbbs::Host::take_census`, and are meaningful whenever this function
+/// runs at all. A machine with no terminal connected yet -- exactly the
+/// shape of a board's boot-time database update, before any channel exists
+/// to poll -- has `census.polls == 0` for the update's entire duration, and
+/// the worst-cycle number is precisely the stall metric worth seeing during
+/// it (see the `MBBS_TRACE_TURNS` diagnostic this same gap already drove
+/// someone to add, at this function's own call site in `life`, as a
+/// stopgap for the report this fixes). So the driver-turn line prints
+/// whenever this function runs and at least one turn happened, and the
+/// poll line prints only when there is a poll census worth dividing by --
+/// two conditions, not one shared early return.
 fn report_census<A: Abi>(
     host: &mut mbbs::Host<A>,
     who: MachineId,
@@ -533,30 +552,31 @@ fn report_census<A: Abi>(
     *turns = 0;
     *worst_turn = Duration::ZERO;
     let census = host.take_census();
-    if census.polls == 0 {
-        return;
-    }
     let secs = every.as_secs_f64();
     // Named, because a board runs one of these per machine on its own thread
     // and both write to the same stderr. Two modules' censuses interleaved
     // under one label read as one module changing behaviour every ten
     // seconds, which is a conclusion the numbers do not support.
-    eprintln!(
-        "mbbs-server: census[m{who}]: {polls} polls ({rate:.0}/s), {barren} barren \
-         ({barren_pct:.1}%), {calls:.1} host calls each, worst {worst}",
-        who = who.0,
-        polls = census.polls,
-        rate = census.polls as f64 / secs,
-        barren = census.barren,
-        barren_pct = census.barren_pct(),
-        calls = census.per_poll(),
-        worst = census.worst,
-    );
-    eprintln!(
-        "mbbs-server: census[m{who}]: {loops} driver turns, \
-         worst cycle {longest:.0?} -- that is the ceiling on input latency",
-        who = who.0,
-    );
+    if census.polls > 0 {
+        eprintln!(
+            "mbbs-server: census[m{who}]: {polls} polls ({rate:.0}/s), {barren} barren \
+             ({barren_pct:.1}%), {calls:.1} host calls each, worst {worst}",
+            who = who.0,
+            polls = census.polls,
+            rate = census.polls as f64 / secs,
+            barren = census.barren,
+            barren_pct = census.barren_pct(),
+            calls = census.per_poll(),
+            worst = census.worst,
+        );
+    }
+    if loops > 0 {
+        eprintln!(
+            "mbbs-server: census[m{who}]: {loops} driver turns, \
+             worst cycle {longest:.0?} -- that is the ceiling on input latency",
+            who = who.0,
+        );
+    }
 }
 
 /// `mjrfin` -- `MAJORBBS.C:4818-4831`: hang every channel up, then run every
@@ -1093,10 +1113,15 @@ fn life<A: Abi>(
             worst_turn = spent;
         }
         // DIAGNOSTIC 2026-08-20 -- `MBBS_TRACE_TURNS=<ms>` prints every turn
-        // that took longer than that. The running census cannot answer this
-        // question: `report_census` returns early on a zero-poll interval
-        // (`:536`), which is exactly the idle board whose heartbeat turns are
-        // the ones worth seeing.
+        // that took longer than that, at full resolution -- still the tool
+        // for finding *which* turn stalled. `report_census`'s own
+        // driver-turn line (below) used to be unable to answer this at all
+        // on a zero-poll interval -- exactly the idle board, or the
+        // boot-time database update before any terminal exists to poll --
+        // because it shared one early return with the poll line it had
+        // nothing to divide by; it is gated on `loops > 0` now, not on
+        // `census.polls`, so the worst-cycle number this comment is about
+        // shows up on the periodic report too, not only under this env var.
         if let Some(floor) = std::env::var("MBBS_TRACE_TURNS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
