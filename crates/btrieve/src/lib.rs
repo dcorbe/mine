@@ -247,14 +247,31 @@ impl std::error::Error for BtvError {}
 /// different routes to "no transaction is open" landing on one status is
 /// itself the measurement, not a name read off a manual. This host does not
 /// reproduce Btrieve's numeric status codes at the engine layer (Task 7's
-/// marshalling does that); the two variants below are what `dfaBegTrans` and
-/// `dfaEndTrans`/`dfaAbtTrans` each need to tell apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// marshalling does that); the first two variants below are what
+/// `dfaBegTrans` and `dfaEndTrans`/`dfaAbtTrans` each need to tell apart.
+///
+/// [`Self::CommitFailed`] is Task 7's own addition, unmeasured against the
+/// real engine (`xactprobe` has no disk-full scenario): [`Btrieve::end`]'s
+/// deferred commit is the first point a transaction's own flush can fail
+/// after the fact rather than at the failing op itself -- every op inside a
+/// transaction that defers now only *stages* into a cache, which cannot
+/// fail the way a real disk write can, so a genuine `ENOSPC`/`EIO` surfaces
+/// here instead. No longer `Copy` because of it -- carrying the failure's
+/// own message needs an owned `String`; every other derive is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionError {
     /// [`Btrieve::begin`] while a transaction was already open.
     AlreadyActive,
     /// [`Btrieve::end`] or [`Btrieve::abort`] with none open.
     NoneActive,
+    /// [`Btrieve::end`]'s deferred flush failed for at least one covered
+    /// block -- the first such failure's own message. Every other covered
+    /// block still has its transaction bookkeeping closed out (see
+    /// [`Btrieve::end`]'s own doc comment for why one block's disk error
+    /// must not strand every other block's commit); the block that failed
+    /// is left with its cache invalidated, matching
+    /// [`Block::write_changed_pages`]'s existing failure handling.
+    CommitFailed(String),
 }
 
 impl fmt::Display for TransactionError {
@@ -262,6 +279,7 @@ impl fmt::Display for TransactionError {
         match self {
             Self::AlreadyActive => write!(f, "a transaction is already open"),
             Self::NoneActive => write!(f, "no transaction is open"),
+            Self::CommitFailed(why) => write!(f, "committing a transaction failed: {why}"),
         }
     }
 }
@@ -1014,17 +1032,36 @@ pub struct Block<M: Mem> {
 /// (`docs/plans/2026-08-12-btrieve-finish.md` Task 6, and `DFAAPI.C`'s
 /// `PRIMBV`/"normal pre-image `dfaMode()`" -- see `at::` in this file's
 /// module doc comment). This host keeps the whole file's bytes instead of
-/// only the pages a write touched: `Block::insert`/`Block::update` write
+/// only the pages a write touched -- for a v5 block, or a v6 one with no
+/// page cache to defer into (see [`Block::write_changed_pages`]'s own
+/// fallback for that second case): `Block::insert`/`Block::update` write
 /// through several places (a data page, and on `insert` sometimes the
 /// allocation table) and re-deriving exactly which bytes moved would have to
 /// track every one of them precisely, where "the file as it was" cannot be
-/// wrong by construction. The cost is one extra copy of the file, taken
-/// once per transaction per block actually written -- not per write, and not
-/// for a block a transaction never touches.
+/// wrong by construction.
+///
+/// # `bytes` is `None` for a deferred (v6, cached) block -- Task 7
+///
+/// A v6 block with a cache attached defers every in-transaction write to
+/// that cache instead of writing through immediately (`Block::
+/// stage_changed_pages`), so disk is never touched for it between `begin`
+/// and whichever of `end`/`abort` closes the transaction. There is nothing
+/// on disk for a whole-file snapshot to be a pre-image *of* -- disk already
+/// **is** the pre-image, for as long as the transaction lasts. Reading and
+/// holding 55 MB of bytes that will never be written back would cost real
+/// memory for a restore [`Btrieve::abort`] can instead get for free
+/// ([`cache::PageCache::drop_dirty`]), so [`Block::capture_for_journal`]
+/// skips the disk read entirely for such a block and leaves this `None`;
+/// [`Btrieve::abort`] takes `None` here as "nothing to restore on disk",
+/// not "nothing was captured" -- the in-memory fields below are still taken
+/// unconditionally, because those are mutated directly regardless of
+/// deferral and still need restoring.
 #[derive(Debug)]
 struct PreImage {
-    /// The file's bytes before this transaction's first write to it.
-    bytes: Vec<u8>,
+    /// The file's bytes before this transaction's first write to it, or
+    /// `None` for a v6 block whose writes this transaction defers -- see
+    /// this struct's own doc comment.
+    bytes: Option<Vec<u8>>,
     /// The in-memory model at the same instant, so a restore does not need a
     /// re-read to agree with the bytes it just wrote back.
     records: Option<Records>,
@@ -1142,6 +1179,125 @@ pub(crate) enum Stop {
 enum Side {
     Left,
     Right,
+}
+
+/// One shadow pair's canonicalised write, computed by [`diff_changed_pages`]
+/// and consumed by [`Block::write_changed_pages_attempt`] (writes it to
+/// disk, held-back then flipped) and [`Block::stage_changed_pages`] (stages
+/// it straight into the cache, generation already final -- a deferred write
+/// has no disk crash to be safe against, only "does the cache end up
+/// holding what N real flushes would have left").
+struct Flip {
+    page: usize,
+    image: Vec<u8>,
+    generation: u16,
+}
+
+/// The read-only diff every v6 commit path needs: which of `store`'s dirty
+/// pages are plain content, and which shadow pairs (if any) need the
+/// held-back-then-flip canonicalisation, and with what final bytes/
+/// generation. Pulled out of [`Block::write_changed_pages_attempt`] so that
+/// function's disk-writing tail and [`Block::stage_changed_pages`]'s
+/// cache-only tail can share the one computation neither of them should
+/// re-derive differently -- see [`Block::write_changed_pages_attempt`]'s own
+/// doc comment for the shadow-paging design this computes.
+fn diff_changed_pages(store: &v6::Store) -> (Vec<usize>, Vec<Flip>) {
+    let old_pages = store.original_pages();
+
+    let generation = |image: &[u8]| -> u16 {
+        u16::from_le_bytes([image[at::GENERATION], image[at::GENERATION + 1]])
+    };
+
+    // The shadow pairs a write actually touched, control record first --
+    // the order phase 3 flips them in. `structural_pairs()` is already
+    // sorted ascending, and physical 0/1 (the control record, always
+    // noted by `v6::write_fcr`) sorts first by construction.
+    let pairs = store.structural_pairs();
+
+    // A pair the file grew into is not a flip at all: neither half
+    // existed before, so nothing of it is live and phase 1 puts both
+    // halves down with everything else new.
+    let flip_pairs: Vec<(usize, usize)> =
+        pairs.iter().copied().filter(|&(_, second)| second < old_pages).collect();
+
+    let mut flips: Vec<Flip> = Vec::new();
+
+    for &(first, second) in &flip_pairs {
+        let before_first = store.original(first).expect("noted structural pairs are read before written");
+        let before_second = store.original(second).expect("noted structural pairs are read before written");
+        let after_first = store.current(first);
+        let after_second = store.current(second);
+
+        // A pair neither half of which moved is not part of this write at
+        // all. Without this the canonicalisation below "flips" every
+        // untouched allocation-table block to its other half with a
+        // bumped generation -- the same content, written for nothing. On
+        // `WCCMP002.DAT`, whose table runs to fourteen blocks, that was
+        // 13 spurious page writes out of 16.
+        if before_first == after_first && before_second == after_second {
+            continue;
+        }
+        let (live_before, stale_before) = if generation(before_first) > generation(before_second) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let live_after = if generation(after_first) > generation(after_second) {
+            first
+        } else {
+            second
+        };
+
+        let wanted = if live_after == stale_before {
+            // One flip, or an odd number of them: the winning image is
+            // already on the half that was stale, and its own generation
+            // already beats the half that was live.
+            generation(store.current(live_after))
+        } else {
+            // An even number of flips landed the winner back on the half
+            // that started live. Move it across and give it the smallest
+            // generation that still wins, so the live half is never
+            // written.
+            generation(store.original(live_before).expect("read above")).wrapping_add(1)
+        };
+
+        let mut image = store.current(live_after).to_vec();
+        image[at::GENERATION..at::GENERATION + 2].copy_from_slice(&wanted.to_le_bytes());
+        let stale_before_bytes = store.original(stale_before).expect("read above");
+        if image == stale_before_bytes {
+            continue;
+        }
+        flips.push(Flip {
+            page: stale_before,
+            image,
+            generation: wanted,
+        });
+    }
+
+    // Everything else that changed. **Both** halves of every flip-
+    // covered pair are excluded, not just the halves phase 2 writes:
+    // canonicalising a double flip deliberately leaves the old live half
+    // alone, so its bytes still differ from `original` and it must not
+    // be mistaken for content. Leaving it is the point -- it becomes the
+    // pair's stale copy, which is exactly what a stale copy is for. A
+    // pair the file grew into (`second >= old_pages`, excluded from
+    // `flip_pairs` above) is *not* excluded here -- it never went
+    // through canonicalisation, so both its halves fall through to
+    // ordinary content below, exactly like the old tail write handled
+    // them.
+    let flip_covered: std::collections::HashSet<usize> =
+        flip_pairs.iter().flat_map(|&(first, second)| [first, second]).collect();
+    let content: Vec<usize> = store
+        .dirty_pages()
+        .into_iter()
+        .filter(|n| !flip_covered.contains(n))
+        .filter(|&n| match store.original(n) {
+            None => true, // appended this operation -- always new content
+            Some(before) => before != store.current(n),
+        })
+        .collect();
+
+    (content, flips)
 }
 
 #[cfg(test)]
@@ -1267,10 +1423,25 @@ impl<M: Mem> Block<M> {
         if !self.txn_active || self.pre_image.is_some() {
             return Ok(());
         }
-        let bytes = read_whole(&self.path).map_err(|e| BtvError {
-            file: self.name.clone(),
-            why: format!("{}: reading a transaction pre-image: {e}", self.path.display()),
-        })?;
+        // Task 7: a v6 block with a cache defers every in-transaction write
+        // to that cache (`Self::stage_changed_pages`) rather than writing
+        // through immediately, so disk is never touched for it until
+        // `Btrieve::end`/`Btrieve::abort` closes the transaction -- there is
+        // nothing for a whole-file snapshot to restore that disk does not
+        // already hold. Skipping the read saves exactly the cost this
+        // struct's own doc comment describes (up to the whole file, once per
+        // transaction per block written) for the one case where it can never
+        // be used. A v5 block, or a v6 block with no cache (only a hand-built
+        // test `Block` reaches this), still writes straight through even
+        // inside a transaction, so it still needs the real snapshot.
+        let bytes = if self.cache.is_some() {
+            None
+        } else {
+            Some(read_whole(&self.path).map_err(|e| BtvError {
+                file: self.name.clone(),
+                why: format!("{}: reading a transaction pre-image: {e}", self.path.display()),
+            })?)
+        };
         self.capture_pre_image(bytes);
         Ok(())
     }
@@ -1283,9 +1454,10 @@ impl<M: Mem> Block<M> {
     /// rather than reading the file a second time. Now that a v6 write
     /// reads pages lazily through [`v6::Store`] and never holds the whole
     /// file, that shortcut no longer has anything cheap to shortcut --
-    /// [`Self::capture_for_journal`]'s own disk read is the only way to get
-    /// a transaction's pre-image, the same as v5 always needed one for.
-    fn capture_pre_image(&mut self, bytes: Vec<u8>) {
+    /// [`Self::capture_for_journal`]'s own disk read (or its Task 7 skip,
+    /// for a deferred block -- see [`PreImage`]'s own doc comment) is the
+    /// only way to get a transaction's pre-image.
+    fn capture_pre_image(&mut self, bytes: Option<Vec<u8>>) {
         self.pre_image = Some(PreImage {
             bytes,
             records: self.records.clone(),
@@ -1557,8 +1729,100 @@ impl<M: Mem> Block<M> {
     /// [`Block::invalidate_cache`] -- same primitive [`Btrieve::abort`]
     /// uses for the same reason -- nukes and refetches rather than trying
     /// to reason about exactly how far the failed write got.
+    ///
+    /// # Autocommit versus a transaction in progress (Task 7)
+    ///
+    /// Outside a transaction (`!self.txn_active`), this is unchanged: the
+    /// write lands on disk before this returns, exactly as every task before
+    /// this one built it. Inside one, with a cache actually attached to
+    /// defer into, this instead calls [`Self::stage_changed_pages`] -- the
+    /// same canonicalised bytes, staged into the cache and left dirty,
+    /// nothing touching disk. `Btrieve::end` is what turns every covered
+    /// block's staged pages into a real flush (one combined
+    /// [`v6::Store::for_commit`] pass, not one per op); `Btrieve::abort` is
+    /// what throws them away (`PageCache::drop_dirty`). A `txn_active` block
+    /// with no cache (only reachable for a hand-built test `Block` that
+    /// skipped `Self::open` yet still got pushed through `Btrieve::begin` --
+    /// never a real `opnbtv`) has nowhere to defer *to*, so it falls back to
+    /// this same immediate path rather than silently discarding the write.
     fn write_changed_pages(&mut self, store: &mut v6::Store) -> Result<(), BtvError> {
+        if self.txn_active && self.cache.is_some() {
+            self.stage_changed_pages(store);
+            return Ok(());
+        }
         let result = self.write_changed_pages_attempt(store);
+        if result.is_err() {
+            self.invalidate_cache();
+        }
+        result
+    }
+
+    /// The deferred half of [`Self::write_changed_pages`]: compute the same
+    /// diff [`Self::write_changed_pages_attempt`] would, but push it into
+    /// the attached cache only -- left dirty, not [`v6::Store::
+    /// cache_mark_clean`]ed, because nothing has actually reached disk yet.
+    ///
+    /// This is *not* "skip the flip ceremony because nothing is written to
+    /// disk yet". [`Map::claim`]/[`Map::relocate`]/[`write_fcr`] and friends
+    /// decide which physical half of a shadow pair to write by reading the
+    /// *current* generation through this same `store` -- which, for an op
+    /// inside a transaction, means through the cache, which means through
+    /// whatever an *earlier* op in the same transaction staged here. So the
+    /// cache has to end up holding exactly the bytes a real flush would have
+    /// left (final winning image, final generation, on the physical page a
+    /// real flush would have put it on) or the next op's own read of "what
+    /// is currently live" would disagree with what a real, undeferred
+    /// sequence of the same ops would have produced. Only the *disk* half of
+    /// the ceremony (held-back generation in phase 2, the single flipping
+    /// write in phase 3) is something an in-memory cache has no crash to be
+    /// unsafe about, so that part alone is skipped.
+    fn stage_changed_pages(&mut self, store: &mut v6::Store) {
+        let (content, flips) = diff_changed_pages(store);
+        for &number in &content {
+            let bytes = store.current(number).to_vec();
+            store.cache_put(number, bytes);
+        }
+        for flip in &flips {
+            store.cache_put(flip.page, flip.image.clone());
+        }
+        // Deliberately no `cache_mark_clean()` here -- these pages are
+        // staged, not durable. `Btrieve::end`'s commit flush is what marks
+        // them clean; `Btrieve::abort`'s `PageCache::drop_dirty` is what
+        // discards them if the transaction never reaches `end`.
+    }
+
+    /// [`Btrieve::end`]'s own half of Task 7's deferral: turn everything
+    /// this block's cache holds staged-but-undurable into one real,
+    /// flushed disk write, covering every op the just-ending transaction
+    /// ran against this block, not one flush per op.
+    ///
+    /// A no-op for a v5 block (`self.cache` is `None`) or a v6 block whose
+    /// cache holds nothing dirty -- no write happened this transaction, or
+    /// none of them were deferred (a `txn_active` block with no cache falls
+    /// back to writing straight through immediately, see
+    /// [`Self::write_changed_pages`]'s own doc comment, so it never leaves
+    /// anything for this to find either).
+    ///
+    /// # Errors
+    ///
+    /// If [`v6::Store::for_commit`] cannot read the file's true (untouched)
+    /// disk bytes, or the flush itself fails -- the same disk errors
+    /// [`Self::write_changed_pages_attempt`] can already return, since this
+    /// calls that same function. On failure, this block's cache is
+    /// invalidated, the same handling an autocommit flush already gets from
+    /// [`Self::write_changed_pages`].
+    fn commit_deferred(&mut self) -> Result<(), BtvError> {
+        let Some(cache) = self.cache.clone() else {
+            return Ok(());
+        };
+        if cache.borrow().dirty_pages().is_empty() {
+            return Ok(());
+        }
+        let mut store = v6::Store::for_commit(&cache, &self.path, self.geometry.page).map_err(|why| BtvError {
+            file: self.name.clone(),
+            why,
+        })?;
+        let result = self.write_changed_pages_attempt(&mut store);
         if result.is_err() {
             self.invalidate_cache();
         }
@@ -1577,108 +1841,12 @@ impl<M: Mem> Block<M> {
             why,
         };
         let page = usize::from(self.geometry.page);
-        let old_pages = store.original_pages();
 
         let generation = |image: &[u8]| -> u16 {
             u16::from_le_bytes([image[at::GENERATION], image[at::GENERATION + 1]])
         };
 
-        // The shadow pairs a write actually touched, control record first --
-        // the order phase 3 flips them in. `structural_pairs()` is already
-        // sorted ascending, and physical 0/1 (the control record, always
-        // noted by `v6::write_fcr`) sorts first by construction.
-        let pairs = store.structural_pairs();
-
-        // A pair the file grew into is not a flip at all: neither half
-        // existed before, so nothing of it is live and phase 1 puts both
-        // halves down with everything else new.
-        let flip_pairs: Vec<(usize, usize)> =
-            pairs.iter().copied().filter(|&(_, second)| second < old_pages).collect();
-
-        // Phase 2's writes, canonicalised to one flip each: the final image,
-        // the half of the pair it goes on, and the generation phase 3 will
-        // give it.
-        struct Flip {
-            page: usize,
-            image: Vec<u8>,
-            generation: u16,
-        }
-        let mut flips: Vec<Flip> = Vec::new();
-
-        for &(first, second) in &flip_pairs {
-            let before_first = store.original(first).expect("noted structural pairs are read before written");
-            let before_second = store.original(second).expect("noted structural pairs are read before written");
-            let after_first = store.current(first);
-            let after_second = store.current(second);
-
-            // A pair neither half of which moved is not part of this write at
-            // all. Without this the canonicalisation below "flips" every
-            // untouched allocation-table block to its other half with a
-            // bumped generation -- the same content, written for nothing. On
-            // `WCCMP002.DAT`, whose table runs to fourteen blocks, that was
-            // 13 spurious page writes out of 16.
-            if before_first == after_first && before_second == after_second {
-                continue;
-            }
-            let (live_before, stale_before) = if generation(before_first) > generation(before_second) {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            let live_after = if generation(after_first) > generation(after_second) {
-                first
-            } else {
-                second
-            };
-
-            let wanted = if live_after == stale_before {
-                // One flip, or an odd number of them: the winning image is
-                // already on the half that was stale, and its own generation
-                // already beats the half that was live.
-                generation(store.current(live_after))
-            } else {
-                // An even number of flips landed the winner back on the half
-                // that started live. Move it across and give it the smallest
-                // generation that still wins, so the live half is never
-                // written.
-                generation(store.original(live_before).expect("read above")).wrapping_add(1)
-            };
-
-            let mut image = store.current(live_after).to_vec();
-            image[at::GENERATION..at::GENERATION + 2].copy_from_slice(&wanted.to_le_bytes());
-            let stale_before_bytes = store.original(stale_before).expect("read above");
-            if image == stale_before_bytes {
-                continue;
-            }
-            flips.push(Flip {
-                page: stale_before,
-                image,
-                generation: wanted,
-            });
-        }
-
-        // Everything else that changed. **Both** halves of every flip-
-        // covered pair are excluded, not just the halves phase 2 writes:
-        // canonicalising a double flip deliberately leaves the old live half
-        // alone, so its bytes still differ from `original` and it must not
-        // be mistaken for content. Leaving it is the point -- it becomes the
-        // pair's stale copy, which is exactly what a stale copy is for. A
-        // pair the file grew into (`second >= old_pages`, excluded from
-        // `flip_pairs` above) is *not* excluded here -- it never went
-        // through canonicalisation, so both its halves fall through to
-        // ordinary content below, exactly like the old tail write handled
-        // them.
-        let flip_covered: std::collections::HashSet<usize> =
-            flip_pairs.iter().flat_map(|&(first, second)| [first, second]).collect();
-        let content: Vec<usize> = store
-            .dirty_pages()
-            .into_iter()
-            .filter(|n| !flip_covered.contains(n))
-            .filter(|&n| match store.original(n) {
-                None => true, // appended this operation -- always new content
-                Some(before) => before != store.current(n),
-            })
-            .collect();
+        let (content, flips) = diff_changed_pages(store);
 
         let mut out = std::fs::OpenOptions::new()
             .write(true)
@@ -6107,20 +6275,32 @@ impl<M: Mem> Btrieve<M> {
     /// write made since [`Self::begin`], and discard the pre-images that
     /// would have undone them.
     ///
-    /// **Writes are already visible before this is called.** Measured
-    /// (`xactprobe`'s `visibility` scenario): a `GET_EQUAL` for a record
-    /// inserted earlier in the same transaction found it, tag and all,
-    /// before `dfaEndTrans` was ever reached (`get-inside-txn status=0 (OK)
-    /// tag=aa`), and it was still there after a close and reopen
-    /// (`get-after-close-reopen status=0 (OK) tag=aa`). So this host's
-    /// `Block::insert`/`Block::update` already write straight through, live,
-    /// the same as the real engine -- there is no buffered write for `end`
-    /// to flush. All it does is stop tracking pre-images, which matches: a
-    /// failing op inside a transaction does not implicitly end or abort it
-    /// either (`xactprobe`'s `fail_inside`: a duplicate-key insert returned
-    /// status 5, and every op after it -- including the eventual `end` --
-    /// still succeeded, and both the surviving insert and the one after the
-    /// failure were there on reopen).
+    /// **Writes are already visible before this is called**, in the sense
+    /// that matters to a module. Measured (`xactprobe`'s `visibility`
+    /// scenario): a `GET_EQUAL` for a record inserted earlier in the same
+    /// transaction found it, tag and all, before `dfaEndTrans` was ever
+    /// reached (`get-inside-txn status=0 (OK) tag=aa`), and it was still
+    /// there after a close and reopen (`get-after-close-reopen status=0 (OK)
+    /// tag=aa`). A v5 block, or a v6 one with no cache, still keeps that
+    /// guarantee the same way it always has: `Block::insert`/`Block::update`
+    /// write straight through, live, so there is nothing for `end` to flush
+    /// for it.
+    ///
+    /// # A deferred (v6, cached) block *does* have something to flush -- Task 7
+    ///
+    /// Such a block's in-transaction writes only ever staged into its cache
+    /// (`Block::stage_changed_pages`), never touching disk, so this is the
+    /// point disk actually catches up: [`Block::commit_deferred`] runs one
+    /// combined [`v6::Store::for_commit`] pass per covered block, flushing
+    /// every page any op in the transaction touched through the same
+    /// shadow-pair-aware three-phase write [`Block::write_changed_pages_
+    /// attempt`] always uses, not one flush per op. "Visible before `end`"
+    /// still holds for a module -- every read this host serves for such a
+    /// block answers from the same cache the writes staged into, or from
+    /// `self.records`, which every v6 write updates directly regardless of
+    /// deferral -- it is only *disk* (a different process reading the file,
+    /// or this one after a close and reopen) that was not caught up until
+    /// now.
     ///
     /// # Errors
     ///
@@ -6128,16 +6308,31 @@ impl<M: Mem> Btrieve<M> {
     /// `xactprobe`'s `end_no_begin` scenario calls `dfaEndTrans` on a freshly
     /// opened file with no `dfaBegTrans` first, and the real engine refuses
     /// it (`end_no_begin: status=39`) rather than treating it as a no-op.
+    ///
+    /// [`TransactionError::CommitFailed`] if [`Block::commit_deferred`]
+    /// fails for at least one covered block -- unmeasured against the real
+    /// engine (no `xactprobe` scenario forces a disk error at `end` itself);
+    /// this end's own doc comment on that variant states this call's
+    /// policy. Every block still gets its transaction bookkeeping closed out
+    /// regardless: one file's disk error should not strand every other
+    /// file's commit, the same principle [`Self::abort`] already follows.
     pub fn end(&mut self) -> Result<(), TransactionError> {
         if !self.transaction {
             return Err(TransactionError::NoneActive);
         }
         self.transaction = false;
+        let mut failure: Option<String> = None;
         for block in &mut self.open {
             block.txn_active = false;
             block.pre_image = None;
+            if let Err(e) = block.commit_deferred() {
+                failure.get_or_insert_with(|| e.to_string());
+            }
         }
-        Ok(())
+        match failure {
+            Some(why) => Err(TransactionError::CommitFailed(why)),
+            None => Ok(()),
+        }
     }
 
     /// Abort a transaction, as `dfaAbtTrans` (Btrieve op 21) does: undo
@@ -6179,6 +6374,22 @@ impl<M: Mem> Btrieve<M> {
     /// 3's own review: every existing `abort_undoes_*` test uses a v5
     /// fixture, which never attaches a cache, so nothing caught this until
     /// `abort_invalidates_the_v6_cache_not_just_disk_and_the_model` did.
+    ///
+    /// # A deferred (v6, cached) block never touched disk -- Task 7
+    ///
+    /// [`PreImage::bytes`] is `None` for such a block ([`PreImage`]'s own
+    /// doc comment): every in-transaction write went to its cache only
+    /// (`Block::stage_changed_pages`), so disk already **is** the
+    /// pre-image and there is nothing to write back. Discarding what this
+    /// transaction staged is [`cache::PageCache::drop_dirty`] -- cheaper
+    /// than [`Block::invalidate_cache`]'s full reopen because every already-
+    /// durable, pre-transaction page already resident stays resident; only
+    /// the pages this transaction's own writes left dirty (never marked
+    /// clean, because nothing ever flushed them) are thrown away. The
+    /// in-memory model (`records`/`geometry`/`dirty`) is restored from
+    /// `pre` exactly as it is for the disk-writing branch, because those
+    /// fields are mutated directly by every v6 write regardless of
+    /// deferral and still need putting back.
     pub fn abort(&mut self) -> Result<(), TransactionError> {
         if !self.transaction {
             return Err(TransactionError::NoneActive);
@@ -6189,24 +6400,39 @@ impl<M: Mem> Btrieve<M> {
             let Some(pre) = block.pre_image.take() else {
                 continue;
             };
-            if std::fs::write(&block.path, &pre.bytes).is_err() {
-                // Restoring the model without the disk write succeeding
-                // would make the two disagree in a way a fresh read could
-                // not even detect, since the next read of this file would
-                // see the *unrestored* disk bytes. Leave both, and the
-                // pre-image, exactly as they were so nothing here claims a
-                // rollback that did not happen.
-                block.pre_image = Some(pre);
-                continue;
+            match &pre.bytes {
+                Some(bytes) => {
+                    if std::fs::write(&block.path, bytes).is_err() {
+                        // Restoring the model without the disk write
+                        // succeeding would make the two disagree in a way a
+                        // fresh read could not even detect, since the next
+                        // read of this file would see the *unrestored* disk
+                        // bytes. Leave both, and the pre-image, exactly as
+                        // they were so nothing here claims a rollback that
+                        // did not happen.
+                        block.pre_image = Some(pre);
+                        continue;
+                    }
+                    block.records = pre.records;
+                    block.geometry = pre.geometry;
+                    block.dirty = pre.dirty;
+                    // The disk write above just put pre-transaction bytes
+                    // back -- any page the transaction's own write had
+                    // pushed into this block's cache is now stale. See
+                    // `Block::invalidate_cache`'s own doc comment.
+                    block.invalidate_cache();
+                }
+                None => {
+                    // Task 7: nothing was ever written to disk for this
+                    // block -- see this method's own doc comment.
+                    if let Some(cache) = &block.cache {
+                        cache.borrow_mut().drop_dirty();
+                    }
+                    block.records = pre.records;
+                    block.geometry = pre.geometry;
+                    block.dirty = pre.dirty;
+                }
             }
-            block.records = pre.records;
-            block.geometry = pre.geometry;
-            block.dirty = pre.dirty;
-            // The disk write above just put pre-transaction bytes back --
-            // any page the transaction's own write had pushed into this
-            // block's cache is now stale. See `Block::invalidate_cache`'s
-            // own doc comment.
-            block.invalidate_cache();
         }
         Ok(())
     }
@@ -12418,12 +12644,100 @@ mod tests {
         );
     }
 
+    /// Task 7's own headline behaviour, proven directly: a v6 block's
+    /// writes inside a transaction do not reach disk one at a time -- they
+    /// stage into the cache and stay there until `Btrieve::end` runs one
+    /// combined flush. Two inserts and an update, all inside one
+    /// transaction: `WROTE` (every byte a real disk write has put down,
+    /// `Block::write_changed_pages_attempt`'s own counter) stays zero
+    /// through every one of them, and only moves once `end` is called.
+    /// Disk agreeing with the model afterward (read fresh, cache dropped,
+    /// the same technique every `abort_undoes_*` test already uses) is what
+    /// tells this apart from "happened to look deferred because nothing
+    /// checked yet".
+    #[test]
+    fn ending_a_transaction_flushes_every_deferred_v6_write_to_disk() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+
+        let dir = crate::testing::scratch("txn-end-flushes-deferred-v6");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let path = dir.join("V6EMPTY1KEY.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        crate::testing::make_keys_modifiable(&path);
+
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let maxlen = geometry.reclen;
+        let at = btrieve
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, maxlen)
+            .expect("opens");
+        assert!(
+            btrieve.block(at).expect("open").cache.is_some(),
+            "a real v6 open attaches a cache -- this test is meaningless without one"
+        );
+
+        // A baseline record before the transaction, written (and flushed)
+        // the ordinary autocommit way, so this test can also see that
+        // `end`'s commit does not disturb what was already durable.
+        let baseline = btrieve.block_mut(at).expect("open").insert(&v6_record(b"BASE")).expect("baseline");
+
+        btrieve.begin().expect("begin");
+        WROTE.with(|wrote| wrote.set(0));
+
+        let first = btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("first insert");
+        assert_eq!(WROTE.with(std::cell::Cell::get), 0, "a deferred insert must not touch disk");
+
+        let second = btrieve.block_mut(at).expect("open").insert(&v6_record(b"BBBB")).expect("second insert");
+        assert_eq!(WROTE.with(std::cell::Cell::get), 0, "a second deferred insert must not touch disk either");
+
+        btrieve
+            .block_mut(at)
+            .expect("open")
+            .update(first, &v6_record(b"CCCC"))
+            .expect("a deferred update");
+        assert_eq!(WROTE.with(std::cell::Cell::get), 0, "a deferred update must not touch disk");
+
+        // Visible in-session before `end`, the same contract
+        // `an_insert_made_after_begin_is_visible_before_end` pins for v5.
+        {
+            let block = btrieve.block_mut(at).expect("open");
+            let model = block.records().expect("in-memory model before end");
+            assert!(model.find_physical(first).is_some());
+            assert!(model.find_physical(second).is_some());
+        }
+
+        btrieve.end().expect("end");
+        assert!(
+            WROTE.with(std::cell::Cell::get) > 0,
+            "end's own combined flush must be what finally reaches disk"
+        );
+        assert!(!btrieve.block(at).expect("open").txn_active, "no longer covered");
+        assert!(btrieve.block(at).expect("open").pre_image.is_none(), "pre-image discarded");
+
+        // A fresh read straight off disk -- `records` dropped, so this walks
+        // the file directly rather than answering from the in-memory model
+        // (or the cache) that already agreed before `end` ran.
+        btrieve.block_mut(at).expect("open").records = None;
+        let reread = btrieve.block_mut(at).expect("open").records().expect("a fresh read from disk");
+        assert!(reread.find_physical(baseline).is_some(), "the pre-transaction baseline is untouched");
+        assert!(reread.find_physical(first).is_some(), "the first deferred insert reached disk");
+        assert!(reread.find_physical(second).is_some(), "the second deferred insert reached disk");
+        let updated = at_position(&reread, first).expect("still there");
+        assert_eq!(&updated.bytes[..4], b"CCCC", "the deferred update's own value reached disk");
+    }
+
     /// Reproduces `xactprobe`'s `fail_inside` scenario indirectly: `end`
     /// keeps the write rather than rolling it back, matching real Btrieve
     /// where every op after a failed one (including the eventual `end`)
-    /// still succeeded and both records were there on reopen. This host has
-    /// no buffered-write path for `end` to flush -- see [`Btrieve::end`]'s
-    /// doc comment -- so what `end` actually has to get right is *not*
+    /// still succeeded and both records were there on reopen. This is a v5
+    /// fixture, which still writes straight through with nothing buffered
+    /// for `end` to flush -- see [`Btrieve::end`]'s own doc comment for the
+    /// v6 case (Task 7), where there *is* something to flush and this
+    /// assertion (the write survives `end`) is exactly what
+    /// `ending_a_transaction_flushes_every_deferred_v6_write_to_disk` checks
+    /// for that path instead. What `end` has to get right here is *not*
     /// undoing anything, and discarding the now-useless pre-image.
     #[test]
     fn ending_a_transaction_keeps_the_write_and_discards_the_pre_image() {

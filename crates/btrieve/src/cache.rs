@@ -141,6 +141,23 @@ impl PageCache {
         Ok(&self.pages[&physical].bytes)
     }
 
+    /// A page's whole content if it is already resident, without faulting
+    /// it in from disk when it is not -- the read-only twin of [`Self::page`]
+    /// for a caller that wants to know "do we already have this for free"
+    /// without paying a read-through's cost on a miss.
+    ///
+    /// `v6::Store`'s own header-only reads are the reason this exists: a
+    /// twin search costs a handful of bytes per candidate specifically by
+    /// *never* promoting a miss into a whole-page fetch, but a page a
+    /// deferred write already staged here in full (Task 7,
+    /// `super::lib::Block::stage_changed_pages`) has to answer with those
+    /// bytes rather than stale, not-yet-flushed disk content -- `peek` is
+    /// what lets a header check see a resident page for free while a
+    /// genuine miss still costs nothing here at all.
+    pub(crate) fn peek(&self, physical: u32) -> Option<&[u8]> {
+        self.pages.get(&physical).map(|p| p.bytes.as_slice())
+    }
+
     /// A page's whole content, mutably -- fetch-through the same as
     /// [`Self::page`], then marked dirty because a caller only reaches for
     /// `&mut` to change it.

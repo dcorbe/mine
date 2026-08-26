@@ -460,9 +460,26 @@ impl Store {
     /// [`Self::ensure_loaded`]'s own call) is served through `cache` when
     /// this `Store` is [`Self::attach`]ed to one, instead of `file` -- see
     /// [`Self::attach`]'s own doc comment for why a header-length request
-    /// never takes this branch even when a cache is attached. The borrow
-    /// this takes on `cache` is scoped to this one page: the bytes are
-    /// copied out before it ends, so nothing here can re-enter it.
+    /// never *faults a page in through* `cache` even when one is attached
+    /// (that would turn every twin-search miss into a whole-page fetch).
+    ///
+    /// A header-length request still has to check whether `cache` already
+    /// holds this page **resident**, though -- [`PageCache::peek`], which
+    /// costs nothing when it does not (the ordinary case, and the one the
+    /// paragraph above is about) and is load-bearing when it does (Task 7):
+    /// a deferred write inside a transaction stages its own finished pages
+    /// into the cache without ever touching disk
+    /// (`super::lib::Block::stage_changed_pages`), so a *later* op in the
+    /// same transaction reading this same page's header -- `Self::header`'s
+    /// only caller for the file control record is `Block::v6_live_fcr`,
+    /// which every insert/update/delete calls to find the free-list head --
+    /// must see that staged content, not disk's still-pre-transaction
+    /// bytes. Measured directly: without this check, two inserts in one
+    /// transaction both read the free-list head the first one had already
+    /// claimed, off disk, and collided on the same record position.
+    ///
+    /// The borrow this takes on `cache` is scoped to this one page: the
+    /// bytes are copied out before it ends, so nothing here can re-enter it.
     fn read_disk(&mut self, page: usize, len: usize) -> Result<Vec<u8>, String> {
         if len == self.page_size {
             if let Some(cache) = &self.cache {
@@ -471,6 +488,12 @@ impl Store {
                 let mut guard = cache.borrow_mut();
                 let bytes = guard.page(physical)?.to_vec();
                 return Ok(bytes);
+            }
+        } else if let Some(cache) = &self.cache {
+            let physical = u32::try_from(page)
+                .map_err(|_| format!("physical page {page} does not fit a u32"))?;
+            if let Some(bytes) = cache.borrow().peek(physical) {
+                return Ok(bytes[..len].to_vec());
             }
         }
         let file = self
@@ -703,6 +726,152 @@ impl Store {
     pub(crate) fn cache_mark_clean(&mut self) {
         if let Some(cache) = &self.cache {
             cache.borrow_mut().mark_clean();
+        }
+    }
+
+    /// Build a `Store` for [`super::lib::Block::write_changed_pages_attempt`]
+    /// to flush a whole deferred transaction's already-decided changes in
+    /// one pass, rather than one op's.
+    ///
+    /// Every mutating v6 op inside a transaction (`Block::write_changed_pages`'s
+    /// deferred branch, Task 7) stages its own finished canonicalisation
+    /// straight into `cache` and stops there -- no disk write, no
+    /// [`Self::cache_mark_clean`] -- so by the time `Btrieve::end` calls
+    /// this, `cache` already holds the whole transaction's final bytes for
+    /// every page any op touched, still marked dirty because nothing has
+    /// flushed them yet. Disk, meanwhile, has not been written to at all for
+    /// this block since the transaction began: every write stopped at the
+    /// cache. So "before" for this commit is simply *what disk still
+    /// holds*, read fresh, and "after" is whatever `cache` has resident --
+    /// no per-op bookkeeping needs to be threaded across the transaction,
+    /// because both ends of the diff are already sitting somewhere this can
+    /// read them directly.
+    ///
+    /// # Structural pairs are re-derived by position, not re-noted
+    ///
+    /// A live `Store` learns which pages are shadow pairs from
+    /// [`Self::note_structural_pair`], called once per op by whichever
+    /// function ([`Map::claim`]/[`Map::relocate`]/[`Map::unclaim`]/
+    /// [`Map::retire`]/[`Map::reclaim`]/[`write_fcr`]) just touched one --
+    /// but no single op's `Store` survives long enough to have called it for
+    /// *every* pair a whole transaction's worth of ops touched. This
+    /// reconstructs the same answer from the file's own fixed geometry
+    /// instead: physical 0/1 is always the file control record's pair, and
+    /// every other allocation-table block's pair sits at [`Map::pair_position`]'s
+    /// formula position -- a page whose distance from physical 2, modulo one
+    /// block's stride, is 0 or 1 is a pair half; anything else is ordinary
+    /// content (a B-tree node or a data page, never shadow-paired -- see
+    /// this module's own doc comment). Pure arithmetic, the same formula
+    /// [`Map::table_pages`] already walks, so it costs nothing to ask it of
+    /// every dirty page rather than trying to remember which ones mattered.
+    ///
+    /// # Errors
+    ///
+    /// If `path` cannot be opened, its length is not a whole number of
+    /// `page_size`-byte pages, or a pre-existing page's true disk bytes
+    /// cannot be read in full.
+    pub(crate) fn for_commit(
+        cache: &std::rc::Rc<std::cell::RefCell<crate::cache::PageCache>>,
+        path: &std::path::Path,
+        page_size: u16,
+    ) -> Result<Self, String> {
+        let page_size_usize = usize::from(page_size);
+        if page_size_usize == 0 {
+            return Err("a v6 file's page size cannot be zero".to_owned());
+        }
+        let mut disk = super::open_for_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let disk_len = disk
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        let disk_len = usize::try_from(disk_len).map_err(|_| {
+            format!("{}: {disk_len} bytes does not fit this host's usize", path.display())
+        })?;
+        if !disk_len.is_multiple_of(page_size_usize) {
+            return Err(format!(
+                "{}: {disk_len} bytes is not a whole number of {page_size}-byte pages -- \
+                 disk should be untouched by a deferred transaction",
+                path.display()
+            ));
+        }
+        let original_pages = disk_len / page_size_usize;
+
+        // Every page any op in this transaction actually changed, plus the
+        // other half of any shadow pair one of them belongs to (the flip
+        // canonicalisation below needs both halves' before/after images even
+        // when only one half is independently dirty -- see
+        // `Block::write_changed_pages_attempt`'s own flip loop).
+        let dirty: Vec<usize> =
+            cache.borrow().dirty_pages().into_iter().map(|p| p as usize).collect();
+        let mut structural_pairs = std::collections::BTreeSet::new();
+        let mut touched: std::collections::BTreeSet<usize> = dirty.iter().copied().collect();
+        for &n in &dirty {
+            if let Some(pair) = Self::structural_pair_of(n, page_size_usize) {
+                structural_pairs.insert(pair);
+                touched.insert(pair.0);
+                touched.insert(pair.1);
+            }
+        }
+
+        let mut pages = HashMap::with_capacity(touched.len());
+        for n in touched {
+            let current = {
+                let physical = u32::try_from(n)
+                    .map_err(|_| format!("physical page {n} does not fit a u32"))?;
+                cache.borrow_mut().page(physical)?.to_vec()
+            };
+            // A page at or past `original_pages` was appended during this
+            // transaction and never existed on disk -- no `original` to read,
+            // same convention as `Self::append_page`.
+            let original = if n < original_pages {
+                let bytes = super::read_at_open(&mut disk, n * page_size_usize, page_size_usize)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                if bytes.len() != page_size_usize {
+                    return Err(format!(
+                        "{}: physical page {n} is only {} of {page_size_usize} bytes -- \
+                         past the end of the file",
+                        path.display(),
+                        bytes.len()
+                    ));
+                }
+                Some(bytes)
+            } else {
+                None
+            };
+            pages.insert(n, Entry { original, current, dirty: true });
+        }
+
+        let total_pages = cache.borrow().total_pages();
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Some(disk),
+            cache: Some(std::rc::Rc::clone(cache)),
+            page_size: page_size_usize,
+            original_pages,
+            total_pages,
+            pages,
+            headers: HashMap::new(),
+            structural_pairs,
+        })
+    }
+
+    /// Which shadow pair physical page `physical` belongs to, if any -- see
+    /// [`Self::for_commit`]'s own doc comment for why this is arithmetic
+    /// rather than a scan. `physical < 2` is always the file control
+    /// record's own pair; otherwise this is [`Map::pair_position`]'s formula,
+    /// inverted: a page whose distance from physical 2, modulo one block's
+    /// stride, is 0 or 1 is that block's own pair half.
+    fn structural_pair_of(physical: usize, page_size: usize) -> Option<(usize, usize)> {
+        if physical < 2 {
+            return Some((0, 1));
+        }
+        let stride = Map::entries_per_block(page_size) + 2;
+        let offset = (physical - 2) % stride;
+        if offset < 2 {
+            let first = physical - offset;
+            Some((first, first + 1))
+        } else {
+            None
         }
     }
 }
