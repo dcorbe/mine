@@ -283,4 +283,73 @@ mod tests {
              {keys_compared} keys, {records_compared} records"
         );
     }
+
+    /// Re-review of round 3, finding 2: the design argument that
+    /// [`OrderIndex::from_positions`]' sequence equals [`Records`]'s own
+    /// physical order was never checked empirically -- only counts and
+    /// individual positions were, through `Block::v6_physical_len`/
+    /// `Block::v6_physical_at`'s own callers. This is that check, over the
+    /// same corpus [`order_index_and_byte_fetch_match_records_over_the_v6_
+    /// corpus`] uses: for every fixed-length v6 file, `Block::v6_build_
+    /// physical_index`'s own `OrderIndex` (the allocation table plus each
+    /// claimed data page's own live-slot markers) must produce the
+    /// identical sequence, element by element, that `Records::physical`
+    /// already reads off the same file a different way (`records::
+    /// walk_v6`, a whole-file scan in ascending logical-then-slot order).
+    #[test]
+    fn the_physical_order_index_matches_records_physical_order_over_the_v6_corpus() {
+        let mut files_compared = 0usize;
+        let mut records_compared = 0usize;
+
+        for path in v6_candidate_paths() {
+            let Some((btrieve, at)) = open_v6_fixed(&path) else { continue };
+            let block = btrieve.block(at).expect("just opened");
+            let keys = block.keys().to_vec();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let records = match Records::read(&name, &path, block.geometry(), &keys) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if records.is_empty() {
+                continue;
+            }
+
+            let physical = block
+                .v6_build_physical_index()
+                .unwrap_or_else(|e| panic!("{name}: v6_build_physical_index: {e}"));
+
+            assert_eq!(
+                physical.len(),
+                records.len(),
+                "{name}: the physical-order index's length disagrees with Records' own \
+                 physical count"
+            );
+
+            for at in 0..records.len() {
+                let expected = records.physical(at).expect("in range");
+                let position = physical.position_at(at).unwrap_or_else(|| {
+                    panic!("{name}: physical rank {at}: the index has no position")
+                });
+                assert_eq!(
+                    position, expected.position,
+                    "{name}: physical rank {at}: the index's own position disagrees with \
+                     Records' physical order at the identical rank"
+                );
+                assert_eq!(
+                    physical.rank_of(position),
+                    Some(at),
+                    "{name}: position {position}: rank_of disagrees with its own forward mapping"
+                );
+            }
+
+            records_compared += records.len();
+            files_compared += 1;
+        }
+
+        assert!(files_compared > 0, "the walker found no fixed-length v6 files -- it has gone blind");
+        eprintln!(
+            "the_physical_order_index_matches_records_physical_order_over_the_v6_corpus: \
+             {files_compared} files, {records_compared} records"
+        );
+    }
 }
