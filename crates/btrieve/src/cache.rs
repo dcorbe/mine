@@ -158,6 +158,53 @@ impl PageCache {
         self.pages.get(&physical).map(|p| p.bytes.as_slice())
     }
 
+    /// `len` bytes from the start of a page, **without faulting it in**:
+    /// a resident page answers from memory (a transaction's staged content
+    /// must win over disk -- `v6::Store::read_disk`'s own doc comment holds
+    /// the measurement); anything else is a raw read through this cache's
+    /// own handle, deliberately not stored, so a header-length probe of a
+    /// page nothing else wants resident stays a cheap read instead of a
+    /// whole-page fetch.
+    ///
+    /// This is what lets an [`attach`](crate::v6::Store::attach)ed `Store`
+    /// exist without a file handle of its own: the cache's handle is the
+    /// block's one handle, for full pages and for these probes alike.
+    ///
+    /// # Errors
+    ///
+    /// If `len` exceeds the page size, the page is past the file's end, or
+    /// the read itself fails or comes up short.
+    pub(crate) fn sub_page(&mut self, physical: u32, len: usize) -> Result<Vec<u8>, String> {
+        if len > self.page_size {
+            return Err(format!(
+                "{}: a {len}-byte probe does not fit a {}-byte page",
+                self.path.display(),
+                self.page_size
+            ));
+        }
+        if let Some(bytes) = self.peek(physical) {
+            return Ok(bytes[..len].to_vec());
+        }
+        if physical >= self.total_pages {
+            return Err(format!(
+                "{}: physical page {physical}, and the file is {} pages",
+                self.path.display(),
+                self.total_pages
+            ));
+        }
+        let offset = physical as usize * self.page_size;
+        let bytes = super::read_at_open(&mut self.file, offset, len)
+            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        if bytes.len() != len {
+            return Err(format!(
+                "{}: physical page {physical} is only {} of {len} bytes -- past the end of the file",
+                self.path.display(),
+                bytes.len(),
+            ));
+        }
+        Ok(bytes)
+    }
+
     /// A page's whole content, mutably -- fetch-through the same as
     /// [`Self::page`], then marked dirty because a caller only reaches for
     /// `&mut` to change it.

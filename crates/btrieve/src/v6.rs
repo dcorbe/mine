@@ -243,20 +243,32 @@ struct Entry {
 /// distinct pages, and on a live board doing many writes a second that
 /// measured as 35,860 `openat`s in three seconds against one file,
 /// `/proc/[pid]/fd` showing *zero* held handles throughout -- pure syscall
-/// overhead, not I/O (page cache absorbed every `read`). `Self::open` now
-/// opens the file once and keeps the handle in `file`; `read_disk` reads
-/// through it. `file` is `None` only for [`Self::from_bytes`], whose own doc
-/// comment already guarantees `read_disk` is never reached for that variant.
+/// overhead, not I/O (page cache absorbed every `read`). `Self::open` opens
+/// the file once and keeps the handle in `file`; `read_disk` reads through
+/// it.
 ///
-/// This handle is never used to write, and never outlives one write
-/// operation -- `Store` is opened fresh at the top of `insert_v6`/
-/// `update_v6`/`delete_v6` and dropped at the end of that call, and every
-/// read through it happens before [`super::lib::Block::write_changed_pages`]
-/// opens its own, separate handle to actually write the pages back (see that
-/// function's own doc comment). So there is no window where this handle
-/// could observe stale bytes: nothing writes to the file while it is open,
-/// and the *next* write opens a brand new handle, which a fresh `open(2)`
-/// always resolves against the file's current contents.
+/// [`Self::attach`] holds **no handle at all**: every read it makes routes
+/// through the attached cache -- [`crate::cache::PageCache::page`] for full
+/// pages, [`crate::cache::PageCache::sub_page`] for header probes -- so the
+/// cache's block-lifetime handle is the file's one handle. The eager open
+/// `attach` used to make was the same defect one layer up: one
+/// `openat`/`close` pair per keyed read and per attached write, ~74 a
+/// second on a live board's update sweep, none of which ever read a byte
+/// (measured 2026-08-27, `strace -k`: `open64 <- Store::attach <-
+/// Block::nav_root <- Block::query <- locate <- dfaAcqLock`). `file` is
+/// therefore `None` for both `attach` (reads go to the cache) and
+/// [`Self::from_bytes`] (every page pre-loaded; `read_disk` unreached).
+///
+/// `Self::open`'s handle is never used to write, and never outlives one
+/// write operation -- a cacheless `Store` is opened fresh at the top of the
+/// write and dropped at its end, and every read through it happens before
+/// [`super::lib::Block::write_changed_pages`] opens its own, separate handle
+/// to actually write the pages back (see that function's own doc comment).
+/// An attached `Store` reading through the cache's long-lived handle sees
+/// the file's current bytes for the same reason the cache itself does: a
+/// held descriptor names the inode, not a snapshot, and nothing replaces
+/// these files by rename -- the one hazard a long-lived handle adds, and one
+/// the resident cache already could not survive.
 pub(crate) struct Store {
     path: std::path::PathBuf,
     file: Option<std::fs::File>,
@@ -347,11 +359,18 @@ impl Store {
         if page_size_usize == 0 {
             return Err("a v6 file's page size cannot be zero".to_owned());
         }
-        let file = super::open_for_read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // No handle of its own: every read an attached `Store` makes goes
+        // through the cache -- full pages via [`PageCache::page`], header
+        // probes via [`PageCache::sub_page`] -- so the cache's block-lifetime
+        // handle is the file's one handle. This used to open here anyway,
+        // which billed one `openat`/`close` pair to *every* keyed read
+        // (`Block::nav_root` builds a `Store` per query to find the live
+        // FCR) and every attached write: ~74 opens a second on a live
+        // board's update sweep, none of which ever read a byte.
         let pages = cache.borrow().total_pages();
         Ok(Self {
             path: path.to_path_buf(),
-            file: Some(file),
+            file: None,
             cache: Some(std::rc::Rc::clone(cache)),
             page_size: page_size_usize,
             original_pages: pages,
@@ -448,25 +467,24 @@ impl Store {
         self.original_pages
     }
 
-    /// Reads through the handle [`Self::open`]/[`Self::attach`] opened,
-    /// never a fresh one -- this used to be a `read_at(&self.path, ...)`
-    /// call, one `open(2)` per invocation; see this type's own doc comment
-    /// for what that cost on a live board. `expect`s a handle because the
-    /// only `Store` without one, [`Self::from_bytes`], pre-loads every
-    /// page, so [`Self::header`] and [`Self::ensure_loaded`] never fall
-    /// through to this on that variant.
+    /// Reads through the attached cache when there is one, else through the
+    /// handle [`Self::open`] opened -- never a fresh open; see this type's
+    /// own doc comment for what per-invocation opens cost on a live board,
+    /// twice. `expect`s a handle on the cacheless path because the only
+    /// `Store` with neither cache nor handle, [`Self::from_bytes`],
+    /// pre-loads every page, so [`Self::header`] and [`Self::ensure_loaded`]
+    /// never fall through to this on that variant.
     ///
-    /// A *full page* request (`len == self.page_size`, always
-    /// [`Self::ensure_loaded`]'s own call) is served through `cache` when
-    /// this `Store` is [`Self::attach`]ed to one, instead of `file` -- see
-    /// [`Self::attach`]'s own doc comment for why a header-length request
-    /// never *faults a page in through* `cache` even when one is attached
+    /// Through the cache, a *full page* request (`len == self.page_size`,
+    /// always [`Self::ensure_loaded`]'s own call) faults the page in and
+    /// keeps it resident ([`PageCache::page`]); a header-length request goes
+    /// through [`PageCache::sub_page`] instead, which never faults a page in
     /// (that would turn every twin-search miss into a whole-page fetch).
     ///
     /// A header-length request still has to check whether `cache` already
-    /// holds this page **resident**, though -- [`PageCache::peek`], which
-    /// costs nothing when it does not (the ordinary case, and the one the
-    /// paragraph above is about) and is load-bearing when it does (Task 7):
+    /// holds this page **resident** -- `sub_page`'s own peek, which costs
+    /// nothing when it does not (the ordinary case) and is load-bearing when
+    /// it does (Task 7):
     /// a deferred write inside a transaction stages its own finished pages
     /// into the cache without ever touching disk
     /// (`super::lib::Block::stage_changed_pages`), so a *later* op in the
@@ -481,20 +499,19 @@ impl Store {
     /// The borrow this takes on `cache` is scoped to this one page: the
     /// bytes are copied out before it ends, so nothing here can re-enter it.
     fn read_disk(&mut self, page: usize, len: usize) -> Result<Vec<u8>, String> {
-        if len == self.page_size {
-            if let Some(cache) = &self.cache {
-                let physical = u32::try_from(page)
-                    .map_err(|_| format!("physical page {page} does not fit a u32"))?;
-                let mut guard = cache.borrow_mut();
-                let bytes = guard.page(physical)?.to_vec();
-                return Ok(bytes);
-            }
-        } else if let Some(cache) = &self.cache {
+        if let Some(cache) = &self.cache {
             let physical = u32::try_from(page)
                 .map_err(|_| format!("physical page {page} does not fit a u32"))?;
-            if let Some(bytes) = cache.borrow().peek(physical) {
-                return Ok(bytes[..len].to_vec());
-            }
+            let mut guard = cache.borrow_mut();
+            return if len == self.page_size {
+                Ok(guard.page(physical)?.to_vec())
+            } else {
+                // Peek-else-raw, both inside `sub_page`: staged content wins
+                // over disk, and a miss stays a header-length read through
+                // the cache's handle instead of a whole-page fetch -- an
+                // attached `Store` has no handle of its own to fall back to.
+                guard.sub_page(physical, len)
+            };
         }
         let file = self
             .file

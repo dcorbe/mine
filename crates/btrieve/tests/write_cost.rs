@@ -1107,3 +1107,59 @@ fn wccmp002_physical_step_cost_today_cold() {
         cost.peak,
     );
 }
+
+/// A keyed read on an already-open v6 block opens no file at all: the
+/// block-lifetime `PageCache` holds the one handle, and everything a read
+/// needs -- the live FCR's shadow-pair headers, allocation-table pages, the
+/// B-tree descent itself -- reads through it.
+///
+/// This is the read-path twin of the `opens <=` bounds the update tests
+/// above carry, and it exists because the defect it pins was real twice:
+/// first `v6::Store::read_disk` opening per page (this file's own module
+/// doc), then `v6::Store::attach` opening per *construction* -- one
+/// `openat`/`close` pair per keyed read, ~74 a second on a live board's
+/// database-update sweep, caught by `strace -k` under `Block::nav_root`.
+/// Zero is the design point, not a budget: a read that opens anything is a
+/// read not going through the cache.
+#[test]
+fn keyed_reads_on_an_open_block_cost_no_file_opens() {
+    let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut mem = FlatMem::new(64 * 1024);
+    let mut heap = FlatHeap::new(0x100);
+    let mut btrieve = Btrieve::<Flat>::default();
+
+    let dir = scratch("v6-keyed-read-opens");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/btrieve-oracle/fixtures/PP2BLOCK.DAT");
+    let path = dir.join("PP2BLOCK.DAT");
+    std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+
+    let geometry = Geometry::read("PP2BLOCK.DAT", &path).expect("reads");
+    let maxlen = geometry.reclen;
+    let at = btrieve
+        .open(&mut mem, &mut heap, "PP2BLOCK.DAT", &path, geometry, maxlen)
+        .expect("opens");
+    let block = btrieve.block_mut(at).expect("open");
+    let mut locks = LockTable::default();
+
+    btrieve::testing::reset_file_opens();
+
+    // Cold and warm both covered: the first Equal faults its pages into the
+    // cache, the rest ride it -- and none of the hundred may open the file.
+    // PP2BLOCK.DAT's keys are the u32 counters 0..1500 at record offset 0
+    // (`get_equal_finds_pp2blocks_own_lowest_key`, this crate's own lib.rs).
+    for value in 0u32..100 {
+        let found = block
+            .get(0, btrieve::Op::Equal, &value.to_le_bytes(), 0, &mut locks, maxlen)
+            .expect("get must not error");
+        assert!(found.is_some(), "key {value} is one of this fixture's own");
+    }
+
+    assert_eq!(
+        btrieve::testing::file_opens(),
+        0,
+        "a keyed read on an open block must go through the block's own page \
+         cache, never a fresh open(2)"
+    );
+}
