@@ -53,6 +53,7 @@
 compile_error!("m32 enters 32-bit code via __USER32_CS: x86_64 only");
 
 mod asm;
+pub mod dpmi;
 mod fault;
 pub mod flatptr;
 mod image;
