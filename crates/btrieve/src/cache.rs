@@ -51,6 +51,24 @@ pub(crate) struct PageCache {
     /// the same question, but this field costs nothing to keep and needs no
     /// extra syscall to consult.
     original_total_pages: u32,
+
+    /// The v6 allocation table, resolved to `logical -> live physical`, held
+    /// across this cache's whole (block) lifetime instead of re-walked from
+    /// the file on every `v6::Map::read`. `None` until first built, and reset
+    /// to `None` whenever anything this cache cannot see coming changes the
+    /// table wholesale ([`super::Block::invalidate_cache`], `v6_reindex`, a
+    /// whole-file rewrite). The v6 write mutators (`claim`/`relocate`/
+    /// `reclaim`/`unclaim`) keep it current through [`Self::alloc_put`]/
+    /// [`Self::alloc_remove`] so it never has to be rebuilt mid-lifetime.
+    alloc: Option<HashMap<u32, u32>>,
+
+    /// Per-operation undo log for [`Self::alloc`]: each `(logical, prior)` is
+    /// what an `alloc_put`/`alloc_remove` overwrote, newest last.
+    /// [`Self::mark_clean`] clears it (the op committed); [`Self::drop_dirty`]
+    /// replays it in reverse (the op aborted), rolling the map back exactly as
+    /// it rolls the pages back -- so an aborted write leaves the cached map
+    /// identical to the disk it also restored.
+    alloc_undo: Vec<(u32, Option<u32>)>,
 }
 
 impl PageCache {
@@ -92,6 +110,8 @@ impl PageCache {
             pages: HashMap::new(),
             total_pages,
             original_total_pages: total_pages,
+            alloc: None,
+            alloc_undo: Vec::new(),
         })
     }
 
@@ -248,6 +268,9 @@ impl PageCache {
         for page in self.pages.values_mut() {
             page.dirty = false;
         }
+        // The op committed: its allocation-table mutations are now real, so
+        // there is nothing left to undo them back to.
+        self.alloc_undo.clear();
     }
 
     /// The abort path: throw away every dirty page, keeping clean ones
@@ -278,7 +301,69 @@ impl PageCache {
         {
             self.total_pages -= 1;
         }
+        // Roll the cached allocation map back exactly as the pages rolled back:
+        // replay this op's mutations newest-first, each restoring the value it
+        // overwrote. After this the map matches the disk this call just
+        // restored, so the next reader sees the pre-op table, not a half-
+        // applied one.
+        if let Some(alloc) = &mut self.alloc {
+            while let Some((logical, prior)) = self.alloc_undo.pop() {
+                match prior {
+                    Some(physical) => {
+                        alloc.insert(logical, physical);
+                    }
+                    None => {
+                        alloc.remove(&logical);
+                    }
+                }
+            }
+        } else {
+            self.alloc_undo.clear();
+        }
         dirty.len()
+    }
+
+    /// The cached v6 allocation map (`logical -> live physical`), if it has
+    /// been built this cache's lifetime. `None` means a caller must build it
+    /// (via `v6::Map::read`) and hand it back through [`Self::set_alloc`].
+    pub(crate) fn alloc_map(&self) -> Option<&HashMap<u32, u32>> {
+        self.alloc.as_ref()
+    }
+
+    /// Install a freshly-built allocation map as the cached one, clearing any
+    /// stale undo log (a fresh build is a clean baseline -- nothing to roll
+    /// back to before it).
+    pub(crate) fn set_alloc(&mut self, map: HashMap<u32, u32>) {
+        self.alloc = Some(map);
+        self.alloc_undo.clear();
+    }
+
+    /// Point `logical` at `physical` in the cached map, recording what it
+    /// overwrote so an abort can undo it. A no-op when no map is cached yet
+    /// (the next build reads the already-written table).
+    pub(crate) fn alloc_put(&mut self, logical: u32, physical: u32) {
+        if let Some(alloc) = &mut self.alloc {
+            let prior = alloc.insert(logical, physical);
+            self.alloc_undo.push((logical, prior));
+        }
+    }
+
+    /// Drop `logical` from the cached map (an `unclaim`), recording what it
+    /// removed so an abort can restore it. A no-op when no map is cached yet.
+    pub(crate) fn alloc_remove(&mut self, logical: u32) {
+        if let Some(alloc) = &mut self.alloc {
+            let prior = alloc.remove(&logical);
+            self.alloc_undo.push((logical, prior));
+        }
+    }
+
+    /// Forget the cached allocation map entirely -- for the paths that change
+    /// the table in ways the incremental mutators do not model (a whole-file
+    /// rewrite, `v6_reindex`, [`super::Block::invalidate_cache`]). The next
+    /// `v6::Map::read` rebuilds it from the current file.
+    pub(crate) fn invalidate_alloc(&mut self) {
+        self.alloc = None;
+        self.alloc_undo.clear();
     }
 
     /// How many pages this cache currently holds in memory -- instrumentation,

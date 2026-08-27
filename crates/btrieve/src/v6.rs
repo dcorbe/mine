@@ -460,6 +460,84 @@ impl Store {
         self.total_pages
     }
 
+    /// Keep the block cache's allocation map current after a write mutator
+    /// repointed `logical` at `physical` (a claim, relocate or reclaim). A
+    /// no-op for a cache-less `Store` (a test fixture) and for a cache that
+    /// has not built its map yet -- the next `Map::read` reads the already-
+    /// written table either way.
+    pub(crate) fn note_alloc(&self, logical: u32, physical: u32) {
+        if let Some(cache) = &self.cache {
+            cache.borrow_mut().alloc_put(logical, physical);
+        }
+    }
+
+    /// Keep the block cache's allocation map current after a write mutator
+    /// released `logical` (an unclaim). Same no-op conditions as
+    /// [`Self::note_alloc`].
+    pub(crate) fn note_unclaim(&self, logical: u32) {
+        if let Some(cache) = &self.cache {
+            cache.borrow_mut().alloc_remove(logical);
+        }
+    }
+
+    /// Make sure this store's block cache holds the allocation map, building it
+    /// once (a single file walk) if it does not. A no-op for a cache-less
+    /// store -- those resolve through [`Map::read`] every time, unchanged.
+    pub(crate) fn ensure_alloc(&mut self, page_size: u16) -> Result<(), String> {
+        let need = self
+            .cache
+            .as_ref()
+            .is_some_and(|c| c.borrow().alloc_map().is_none());
+        if need {
+            let built = Map::read_uncached(self, page_size)?;
+            if let Some(cache) = &self.cache {
+                cache.borrow_mut().set_alloc(built.physical);
+            }
+        }
+        Ok(())
+    }
+
+    /// The physical page `logical` currently lives on, resolved through the
+    /// cached allocation map with **no clone** -- one `HashMap` lookup, not a
+    /// copy of the whole table the way `Map::read(self).physical(logical)`
+    /// costs. Falls back to a fresh [`Map::read`] only for a cache-less store.
+    pub(crate) fn resolve(&mut self, logical: u32, page_size: u16) -> Result<Option<u32>, String> {
+        self.ensure_alloc(page_size)?;
+        if self.cache.is_some() {
+            let cache = self.cache.as_ref().expect("just checked");
+            let physical = cache.borrow().alloc_map().and_then(|m| m.get(&logical).copied());
+            return Ok(physical);
+        }
+        Ok(Map::read(self, page_size)?.physical(logical))
+    }
+
+    /// Fill `claimed[p] = true` for every physical page the allocation table
+    /// currently hands out, through the cached map with no clone -- the twin
+    /// search in [`Map::relocate`]/[`Map::reclaim`] needs the live set, not
+    /// the `logical -> physical` direction. Falls back to a fresh walk for a
+    /// cache-less store. `claimed` must already be `pages` long.
+    pub(crate) fn mark_claimed(&mut self, page_size: u16, claimed: &mut [bool]) -> Result<(), String> {
+        self.ensure_alloc(page_size)?;
+        if self.cache.is_some() {
+            let cache = self.cache.as_ref().expect("just checked");
+            let borrow = cache.borrow();
+            if let Some(map) = borrow.alloc_map() {
+                for &physical in map.values() {
+                    if (physical as usize) < claimed.len() {
+                        claimed[physical as usize] = true;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for (_, physical) in Map::read(self, page_size)?.entries() {
+            if (physical as usize) < claimed.len() {
+                claimed[physical as usize] = true;
+            }
+        }
+        Ok(())
+    }
+
     /// How many pages this file had when [`Self::open`] was called. A page
     /// numbered at or past this existed nowhere before this write and so has
     /// no `before` image -- see [`Self::original`].
@@ -948,6 +1026,42 @@ impl Map {
     ///   3a measured zero of these across all eight committed fixtures), so
     ///   a wrong pick would be worse than stopping.
     pub fn read(store: &mut Store, page_size: u16) -> Result<Self, String> {
+        // Fast path: a map already built and kept current on this block's
+        // page cache. Cloning it copies the table's buckets but re-reads and
+        // re-hashes nothing -- the file walk, the O(pages) part, is what this
+        // skips. The write mutators keep the cached map current, so this
+        // never returns a stale one.
+        let cached = store
+            .cache
+            .as_ref()
+            .and_then(|c| c.borrow().alloc_map().cloned());
+        if let Some(physical) = cached {
+            // In debug, prove the maintained map still matches a fresh walk --
+            // a mutator that forgot to update it corrupts writes silently, so
+            // every read in every debug test re-derives and compares. Release
+            // (where the perf gate runs) skips it.
+            #[cfg(debug_assertions)]
+            {
+                let fresh = Self::read_uncached(store, page_size)?;
+                debug_assert_eq!(
+                    physical, fresh.physical,
+                    "the cached v6 allocation map diverged from a fresh walk of the file \
+                     -- a write mutator did not keep it current"
+                );
+            }
+            return Ok(Self { physical });
+        }
+        let built = Self::read_uncached(store, page_size)?;
+        if let Some(cache) = &store.cache {
+            cache.borrow_mut().set_alloc(built.physical.clone());
+        }
+        Ok(built)
+    }
+
+    /// [`Self::read`]'s underlying file walk, with no cache in the way -- the
+    /// original whole-table resolution. Used to first build the cache, and in
+    /// debug to check the cached copy against a fresh one.
+    fn read_uncached(store: &mut Store, page_size: u16) -> Result<Self, String> {
         #[cfg(test)]
         READS.with(|reads| reads.set(reads.get() + 1));
         let page_size_usize = usize::from(page_size);
@@ -1461,6 +1575,7 @@ impl Map {
         stale_bytes[entry_at_new + 2..entry_at_new + 4].copy_from_slice(&new_physical16.to_le_bytes());
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
+        store.note_alloc(new_logical, u32::from(new_physical16));
         Ok(new_logical)
     }
 
@@ -1534,6 +1649,7 @@ impl Map {
         stale_bytes[repoint..repoint + ENTRY].fill(0);
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
+        store.note_unclaim(logical);
         Ok(())
     }
 
@@ -1675,12 +1791,7 @@ impl Map {
         // multi-block file the difference is a live page belonging to another
         // block being picked as this id's twin and written over.
         let mut claimed = vec![false; pages];
-        for (_, page) in Self::read(store, page_size)?.entries() {
-            let page = page as usize;
-            if page < pages {
-                claimed[page] = true;
-            }
-        }
+        store.mark_claimed(page_size, &mut claimed)?;
         // **Still an O(pages) scan** -- the format gives no index from a
         // logical id to its abandoned twin, so ruling out every candidate is
         // the only way to answer "does one exist". What changed is the
@@ -1733,6 +1844,7 @@ impl Map {
         stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
+        store.note_alloc(logical, u32::from(new_physical16));
         Ok(u32::from(new_physical16))
     }
 
@@ -1869,12 +1981,7 @@ impl Map {
         // own doc comment for why a same-id abandoned twin is preferred
         // over growing the file.
         let mut claimed = vec![false; pages];
-        for (_, page) in Self::read(store, page_size)?.entries() {
-            let page = page as usize;
-            if page < pages {
-                claimed[page] = true;
-            }
-        }
+        store.mark_claimed(page_size, &mut claimed)?;
         let mut twin = None;
         for page in 4..pages {
             if page == claimed_physical || claimed[page] {
@@ -1913,6 +2020,7 @@ impl Map {
         stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
+        store.note_alloc(logical, u32::from(new_physical16));
         Ok(u32::from(new_physical16))
     }
 }

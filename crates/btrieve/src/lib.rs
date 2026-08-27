@@ -2641,7 +2641,7 @@ impl<M: Mem> Block<M> {
         let (logical, slot) = layout.slot_of(head).ok_or_else(|| {
             format!("the free-list head is {head}, which is not on a slot boundary")
         })?;
-        let physical = v6::Map::read(store, page_size)?.physical(logical).ok_or_else(|| {
+        let physical = store.resolve(logical, page_size)?.ok_or_else(|| {
             format!(
                 "the free-list head is {head}, on logical page {logical}, which the \
                  allocation table claims no physical page for"
@@ -2723,8 +2723,8 @@ impl<M: Mem> Block<M> {
         let logical = v6::Map::claim(store, page_size, &content, [0x00, 0x44])
             .map_err(|why| format!("claiming a page for the new record: {why}"))?;
 
-        let physical = v6::Map::read(store, page_size)?
-            .physical(logical)
+        let physical = store
+            .resolve(logical, page_size)?
             .ok_or_else(|| format!("logical page {logical} was just claimed and is not claimed"))?
             as usize;
 
@@ -4563,7 +4563,7 @@ impl<M: Mem> Block<M> {
             return Ok((logical, free_head));
         }
         let next = {
-            let physical = v6::Map::read(store, page_size)?.physical(free_head).ok_or_else(|| {
+            let physical = store.resolve(free_head, page_size)?.ok_or_else(|| {
                 format!(
                     "the B-tree free list names logical {free_head}, which the \
                      allocation table claims no physical page for"
@@ -4657,8 +4657,8 @@ impl<M: Mem> Block<M> {
             per_logical.entry(logical).or_default().push((within, prev, next));
         }
         for (logical, writes) in per_logical {
-            let physical = v6::Map::read(store, page_size)?
-                .physical(logical)
+            let physical = store
+                .resolve(logical, page_size)?
                 .ok_or_else(|| format!("logical page {logical} is claimed by nothing"))?;
             let mut content = store.page(physical as usize)?.to_vec();
             for (within, prev, next) in writes {
@@ -4718,8 +4718,8 @@ impl<M: Mem> Block<M> {
         let (logical, slot) = layout
             .slot_of(position)
             .ok_or_else(|| format!("record position {position} is not on a slot boundary"))?;
-        let physical = v6::Map::read(store, self.geometry.page)?
-            .physical(logical)
+        let physical = store
+            .resolve(logical, self.geometry.page)?
             .ok_or_else(|| format!("logical page {logical} is claimed by nothing"))?;
         let within = layout.position(0, slot) as usize + offset;
         let content = store.page(physical as usize)?;
@@ -11098,6 +11098,170 @@ mod tests {
         assert!(
             map_reads < 20,
             "the allocation table was walked {map_reads} times for one insert"
+        );
+    }
+
+    /// **The boot database-update workload, deterministically.** The single
+    /// tests above measure one op on an already-large file; the stall the
+    /// 32-bit board shows is the module *building* `WCCMP002.DAT` -- growing a
+    /// 24 KB seed to ~60 MB by inserting thousands of map records. Each insert
+    /// costs a few [`v6::Map::read`] calls (an index split relocates pages),
+    /// and each `Map::read` walks the whole allocation table -- O(pages) -- so
+    /// as the file grows the per-insert cost grows with it, and the aggregate
+    /// is O(records * pages). This is what makes a single update pass take
+    /// seconds under load.
+    ///
+    /// This inserts a fixed batch into the seed and reports the total
+    /// `Map::read` count and wall time -- the number a Store-cached allocation
+    /// map has to bring down. Point `$WCCMP002` at the 24 KB `wccmp002.vir`
+    /// seed (or any WCCMP002); the batch grows it either way.
+    #[test]
+    #[ignore = "needs a WCCMP002.DAT/wccmp002.vir seed, named by $WCCMP002"]
+    fn building_the_map_walks_the_allocation_table_far_too_many_times() {
+        let Ok(source) = std::env::var("WCCMP002") else {
+            eprintln!("set WCCMP002=/path/to/wccmp002.vir to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v6-build-map-cost");
+        let path = dir.join("WCCMP002.DAT");
+        std::fs::copy(&source, &path).expect("the seed copies into scratch");
+
+        // Open through the real `Btrieve::open` so the block carries a page
+        // cache -- the write path only attaches (and so only caches the
+        // allocation map) when one is present, which is exactly what a real
+        // `opnbtv` gives it and what `block_from_file` does not.
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+        let geometry = Geometry::read("WCCMP002.DAT", &path).expect("reads");
+        assert_eq!(geometry.version, Version::V6);
+        let maxlen = geometry.reclen;
+        let reclen = usize::from(geometry.reclen);
+        let page = usize::from(geometry.page);
+        let at = btrieve
+            .open(&mut mem, &mut heap, "WCCMP002.DAT", &path, geometry, maxlen)
+            .expect("opens");
+        assert!(btrieve.block(at).expect("open").cache.is_some(), "a real open attaches a cache");
+        let start_pages = std::fs::metadata(&path).expect("metadata").len() as usize / page;
+
+        const BATCH: u32 = 3000;
+        crate::v6::READS.with(|reads| reads.set(0));
+        let start = std::time::Instant::now();
+        let mut inserted = 0u32;
+        for i in 0..BATCH {
+            let mut record = vec![0u8; reclen];
+            // A fresh, unique key each time -- a genuinely new record, growing
+            // the map the way the module's own update does.
+            record[..4].copy_from_slice(&(0x4000_0000u32 + i).to_le_bytes());
+            // The seed carries one allocation block (1022 entries); growing a
+            // new block is a separate unimplemented path, so this stops when
+            // the block fills rather than failing -- whatever grew is enough to
+            // measure the per-insert allocation-table walk.
+            match btrieve.block_mut(at).expect("open").insert(&record) {
+                Ok(_) => inserted += 1,
+                Err(e) if e.why.contains("growing a new block") => break,
+                Err(e) => panic!("insert {i}: {}", e.why),
+            }
+        }
+        let took = start.elapsed();
+        let map_reads = crate::v6::READS.with(std::cell::Cell::get);
+        let end_pages = std::fs::metadata(&path).expect("metadata").len() as usize / page;
+
+        eprintln!(
+            "building the map: {inserted} inserts grew the file {start_pages} -> {end_pages} pages \
+             in {took:?}; the allocation table was walked {map_reads} times \
+             ({:.1} per insert, each O({end_pages}) pages)",
+            map_reads as f64 / f64::from(inserted.max(1))
+        );
+
+        // The gate: walking the allocation table O(pages) once per insert (or
+        // more) makes this O(records * pages). A Store that holds the map in
+        // memory walks the table a small bounded number of times for the whole
+        // batch, not once (or several times) per insert. This bound fails
+        // loudly against the current per-op rebuild and holds the fix to a map
+        // built a handful of times across the entire batch.
+        assert!(
+            map_reads < inserted as usize / 25 + 50,
+            "building the map with {inserted} inserts walked the whole allocation table \
+             {map_reads} times -- it should hold the map in memory and walk the file \
+             only a handful of times for the whole batch, not once per insert"
+        );
+    }
+
+    /// The **real-scale** write cost: a batch of updates on a genuine ~58 MB
+    /// `WCCMP002.DAT` (14,877 pages), the size the boot update actually builds.
+    /// Point `$WCCMP002_BIG` at one (built by the module, or copied from a
+    /// board's own file). Each key-changing update relocates pages, and each
+    /// relocation used to walk the whole 14,877-page allocation table -- this
+    /// reports the total walks and the wall time across the batch, the numbers
+    /// the cache and (if needed) the twin-scan fix have to bring down at the
+    /// scale that actually stalls, not the seed's 2034 pages.
+    #[test]
+    #[ignore = "needs a ~58MB WCCMP002.DAT, named by $WCCMP002_BIG"]
+    fn updating_a_large_map_does_not_rewalk_the_allocation_table() {
+        let Ok(source) = std::env::var("WCCMP002_BIG") else {
+            eprintln!("set WCCMP002_BIG=/path/to/a/large/WCCMP002.DAT to run this");
+            return;
+        };
+        let dir = crate::testing::scratch("v6-large-update-cost");
+        let path = dir.join("WCCMP002.DAT");
+        std::fs::copy(&source, &path).expect("the file copies into scratch");
+        crate::testing::make_keys_modifiable(&path);
+
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+        let geometry = Geometry::read("WCCMP002.DAT", &path).expect("reads");
+        assert_eq!(geometry.version, Version::V6);
+        let maxlen = geometry.reclen;
+        let page = usize::from(geometry.page);
+        let pages = std::fs::metadata(&path).expect("metadata").len() as usize / page;
+        let at = btrieve
+            .open(&mut mem, &mut heap, "WCCMP002.DAT", &path, geometry, maxlen)
+            .expect("opens");
+
+        // The positions and bytes of the first N records, to update in a loop.
+        const BATCH: usize = 200;
+        let targets: Vec<(u32, Vec<u8>)> = {
+            let block = btrieve.block_mut(at).expect("open");
+            let records = block.records().expect("records");
+            let n = BATCH.min(records.len());
+            (0..n)
+                .map(|i| {
+                    let r = records.physical(i).expect("in range");
+                    (r.position, r.bytes.clone())
+                })
+                .collect()
+        };
+
+        crate::v6::READS.with(|reads| reads.set(0));
+        let start = std::time::Instant::now();
+        for (round, (position, bytes)) in targets.iter().enumerate() {
+            // Flip a byte so it is a real, page-relocating write, not a no-op.
+            let mut edited = bytes.clone();
+            let last = edited.len() - 1;
+            edited[last] ^= (round as u8).wrapping_add(1);
+            btrieve
+                .block_mut(at)
+                .expect("open")
+                .update(*position, &edited)
+                .unwrap_or_else(|e| panic!("update {round}: {}", e.why));
+        }
+        let took = start.elapsed();
+        let map_reads = crate::v6::READS.with(std::cell::Cell::get);
+
+        eprintln!(
+            "large-map updates: {} updates on a {pages}-page file in {took:?}; the \
+             allocation table was walked {map_reads} times ({:.2} per update)",
+            targets.len(),
+            map_reads as f64 / targets.len().max(1) as f64
+        );
+
+        assert!(
+            map_reads < targets.len() / 25 + 50,
+            "{} updates on a {pages}-page file walked the whole allocation table \
+             {map_reads} times -- the cache must hold it, not rewalk per relocation",
+            targets.len()
         );
     }
 
