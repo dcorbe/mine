@@ -2842,10 +2842,17 @@ mod tests {
 
     /// `softcr == 0` is documented as "disabled" (guide `btuscr`), which
     /// means NUL is not a wildcard soft-CR value on a default channel --
-    /// nobody has called `btuscr`, so a NUL byte in module output must reach
-    /// the wire untouched, the same as any other byte. This is the guard
-    /// `softcr != 0` exists to enforce; without it, `byte == softcr` is
-    /// trivially true for every NUL a default channel is ever asked to send.
+    /// nobody has called `btuscr`. This is the guard `softcr != 0` exists to
+    /// enforce; without it, `byte == softcr` is trivially true for every NUL a
+    /// default channel is ever asked to send, and the NUL would be converted
+    /// to a CR.
+    ///
+    /// The NUL is then *dropped*, not passed through: genuine GALGSBL's drain
+    /// strips `0x00`/`0x01` block-terminator bytes before `send()`
+    /// (`test al,0xfe` at VA `0x405767` -- see [`crate::gsbl::Channel::transmit`]'s
+    /// drop), so `a\0b` reaches the wire as `ab`. That still proves the guard:
+    /// a broken `softcr != 0` converts the NUL to `\r` *before* the drop, so
+    /// the byte takes the CR path and the output becomes `a\r\nb`, not `ab`.
     #[test]
     fn a_default_channel_does_not_translate_a_nul_byte() {
         let mut f = Fixture::new();
@@ -2853,8 +2860,9 @@ mod tests {
         f.host.gsbl_mut().transmit(console, b"a\0b");
         assert_eq!(
             f.host.gsbl_mut().drain_output(console),
-            b"a\0b".to_vec(),
-            "softcr == 0 means disabled, not \"NUL is the soft CR\""
+            b"ab".to_vec(),
+            "softcr == 0 means disabled (no CR), and the NUL is then dropped as \
+             a GSBL block terminator -- not converted, not passed through"
         );
     }
 

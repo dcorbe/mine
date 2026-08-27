@@ -1123,6 +1123,24 @@ impl Channel {
             }
             _ => {}
         }
+        // Genuine GALGSBL's drain drops the GSBL block-terminator bytes before
+        // `send()` (`test al,0xfe; je` at GALGSBL VA `0x405767`): every byte
+        // reaches the wire except `0x00` (ends a clearable output block) and
+        // `0x01` (a non-clearable one, the `btuxmn` kind), which are consumed
+        // as internal redraw-suppression bookkeeping. MajorMUD ends every
+        // in-Realm prompt with `prf("\x01")`; without this the raw SOH leaks
+        // and a dumb terminal paints a glyph after `[HP=..]:`. Dropped *after*
+        // the `hardcr`/`softcr` translation above, matching the genuine order
+        // (`btuxmt` transforms, then the drain drops): a byte the soft-CR just
+        // turned into `\r` already took the CR path, and a marker between a
+        // supplied CRLF and its module `\n` stays invisible without disturbing
+        // `supplied_lf`. This host has no `btuxmn` bulk mode (it delegates to
+        // `btuxmt`), so `btuxmt` output only ever reaches genuine's dropping
+        // path; the verbatim path is `btuxct` ([`Gsbl::transmit_raw`]), which
+        // keeps these bytes as genuine's bulk drain does.
+        if byte == 0x00 || byte == 0x01 {
+            return;
+        }
         *supplied_lf = false;
         // Backspace (0x08) is deliberately not special-cased here: it falls
         // through and costs a column like any other byte, exactly as it did
@@ -1360,6 +1378,54 @@ mod tests {
             String::from_utf8_lossy(&undrained),
             "a drain between two btuxmt calls changed the bytes"
         );
+    }
+
+    /// Genuine GALGSBL's drain drops the `0x00`/`0x01` GSBL block-terminator
+    /// bytes before `send()` -- the normal (non-bulk) path is a byte scan
+    /// whose `test al,0xfe; je` (GALGSBL VA `0x405767`) forwards every byte
+    /// *except* `0x00`/`0x01`, which it consumes as internal redraw-suppression
+    /// bookkeeping (`0x00` ends a clearable block, `0x01` a non-clearable one)
+    /// and never stages for the wire. MajorMUD ends every in-Realm prompt with
+    /// `prf("\x01")`; without the drop the raw SOH leaks and a dumb terminal
+    /// (syncterm) paints a glyph after `[HP=..]:`.
+    #[test]
+    fn transmit_drops_the_gsbl_block_terminator_bytes() {
+        // The prompt as WCCMMUD emits it: text, then the lone SOH marker.
+        let mut g = one();
+        g.transmit(chan(), b"[HP=28]:\x01");
+        assert_eq!(
+            g.drain_output(chan()),
+            b"[HP=28]:".to_vec(),
+            "the \\x01 prompt marker must not reach the wire",
+        );
+
+        // `test al,0xfe` covers `0x00` too, and it can sit mid-stream.
+        let mut g = one();
+        g.transmit(chan(), b"ab\x00cd");
+        assert_eq!(g.drain_output(chan()), b"abcd".to_vec());
+
+        // The dropped marker costs no wrap column. At width 9, `[HP=28]:` is 8
+        // columns (under the limit, no wrap pending); a `\x01` that wrongly
+        // consumed a column would reach 9, arm the wrap, and break the next
+        // byte onto a new line. It must not.
+        let mut g = one();
+        g.channel_mut(chan()).width = 9;
+        g.transmit(chan(), b"[HP=28]:\x01X");
+        assert_eq!(
+            g.drain_output(chan()),
+            b"[HP=28]:X".to_vec(),
+            "the marker consumed a column and forced a spurious wrap",
+        );
+    }
+
+    /// `btuxct` (binary output) is genuine GALGSBL's bulk/verbatim path -- the
+    /// drain sends its span unfiltered -- so it must keep `0x00`/`0x01`, unlike
+    /// the wrapped `btuxmt` text path above.
+    #[test]
+    fn transmit_raw_keeps_the_terminator_bytes() {
+        let mut g = one();
+        g.transmit_raw(chan(), b"\x00\x01raw");
+        assert_eq!(g.drain_output(chan()), b"\x00\x01raw".to_vec());
     }
 
     #[test]
