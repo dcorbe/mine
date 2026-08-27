@@ -14,4 +14,5 @@
 //! timer/keyboard IRQs are injected by rewriting the guest's signal context to
 //! enter its own registered ISR.
 
+pub mod decode;
 pub mod virq;
