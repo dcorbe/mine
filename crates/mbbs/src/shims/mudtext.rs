@@ -346,7 +346,15 @@ pub fn findtvar<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::R
             }
         }
     }
-    Ok(abi::Ret::Int(A::Int::from(super::NO)))
+    // Not found is `-1` at `A`'s own width, not at 16 bits. `A::Int::from(NO)`
+    // zero-extends the `u16` `0xffff`, which is `-1` under `Wg16` but `65535`
+    // under `Wg32` (see `Abi::int_from_u32`'s doc). The 32-bit module tests the
+    // result with `cmp eax, 0xffffffff`; handed `65535` it misses that guard
+    // and indexes `txtvars[65535*20+0x10]`, far past the table, then calls the
+    // null `varrou` it reads there -- a SIGSEGV at 0x0 on the Realm-exit
+    // `PAUSE_FU`/`FU_PAUSE` expansion. This is the same trap `toupper(EOF)`
+    // documents in `shims::text`.
+    Ok(abi::Ret::Int(A::int_from_u32(u32::MAX)))
 }
 
 /// The byte that opens and closes a text-variable reference in a buffer
