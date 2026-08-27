@@ -903,6 +903,34 @@ fn here_for(cursor: Cursor, key: u16) -> Result<Option<usize>, OpError> {
             wanted: key,
         }),
         Cursor::Physical { .. } => Err(OpError::NoKeyEstablished),
+        // The v5 rank helper; a v6 `Positioned` cursor never reaches it (a
+        // v5 block never sets one). Defensive, not reachable.
+        Cursor::Positioned { .. } => Err(OpError::NoKeyEstablished),
+    }
+}
+
+/// [`here_for`]'s v6 positional counterpart: the record position a keyed
+/// `Get Next`/`Previous` continues from, given the cursor a prior v6 read or
+/// acquire left behind.
+///
+/// The same three non-continuations [`here_for`] gives: nothing positioned
+/// (`Ok(None)`, so `Get Next` falls to `Get Lowest`); a cursor on a
+/// *different* key ([`OpError::DifferentKey`]); a physical-step cursor that
+/// established no key at all ([`OpError::NoKeyEstablished`], the same refusal
+/// `here_for` gives its `Cursor::Physical` -- a physical step hands a
+/// following keyed Get nothing to continue from). A v6 fast-path block leaves
+/// `Positioned`, never `Ordered`, so the latter is the defensive, unreachable
+/// arm here.
+fn here_position(cursor: Cursor, key: u16) -> Result<Option<u32>, OpError> {
+    match cursor {
+        Cursor::Nowhere => Ok(None),
+        Cursor::Positioned { key: had, position } if had == key => Ok(Some(position)),
+        Cursor::Positioned { key: had, .. } => Err(OpError::DifferentKey {
+            current: had,
+            wanted: key,
+        }),
+        Cursor::Physical { .. } => Err(OpError::NoKeyEstablished),
+        Cursor::Ordered { .. } => Err(OpError::NoKeyEstablished),
     }
 }
 
@@ -951,9 +979,15 @@ impl<M: Mem> Block<M> {
     pub fn query(&mut self, key: u16, op: Op, value: &[u8]) -> Result<bool, OpError> {
         let cursor = self.cursor();
 
-        let found = if self.v6_fast_reads() {
-            self.v6_query_rank(cursor, key, op, value)?
-        } else {
+        if self.v6_fast_reads() {
+            let Some(position) = self.v6_query_position(cursor, key, op, value)? else {
+                return Ok(false);
+            };
+            self.seek_to(Cursor::Positioned { key, position });
+            return Ok(true);
+        }
+
+        let found = {
             let definitions: Vec<Key> = self.keys().to_vec();
             let records = self.records()?;
             let count = records
@@ -1013,38 +1047,46 @@ impl<M: Mem> Block<M> {
     }
 
     /// [`Block::query`]'s v6 fast path (`Block::v6_fast_reads`): the
-    /// identical nine-way match, served from `Block::v6_order_len`/
-    /// `Block::v6_seek_rank` instead of a materialised [`Records`]. `Next`/
-    /// `Previous` stay pure rank arithmetic either way -- neither needs a
-    /// seek, only the count and (for `Next`, continuing) `here_for` -- so
-    /// they are not routed through `Block::v6_seek_rank` at all.
+    /// identical nine-way match, but answering **record positions** the tree
+    /// is seeked to directly (`Block::v6_seek_position`/`Block::v6_next_
+    /// position`/`Block::v6_prev_position`) rather than ranks into a
+    /// materialised order. No [`order::OrderIndex`] is built or consulted on
+    /// this path -- a write between two reads leaves nothing for the next
+    /// read to rebuild, which is what keeps the 32-bit board from stalling.
+    ///
+    /// `Next`/`Previous` re-seek the tree from the cursor's current position
+    /// (`here_position`) and step once; every other op is a bounded seek. The
+    /// rank the old fast path materialised for `Get by Percentage` is the one
+    /// caller that still needs a count, and it builds the order on demand.
     ///
     /// # Errors
     ///
     /// [`OpError::NoSuchKey`] if `key` names no key this block has (checked
     /// explicitly, first, so this answers the identical error the
-    /// `Records`-based path's `ordered_len(key).ok_or(...)` gives -- nothing
-    /// downstream of this point ever sees an unknown key). Whatever
-    /// [`here_for`] or the v6 lookups themselves refuse otherwise.
-    fn v6_query_rank(&mut self, cursor: Cursor, key: u16, op: Op, value: &[u8]) -> Result<Option<usize>, OpError> {
+    /// `Records`-based path's `ordered_len(key).ok_or(...)` gives). Whatever
+    /// [`here_position`] or the v6 seeks themselves refuse otherwise.
+    fn v6_query_position(&mut self, cursor: Cursor, key: u16, op: Op, value: &[u8]) -> Result<Option<u32>, OpError> {
         if !self.keys().iter().any(|k| k.number == key) {
             return Err(OpError::NoSuchKey(key));
         }
-        let count = self.v6_order_len(key)?;
         Ok(match op {
-            Op::Lowest => (count > 0).then_some(0),
-            Op::Highest => count.checked_sub(1),
-            Op::Equal => self.v6_seek_rank(key, nav::Bias::Equal, value)?,
-            Op::AtLeast => self.v6_seek_rank(key, nav::Bias::AtLeast, value)?,
-            Op::Greater => self.v6_seek_rank(key, nav::Bias::Greater, value)?,
-            Op::AtMost => self.v6_seek_rank(key, nav::Bias::AtMost, value)?,
-            Op::Less => self.v6_seek_rank(key, nav::Bias::Less, value)?,
-            Op::Next => match here_for(cursor, key)? {
-                Some(at) => Some(at + 1).filter(|at| *at < count),
-                None => (count > 0).then_some(0),
+            Op::Lowest => self.v6_seek_position(key, nav::Bias::Lowest, None)?,
+            Op::Highest => self.v6_seek_position(key, nav::Bias::Highest, None)?,
+            Op::Equal => self.v6_seek_position(key, nav::Bias::Equal, Some(value))?,
+            Op::AtLeast => self.v6_seek_position(key, nav::Bias::AtLeast, Some(value))?,
+            Op::Greater => self.v6_seek_position(key, nav::Bias::Greater, Some(value))?,
+            Op::AtMost => self.v6_seek_position(key, nav::Bias::AtMost, Some(value))?,
+            Op::Less => self.v6_seek_position(key, nav::Bias::Less, Some(value))?,
+            Op::Next => match here_position(cursor, key)? {
+                Some(position) => self.v6_next_position(key, position)?,
+                // Measured (`S1`): Get Next with nothing having positioned the
+                // file behaves like Get Lowest, not like a refusal.
+                None => self.v6_seek_position(key, nav::Bias::Lowest, None)?,
             },
-            Op::Previous => match here_for(cursor, key)? {
-                Some(at) => at.checked_sub(1),
+            Op::Previous => match here_position(cursor, key)? {
+                Some(position) => self.v6_prev_position(key, position)?,
+                // Measured (`S1c`): Get Previous with nothing having positioned
+                // the file answers "not found", not a refusal.
                 None => None,
             },
         })
@@ -1194,22 +1236,15 @@ impl<M: Mem> Block<M> {
             if found.is_none() {
                 return Ok(None);
             }
-            // The position names a record; the key says which order a
-            // later Get Next should continue in. A physical cursor is the
-            // fallback for a key `Block::v6_rank_of` cannot resolve the
-            // position through -- not reachable for MajorMUD's own
-            // eighteen files (every key indexes every record), kept
-            // because a partial or freshly-narrowed key set is not
-            // something this type refuses to represent elsewhere either.
-            Ok(Some(match self.v6_rank_of(key, position)? {
-                Some(at) => Cursor::Ordered { key, at },
-                None => {
-                    let Some(physical) = self.v6_physical_rank_of(position)? else {
-                        return Ok(None);
-                    };
-                    Cursor::Physical { at: physical }
-                }
-            }))
+            // The position names a record; the key says which order a later
+            // Get Next should continue in -- exactly what `Cursor::Positioned`
+            // is, and it costs nothing to establish (no rank, no
+            // `OrderIndex`). A key that excludes this record from its own
+            // index answers a following Get Next "not found" through the
+            // positional seek rather than through a physical cursor; not
+            // reachable for MajorMUD's eighteen files (every key indexes every
+            // record), and a distinction this type no longer needs to draw.
+            Ok(Some(Cursor::Positioned { key, position }))
         } else {
             let Some(physical) = self.records()?.find_physical(position) else {
                 return Ok(None);
@@ -1317,6 +1352,18 @@ impl<M: Mem> Block<M> {
             (Step::Next, Cursor::Ordered { key, at }) => physical_of(self, key, at)? + 1,
             (Step::Previous, Cursor::Ordered { key, at }) => {
                 match physical_of(self, key, at)?.checked_sub(1) {
+                    Some(at) => at,
+                    None => return Ok(None),
+                }
+            }
+            // A v6 keyed cursor already names the record's position; a
+            // physical step from it is that position's physical rank, plus or
+            // minus one -- no `OrderIndex`, no rank translation.
+            (Step::Next, Cursor::Positioned { position, .. }) => {
+                self.v6_physical_rank_of(position)?.ok_or(OpError::CursorStale)? + 1
+            }
+            (Step::Previous, Cursor::Positioned { position, .. }) => {
+                match self.v6_physical_rank_of(position)?.ok_or(OpError::CursorStale)?.checked_sub(1) {
                     Some(at) => at,
                     None => return Ok(None),
                 }
@@ -2280,36 +2327,11 @@ impl<M: Mem> Block<M> {
 
         if let Some(&last) = inserted.last() {
             let cursor = if self.v6_fast_reads() {
-                match self.v6_rank_of(key, last) {
-                    Ok(Some(at)) => Cursor::Ordered { key, at },
-                    // This key excludes the just-inserted record from its
-                    // index (`Key::excluded`) -- not reachable for any of
-                    // MajorMUD's own eighteen files (every key indexes
-                    // every record, see `Block::acquire_absolute`'s own
-                    // doc comment for the same fact). The physical index
-                    // still answers this the same fast way.
-                    Ok(None) => match self.v6_physical_rank_of(last) {
-                        Ok(Some(physical)) => Cursor::Physical { at: physical },
-                        Ok(None) => {
-                            return Err(InsertExtendedError {
-                                inserted,
-                                error: OpError::Records(BtvError {
-                                    file: self.name().to_owned(),
-                                    why: format!(
-                                        "position {last} was just inserted but the physical \
-                                         index does not find it"
-                                    ),
-                                }),
-                            })
-                        }
-                        Err(error) => {
-                            return Err(InsertExtendedError { inserted, error: OpError::from(error) })
-                        }
-                    },
-                    Err(error) => {
-                        return Err(InsertExtendedError { inserted, error: OpError::from(error) })
-                    }
-                }
+                // The just-inserted record's own position is the currency; the
+                // key says which order a following Get Next continues in. No
+                // rank, no `OrderIndex` -- an insert during a table rebuild
+                // leaves nothing for the next keyed read to rebuild.
+                Cursor::Positioned { key, position: last }
             } else {
                 let physical = match self.records() {
                     Ok(r) => r.find_physical(last).expect("just inserted"),
@@ -2459,7 +2481,17 @@ impl<M: Mem> Block<M> {
                     return Err(OpError::EndOfFile);
                 }
                 let at = (percentage * count / 10_000).min(count - 1);
-                self.seek_to(Cursor::Ordered { key, at });
+                // Get by Percentage is the one keyed read genuinely addressed
+                // by rank. On v6 it resolves that rank to a position through
+                // the on-demand `OrderIndex` (the only op that still builds
+                // it) and stores a `Positioned` cursor, so a following Get Next
+                // continues positionally like every other v6 read.
+                if self.v6_fast_reads() {
+                    let position = self.v6_position_at(key, at)?.ok_or(OpError::EndOfFile)?;
+                    self.seek_to(Cursor::Positioned { key, position });
+                } else {
+                    self.seek_to(Cursor::Ordered { key, at });
+                }
                 self.take_lock(lock, locks)?;
                 self.deliver_current(Some(key), offered)
             }

@@ -925,9 +925,25 @@ pub enum Cursor {
     /// Nothing has positioned the file yet, and `absbtv` has nothing to report.
     Nowhere,
 
-    /// At a place in a key's order: what the query and acquire families leave
-    /// behind, and what `qnxbtv` steps along.
+    /// At a place in a key's order, addressed by rank: the **v5** query and
+    /// acquire families leave this behind, and `qnxbtv` steps it by `at + 1`
+    /// against a materialised [`records::Records`] order. A v6 file with a
+    /// page cache uses [`Self::Positioned`] instead -- see its doc comment.
     Ordered { key: u16, at: usize },
+
+    /// At a place in a key's order, addressed by **record position** rather
+    /// than rank: what the **v6** query and acquire families leave behind.
+    ///
+    /// `position` is the physical record the cursor sits on; `key` is which
+    /// key's order a following `Get Next`/`Previous` continues in. Storing the
+    /// position, not a rank, is what lets a v6 read re-navigate the B-tree
+    /// positionally (`nav::TreeCursor`, O(log n)) instead of materialising and
+    /// rebuilding a rank [`order::OrderIndex`] (O(records)) every time a write
+    /// invalidates it -- the whole point of the positional read path. A rank
+    /// is computed only for the genuinely rank-addressed ops (`Get by
+    /// Percentage`), on demand, and immediately turned back into a position
+    /// here.
+    Positioned { key: u16, position: u32 },
 
     /// At a place in physical order: what the step family leaves behind.
     Physical { at: usize },
@@ -1484,7 +1500,16 @@ impl<M: Mem> Block<M> {
     /// different crate. Nothing else about it changed, and its own paragraph
     /// above already names the caller this widening is for.
     pub fn keyed<'a>(&self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
-        let shift = self.records.as_ref().map_or(0, Records::key_shift);
+        // The key shift is a fact about the file's version, `2` for v6 and `0`
+        // for v5 -- the identical rule `records::Records::read` sets its own
+        // `key_shift` by, and what `Self::update_v6` hardcodes. Reading it off
+        // `self.records` instead used to answer `0` for a v6 fast-reads block
+        // (which carries no `Records` -- that materialised model is exactly
+        // what the fast path skips), so `deliver_current` extracted the
+        // delivered key value two bytes early. The shim only hid it by priming
+        // `Records` through its own `load`; a module using this crate directly
+        // got the wrong key buffer back.
+        let shift = if self.geometry.version == Version::V6 { 2 } else { 0 };
         records::keyed(shift, bytes)
     }
 
@@ -1735,6 +1760,10 @@ impl<M: Mem> Block<M> {
     pub fn current(&self) -> Option<Record> {
         match self.cursor {
             Cursor::Nowhere => None,
+            Cursor::Positioned { position, .. } if self.v6_fast_reads() => {
+                let bytes = self.v6_record_bytes_at(position).ok().flatten()?;
+                Some(Record { position, bytes })
+            }
             Cursor::Ordered { key, at } if self.v6_fast_reads() => {
                 let position = self.v6_position_at(key, at).ok().flatten()?;
                 let bytes = self.v6_record_bytes_at(position).ok().flatten()?;
@@ -1747,6 +1776,10 @@ impl<M: Mem> Block<M> {
             }
             Cursor::Ordered { key, at } => self.records.as_ref()?.ordered(key, at).cloned(),
             Cursor::Physical { at } => self.records.as_ref()?.physical(at).cloned(),
+            // A `Positioned` cursor is only ever set on a `v6_fast_reads`
+            // block (the arm above catches it there); a non-fast block never
+            // produces one. Defensive, not reachable.
+            Cursor::Positioned { .. } => None,
         }
     }
 
@@ -3072,6 +3105,179 @@ impl<M: Mem> Block<M> {
         Ok(order.get(&key).expect("just ensured").rank_of(position))
     }
 
+    /// The position a fresh [`nav::TreeCursor`] seek (`bias`, `target`)
+    /// lands on -- the same seek [`Self::v6_seek_rank`] runs, but answering
+    /// the *position* it already computes rather than translating it through
+    /// a materialised rank [`order::OrderIndex`].
+    ///
+    /// This is the whole point of the positional read path:
+    /// [`ops::Block::query`]'s v6 fast path for [`ops::Op::Equal`]/`AtLeast`/
+    /// `Greater`/`Less`/`AtMost`/`Lowest`/`Highest` seeks the B-tree in
+    /// O(log n) and stores the position it finds, so a write between two
+    /// reads costs the next read nothing -- there is no rank to rebuild.
+    /// `nav::TreeCursor` is differentially proven to walk a key's records in
+    /// the identical order [`order::OrderIndex::build`] would (it is the same
+    /// walk), so the position a caller stores back into a [`Cursor::
+    /// Positioned`] answers every following read the same records the rank
+    /// path did.
+    ///
+    /// # Errors
+    ///
+    /// If `key` names no key this block has, or whatever [`Self::nav_root`]/
+    /// [`nav::TreeCursor::seek`] refuse.
+    fn v6_seek_position(&self, key: u16, bias: nav::Bias, target: Option<&[u8]>) -> Result<Option<u32>, BtvError> {
+        let fail = |why: String| BtvError {
+            file: self.name.clone(),
+            why,
+        };
+        let Some((root, shape, dup, cache, mut resolve)) = self.nav_root(key).map_err(&fail)? else {
+            return Ok(None);
+        };
+        let definition = self
+            .keys
+            .iter()
+            .find(|k| k.number == key)
+            .ok_or_else(|| fail(format!("no such key: {key}")))?;
+        let cmp = |a: &[u8], b: &[u8]| definition.compare_extracted(a, b);
+        let (_, found) =
+            nav::TreeCursor::seek(cache, &mut resolve, root, shape, target, bias, dup, &cmp)
+                .map_err(&fail)?;
+        Ok(found)
+    }
+
+    /// `key`'s own value at `position`, in the segments-concatenated form a
+    /// module hands to `Get Equal` (and the form [`Self::v6_seek_position`]'s
+    /// `target` takes) -- [`Self::v6_next_position`]/[`Self::v6_prev_
+    /// position`] read it to re-seek the tree from where a positional cursor
+    /// sits. `None` when `position` names no live record.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::v6_record_bytes_at`] refuses.
+    fn v6_key_value_at(&self, key: u16, position: u32) -> Result<Option<Vec<u8>>, BtvError> {
+        let fail = |why: String| BtvError {
+            file: self.name.clone(),
+            why,
+        };
+        let Some(bytes) = self.v6_record_bytes_at(position).map_err(&fail)? else {
+            return Ok(None);
+        };
+        let definition = self
+            .keys
+            .iter()
+            .find(|k| k.number == key)
+            .ok_or_else(|| fail(format!("no such key: {key}")))?;
+        Ok(Some(definition.extract(&self.keyed(&bytes))))
+    }
+
+    /// The record after `position` in `key`'s order -- `Get Next`'s v6
+    /// positional answer, with no rank and no [`order::OrderIndex`].
+    ///
+    /// Seeks the B-tree to `position`'s own key value (`Bias::Equal`, so it
+    /// lands on the head of that value's duplicate group) and walks forward
+    /// exactly as far as `position` itself, then one entry more. A unique
+    /// key costs the O(log n) seek and a single step; a duplicate group
+    /// costs the seek plus a walk to `position` within the group -- bounded
+    /// by the group's own size, never the file's record count. Stepping past
+    /// the last record, or past the last of `position`'s own group into the
+    /// next key value, is exactly what `nav::TreeCursor::next` already does.
+    ///
+    /// `None` when `position` is the last record in `key`'s order, or when
+    /// `position` names no record `key` indexes (an excluded value, or a
+    /// stale position) -- the walk never finds it to step from.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::nav_root`]/[`nav::TreeCursor`] refuse.
+    fn v6_next_position(&self, key: u16, position: u32) -> Result<Option<u32>, BtvError> {
+        let fail = |why: String| BtvError {
+            file: self.name.clone(),
+            why,
+        };
+        let Some(value) = self.v6_key_value_at(key, position)? else {
+            return Ok(None);
+        };
+        let Some((root, shape, dup, cache, mut resolve)) = self.nav_root(key).map_err(&fail)? else {
+            return Ok(None);
+        };
+        let definition = self
+            .keys
+            .iter()
+            .find(|k| k.number == key)
+            .ok_or_else(|| fail(format!("no such key: {key}")))?;
+        let cmp = |a: &[u8], b: &[u8]| definition.compare_extracted(a, b);
+        let (mut cursor, mut current) = nav::TreeCursor::seek(
+            cache,
+            &mut resolve,
+            root,
+            shape,
+            Some(&value),
+            nav::Bias::Equal,
+            dup,
+            &cmp,
+        )
+        .map_err(&fail)?;
+        loop {
+            match current {
+                Some(p) if p == position => {
+                    return cursor.next(cache, &mut resolve, shape).map_err(&fail);
+                }
+                Some(_) => current = cursor.next(cache, &mut resolve, shape).map_err(&fail)?,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// The record before `position` in `key`'s order -- `Get Previous`'s v6
+    /// positional answer, the backward mirror of [`Self::v6_next_position`].
+    ///
+    /// Seeks `Bias::AtMost` to `position`'s key value (priming the cursor
+    /// backward, landing on that value's group) and walks `prev` to
+    /// `position`, then one entry more. Same bound: the seek plus the group,
+    /// never the record count.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::nav_root`]/[`nav::TreeCursor`] refuse.
+    fn v6_prev_position(&self, key: u16, position: u32) -> Result<Option<u32>, BtvError> {
+        let fail = |why: String| BtvError {
+            file: self.name.clone(),
+            why,
+        };
+        let Some(value) = self.v6_key_value_at(key, position)? else {
+            return Ok(None);
+        };
+        let Some((root, shape, dup, cache, mut resolve)) = self.nav_root(key).map_err(&fail)? else {
+            return Ok(None);
+        };
+        let definition = self
+            .keys
+            .iter()
+            .find(|k| k.number == key)
+            .ok_or_else(|| fail(format!("no such key: {key}")))?;
+        let cmp = |a: &[u8], b: &[u8]| definition.compare_extracted(a, b);
+        let (mut cursor, mut current) = nav::TreeCursor::seek(
+            cache,
+            &mut resolve,
+            root,
+            shape,
+            Some(&value),
+            nav::Bias::AtMost,
+            dup,
+            &cmp,
+        )
+        .map_err(&fail)?;
+        loop {
+            match current {
+                Some(p) if p == position => {
+                    return cursor.prev(cache, &mut resolve, shape).map_err(&fail);
+                }
+                Some(_) => current = cursor.prev(cache, &mut resolve, shape).map_err(&fail)?,
+                None => return Ok(None),
+            }
+        }
+    }
+
     /// The position at rank `at` in `key`'s order -- [`ops::Block::
     /// current`]'s own v6 fast path for a [`Cursor::Ordered`] position, and
     /// [`ops::physical_of`]'s v6 equivalent.
@@ -3085,21 +3291,6 @@ impl<M: Mem> Block<M> {
             why,
         })?;
         Ok(self.v6_order.borrow().get(&key).expect("just ensured").position_at(at))
-    }
-
-    /// `position`'s own rank in `key`'s order, if this key indexes it --
-    /// [`ops::Block::insert_extended`]'s own v6 currency-establishing tail,
-    /// and [`ops::Block::acquire_absolute`]'s v6 fast path.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`Self::v6_ensure_order`] refuses.
-    fn v6_rank_of(&self, key: u16, position: u32) -> Result<Option<usize>, BtvError> {
-        self.v6_ensure_order(key).map_err(|why| BtvError {
-            file: self.name.clone(),
-            why,
-        })?;
-        Ok(self.v6_order.borrow().get(&key).expect("just ensured").rank_of(position))
     }
 
     /// Throw away every key's cached [`order::OrderIndex`], and drop
@@ -14797,17 +14988,21 @@ mod tests {
         );
     }
 
-    /// Task 7's ops cutover, exercised through a *real* cache-backed v6
-    /// `Block` (`Btrieve::open`, not a hand-built fixture) rather than only
-    /// through the corpus differential (`order::tests::order_index_and_
-    /// byte_fetch_match_records_over_the_v6_corpus`, which proves the
-    /// position/rank/byte machinery agrees with `Records` but never calls
-    /// `Block::query`/`Block::get` at all): five records, five key values,
-    /// every keyed `Op` this crate's own ops test suite pins by literal
-    /// rank for v5 -- `Cursor::Ordered { key, at }`'s `at` staying a stable,
-    /// literal rank is the whole point of Task 7's controller ruling
-    /// ("keep the rank model, kill the bytes"), so this checks the exact
-    /// same literal values a v5 fixture of this shape would produce.
+    /// The v6 fast path exercised through a *real* cache-backed v6 `Block`
+    /// (`Btrieve::open`, not a hand-built fixture) rather than only through the
+    /// corpus differential (`order::tests::order_index_and_byte_fetch_match_
+    /// records_over_the_v6_corpus`, which proves the position/byte machinery
+    /// agrees with `Records` but never calls `Block::query`/`Block::get` at
+    /// all): five records, five key values, every keyed `Op`.
+    ///
+    /// **Positional cursor**: Task 7 stored a rank in `Cursor::Ordered`; the
+    /// v6 fast path now stores the record's position in `Cursor::Positioned`
+    /// and re-navigates the B-tree rather than materialising a rank
+    /// `OrderIndex` (see that variant's doc comment for why). So this pins the
+    /// contract the way it is now observable -- the *record* each op lands on,
+    /// in the identical key order a v5 rank walk produces, with the cursor a
+    /// `Positioned` on that record's own position -- rather than the literal
+    /// rank a v5 fixture of this shape would produce.
     #[test]
     fn v6_fast_path_query_and_get_match_the_v5_rank_contract() {
         let mut mem = FlatMem::new(64 * 1024);
@@ -14841,36 +15036,48 @@ mod tests {
         let mut locks = LockTable::default();
         let block = btrieve.block_mut(at).expect("open");
 
+        // Each op is pinned by the *record* it lands on (its four-byte tag),
+        // in the identical key order a v5 rank contract would walk, and by the
+        // cursor being a `Positioned` on key 0 at that very record's position.
+        // The rank the old fast path stored is gone; the sequence it enforced
+        // -- AAAA, EEEE, CCCC, DDDD, CCCC, DDDD, CCCC, BBBB, CCCC -- is exactly
+        // what these bytes assertions still pin, positionally.
+        let landed = |block: &mut Block<Flat>, tag: &[u8; 4]| {
+            let cur = block.current().expect("positioned");
+            assert_eq!(&cur.bytes[..4], tag, "landed on the wrong record");
+            assert_eq!(
+                block.cursor(),
+                Cursor::Positioned { key: 0, position: cur.position },
+                "a v6 keyed read leaves a positional cursor on key 0 at the record it found"
+            );
+        };
+
         assert!(block.query(0, Op::Lowest, &[]).expect("query"));
-        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 0 });
-        assert_eq!(&block.current().expect("positioned").bytes[..4], b"AAAA");
+        landed(block, b"AAAA");
 
         assert!(block.query(0, Op::Highest, &[]).expect("query"));
-        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 4 });
-        assert_eq!(&block.current().expect("positioned").bytes[..4], b"EEEE");
+        landed(block, b"EEEE");
 
         assert!(block.query(0, Op::Equal, b"CCCC").expect("query"));
-        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 2 });
+        landed(block, b"CCCC");
 
         assert!(block.query(0, Op::Next, &[]).expect("query"));
-        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 3 });
-        assert_eq!(&block.current().expect("positioned").bytes[..4], b"DDDD");
+        landed(block, b"DDDD");
 
         assert!(block.query(0, Op::Previous, &[]).expect("query"));
-        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 2 });
-        assert_eq!(&block.current().expect("positioned").bytes[..4], b"CCCC");
+        landed(block, b"CCCC");
 
         assert!(block.query(0, Op::Greater, b"CCCC").expect("query"));
-        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 3 });
+        landed(block, b"DDDD");
 
         assert!(block.query(0, Op::AtLeast, b"CCCC").expect("query"));
-        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 2 });
+        landed(block, b"CCCC");
 
         assert!(block.query(0, Op::Less, b"CCCC").expect("query"));
-        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 1 });
+        landed(block, b"BBBB");
 
         assert!(block.query(0, Op::AtMost, b"CCCC").expect("query"));
-        assert_eq!(block.cursor(), Cursor::Ordered { key: 0, at: 2 });
+        landed(block, b"CCCC");
 
         let miss = block.query(0, Op::Equal, b"ZZZZ").expect("query, not found");
         assert!(!miss, "a value nothing holds is not found, not an error");
@@ -14892,6 +15099,95 @@ mod tests {
                 .expect("find percentage"),
             4_000,
             "CCCC sits at rank 2 of 5 -- 2/5 = 40.00%"
+        );
+    }
+
+    /// The positional `Get Next`/`Get Previous` path walked across a **real
+    /// duplicate-permitting key**, checked against the real engine's own
+    /// recorded walk -- the coverage the contract test above (unique keys)
+    /// and the corpus differential (`nav::TreeCursor` in isolation, never
+    /// through `Block::query`) both leave open.
+    ///
+    /// `DUPKEY30.DAT` is the real engine's own file: 30 fixed-length records
+    /// over one 4-byte descending duplicate-permitting key (WCCUSERS key 2's
+    /// shape), key values `0..=9` each held by exactly three records. Its
+    /// `tools/btrieve-oracle/fixtures/DUPKEY30.txt` records what genuine
+    /// Btrieve's `B_GET_FIRST`/`B_GET_NEXT` visits: every record in each
+    /// duplicate chain, descending -- `9,9,9,8,8,8,...,0,0,0`, thirty values.
+    /// A positional `Get Next` that skipped a chain's tail, or crossed a
+    /// group boundary early, would not reproduce it.
+    ///
+    /// Two independent checks: the forward walk against that recorded value
+    /// sequence (a non-circular oracle -- the real engine, not this crate's
+    /// own `nav`), and the forward positions against the reverse of the
+    /// backward `Get Previous` walk (the two must be mirror images, which
+    /// catches a within-group order that reads one way but not the other).
+    #[test]
+    fn positional_get_next_walks_a_real_duplicate_key_in_the_engines_own_order() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+
+        let dir = crate::testing::scratch("dupkey30-positional-walk");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
+        let path = dir.join("DUPKEY30.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+
+        let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
+        let maxlen = geometry.reclen;
+        let at = btrieve
+            .open(&mut mem, &mut heap, "DUPKEY30.DAT", &path, geometry, maxlen)
+            .expect("opens");
+        let block = btrieve.block_mut(at).expect("open");
+        assert!(
+            block.v6_fast_reads(),
+            "DUPKEY30.DAT is a fixed-length cached v6 file -- this test is the fast path or nothing"
+        );
+
+        let mut locks = LockTable::default();
+
+        // Forward: Get Lowest, then Get Next to the end. Collect both the
+        // delivered key value (against the engine oracle) and the position
+        // (against the backward walk).
+        let key_value = |d: &Delivery| {
+            let bytes = d.key.as_ref().expect("a keyed get delivers its key");
+            u32::from_le_bytes(bytes[..4].try_into().expect("a 4-byte key"))
+        };
+        let mut forward_values = Vec::new();
+        let mut forward_positions = Vec::new();
+        let first = block.get(0, Op::Lowest, &[], 0, &mut locks, maxlen).expect("get").expect("first");
+        forward_values.push(key_value(&first));
+        forward_positions.push(block.current().expect("positioned").position);
+        while let Some(d) = block.get(0, Op::Next, &[], 0, &mut locks, maxlen).expect("get next") {
+            forward_values.push(key_value(&d));
+            forward_positions.push(block.current().expect("positioned").position);
+        }
+
+        // The real engine's own `keys 0` walk: descending, every record of
+        // each duplicate chain, thirty values (DUPKEY30.txt).
+        let expected: Vec<u32> = (0..=9u32).rev().flat_map(|v| [v, v, v]).collect();
+        assert_eq!(
+            forward_values, expected,
+            "positional Get Next must visit every record of each duplicate chain in the \
+             engine's own descending order -- 9,9,9,...,0,0,0"
+        );
+
+        // Backward: Get Highest, then Get Previous to the start. Its positions
+        // reversed must equal the forward positions -- the same 30 records,
+        // the same order, walked the other way.
+        let mut backward_positions = Vec::new();
+        let last = block.get(0, Op::Highest, &[], 0, &mut locks, maxlen).expect("get").expect("last");
+        let _ = last;
+        backward_positions.push(block.current().expect("positioned").position);
+        while let Some(_d) = block.get(0, Op::Previous, &[], 0, &mut locks, maxlen).expect("get previous") {
+            backward_positions.push(block.current().expect("positioned").position);
+        }
+        backward_positions.reverse();
+        assert_eq!(
+            forward_positions, backward_positions,
+            "the backward Get Previous walk must be the exact mirror of the forward one, \
+             within duplicate groups included"
         );
     }
 

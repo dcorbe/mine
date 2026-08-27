@@ -2821,14 +2821,21 @@ pub(crate) fn update_variable<A: Abi>(
     file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
 
     // Currency maintenance, identical to `dupdbtv`'s own tail -- see that
-    // routine's doc comment for why an `Ordered` cursor is re-derived rather
-    // than carried forward, and why `Physical` needs no correction.
+    // routine's doc comment for why a keyed cursor is re-derived rather than
+    // carried forward, and why `Physical` needs no correction.
     //
-    // `Block::cursor_for` rather than `Block::records()`: see
-    // `insert_record`'s identical tail for why -- the same whole-file read
-    // this update's own `duplicate_key` call above no longer pays for
-    // either.
-    if let Cursor::Ordered { key, .. } = file.cursor() {
+    // Both keyed cursors: `Cursor::Ordered` is v5's rank (which the update's
+    // key change may have shifted); `Cursor::Positioned` is v6's position
+    // (stable across a fixed-length update, so this re-derivation is a no-op
+    // for it, but kept uniform). `Block::cursor_for` rather than
+    // `Block::records()`: see `insert_record`'s identical tail for why -- the
+    // same whole-file read this update's own `duplicate_key` call above no
+    // longer pays for either.
+    let keyed = match file.cursor() {
+        Cursor::Ordered { key, .. } | Cursor::Positioned { key, .. } => Some(key),
+        Cursor::Physical { .. } | Cursor::Nowhere => None,
+    };
+    if let Some(key) = keyed {
         let cursor = file
             .cursor_for(key, position)
             .map_err(|e| ShimError::Failed(e.to_string()))?
