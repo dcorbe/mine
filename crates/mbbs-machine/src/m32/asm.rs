@@ -46,13 +46,22 @@
 //! selector round-trip through `0 -> 0` still **zeroes** `FS_BASE`: measured
 //! on this box, one crossing with [`Ctx::fs`] left at its default was enough
 //! to break the very next `std::thread_local` access after `mbbs32_enter`
-//! returned. [`enter`] is the fix: it saves the calling thread's real
-//! `FS_BASE` with `arch_prctl(ARCH_GET_FS)` before touching `FS` at all, and
-//! restores it with `arch_prctl(ARCH_SET_FS)` after the raw crossing is over
-//! -- every time, not only when [`Ctx::fs`] is non-zero, because the selector
-//! reload that breaks `FS_BASE` happens unconditionally. A module with no TIB
-//! still carries `fs = 0`, which is a no-op for the *selector*; it is
-//! [`enter`]'s job, not the assembly's, to make it a no-op for `FS_BASE` too.
+//! returned. [`enter`] is the fix: it reads the calling thread's real
+//! `FS_BASE` before touching `FS` at all ([`host_fs_base`] -- one
+//! `arch_prctl(ARCH_GET_FS)` per thread, cached, because glibc never moves
+//! it), and writes it back after the raw crossing is over -- through the
+//! `wrfsbase` instruction where the kernel allows it ([`fsgsbase_enabled`]),
+//! through `arch_prctl(ARCH_SET_FS)` otherwise. Every time, not only when
+//! [`Ctx::fs`] is non-zero, because the selector reload that breaks
+//! `FS_BASE` happens unconditionally. A module with no TIB still carries
+//! `fs = 0`, which is a no-op for the *selector*; it is [`enter`]'s job, not
+//! the assembly's, to make it a no-op for `FS_BASE` too. The save/restore
+//! used to be a pair of `arch_prctl` syscalls per crossing, and per crossing
+//! is the wrong unit: MajorMUD's database-update sweep crosses ~800 times
+//! per Btrieve operation, which put ~60,000 `arch_prctl` calls a second on
+//! the machine thread and made one module-batched kick overrun the host's
+//! one-second stall floor where the 16-bit machine (which never touches
+//! `FS`) stayed far under it.
 //!
 //! **`DS` and `ES` are loaded from `SS` before the jump, unconditionally, and
 //! this was also measured rather than assumed -- the second thing the first
@@ -369,14 +378,78 @@ fn fs_base() -> u64 {
     base
 }
 
+/// [`fs_base`], read once per thread and cached.
+///
+/// glibc sets a thread's `FS_BASE` exactly once, at thread creation, and
+/// nothing in this process moves it afterwards -- the only writer is
+/// [`enter`]'s restore, which writes back this same value. So the syscall
+/// read is per-thread, not per-crossing. Per-crossing it was ruinous: a
+/// MajorMUD database-update operation makes ~800 crossings, and `strace -c`
+/// on a live board's update sweep counted 910,468 `arch_prctl` calls in 15
+/// seconds against 569 Btrieve operations (2026-08-26) -- ~98% of the
+/// thread's syscall time.
+///
+/// Must be called while `FS_BASE` is still the host's -- before the raw
+/// crossing -- because the cache lives in thread-local storage addressed
+/// through that very base. [`enter`] is the only caller and does exactly
+/// that.
+fn host_fs_base() -> u64 {
+    thread_local! {
+        static CACHED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    }
+    // `0` doubles as "not read yet": a glibc thread's `FS_BASE` is never 0 --
+    // it addresses the thread control block itself.
+    CACHED.with(|cache| {
+        let mut base = cache.get();
+        if base == 0 {
+            base = fs_base();
+            cache.set(base);
+        }
+        base
+    })
+}
+
+/// Whether the kernel lets user space execute `wrfsbase` (CR4.FSGSBASE set).
+///
+/// `AT_HWCAP2` bit 1 is Linux's own signal for exactly this. CPUID is *not*
+/// enough: a kernel older than 5.9, or booted with `nofsgsbase`, leaves
+/// CR4.FSGSBASE clear on a CPU that advertises the feature, and the
+/// instruction faults `#UD`. Resolved once; an atomic load afterwards --
+/// and [`enter`] resolves it *before* the crossing, because `OnceLock`'s
+/// initialisation path is ordinary Rust that may touch thread-local state,
+/// which does not exist between the raw crossing and the restore.
+fn fsgsbase_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    const HWCAP2_FSGSBASE: libc::c_ulong = 1 << 1;
+    // SAFETY: `getauxval` reads the process's own auxiliary vector and has no
+    // preconditions.
+    *ENABLED.get_or_init(|| unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_FSGSBASE != 0)
+}
+
 /// Restore `FS_BASE` to a value [`fs_base`] previously read back on this same
-/// thread.
+/// thread -- the syscall fallback for a kernel without [`fsgsbase_enabled`].
 fn set_fs_base(base: u64) {
     // SAFETY: setting the calling thread's own FS_BASE back to a value it
     // held before the crossing -- never a made-up address, never another
     // thread's.
     unsafe {
         libc::syscall(libc::SYS_arch_prctl, ARCH_SET_FS, base as usize);
+    }
+}
+
+/// Restore `FS_BASE` through the `wrfsbase` instruction: the same write
+/// [`set_fs_base`] asks the kernel for, without the kernel round-trip.
+///
+/// # Safety
+///
+/// [`fsgsbase_enabled`] must have answered `true`, or this instruction is
+/// undefined (`#UD`). `base` must be a value this same thread's `FS_BASE`
+/// actually held -- the identical contract [`set_fs_base`] documents.
+unsafe fn write_fs_base(base: u64) {
+    // SAFETY: forwarded from this function's own contract; the instruction
+    // itself touches nothing but the named register and the hidden base.
+    unsafe {
+        std::arch::asm!("wrfsbase {0}", in(reg) base, options(nomem, nostack, preserves_flags));
     }
 }
 
@@ -396,10 +469,22 @@ fn set_fs_base(base: u64) {
 /// appropriate, and live until the trampoline (or a fault) returns control
 /// here.
 pub(crate) unsafe fn enter(ctx: *mut Ctx) {
-    let host_fs_base = fs_base();
+    // Both resolved BEFORE the crossing and carried in locals: from the
+    // moment `mbbs32_enter_raw` returns until the restore below, `FS_BASE`
+    // is zero, so nothing on that path may touch thread-local state -- not
+    // the per-thread cache behind `host_fs_base`, and not `OnceLock`'s
+    // initialisation path behind `fsgsbase_enabled`.
+    let host_fs_base = host_fs_base();
+    let wrfsbase = fsgsbase_enabled();
     // SAFETY: forwarded from this function's own contract.
     unsafe { mbbs32_enter_raw(ctx) };
-    set_fs_base(host_fs_base);
+    if wrfsbase {
+        // SAFETY: `wrfsbase` gated on `fsgsbase_enabled`; the base is the one
+        // this same thread held before the crossing.
+        unsafe { write_fs_base(host_fs_base) };
+    } else {
+        set_fs_base(host_fs_base);
+    }
 }
 
 /// The trampoline's bytes, for copying into a mapping below 4 GiB.
@@ -579,5 +664,58 @@ mod tests {
         assert_eq!(ctx.out_esi, 0x2000_0001, "ESI was not loaded, or not restored");
         assert_eq!(ctx.out_edi, 0x3000_0001, "EDI was not loaded, or not restored");
         assert_eq!(ctx.out_ebp, 0x4000_0001, "EBP was not loaded, or not restored");
+    }
+
+    /// The cache answers what the syscall answers -- on this thread and on a
+    /// fresh one -- and keeps answering it, since [`enter`] restores exactly
+    /// this value after every crossing.
+    #[test]
+    fn host_fs_base_matches_a_fresh_arch_prctl_read() {
+        assert_eq!(host_fs_base(), fs_base(), "first read must come from the same place");
+        assert_eq!(host_fs_base(), fs_base(), "the cached answer must not drift");
+        std::thread::spawn(|| {
+            let cached = host_fs_base();
+            assert_ne!(cached, 0, "a glibc thread's FS_BASE is never 0");
+            assert_eq!(cached, fs_base(), "another thread caches its own base, not this one's");
+        })
+        .join()
+        .expect("the spawned thread's own assertions hold");
+    }
+
+    /// `wrfsbase` writes the same hidden base `arch_prctl(ARCH_SET_FS)`
+    /// does: write the thread's own current base back through the
+    /// instruction, then prove thread-local storage still works and the
+    /// kernel reads the same value back. Exercises the exact instruction
+    /// [`enter`]'s fast path uses, on the real CPU.
+    #[test]
+    fn wrfsbase_restore_round_trips_when_the_kernel_offers_it() {
+        if !fsgsbase_enabled() {
+            // Nothing to exercise: `enter` takes the syscall path here, which
+            // the three crossing tests above already ran.
+            return;
+        }
+        let before = fs_base();
+        // A discriminating write: point the base somewhere else entirely and
+        // make the KERNEL confirm it moved -- writing `before` back first
+        // would pass even if the instruction silently did nothing. Between
+        // the two writes nothing may touch thread-local state, so the
+        // read-back is captured raw and asserted only after the restore.
+        let scratch = [0u8; 64];
+        let elsewhere = scratch.as_ptr() as u64;
+        // SAFETY: `fsgsbase_enabled` just answered true; `elsewhere` is a
+        // live local buffer this thread owns, and nothing dereferences
+        // through FS before the restore two lines down.
+        unsafe { write_fs_base(elsewhere) };
+        let kernel_saw = fs_base();
+        // SAFETY: as above; `before` is this same thread's own real base.
+        unsafe { write_fs_base(before) };
+
+        assert_eq!(kernel_saw, elsewhere, "the kernel must read back the base wrfsbase wrote");
+        thread_local! {
+            static ALIVE: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+        }
+        ALIVE.with(|c| c.set(0xC0FFEE));
+        assert_eq!(ALIVE.with(core::cell::Cell::get), 0xC0FFEE, "TLS must survive the round trip");
+        assert_eq!(fs_base(), before, "the restore must land the original base");
     }
 }
