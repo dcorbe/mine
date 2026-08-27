@@ -53,6 +53,26 @@ impl Machine {
         Ok(Self { mapping, ctx })
     }
 
+    /// Wrap a mapping the LE loader has already populated, entering at the
+    /// image's own entry point. `code_lo`/`code_hi` span the whole mapping, so
+    /// the fault arm can read instruction bytes anywhere in it.
+    pub fn adopt(mapping: Mapping, entry_eip: u32, entry_esp: u32) -> io::Result<Self> {
+        crate::m32::fault::arm(current_cs())?;
+        let base = mapping.base() as usize as u64;
+        let len = mapping.len() as u64;
+        let ctx = Ctx {
+            target_offset: entry_eip,
+            target_selector: USER32_CS,
+            esp: entry_esp,
+            dpmi: 1,
+            vif: 1,
+            code_lo: base,
+            code_hi: base + len,
+            ..Default::default()
+        };
+        Ok(Self { mapping, ctx })
+    }
+
     /// The linear base of the guest mapping -- where to write code and the
     /// address to enter at.
     pub fn base(&self) -> u32 {

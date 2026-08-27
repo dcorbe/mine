@@ -5,6 +5,8 @@
 //! objects into a `crate::m32::Mapping` and applies fixups. Neither runs the
 //! image -- that is the DPMI machine's job.
 
+pub mod load;
 pub mod parse;
 
+pub use load::{LeLoaded, load};
 pub use parse::{Flavour, LeError, LeImage, LeObject, PageEntry, parse};
