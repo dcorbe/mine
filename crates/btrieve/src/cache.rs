@@ -69,6 +69,17 @@ pub(crate) struct PageCache {
     /// it rolls the pages back -- so an aborted write leaves the cached map
     /// identical to the disk it also restored.
     alloc_undo: Vec<(u32, Option<u32>)>,
+
+    /// Each physical page's own logical id as its header carries it -- `0` for
+    /// the file control record's pair, the allocation-table (`"PP"`) pages,
+    /// and never-written slots. The v6 twin search in `v6::Map::relocate`/
+    /// `reclaim` walks every page looking for an abandoned copy of one logical
+    /// id; reading that off this vector is an array index instead of a header
+    /// read (a page fetch plus a hashed lookup) per candidate. `None` until
+    /// first built; the write mutators keep it current, and it is dropped on
+    /// abort (rebuilt next need) rather than undone -- aborts are rare and the
+    /// rebuild is one walk.
+    page_logical: Option<Vec<u16>>,
 }
 
 impl PageCache {
@@ -112,6 +123,7 @@ impl PageCache {
             original_total_pages: total_pages,
             alloc: None,
             alloc_undo: Vec::new(),
+            page_logical: None,
         })
     }
 
@@ -320,6 +332,9 @@ impl PageCache {
         } else {
             self.alloc_undo.clear();
         }
+        // The per-page logical-id vector this op mutated is thrown away rather
+        // than undone: the pages it named are gone, and a rebuild is one walk.
+        self.page_logical = None;
         dirty.len()
     }
 
@@ -364,6 +379,38 @@ impl PageCache {
     pub(crate) fn invalidate_alloc(&mut self) {
         self.alloc = None;
         self.alloc_undo.clear();
+    }
+
+    /// The per-physical-page logical-id vector, if it has been built this
+    /// cache's lifetime. `None` means a caller must build it (a walk of every
+    /// page's header) and hand it back through [`Self::set_page_logical`].
+    pub(crate) fn page_logical(&self) -> Option<&[u16]> {
+        self.page_logical.as_deref()
+    }
+
+    /// Install a freshly-built per-page logical-id vector.
+    pub(crate) fn set_page_logical(&mut self, table: Vec<u16>) {
+        self.page_logical = Some(table);
+    }
+
+    /// Record that physical page `physical` now carries logical id `logical`
+    /// in its header (a claim/relocate/reclaim target), growing the vector to
+    /// reach it if the file just did. A no-op when the vector is not built
+    /// yet -- the next build reads the already-written headers.
+    pub(crate) fn note_page_logical(&mut self, physical: usize, logical: u16) {
+        if let Some(table) = &mut self.page_logical {
+            if physical >= table.len() {
+                table.resize(physical + 1, 0);
+            }
+            table[physical] = logical;
+        }
+    }
+
+    /// Drop the cached per-page logical-id vector -- called on abort (the
+    /// pages this op wrote are being thrown away) and wherever the table is
+    /// rewritten wholesale. Rebuilt on next need.
+    pub(crate) fn invalidate_page_logical(&mut self) {
+        self.page_logical = None;
     }
 
     /// How many pages this cache currently holds in memory -- instrumentation,

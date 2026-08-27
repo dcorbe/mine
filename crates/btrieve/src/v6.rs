@@ -538,6 +538,85 @@ impl Store {
         Ok(())
     }
 
+    /// Every physical page's own header logical id -- `0` for the FCR pair,
+    /// `"PP"` allocation-table pages, and never-written slots; the LOGICAL
+    /// field for a data/index page. The twin search reads this off the cache
+    /// per candidate instead of fetching and parsing each header.
+    fn build_page_logical(&mut self, page_size: u16) -> Result<Vec<u16>, String> {
+        let total = self.total_pages;
+        let mut table = vec![0u16; total];
+        for page in 4..total {
+            let header = self.header(page)?;
+            if header[..2] == *MAGIC {
+                continue;
+            }
+            table[page] = u16::from_le_bytes([header[LOGICAL], header[LOGICAL + 1]]);
+        }
+        Ok(table)
+    }
+
+    /// Build the block cache's per-page logical-id vector once if it is not
+    /// present. No-op for a cache-less store.
+    pub(crate) fn ensure_page_logical(&mut self, page_size: u16) -> Result<(), String> {
+        let need = self
+            .cache
+            .as_ref()
+            .is_some_and(|c| c.borrow().page_logical().is_none());
+        if need {
+            let built = self.build_page_logical(page_size)?;
+            if let Some(cache) = &self.cache {
+                cache.borrow_mut().set_page_logical(built);
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep the block cache's per-page logical-id vector current after a write
+    /// mutator wrote `logical` into physical page `physical`'s header. No-op
+    /// for a cache-less store or a vector not built yet.
+    pub(crate) fn note_page_logical(&self, physical: usize, logical: u16) {
+        if let Some(cache) = &self.cache {
+            cache.borrow_mut().note_page_logical(physical, logical);
+        }
+    }
+
+    /// Physical page `physical`'s header logical id, served from the cached
+    /// vector (an array index) rather than a header fetch. Falls back to a
+    /// direct header read for a cache-less store. In debug it checks the
+    /// cached value against the live header, so a mutator that let the vector
+    /// go stale -- which would make the twin search overwrite a live page --
+    /// fails loudly in every test.
+    pub(crate) fn logical_at(&mut self, physical: usize, page_size: u16) -> Result<u16, String> {
+        self.ensure_page_logical(page_size)?;
+        let cached = self
+            .cache
+            .as_ref()
+            .and_then(|c| c.borrow().page_logical().and_then(|t| t.get(physical).copied()));
+        if let Some(value) = cached {
+            #[cfg(debug_assertions)]
+            {
+                let header = self.header(physical)?;
+                let actual = if header[..2] == *MAGIC {
+                    0
+                } else {
+                    u16::from_le_bytes([header[LOGICAL], header[LOGICAL + 1]])
+                };
+                debug_assert_eq!(
+                    value, actual,
+                    "the cached per-page logical id for physical {physical} diverged from its \
+                     header -- a write mutator did not keep it current"
+                );
+            }
+            return Ok(value);
+        }
+        let header = self.header(physical)?;
+        Ok(if header[..2] == *MAGIC {
+            0
+        } else {
+            u16::from_le_bytes([header[LOGICAL], header[LOGICAL + 1]])
+        })
+    }
+
     /// How many pages this file had when [`Self::open`] was called. A page
     /// numbered at or past this existed nowhere before this write and so has
     /// no `before` image -- see [`Self::original`].
@@ -1575,6 +1654,7 @@ impl Map {
         stale_bytes[entry_at_new + 2..entry_at_new + 4].copy_from_slice(&new_physical16.to_le_bytes());
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
+        store.note_page_logical(usize::from(new_physical16), new_logical16);
         store.note_alloc(new_logical, u32::from(new_physical16));
         Ok(new_logical)
     }
@@ -1810,11 +1890,10 @@ impl Map {
             if page == claimed_physical || claimed[page] {
                 continue;
             }
-            let header = store.header(page)?;
-            if header[..2] == *MAGIC {
-                continue;
-            }
-            if u16::from_le_bytes([header[LOGICAL], header[LOGICAL + 1]]) == logical16 {
+            // `logical_at` answers `0` for the `"PP"` allocation-table pages,
+            // and a real logical id is `>= 1`, so the magic-page skip the header
+            // read used to make is automatic here.
+            if store.logical_at(page, page_size)? == logical16 {
                 twin = Some(page);
                 break;
             }
@@ -1844,6 +1923,7 @@ impl Map {
         stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
+        store.note_page_logical(usize::from(new_physical16), logical16);
         store.note_alloc(logical, u32::from(new_physical16));
         Ok(u32::from(new_physical16))
     }
@@ -1987,11 +2067,10 @@ impl Map {
             if page == claimed_physical || claimed[page] {
                 continue;
             }
-            let header = store.header(page)?;
-            if header[..2] == *MAGIC {
-                continue;
-            }
-            if u16::from_le_bytes([header[LOGICAL], header[LOGICAL + 1]]) == logical16 {
+            // `logical_at` answers `0` for the `"PP"` allocation-table pages,
+            // and a real logical id is `>= 1`, so the magic-page skip the header
+            // read used to make is automatic here.
+            if store.logical_at(page, page_size)? == logical16 {
                 twin = Some(page);
                 break;
             }
@@ -2020,6 +2099,7 @@ impl Map {
         stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
+        store.note_page_logical(usize::from(new_physical16), logical16);
         store.note_alloc(logical, u32::from(new_physical16));
         Ok(u32::from(new_physical16))
     }
