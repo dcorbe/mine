@@ -209,6 +209,47 @@ pub(crate) struct Ctx {
     /// so the value the CPU pushed already is the address a disassembly of
     /// the image is annotated with.
     pub out_eip: u32,
+
+    // ---- DPMI extension (append-only) --------------------------------------
+    //
+    // These fields exist for `crate::m32::dpmi`, which runs a DOS-extender
+    // guest whose privileged `int`/`in`/`out`/`cli`/`sti` faults are *decoded*
+    // rather than fatal. They are appended deliberately: the assembly above
+    // addresses only the fixed-offset fields at the front of this struct
+    // (`offset_of!`-named), so adding fields at the end changes no offset it
+    // reads. Every field here is zero for an ordinary m32 (PE32) crossing --
+    // which never sets `dpmi` -- and that zero is exactly what keeps the DPMI
+    // branch in `crate::m32::fault::recover` invisible to the PE32 path.
+    /// `0` = an ordinary m32 excursion (faults are poisoned). Nonzero = a DPMI
+    /// excursion: `crate::m32::fault::recover` hands the fault to
+    /// `crate::m32::dpmi::fault::recover_trap` first.
+    pub dpmi: u64,
+
+    /// Virtual interrupt-enable flag, owned by the fault handler: a guest
+    /// `cli`/`sti` writes it and IRQ injection reads it. Meaningful only when
+    /// `dpmi != 0`.
+    pub vif: u64,
+
+    /// Inclusive-low / exclusive-high linear bounds of the guest's mapping, so
+    /// the handler can read instruction bytes at the faulting `EIP` without
+    /// risking a fault of its own. Meaningful only when `dpmi != 0`.
+    pub code_lo: u64,
+    pub code_hi: u64,
+
+    /// What the handler decoded, when `dpmi != 0`: `0` = a genuine fault
+    /// (`out_signo`/`out_eip` authoritative), `1` = a software interrupt
+    /// (`out_vector` is the vector), `2` = a port access (`out_vector` packs
+    /// it -- see `crate::m32::dpmi::machine`).
+    pub out_kind: u64,
+
+    /// The decoded software-interrupt vector (kind 1) or packed port op
+    /// (kind 2). Meaningless for kind 0.
+    pub out_vector: u64,
+
+    /// Length in bytes of the decoded trapping instruction, so the host knows
+    /// where the guest resumes (`out_eip + out_len`). Meaningful for kinds 1
+    /// and 2.
+    pub out_len: u64,
 }
 
 impl Ctx {

@@ -201,6 +201,25 @@ unsafe fn recover(signo: libc::c_int, ctx: *mut libc::c_void, host_cs: u16) {
     // possible.
     let ctx32 = gregs[libc::REG_R14 as usize] as *mut Ctx;
 
+    // A DPMI excursion decodes the faulting instruction rather than dying on
+    // it: a privileged `int`/`in`/`out`/`cli`/`sti` in ring 3 is how a
+    // DOS-extender guest asks the host for something, not a crash. The branch
+    // is gated entirely on the per-excursion `dpmi` flag, so an ordinary m32
+    // (PE32) crossing -- which never sets it -- reaches `rewrite` below on the
+    // identical path it always has. `recover_trap` returns `true` when it has
+    // handled the fault (resumed the guest in place for `cli`/`sti`, or set up
+    // a service/port landing-pad exit); `false` falls through to poison, which
+    // is the right outcome for a real fault inside a DPMI guest too.
+    //
+    // SAFETY: `ctx32` is the live `Ctx` this excursion was entered with, so
+    // reading `dpmi` through it is sound; `recover_trap`'s own contract is
+    // forwarded from here (see its `# Safety`).
+    if unsafe { (*ctx32).dpmi } != 0
+        && unsafe { crate::m32::dpmi::fault::recover_trap(uc, ctx32, host_cs) }
+    {
+        return;
+    }
+
     // SAFETY: `ctx32`, `gregs` and `packed` all come from this same fault;
     // `ctx32` is the live `Ctx` this excursion was entered with.
     unsafe { rewrite(uc, packed, ctx32, signo, host_cs) };
@@ -284,7 +303,12 @@ unsafe fn recover_watchdog(
 /// `ctx32` must be a live, dereferenceable `*mut Ctx` -- the excursion's own
 /// context, still owned by its caller's stack frame (or, for the watchdog,
 /// by the `Watched` that armed the timer).
-unsafe fn rewrite(
+///
+/// `pub(crate)` so `crate::m32::dpmi::fault` can reuse this exact register
+/// capture for a serviced trap (passing `signo == 0`, since a trap is not a
+/// fault); duplicating the capture would be a second place to get the greg
+/// indices wrong.
+pub(crate) unsafe fn rewrite(
     uc: &mut libc::ucontext_t,
     packed: u64,
     ctx32: *mut Ctx,

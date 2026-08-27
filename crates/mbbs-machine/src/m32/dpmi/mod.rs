@@ -15,4 +15,8 @@
 //! enter its own registered ISR.
 
 pub mod decode;
+pub mod fault;
+pub mod machine;
 pub mod virq;
+
+pub use machine::{Exit, Machine};

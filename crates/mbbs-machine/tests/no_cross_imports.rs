@@ -8,15 +8,16 @@
 //!
 //! # Recursion
 //!
-//! `m16/` and `m32/` are flat directories today (no subdirectories).
-//! Walking the tree recursively is one way to stay correct if that
-//! changes; this test takes the other option the task allows: it asserts
-//! flatness first and panics loudly if either directory ever grows a
-//! subdirectory. A guard that silently stopped scanning a new nested
-//! module the day someone added `src/m16/sub/foo.rs` would be worse than
-//! no guard at all, so the choice here is to force a human decision (go
-//! recursive, or decide the new subdirectory doesn't need the fence)
-//! rather than let coverage quietly shrink.
+//! `m32/` grew a subdirectory (`m32/dpmi/`, the DOS-extender machine) on
+//! 2026-08-27, which forced the decision this section used to defer: the
+//! scan now walks each machine's directory tree recursively rather than
+//! asserting flatness. `dpmi/` is part of the m32 machine, so it gets the
+//! same fence -- it must not reach into m16 either -- and recursion is the
+//! way to keep that true for every file below `m16/`/`m32/`, at any depth,
+//! as more nested modules appear. The earlier flat scan asserted no
+//! subdirectory existed and panicked if one did, precisely so this choice
+//! would be made by a human rather than let coverage quietly shrink; that
+//! is what happened.
 //!
 //! # Spellings
 //!
@@ -101,22 +102,24 @@ use std::fs;
 use std::path::Path;
 
 /// Lines (with comments stripped) that mention `needle`, as
-/// `path:line: text`. Panics if `dir` contains a subdirectory -- see the
-/// module doc comment's "Recursion" section.
+/// `path:line: text`, across every `.rs` file at any depth under `dir` --
+/// see the module doc comment's "Recursion" section.
 fn offending(dir: &Path, needles: &[&str]) -> Vec<String> {
     let mut hits = Vec::new();
+    scan(dir, needles, &mut hits);
+    hits
+}
+
+/// Walk `dir` recursively, appending any offending lines to `hits`.
+fn scan(dir: &Path, needles: &[&str], hits: &mut Vec<String>) {
     for entry in fs::read_dir(dir).expect("module dir exists") {
         let entry = entry.expect("dirent");
         let path = entry.path();
         let file_type = entry.file_type().expect("dirent file_type");
-        assert!(
-            !file_type.is_dir(),
-            "{} grew a subdirectory ({}); this guard only scans the top \
-             level of m16/m32 -- make it recursive (or confirm the new \
-             subdirectory needs no fence) before adding nested modules",
-            dir.display(),
-            path.display()
-        );
+        if file_type.is_dir() {
+            scan(&path, needles, hits);
+            continue;
+        }
         if path.extension().map_or(false, |e| e == "rs") {
             let text = fs::read_to_string(&path).expect("source is UTF-8");
             for (i, line) in text.lines().enumerate() {
@@ -127,7 +130,6 @@ fn offending(dir: &Path, needles: &[&str]) -> Vec<String> {
             }
         }
     }
-    hits
 }
 
 /// The same scan as [`offending`], over an explicit list of files rather
