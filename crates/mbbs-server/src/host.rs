@@ -1341,8 +1341,57 @@ fn apply<A: Abi>(
     }
 }
 
+/// Offer one channel's queued output to its connection: deliver it whole if
+/// the queue has a slot, leave it in GSBL to coalesce with whatever the
+/// module queues next if the queue is momentarily full, and answer `false`
+/// -- hang this channel up -- only when the connection is actually gone.
+///
+/// **A full queue is never a hangup on its own any more.** It used to be
+/// (`try_send` failed, `drop_channel` ran), and slots alone made bursts of
+/// tiny writes lethal: MajorMUD's character-save spinner emits a few bytes
+/// per poll tick, each tick was drained into its own slot, and a timer
+/// catch-up after one stalled cycle pass fired enough backlogged ticks
+/// back-to-back to eat all 32 slots before the socket task woke --
+/// "channel dropped (could not send output)" in the middle of creating a
+/// character, with a client that was draining fine. Measured live
+/// 2026-08-26/27, twice, once on each side of the m32 FS-base fix.
+///
+/// Holding is bounded and faithful, which is why no byte-budget hangup
+/// replaces the slot one. Bounded: GSBL's own output buffer refuses to grow
+/// past `OUTSIZ` (8 KiB) and raises `OVRFLW` to the module instead, so a
+/// channel that never drains holds at most one buffer here plus
+/// `conn::OUT_CHANNEL_BOUND` queued items -- the same ~264 KiB the old
+/// design could already have in flight. Faithful: `OVRFLW` *is* the real
+/// host's flow control -- GSBL never hung up a slow reader; a dead
+/// connection announces itself through the socket (the writer task errors,
+/// the queue closes, and the next offer here answers `Closed`), and an
+/// idle-but-alive one is the module's own policy to kick, exactly as it
+/// was on real hardware.
+///
+/// `try_reserve` before `drain_output`, not `try_send` after: draining is
+/// what raises the module-visible `OUTMT` status ("your output has been
+/// taken"), so a channel whose output cannot be taken yet must not drain --
+/// holding the bytes *and* the status is what keeps the module's own flow
+/// control honest. It also means there is never a drained buffer with
+/// nowhere to go.
+fn offer(gsbl: &mut mbbs::gsbl::Gsbl, sender: &Sender<Out>, chan: Chan) -> bool {
+    use tokio::sync::mpsc::error::TrySendError;
+    if gsbl.output_len(chan) == 0 {
+        return true;
+    }
+    match sender.try_reserve() {
+        Ok(permit) => {
+            permit.send(Out::Bytes(gsbl.drain_output(chan)));
+            true
+        }
+        Err(TrySendError::Full(())) => true,
+        Err(TrySendError::Closed(())) => false,
+    }
+}
+
 /// Send everything every channel queued, and hang up on anyone who cannot
-/// take it.
+/// take it -- where "cannot take it" is [`offer`]'s verdict, not a single
+/// full queue.
 fn flush<A: Abi>(
     host: &mut Host<A>,
     machine: &mut A::Cpu,
@@ -1352,18 +1401,16 @@ fn flush<A: Abi>(
     terms: Terms,
 ) -> io::Result<()> {
     for chan in terms.all() {
-        let bytes = host.gsbl_mut().drain_output(chan);
-        if bytes.is_empty() {
-            continue;
-        }
         let Some(sender) = &conns[chan.index()] else {
             // Output queued for a channel nobody is connected to. GSBL
             // cannot produce this on its own -- a channel is only ever
             // dispatched into after `Host::connect` -- but there is nowhere
             // to send it, so it is dropped rather than held.
+            host.gsbl_mut().drain_output(chan);
             continue;
         };
-        if sender.try_send(Out::Bytes(bytes)).is_err() {
+        let sender = sender.clone();
+        if !offer(host.gsbl_mut(), &sender, chan) {
             drop_channel(host, machine, module, pool, conns, chan)?;
         }
     }
@@ -1394,25 +1441,21 @@ fn emit_pending(
         if undeliverable.contains(&chan) {
             continue;
         }
-        let bytes = gsbl.drain_output(chan);
-        if bytes.is_empty() {
-            continue;
-        }
         let Some(sender) = &conns[chan.index()] else {
             continue;
         };
-        if sender.try_send(Out::Bytes(bytes)).is_err() {
+        if !offer(gsbl, sender, chan) {
             undeliverable.push(chan);
         }
     }
 }
 
-/// Hang up a channel whose output could not be handed to its connection.
+/// Hang up a channel whose connection is gone.
 ///
-/// Full (a client that cannot keep up) or Closed (the connection task is
-/// already gone): the same treatment either way, because a socket that will
-/// not drain is indistinguishable from one that is gone. This is already the
-/// lost-carrier path.
+/// Reached only on [`offer`]'s `Closed` verdict -- the connection task has
+/// dropped its receiver, which is this design's lost-carrier signal. A
+/// merely *full* queue no longer comes here at all; `offer`'s own doc
+/// comment carries that story.
 ///
 /// One function because there are now two places that reach it -- [`flush`],
 /// and `life`'s own sweep of what the in-cycle emitter could not deliver --
@@ -1466,7 +1509,7 @@ mod tests {
 
     use crate::pool::{MachineId, Pool};
 
-    use super::{Woke, collapse, drain_turn, wait_with_peek, wake};
+    use super::{Woke, collapse, drain_turn, offer, wait_with_peek, wake};
     use crate::msg::{In, Out};
     use mbbs::Wait;
 
@@ -1929,5 +1972,78 @@ mod tests {
             );
             now += RESTART_WINDOW + Duration::from_secs(1);
         }
+    }
+
+    /// [`offer`] with room in the queue drains the channel and delivers its
+    /// output as one message.
+    #[test]
+    fn offer_delivers_queued_output_whole() {
+        let terms = Terms::new(1);
+        let chan = terms.chan(0).expect("channel zero of one");
+        let mut gsbl = mbbs::gsbl::Gsbl::new(terms);
+        gsbl.transmit(chan, b"hello");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Out>(4);
+        assert!(offer(&mut gsbl, &tx, chan), "a deliverable channel stays up");
+        assert_eq!(gsbl.output_len(chan), 0, "delivery drains the channel");
+        match rx.try_recv() {
+            Ok(Out::Bytes(bytes)) => assert_eq!(bytes, b"hello"),
+            Ok(Out::Close) => panic!("expected bytes, got Out::Close"),
+            Err(e) => panic!("expected one Out::Bytes: {e}"),
+        }
+    }
+
+    /// The retired rule was `Full` == hang up, and it is what dropped a
+    /// character-creation session mid-save (see [`offer`]'s doc comment):
+    /// this pins the replacement. A full queue holds the bytes in GSBL --
+    /// channel up, nothing drained -- and once the queue has room again,
+    /// everything the module queued meanwhile arrives coalesced into one
+    /// message, one slot.
+    #[test]
+    fn offer_holds_and_coalesces_when_the_queue_is_full() {
+        let terms = Terms::new(1);
+        let chan = terms.chan(0).expect("channel zero of one");
+        let mut gsbl = mbbs::gsbl::Gsbl::new(terms);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Out>(1);
+        tx.try_send(Out::Bytes(b"occupied".to_vec())).expect("fills the one slot");
+
+        gsbl.transmit(chan, b"spin");
+        assert!(offer(&mut gsbl, &tx, chan), "a full queue is backpressure, not a hangup");
+        assert_eq!(gsbl.output_len(chan), 4, "held in GSBL, not drained into thin air");
+
+        // The module keeps writing while the queue is full -- the spinner's
+        // exact shape -- and none of it costs a slot yet.
+        gsbl.transmit(chan, b"ning");
+        assert!(offer(&mut gsbl, &tx, chan));
+
+        // Queue drains; the next offer delivers everything as ONE message.
+        match rx.try_recv() {
+            Ok(Out::Bytes(bytes)) => assert_eq!(bytes, b"occupied"),
+            Ok(Out::Close) => panic!("expected the occupying message, got Out::Close"),
+            Err(e) => panic!("expected the occupying message: {e}"),
+        }
+        assert!(offer(&mut gsbl, &tx, chan));
+        match rx.try_recv() {
+            Ok(Out::Bytes(bytes)) => assert_eq!(bytes, b"spinning", "held output coalesces"),
+            Ok(Out::Close) => panic!("expected the coalesced message, got Out::Close"),
+            Err(e) => panic!("expected the coalesced message: {e}"),
+        }
+        assert_eq!(gsbl.output_len(chan), 0);
+    }
+
+    /// A connection whose task is gone is the one thing that still hangs a
+    /// channel up -- and the bytes stay queued for [`drop_channel`]'s own
+    /// path rather than being drained into a message nobody will take.
+    #[test]
+    fn offer_reports_only_a_closed_connection() {
+        let terms = Terms::new(1);
+        let chan = terms.chan(0).expect("channel zero of one");
+        let mut gsbl = mbbs::gsbl::Gsbl::new(terms);
+        gsbl.transmit(chan, b"bye");
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Out>(4);
+        drop(rx);
+        assert!(!offer(&mut gsbl, &tx, chan), "a closed connection is the hangup signal");
     }
 }

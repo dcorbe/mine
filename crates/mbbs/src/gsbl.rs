@@ -559,6 +559,17 @@ impl Gsbl {
     /// break, and the bytes a channel emitted depended on when a socket task
     /// happened to run. `transmit` now wraps inside a buffer of its own and
     /// commits once, so there is nothing here to disturb.
+    /// Bytes queued for `chan` that no [`Self::drain_output`] has taken yet.
+    ///
+    /// What a transport asks before deciding whether to drain at all: a
+    /// connection that cannot take another buffer right now leaves the bytes
+    /// here to coalesce with whatever the module queues next, and this count
+    /// is how it tells "momentarily behind" (hold) from "wedged" (hang up)
+    /// -- `mbbs-server`'s own flush is that caller and holds the budget.
+    pub fn output_len(&self, chan: Chan) -> usize {
+        self.channel(chan).output.len()
+    }
+
     pub fn drain_output(&mut self, chan: Chan) -> Vec<u8> {
         let c = self.channel_mut(chan);
         if c.output.is_empty() {

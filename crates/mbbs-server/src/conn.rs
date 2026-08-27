@@ -104,18 +104,23 @@ const OPT_ECHO: u8 = 1;
 const OPT_SGA: u8 = 3;
 
 /// How many [`Out`] messages a connection's outbound queue holds before the
-/// host thread treats it as wedged.
+/// host thread stops handing it more and holds output in GSBL instead.
 ///
 /// Each message is at most `OUTSIZ` (8192, `gsbl.rs`) bytes -- GSBL's own
 /// output buffer refuses to grow past that and queues `OVRFLW` instead, so a
 /// flush can never hand this task more than one buffer's worth at a time.
 /// 32 slots is a few flushes' worth of slack (up to 256KB worst case): enough
 /// to ride out a scheduling hiccup or a slow but working client without
-/// piling up unbounded memory behind one bad socket. A client that is
-/// genuinely wedged -- not reading at all -- fills 32 slots fast, and
-/// `host::flush`'s `try_send` treats the resulting `Full` exactly like a
-/// closed channel: hang up. That is the design point of a bounded channel
-/// here at all.
+/// piling up unbounded memory behind one bad socket.
+///
+/// A full queue is **backpressure, not a hangup**: `host::offer` leaves the
+/// channel's output in GSBL -- where it coalesces with whatever the module
+/// queues next, and where `OVRFLW` backpressures the module itself, exactly
+/// the real host's own flow control -- and only a `Closed` queue (the
+/// socket really gone) hangs the channel up. It used to be a hangup
+/// (`Full` treated like `Closed`), which made a burst of tiny writes
+/// lethal: see `host::offer`'s own doc comment for the measured
+/// character-creation drop that retired that rule.
 const OUT_CHANNEL_BOUND: usize = 32;
 
 /// The keys `crates/mbbs/tests/wccmmud.rs:3623` uses for a player who reaches
