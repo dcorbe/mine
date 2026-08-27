@@ -8,6 +8,7 @@
 //! this way: a crate exists only when the dependency graph forces it.
 //! See docs/plans/2026-08-12-abi-border-design.md §1.
 
+pub mod le;
 pub mod m16;
 pub mod m32;
 pub mod module;
