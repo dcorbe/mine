@@ -743,7 +743,10 @@ pub fn fsdord<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .to_vec();
 
     let Some((index, canonical)) = fsd::ordinal(&spec, &field, &answer) else {
-        return Ok(abi::Ret::Int(A::Int::from(NO)));
+        // `INT fsdord` answers `-1` for an answer that is not on the list.
+        // `-1` at `A`'s own width, not `A::Int::from(NO)`, which is `65535`
+        // under `Wg32` -- see `findtvar`.
+        return Ok(abi::Ret::Int(A::int_from_u32(u32::MAX)));
     };
 
     // `stfans()`, FSD.C:1036: put the canonical spelling back, shift what

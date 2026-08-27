@@ -1417,6 +1417,11 @@ pub fn access<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     )
     .into_owned();
 
+    // `int access` answers `-1` for "no". Every `-1` below is
+    // `int_from_u32(u32::MAX)` -- `-1` at `A`'s own width -- not
+    // `A::Int::from(NO)`, which zero-extends `0xffff` to `65535` under
+    // `Wg32`; see `findtvar` for the crash that mistake caused.
+
     // A path this host will not look in is not a file that is missing -- it is
     // a question it cannot answer, and answering "no" would tell the module the
     // file is absent when nobody looked.
@@ -1429,10 +1434,10 @@ pub fn access<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     // `unlink` already established for the identical call.
     let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
     let Some(path) = host.find(&name) else {
-        return Ok(abi::Ret::Int(A::Int::from(NO)));
+        return Ok(abi::Ret::Int(A::int_from_u32(u32::MAX)));
     };
     let Ok(metadata) = std::fs::metadata(&path) else {
-        return Ok(abi::Ret::Int(A::Int::from(NO)));
+        return Ok(abi::Ret::Int(A::int_from_u32(u32::MAX)));
     };
 
     // Bit 1 is write and bit 2 is read. Nothing else is defined, and a mode
@@ -1444,7 +1449,7 @@ pub fn access<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         )));
     }
     if mode & 2 != 0 && metadata.permissions().readonly() {
-        return Ok(abi::Ret::Int(A::Int::from(NO)));
+        return Ok(abi::Ret::Int(A::int_from_u32(u32::MAX)));
     }
     Ok(abi::Ret::Int(A::Int::from(0u16)))
 }

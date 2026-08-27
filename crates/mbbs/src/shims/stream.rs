@@ -515,7 +515,10 @@ pub fn unlink<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
 
     let Some(path) = host.find(&name) else {
-        return Ok(abi::Ret::Int(A::Int::from(NO)));
+        // `int unlink` answers `-1` when there is nothing to remove. `-1` at
+        // `A`'s own width, not `A::Int::from(NO)`, which is `65535` under
+        // `Wg32` -- see `findtvar`.
+        return Ok(abi::Ret::Int(A::int_from_u32(u32::MAX)));
     };
     std::fs::remove_file(&path)
         .map_err(|e| ShimError::Failed(format!("unlink({named}): {e}")))?;

@@ -194,9 +194,11 @@ pub fn mkdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
 
     // Already there -- file or directory, `mkdir()` does not distinguish --
-    // is exactly DOS's EEXIST: -1, not a host refusal.
+    // is exactly DOS's EEXIST: -1, not a host refusal. `-1` at `A`'s own
+    // width (`int_from_u32(u32::MAX)`), not `A::Int::from(NO)`, which
+    // zero-extends `0xffff` to `65535` under `Wg32` -- see `findtvar`.
     if host.find(&name).is_some() {
-        return Ok(abi::Ret::Int(A::Int::from(NO)));
+        return Ok(abi::Ret::Int(A::int_from_u32(u32::MAX)));
     }
 
     match std::fs::create_dir(host.root.join(&name)) {
@@ -204,7 +206,7 @@ pub fn mkdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
         // Missing parent, permission denied, or anything else `mkdir()`'s
         // own two-value contract (0 or -1) was always going to collapse
         // into `-1` regardless of which it was.
-        Err(_) => Ok(abi::Ret::Int(A::Int::from(NO))),
+        Err(_) => Ok(abi::Ret::Int(A::int_from_u32(u32::MAX))),
     }
 }
 
