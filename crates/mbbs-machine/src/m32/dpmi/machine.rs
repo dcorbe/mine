@@ -27,6 +27,20 @@ pub enum Exit {
     Fault { signo: i32, eip: u32 },
 }
 
+/// The guest register file as a serviced trap sees it -- captured at the
+/// faulting instruction. `ecx` is present here (unlike `crate::m32::Regs`)
+/// because a DOS `int 21h` carries its byte count in `ECX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Regs32 {
+    pub eip: u32,
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub esi: u32,
+    pub edi: u32,
+}
+
 /// A flat 32-bit guest and the crossing state it is entered through.
 pub struct Machine {
     mapping: Mapping,
@@ -105,6 +119,49 @@ impl Machine {
     /// The guest's virtual interrupt-enable flag, as `cli`/`sti` have left it.
     pub fn interrupts_enabled(&self) -> bool {
         self.ctx.vif != 0
+    }
+
+    /// The guest register file captured at the last service/port trap.
+    /// `ECX`/`EDX` carry `int 21h` counts and flat buffer pointers.
+    pub fn regs32(&self) -> Regs32 {
+        Regs32 {
+            eip: self.ctx.out_eip,
+            eax: self.ctx.out_eax,
+            ebx: self.ctx.out_ebx,
+            ecx: self.ctx.out_ecx,
+            edx: self.ctx.out_edx,
+            esi: self.ctx.out_esi,
+            edi: self.ctx.out_edi,
+        }
+    }
+
+    /// Read `len` bytes of guest memory at flat linear address `at`, or `None`
+    /// if the range is not entirely within the mapping. Guest pointers are
+    /// host linear addresses in the flat model, but a service must never
+    /// dereference one unchecked.
+    pub fn read_mem(&self, at: u32, len: usize) -> Option<&[u8]> {
+        let base = self.base();
+        let off = at.checked_sub(base)? as usize;
+        self.mapping.as_slice().get(off..off.checked_add(len)?)
+    }
+
+    /// Write `src` into guest memory at flat linear address `at`; `false` if
+    /// the range is not entirely within the mapping.
+    pub fn write_mem(&mut self, at: u32, src: &[u8]) -> bool {
+        let base = self.base();
+        let Some(off) = at.checked_sub(base).map(|o| o as usize) else {
+            return false;
+        };
+        let Some(end) = off.checked_add(src.len()) else {
+            return false;
+        };
+        match self.mapping.as_mut_slice().get_mut(off..end) {
+            Some(dst) => {
+                dst.copy_from_slice(src);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Enter the guest and run until it faults. On a [`Exit::Service`] the

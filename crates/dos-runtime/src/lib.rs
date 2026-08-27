@@ -34,6 +34,7 @@
 
 pub mod bios;
 pub mod btrieve;
+pub mod dos4g;
 pub mod btrieve_open_path;
 pub use ::dos::kernel as dos;
 pub mod driver;

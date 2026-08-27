@@ -19,7 +19,7 @@ pub mod fault;
 pub mod machine;
 pub mod virq;
 
-pub use machine::{Exit, Machine};
+pub use machine::{Exit, Machine, Regs32};
 
 #[cfg(test)]
 mod spike;

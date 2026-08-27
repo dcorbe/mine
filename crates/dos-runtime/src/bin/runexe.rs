@@ -464,6 +464,9 @@ struct Cli {
 pub enum Format {
     RealMode,
     Pe32,
+    /// An LE/LX linear executable -- a DOS/4GW-era 32-bit protected-mode
+    /// program, run natively by `dos4g` (runexe is the extender).
+    Le,
     Unsupported,
 }
 
@@ -501,7 +504,8 @@ pub fn format_of(file: &[u8]) -> Format {
     };
     match &sig[0..2] {
         b"PE" if sig[2] == 0 && sig[3] == 0 => Format::Pe32,
-        b"NE" | b"LE" | b"LX" => Format::Unsupported,
+        b"LE" | b"LX" => Format::Le,
+        b"NE" => Format::Unsupported,
         _ => Format::RealMode,
     }
 }
@@ -772,15 +776,28 @@ fn main() -> io::Result<()> {
                 interactive,
             );
         }
+        Format::Le => {
+            if tsr.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--tsr requires the real-mode guest; an LE/LX program runs \
+                     natively with no real-mode memory map to load a TSR into",
+                ));
+            }
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            let code = dos_runtime::dos4g::run_le(&data, &mut out)?;
+            std::process::exit(code);
+        }
         Format::Unsupported => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{path}: not a program either runtime can run. \
-                     The 16-bit segmented formats (NE, LE, LX) are refused outright: \
-                     NE covers both Windows 3.x programs and MAJORBBS.EXE, which is \
-                     additionally a Phar Lap 286 extender. The real-mode guest runs MZ \
-                     and the Win32 host runs PE32"
+                    "{path}: not a program either runtime can run. NE is refused \
+                     outright: it covers both Windows 3.x programs and MAJORBBS.EXE, \
+                     which is additionally a Phar Lap 286 extender. The real-mode \
+                     guest runs MZ, the Win32 host runs PE32, and the DOS/4GW host \
+                     runs LE/LX"
                 ),
             ));
         }
@@ -1877,6 +1894,14 @@ mod tests {
         ne[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
         ne[0x80..0x82].copy_from_slice(b"NE");
         assert_eq!(format_of(&ne), Format::Unsupported, "NE is refused, not routed");
+
+        for sig in [b"LE", b"LX"] {
+            let mut le = vec![0u8; 0x100];
+            le[0..2].copy_from_slice(b"MZ");
+            le[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+            le[0x80..0x82].copy_from_slice(sig);
+            assert_eq!(format_of(&le), Format::Le, "LE/LX routes to the DOS/4GW host");
+        }
     }
 
     /// `PE\0\0` is checked in full. A real-mode image whose code happens to
