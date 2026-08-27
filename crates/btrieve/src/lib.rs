@@ -14729,27 +14729,29 @@ mod tests {
         }
     }
 
-    /// Repro for the `Op::Equal` defect found while building Task 7's
-    /// multi-block `for_commit` test (the one above): registered in
-    /// `docs/btrieve-unproven.md`'s own "known defect" section, not just
-    /// described in prose there, so a follow-up owner starts from a
-    /// running test.
+    /// The "`Op::Equal` defect on `PP2BLOCK.DAT`" was the repro test's own
+    /// key extraction, not the engine: `docs/btrieve-unproven.md` §7
+    /// registered a test that sliced `current().bytes[2..6]` -- the FCR's
+    /// key offset applied to a marker-stripped record. A v6 key offset is
+    /// **slot-relative** ([`records::keyed`]'s own doc, Evidence 1b), so
+    /// the true key of this file's lowest record is `bytes[0..4]` -- the
+    /// u32 counter genuine Btrieve indexed -- and `[2..6]` lands two bytes
+    /// into 0xAA fill, a value no record's key holds. `get` answering "not
+    /// found" for it was correct.
     ///
-    /// Minimal: zero writes. `PP2BLOCK.DAT` is opened exactly as it ships,
-    /// its own lowest key found through `query(Lowest)` (already proven
-    /// correct -- a full ascending walk reaches every record), then looked
-    /// up by that same value through `get(Op::Equal, ...)`. Genuine
-    /// Btrieve behaviour for `B_GET_EQUAL` on a key value the tree
-    /// demonstrably holds is "found" -- there is nothing else it could
-    /// mean. This currently fails: `get` reports "not found" for a key
-    /// this same file's own ascending walk just delivered.
+    /// Measured against the fixture itself, not inferred: `PP2BLOCK.DAT`'s
+    /// index pages hold entries `00 00 00 00`, `01 00 00 00`, ... -- the
+    /// bytes at record offset 0 -- while its FCR stores offset 2, and
+    /// `ppprobe.c:118` created the file with `ks->position = 1` (1-based,
+    /// so offset 0). A populated `WCCMP002.DAT` shows the same pair:
+    /// stored offset 2, key bytes at record offset 0.
     ///
-    /// Reproduces identically on the slow path too (`block_from_file`,
-    /// `cache: None`, forcing the pre-Task-7 `Records`-backed `get`) --
-    /// see the fix report for that cross-check; not repeated here, so this
-    /// one test stays the single thing a follow-up runs to see the bug.
+    /// So this asserts both directions: the true key IS found, and the
+    /// mis-extracted one is NOT -- the second half so the trap that wrote
+    /// §7 (reading key bytes off a record without [`records::keyed`],
+    /// [`Records::key_shift`]'s own "they were all missed" list) stays
+    /// documented by a running test rather than prose.
     #[test]
-    #[ignore = "pre-existing keyed-lookup defect on PP2BLOCK.DAT-shaped files; see docs/btrieve-unproven.md"]
     fn get_equal_finds_pp2blocks_own_lowest_key() {
         let mut mem = FlatMem::new(64 * 1024);
         let mut heap = FlatHeap::new(0x100);
@@ -14766,18 +14768,32 @@ mod tests {
             .open(&mut mem, &mut heap, "PP2BLOCK.DAT", &path, geometry, maxlen)
             .expect("opens");
         let block = btrieve.block_mut(at).expect("open");
+        let key = block.keys()[0].clone();
 
         assert!(block.query(0, Op::Lowest, &[]).expect("query"), "the file has at least one record");
-        let lowest_key = block.current().expect("positioned").bytes[2..6].to_vec();
+        let lowest = block.current().expect("positioned");
+        let true_key = key.extract(&records::keyed(2, &lowest.bytes));
+        let shifted_key = lowest.bytes[2..6].to_vec();
+        assert_ne!(true_key, shifted_key, "this file's fill bytes are what made the two distinguishable");
 
         let mut locks = LockTable::default();
         let found = block
-            .get(0, Op::Equal, &lowest_key, 0, &mut locks, maxlen)
+            .get(0, Op::Equal, &true_key, 0, &mut locks, maxlen)
             .expect("get must not error, only find or not find");
         assert!(
             found.is_some(),
-            "Op::Equal must find a key value this same file's own ascending walk just \
-             delivered -- key {lowest_key:?} is demonstrably present"
+            "Op::Equal must find the key value genuine Btrieve indexed for this \
+             record -- {true_key:?} is the tree's own lowest entry"
+        );
+
+        let mis_extracted = block
+            .get(0, Op::Equal, &shifted_key, 0, &mut locks, maxlen)
+            .expect("get must not error, only find or not find");
+        assert!(
+            mis_extracted.is_none(),
+            "{shifted_key:?} is a slot-relative offset applied to a marker-stripped \
+             record -- no record's key, so finding it would mean the engine now \
+             shares the extraction bug the old §7 repro had"
         );
     }
 
