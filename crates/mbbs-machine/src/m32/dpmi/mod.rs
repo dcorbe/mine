@@ -20,3 +20,6 @@ pub mod machine;
 pub mod virq;
 
 pub use machine::{Exit, Machine};
+
+#[cfg(test)]
+mod spike;
