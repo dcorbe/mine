@@ -667,7 +667,16 @@ pub fn dfaAcqNPLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
 /// for why it does not answer `0` when merely unpositioned either.
 pub fn dfaAbs<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let block = dfa_required(host, "dfaAbs")?;
-    Ok(abi::Ret::Long(btv::current_position(host, "dfaAbs", block)?))
+    let position = btv::current_position(host, "dfaAbs", block)?;
+    if super::btrieve_traced() {
+        let name = host
+            .btrieve
+            .block(block)
+            .map(|file| file.name().to_owned())
+            .unwrap_or_default();
+        eprintln!("mbbs-btv: dfaAbs {name} -> {position}");
+    }
+    Ok(abi::Ret::Long(position))
 }
 
 /// `dfaAcqAbsLock`/`dfaGetAbsLock`'s shared middle, which is now
@@ -733,6 +742,14 @@ fn dfa_acq_abs<A: Abi>(
             .map_err(ShimError::Failed)?,
         (true, None) | (false, _) => found,
     };
+    if super::btrieve_traced() {
+        let name = host
+            .btrieve
+            .block(block)
+            .map(|file| file.name().to_owned())
+            .unwrap_or_default();
+        eprintln!("mbbs-btv: {who} {name} abspos={abspos} keynum={keynum} -> {found}");
+    }
     if found {
         note_len(host, block);
     }
@@ -857,6 +874,9 @@ pub fn dfaStepLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi
     let at = file
         .step_position(step)
         .map_err(|e| ShimError::Failed(format!("dfaStepLock({opt}) on {name}: {e}")))?;
+    if super::traced() || super::btrieve_traced() {
+        eprintln!("mbbs-btv: dfaStepLock {name} {step:?} -> {at:?}");
+    }
     if at.is_none() {
         return Ok(abi::Ret::Int(A::Int::from(0u16)));
     }

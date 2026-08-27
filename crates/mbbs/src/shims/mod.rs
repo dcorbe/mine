@@ -68,6 +68,38 @@ pub(crate) fn traced() -> bool {
     *TRACED.get_or_init(|| std::env::var_os("MBBS_TRACE_SHIMS").is_some())
 }
 
+/// Whether `MBBS_TRACE_BTRIEVE` is set: per-operation lines from the Btrieve
+/// shims -- file name, `Op`, key number, and the *result* the module was
+/// handed.
+///
+/// [`traced`] names every dispatch but cannot say what a `qrybtv` searched or
+/// whether it found anything; diagnosing a module that spins waiting for a
+/// record needs exactly those two facts. Separate from `MBBS_TRACE_SHIMS`
+/// because the btrieve lines are the signal and the two-million-dispatch
+/// symbol stream is the noise. Read once, like [`traced`].
+pub(crate) fn btrieve_traced() -> bool {
+    static TRACED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACED.get_or_init(|| std::env::var_os("MBBS_TRACE_BTRIEVE").is_some())
+}
+
+/// The `MBBS_SLOW_SHIM_MS` floor: report any single shim call that takes at
+/// least this many milliseconds, or `None` when unset.
+///
+/// The host is single-threaded by design, so one slow host call *is* a whole
+/// stall -- `lib.rs`'s `stall_note` can say a cycle pass stalled but not which
+/// call did it. Both dispatch paths in `Host::run` time their shim call
+/// against this floor and name the symbol when it is crossed. Costs one
+/// memoised read when unset, an `Instant::now` pair per dispatch when set.
+pub(crate) fn slow_floor() -> Option<std::time::Duration> {
+    static FLOOR: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("MBBS_SLOW_SHIM_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+    })
+}
+
 /// `KERNEL32.dll`'s own import-directory spelling -- measured byte-for-byte
 /// from `LUNATIX.DLL` (`archive/modules/dlls/ISVCWD__LUNWG53F/LUNATIX.DLL`):
 /// mixed case, with the `.dll` suffix, unlike `MAJORBBS`/`GALGSBL`'s bare

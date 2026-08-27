@@ -1702,6 +1702,14 @@ pub(crate) fn locate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Reques
         .query(key, op.as_engine(), &wanted)
         .map_err(|e| ShimError::Failed(format!("{who} on {name}: {e}")))?;
 
+    if super::btrieve_traced() {
+        eprintln!(
+            "mbbs-btv: {who} {name} {op:?} key={key} value={:02x?} -> {}",
+            &wanted[..wanted.len().min(16)],
+            if found { "FOUND" } else { "not-found" },
+        );
+    }
+
     // Not found leaves the file where it was, which is what Btrieve does: a
     // failed Get Equal does not lose the position a successful one established.
     if !found {
@@ -2011,6 +2019,11 @@ pub(crate) fn insert_record<A: Abi>(
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
 
+    if super::btrieve_traced() {
+        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
+        eprintln!("mbbs-btv: {who} INSERT {name} len={length} bytes={:02x?}", &bytes[..bytes.len().min(16)]);
+    }
+
     if let Some((key, value)) = duplicate_key(host, block, &bytes, None)? {
         let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
         if refuse_on_duplicate {
@@ -2028,6 +2041,9 @@ pub(crate) fn insert_record<A: Abi>(
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     let position = file.insert(&bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+    if super::btrieve_traced() {
+        eprintln!("mbbs-btv: {who} INSERT -> position {position}");
+    }
 
     // Currency on the record just inserted, key 0's order -- see
     // [`dinsbtv`]'s own doc comment for why key 0 specifically.
@@ -2775,6 +2791,12 @@ pub(crate) fn update_variable<A: Abi>(
             ))
         })?
         .position;
+    if super::btrieve_traced() {
+        eprintln!(
+            "mbbs-btv: {who} UPDATE {} position {position} len={length}",
+            file.name(),
+        );
+    }
 
     if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
         let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();

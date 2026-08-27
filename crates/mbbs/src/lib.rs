@@ -3355,9 +3355,30 @@ impl<A: Abi> Host<A> {
                 && let Some(Some((shim, cleans))) = self.resolved.get(usize::from(index)).copied()
             {
                 self.calls += 1;
+                let clocked = shims::slow_floor().map(|floor| (floor, std::time::Instant::now()));
                 let mut call = shims::call::<A>(machine);
                 match shim(&mut call, self) {
                     Ok(ret) => {
+                        if let Some((floor, t0)) = clocked {
+                            let took = t0.elapsed();
+                            if took >= floor {
+                                // Slow enough to matter is rare enough to
+                                // afford the name rebuild the fast path
+                                // otherwise skips.
+                                let symbol = match self.import_owner(module, index) {
+                                    Some((_, site)) => format!(
+                                        "{}!{}",
+                                        site.module,
+                                        self.symbol_name(&site.module, &site.symbol)
+                                    ),
+                                    None => format!("thunk #{index}"),
+                                };
+                                eprintln!(
+                                    "mbbs-slow: chan={chan:?} {symbol} took {:.1}ms",
+                                    took.as_secs_f64() * 1e3
+                                );
+                            }
+                        }
                         exit = A::resume(machine, ret, cleans)?;
                         continue;
                     }
@@ -3478,8 +3499,17 @@ impl<A: Abi> Host<A> {
             // individual `_wg16` siblings; see `shims::mod`'s own `call` doc
             // comment.
             let mut call = shims::call::<A>(machine);
+            let clocked = shims::slow_floor().map(|floor| (floor, std::time::Instant::now()));
             match shim(&mut call, self) {
                 Ok(ret) => {
+                    if let Some((floor, t0)) = clocked
+                        && t0.elapsed() >= floor
+                    {
+                        eprintln!(
+                            "mbbs-slow: chan={chan:?} {from}!{symbol} took {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
                     exit = A::resume(machine, ret, cleans)?;
                 }
                 Err(e) => {
