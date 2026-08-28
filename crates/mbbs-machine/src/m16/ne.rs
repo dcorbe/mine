@@ -812,6 +812,10 @@ pub use crate::module::ImportResolver;
 pub struct Module {
     /// Selector per NE segment number, indexed from zero for segment 1.
     selectors: Vec<u16>,
+    /// Whether each segment (indexed the same way as `selectors`) is code
+    /// rather than data, straight from the NE header's own `SEG_DATA` bit
+    /// -- see [`Module::init`]'s ordinal-1 fallback, the only reader.
+    is_code: Vec<bool>,
     autodata: u16,
     entries: Vec<Option<EntryPoint>>,
     /// This module's own declared name -- see [`NeImage::own_name`]. What a
@@ -929,7 +933,30 @@ impl Module {
     pub fn init(&self) -> Option<FarPtr> {
         let candidate = format!("_INIT__{}", self.own_name);
         self.entry_by_name_ignore_ascii_case(&candidate)
-            .or_else(|| self.entry(1))
+            .or_else(|| self.ordinal_one_if_code())
+    }
+
+    /// Ordinal 1, but only once its segment is confirmed to be code.
+    ///
+    /// [`Module::init`]'s own doc comment already distrusts ordinal 1 as a
+    /// rule; this closes the one way trusting it as a *fallback* is unsafe
+    /// rather than merely wrong. Measured against `CXO-LORD.DLL`: ordinal 1
+    /// resolves to offset `0x5b` in segment 4, which that file's own NE
+    /// header marks `SEG_DATA` -- so `map_ne` mapped it non-executable, and
+    /// a far jump into a non-executable descriptor is refused by the CPU
+    /// before `CS` ever loads the new selector. `m16::fault`'s recovery
+    /// claims a fault by reading the *interrupted* `CS`, which in that case
+    /// is still the host's own -- so nobody claims it, and the module
+    /// crashes the whole process instead of the process seeing an ordinary
+    /// [`crate::m16::Poison`]. Refusing here, like the name lookup running
+    /// first above, turns a guess this codebase does not trust into an
+    /// honest `None`.
+    fn ordinal_one_if_code(&self) -> Option<FarPtr> {
+        let entry = (*self.entries.first()?)?;
+        if !*self.is_code.get(usize::from(entry.segment).wrapping_sub(1))? {
+            return None;
+        }
+        self.entry(1)
     }
 
     /// What thunk `index` stands for, as [`Exit::Call`](crate::m16::Exit::Call)
@@ -1075,6 +1102,7 @@ impl Machine {
         // tail is BSS, and leaving it as whatever was there before would be a
         // module reading uninitialised globals that looked initialised.
         let mut selectors = Vec::with_capacity(image.segments.len());
+        let mut is_code = Vec::with_capacity(image.segments.len());
         let first = self.mem.segments.len();
         for (i, entry) in image.segments.iter().enumerate() {
             let mut segment =
@@ -1086,6 +1114,7 @@ impl Machine {
                 .write(0, &file[entry.file.clone()])
                 .expect("the segment is at least as large as its file data");
             selectors.push(segment.selector());
+            is_code.push(!entry.is_data());
             self.mem.segments.push(segment);
         }
 
@@ -1169,6 +1198,7 @@ impl Machine {
 
         Ok(Module {
             selectors,
+            is_code,
             autodata,
             entries: image.entries.clone(),
             own_name: image.own_name.clone(),
