@@ -6984,6 +6984,9 @@ pub struct Btrieve<M: Mem> {
     /// [`Self::begin`]/[`Self::open`] to set that per-block flag, and
     /// [`Self::end`]/[`Self::abort`] to clear it everywhere.
     transaction: bool,
+    /// The system-transaction limits every block opened here starts with
+    /// -- see [`bundle`]; `Limits::default()` is the vendor's 100 ops / 1 s.
+    bundle_limits: bundle::Limits,
 
     /// This session's Btrieve locks -- see [`ops::LockTable`]'s own doc
     /// comment for why this lives here (on the session) rather than on any
@@ -7121,6 +7124,7 @@ impl<M: Mem> Default for Btrieve<M> {
             stack: [M::null_ptr(); BBSTSZ],
             mode: PRIMBV,
             transaction: false,
+            bundle_limits: bundle::Limits::default(),
             locks: ops::LockTable::default(),
             dfa_locks: lock::Locks::default(),
             dfa_current: M::null_ptr(),
@@ -7287,7 +7291,7 @@ impl<M: Mem> Btrieve<M> {
             // rolled back on abort the same as one opened before `begin`.
             txn_active: self.transaction,
             pre_image: None,
-            bundle: bundle::Bundle::default(),
+            bundle: bundle::Bundle::new(self.bundle_limits),
             // A real module's `opnbtv` reached this constructor -- the only
             // one that did -- so this is the one place verification is worth
             // its cost, in a debug build by default, and unconditionally
@@ -7529,6 +7533,56 @@ impl<M: Mem> Btrieve<M> {
         self.mode = mode;
     }
 
+    /// The system-transaction limits every block opened here uses --
+    /// `Limits::default()` is the vendor's 100 ops / 1000 ms.
+    pub fn bundle_limits(&self) -> Limits {
+        self.bundle_limits
+    }
+
+    /// Change the limits for every open block and every later open.
+    pub fn set_bundle_limits(&mut self, limits: Limits) {
+        self.bundle_limits = limits;
+        for block in &mut self.open {
+            block.bundle.set_limits(limits);
+        }
+    }
+
+    /// Commit every bundle that has reached its age limit. The host calls
+    /// this once per pass; a write reaching a limit commits on its own.
+    ///
+    /// # Errors
+    ///
+    /// The first block whose commit failed, after every block was tried --
+    /// [`Self::end`]'s own rule: one file's disk error does not strand the
+    /// others.
+    pub fn tick(&mut self) -> Result<(), BtvError> {
+        let now = std::time::Instant::now();
+        let mut first = None;
+        for block in &mut self.open {
+            if let Err(e) = block.commit_bundle_if_expired(now) {
+                first.get_or_insert(e);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Commit every open bundle now -- what the host does before it blocks
+    /// with no timer to wake it, and what [`Self::begin`] does before a
+    /// transaction opens.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::tick`].
+    pub fn flush_bundles(&mut self) -> Result<(), BtvError> {
+        let mut first = None;
+        for block in &mut self.open {
+            if let Err(e) = block.commit_bundle() {
+                first.get_or_insert(e);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
     /// Begin a transaction, as `dfaBegTrans` (Btrieve op `19+loktyp`) does.
     ///
     /// `loktyp` (`WAITBV`/`NOWTBV`, `DFAAPI.H:36-37`) is not a parameter
@@ -7546,6 +7600,9 @@ impl<M: Mem> Btrieve<M> {
     /// progress, is covered: [`Self::abort`] can undo it, [`Self::end`]
     /// keeps it. Writes already made **before** this call are not covered --
     /// there is nothing before `begin` for a pre-image to be *of*.
+    /// A bundle still open at this point ([`bundle`]) is committed first,
+    /// so those writes are on disk rather than in the cache `abort` would
+    /// empty.
     ///
     /// # Errors
     ///
@@ -7562,6 +7619,10 @@ impl<M: Mem> Btrieve<M> {
         if self.transaction {
             return Err(TransactionError::AlreadyActive);
         }
+        // A bundle staged before `begin` is not the transaction's to undo:
+        // land it now, so `abort`'s `drop_dirty` discards only what the
+        // transaction itself staged.
+        self.flush_bundles().map_err(|e| TransactionError::CommitFailed(e.to_string()))?;
         self.transaction = true;
         for block in &mut self.open {
             block.txn_active = true;
@@ -7914,6 +7975,9 @@ impl<M: Mem> Btrieve<M> {
             file: name.clone(),
             why,
         };
+
+        // Close is a commit point, as the vendor's B_CLOSE was.
+        self.open[index].commit_bundle()?;
 
         if self.open[index].pre_image.is_some() {
             return Err(fail(
@@ -14092,6 +14156,7 @@ mod tests {
             stack: [FlatPtr::NULL; BBSTSZ],
             mode: 0,
             transaction: false,
+            bundle_limits: bundle::Limits::default(),
             locks: ops::LockTable::default(),
             dfa_locks: lock::Locks::default(),
             // The dfa facade's own current-block and stack, empty here: these
@@ -14561,6 +14626,121 @@ mod tests {
     /// actually about (cache invalidation on abort), so it moved to a
     /// fixture with only two records, nowhere near any split or underflow
     /// boundary.
+    /// A session with one cached v6 file open, on a scratch copy of the
+    /// oracle's `V6EMPTY1KEY.DAT`, plus that file's path.
+    fn session_with_v6(tag: &str) -> (Btrieve<Flat>, FlatMem, FlatHeap, FlatPtr, PathBuf) {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::<Flat>::default();
+        let dir = crate::testing::scratch(tag);
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let path = dir.join("V6EMPTY1KEY.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        crate::testing::make_keys_modifiable(&path);
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let at = btrieve
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, geometry.reclen)
+            .expect("opens");
+        assert!(btrieve.block(at).expect("open").cache.is_some(), "a real v6 open attaches a cache");
+        (btrieve, mem, heap, at, path)
+    }
+
+    fn young() -> Limits {
+        Limits { ops: 100, age: std::time::Duration::MAX }
+    }
+
+    #[test]
+    fn a_block_opened_by_the_session_carries_the_sessions_limits() {
+        let (mut btrieve, mut mem, mut heap, at, path) = session_with_v6("bundle-limits-inherit");
+        assert_eq!(btrieve.block(at).expect("open").bundle.limits(), Limits::default());
+        let tight = Limits { ops: 2, age: std::time::Duration::from_secs(1) };
+        btrieve.set_bundle_limits(tight);
+        assert_eq!(btrieve.block(at).expect("open").bundle.limits(), tight, "applies to open blocks");
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let again = btrieve
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, geometry.reclen)
+            .expect("opens");
+        assert_eq!(btrieve.block(again).expect("open").bundle.limits(), tight, "and to later opens");
+    }
+
+    #[test]
+    fn tick_commits_an_aged_bundle_and_leaves_a_young_one() {
+        let (mut btrieve, _mem, _heap, at, path) = session_with_v6("bundle-tick");
+        btrieve.set_bundle_limits(young());
+        let before = std::fs::read(&path).expect("reads");
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("insert");
+        btrieve.tick().expect("ok");
+        assert_eq!(std::fs::read(&path).expect("reads"), before, "a young bundle stays staged");
+        btrieve.set_bundle_limits(Limits { ops: 100, age: std::time::Duration::ZERO });
+        btrieve.tick().expect("ok");
+        assert_ne!(std::fs::read(&path).expect("reads"), before, "an aged bundle commits on tick");
+        assert!(!btrieve.block(at).expect("open").bundle.is_open());
+    }
+
+    #[test]
+    fn flush_bundles_commits_regardless_of_age() {
+        let (mut btrieve, _mem, _heap, at, path) = session_with_v6("bundle-flush");
+        btrieve.set_bundle_limits(young());
+        let before = std::fs::read(&path).expect("reads");
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("insert");
+        btrieve.flush_bundles().expect("ok");
+        assert_ne!(std::fs::read(&path).expect("reads"), before);
+    }
+
+    #[test]
+    fn begin_commits_the_open_bundle_so_abort_cannot_reach_it() {
+        let (mut btrieve, _mem, _heap, at, path) = session_with_v6("bundle-begin");
+        btrieve.set_bundle_limits(young());
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("staged before begin");
+        btrieve.begin().expect("begin");
+        assert!(!btrieve.block(at).expect("open").bundle.is_open(), "begin committed it");
+        let committed = std::fs::read(&path).expect("reads");
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"BBBB")).expect("inside the transaction");
+        btrieve.abort().expect("abort");
+        assert_eq!(std::fs::read(&path).expect("reads"), committed, "abort undid only its own write");
+        btrieve.block_mut(at).expect("open").records = None;
+        let count = btrieve.block_mut(at).expect("open").records().expect("reads").len();
+        assert_eq!(count, 1, "AAAA survives, BBBB does not");
+    }
+
+    #[test]
+    fn close_commits_the_open_bundle() {
+        let (mut btrieve, mut mem, mut heap, at, path) = session_with_v6("bundle-close");
+        btrieve.set_bundle_limits(young());
+        let before = std::fs::read(&path).expect("reads");
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("insert");
+        assert_eq!(std::fs::read(&path).expect("reads"), before, "staged");
+        assert!(btrieve.close(&mut mem, &mut heap, at).expect("closes"));
+        assert_ne!(std::fs::read(&path).expect("reads"), before, "close committed");
+    }
+
+    #[test]
+    fn close_all_files_commits_every_open_bundle() {
+        let (mut btrieve, _mem, _heap, at, path) = session_with_v6("bundle-close-all");
+        btrieve.set_bundle_limits(young());
+        let before = std::fs::read(&path).expect("reads");
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("insert");
+        assert_eq!(btrieve.close_all_files().expect("closes"), 1);
+        assert_ne!(std::fs::read(&path).expect("reads"), before);
+    }
+
+    #[test]
+    fn a_session_dropped_without_close_leaves_the_committed_file_and_it_opens_clean() {
+        let (mut btrieve, mut mem, mut heap, at, path) = session_with_v6("bundle-dropped");
+        btrieve.set_bundle_limits(young());
+        let before = std::fs::read(&path).expect("reads");
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("insert");
+        drop(btrieve);
+        assert_eq!(std::fs::read(&path).expect("reads"), before, "a lost bundle is a lost bundle, not a torn file");
+        let mut again = Btrieve::<Flat>::default();
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let at = again
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, geometry.reclen)
+            .expect("opens clean");
+        assert_eq!(again.block_mut(at).expect("open").records().expect("reads").len(), 0);
+    }
+
     #[test]
     fn abort_invalidates_the_v6_cache_not_just_disk_and_the_model() {
         let mut mem = FlatMem::new(64 * 1024);
@@ -14600,7 +14780,6 @@ mod tests {
             .v6_resolve_logical(logical)
             .expect("resolves before the transaction");
 
-        btrieve.block_mut(at).expect("open").commit_bundle().expect("the baseline lands before the transaction");
         btrieve.begin().expect("begin");
         let bytes = v6_record(b"ABRT");
         btrieve
@@ -14703,7 +14882,6 @@ mod tests {
         // the transaction even starts.
         btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("baseline");
 
-        btrieve.block_mut(at).expect("open").commit_bundle().expect("the baseline lands before the transaction");
         btrieve.begin().expect("begin");
         btrieve.block_mut(at).expect("open").insert(&v6_record(b"BBBB")).expect("in-transaction insert");
 
@@ -14841,7 +15019,7 @@ mod tests {
             .expect("opens");
         // Written when every write was its own commit; the failure under
         // test is a *flush* failure, so keep this block per-op.
-        btrieve.block_mut(at).expect("open").bundle.set_limits(bundle::Limits { ops: 1, ..bundle::Limits::default() });
+        btrieve.set_bundle_limits(Limits { ops: 1, ..Limits::default() });
         assert!(
             btrieve.block(at).expect("open").cache.is_some(),
             "a real v6 open attaches a cache -- this test is meaningless without one"
@@ -15146,7 +15324,7 @@ mod tests {
             if !deferred {
                 // The reference run is one commit per op -- the contrast the
                 // deferred run is measured against.
-                btrieve.block_mut(at).expect("open").bundle.set_limits(bundle::Limits { ops: 1, ..bundle::Limits::default() });
+                btrieve.set_bundle_limits(Limits { ops: 1, ..Limits::default() });
             }
             assert!(
                 btrieve.block(at).expect("open").v6_fast_reads(),
