@@ -594,6 +594,51 @@ fn w16_refuses_a_value_that_does_not_fit_16_bits() {
     assert!(notes[0].contains("16-bit"), "got: {notes:?}");
 }
 
+/// A read/write past the memory a handle actually owns errors -- the
+/// `read_at`/`write_at` bounds check surfaces as a Lua-visible error through
+/// `p:u8`, not a corrupted read. `c:buffer(4)` only promises to zero its
+/// first 4 bytes; `Host::command_scratch`'s own region is
+/// `COMMAND_SCRATCH_BYTES` (128) bytes, so offset 200 both (a) fits `FarPtr`'s
+/// `u16` offset field with room to spare -- ruling out `checked_offset`'s own
+/// "does not fit this pointer's address space" refusal, which is a *different*
+/// failure this test must not accidentally exercise instead -- and (b) still
+/// runs past the real 128-byte segment, landing on
+/// `mbbs_machine::m16::FarPtrError::OutOfBounds`, surfaced through
+/// `CommandCtx::read_at`'s own `"read_at: {e}"` wrapping. The assertion pins
+/// the *segment* wording (`"128-byte segment"`, `FarPtrError::OutOfBounds`'s
+/// own `Display`) and explicitly rules out `checked_offset`'s wording, so a
+/// regression that accidentally routed this through the wrong check would
+/// fail here, not pass for the wrong reason.
+#[test]
+fn a_read_past_the_owned_region_errors_via_the_bounds_check_not_the_offset_check() {
+    let dir = tempdir_with(
+        "a_read_past_the_owned_region_errors_via_the_bounds_check_not_the_offset_check",
+        &[(
+            "oob.lua",
+            r#"mmud.command("oob", function(c)
+                local p = c:buffer(4)
+                p:u8(200)
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut ext = LuaExtension::load(&dir).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "oob", &module);
+
+    assert_eq!(verdict, Verdict::Pass, "a broken handler must never swallow the line");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("128-byte segment"), "must be the real bounds check (FarPtrError::OutOfBounds), got: {notes:?}");
+    assert!(
+        !notes[0].contains("does not fit this pointer's address space"),
+        "must not be checked_offset's own refusal -- that would mean this test exercises the wrong check, got: {notes:?}"
+    );
+}
+
 /// A pointer handle is a table, but nothing about it is a plain integer a
 /// script could fabricate -- see `crates/mbbs-lua/src/ptr.rs`'s own module
 /// doc comment. Two angles on "cannot forge":

@@ -61,6 +61,17 @@
 //! not a stale pointer. This is `mlua::Scope`'s own guarantee, not something
 //! this module enforces by hand -- see
 //! `commands.rs`'s `a_stashed_handle_errors_in_a_later_invocation` test.
+//!
+//! # `w8`/`w16`/`w32` are unsigned only
+//!
+//! `v` in `p:w8/w16/w32(off, v)` must fit `0..=0xff`/`0xffff`/`0xffff_ffff`;
+//! a negative value is refused the same way an over-large one is (see
+//! `write_width`'s own doc comment). There is no `i16`/`i32` convenience --
+//! deliberately, not an oversight. A declared binding that needs to write a
+//! genuinely signed field encodes its own two's-complement bit pattern
+//! before calling `w16`/`w32` (`-1` is `0xffff` at 16 bits, `0xffff_ffff` at
+//! 32), the same way `p:u8/u16/u32`'s own reads hand back an unsigned value
+//! a caller reinterprets itself if the field is signed.
 
 use std::cell::RefCell;
 use std::rc::Rc;
