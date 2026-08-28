@@ -83,8 +83,31 @@ fn install_panic_hook() {
 /// Best-effort and unconditional -- called from both the panic hook and
 /// `TerminalGuard::drop`, so a redundant second call (a panic unwinding
 /// through a live guard runs both) has to be harmless, not just cheap.
+///
+/// # The cursor has to be shown back explicitly, and last
+///
+/// `textscreen`'s painter opens every frame with `ESC [ ?25l` and only
+/// re-shows the cursor when the caller asks for it -- which the option list
+/// does not, having no field for one to sit in. So the program's final frame
+/// normally leaves the cursor hidden.
+///
+/// Whether that survives the exit is **terminal-dependent**, which is why it
+/// was reported from real use but does not reproduce under tmux.
+/// `LeaveAlternateScreen` is `ESC [ ?1049l`, and an xterm-compatible terminal
+/// restores the saved cursor state along with the screen -- masking the
+/// problem entirely. A terminal that implements `?1049` as screen-switching
+/// alone leaves `?25l` in force, and the user is left with an invisible
+/// cursor until they run `reset`.
+///
+/// `Show` therefore comes *after* `LeaveAlternateScreen`, so it is the last
+/// word either way: on a terminal that restores, it is a harmless no-op; on
+/// one that does not, it is the fix. Ordering it before would leave the
+/// outcome up to whatever `?1049l` decides to restore.
 fn restore_terminal() {
-    let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = out.write_all(app::restore_sequence().as_bytes());
+    let _ = out.flush();
     let _ = crossterm::terminal::disable_raw_mode();
 }
 

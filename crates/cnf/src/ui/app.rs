@@ -691,3 +691,55 @@ mod tests {
         assert!(!e.dirty());
     }
 }
+
+/// The bytes that put a terminal back the way we found it.
+///
+/// Extracted from `bin/cnf.rs` so the ordering can be asserted: the binary's
+/// own teardown is not reachable from a test, and the ordering here is the
+/// whole substance of the fix.
+///
+/// # Why `Show` comes last
+///
+/// `crate::ui`'s painter opens every frame with `ESC [ ?25l`, and only
+/// re-shows the cursor when the caller asks for one -- which the option list
+/// never does, having no field for a cursor to sit in. So the final frame
+/// leaves the cursor hidden.
+///
+/// Whether that survives the exit is **terminal-dependent**. crossterm's
+/// `LeaveAlternateScreen` is `ESC [ ?1049l`, and an xterm-compatible terminal
+/// restores the saved cursor state along with the screen, hiding the problem;
+/// one that treats `?1049` as screen-switching alone leaves `?25l` in force
+/// and the user is left running `reset`. Reported from real use, and it does
+/// not reproduce under tmux for exactly this reason.
+///
+/// Emitting `Show` *after* `LeaveAlternateScreen` makes it the last word
+/// either way: a no-op on a terminal that restores, the fix on one that does
+/// not. Ordering it first would leave the outcome to whatever `?1049l`
+/// decides to restore.
+#[must_use]
+pub fn restore_sequence() -> String {
+    use crossterm::Command;
+    let mut out = String::new();
+    let _ = crossterm::terminal::LeaveAlternateScreen.write_ansi(&mut out);
+    let _ = crossterm::cursor::Show.write_ansi(&mut out);
+    out
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::restore_sequence;
+
+    #[test]
+    fn the_restore_sequence_shows_the_cursor_after_leaving_the_alternate_screen() {
+        // Both halves must be present, and `Show` must come second -- on a
+        // terminal that restores cursor state from `?1049l`, an earlier
+        // `?25h` would simply be undone.
+        let s = restore_sequence();
+        let leave = s.find("\x1b[?1049l").expect("leaves the alternate screen");
+        let show = s.find("\x1b[?25h").expect("shows the cursor back");
+        assert!(
+            show > leave,
+            "Show must follow LeaveAlternateScreen, got {s:?}"
+        );
+    }
+}
