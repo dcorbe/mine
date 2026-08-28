@@ -906,10 +906,15 @@ mod tests {
     fn build_lua_extension_produces_a_wg32_extension_from_the_shipped_scripts() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
         let builder = build_lua_extension::<Wg32>(dir);
-        // No modules given: none of the shipped scripts bind a bare
-        // namespace today, so an empty list still loads cleanly -- this
-        // test's own job is proving the generic builder itself produces a
-        // real `Extension<Wg32>`, not exercising namespace resolution.
+        // No modules given: all three shipped scripts bind `wccmmud` (see
+        // `scripts/lib/wccmmud.lua`), so with an empty module list every one
+        // of them soft-skips -- `wccmmud` is not loaded on this machine, so
+        // `namespace::install`'s `__index` handler refuses the bind and
+        // `exec_scripts` catches it as a note, not a load failure. The
+        // extension still builds, just with zero registered commands: this
+        // test's own job is proving that all-skip-still-installs property
+        // and that the generic builder produces a real `Extension<Wg32>`,
+        // not exercising namespace resolution against a real module.
         builder(&[]).expect("the shipped scripts/ directory loads against Wg32 just as it does against Wg16");
     }
 

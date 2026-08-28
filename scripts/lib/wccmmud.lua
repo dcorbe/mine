@@ -1,5 +1,9 @@
 -- MajorMUD (WCCMMUD.DLL) declarations lib.
 --
+-- See `scripts/lib/README.md` for the primitive surface this file is built
+-- on (`mmud.bind`/`M.declare`, the pointer-handle methods, the scratch
+-- budget) -- this file is that README's own worked example.
+--
 -- Every export name, record offset and calling recipe here is transcribed
 -- from docs/2026-08-20-wccmmud-export-facts.md ("the doc"), which is the
 -- authority: where memory of the earlier Rust milestone-1 code and the doc

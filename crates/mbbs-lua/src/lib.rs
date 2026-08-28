@@ -61,6 +61,39 @@
 //! This crate deliberately does not enforce that itself: it is module-agnostic,
 //! and a hard-coded MajorMUD command list has no business in it.
 //!
+//! # Containment: what bounds a script, and what does not
+//!
+//! Once a declared export call crosses into guest code, `mbbs-machine`'s own
+//! guest-CPU watchdog (`m16::watchdog`/`m32`'s equivalent) bounds it -- a
+//! module that loops forever inside `_GET_PLAYER` still gets timed out and
+//! refused re-entry, the same as it would for any other caller. That
+//! watchdog knows nothing about Lua; it only ever sees `A::call`.
+//!
+//! Nothing bounds the Lua on either side of that call. A lib file's
+//! boot-time top-level code (`M.declare{...}`, a stray `for do end` above
+//! it) and a command handler's own body both run as plain Lua, with no
+//! `debug.sethook` instruction budget, no wall-clock deadline, nothing --
+//! `LuaExtension::load`/`load_with_modules` install no such hook anywhere in
+//! this crate. An infinite loop that never calls a declared export runs
+//! forever; an allocation that never stops growing (`t = {}; while true do
+//! table.insert(t, 0) end`) runs until the process runs out of memory.
+//!
+//! `Extension::command`'s own error handling (see its match arm below) does
+//! not help here either: it disables a handler on a THROWN Lua error, and a
+//! loop that never returns never throws. A hang at boot time -- inside a
+//! lib file's own top-level code, before any command is even registered --
+//! is worse still: `LuaExtension::load_with_modules` never returns, so the
+//! board never finishes starting, and there is no handler to disable and no
+//! command yet to have misbehaved.
+//!
+//! This is the trust model, stated plainly, not a gap to apologize for: an
+//! operator who drops a script into `--scripts` is trusting it the way
+//! they'd trust a plugin -- vetted before it runs, not sandboxed once it
+//! does. See `scripts/lib/README.md`'s own note on this for the version
+//! aimed at a lib author, and the design doc's own scope (this file's
+//! module doc, above) for why closing this gap was never part of what
+//! declared bindings set out to do.
+//!
 //! # Where a command's business logic goes
 //!
 //! Nowhere in this crate, deliberately. Every command's own recipe --

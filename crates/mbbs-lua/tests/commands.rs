@@ -1516,18 +1516,21 @@ fn one_script_binding_two_namespaces_on_a_multi_module_machine_resolves_both() {
 // a copy that could drift from what ships -- a change to that file that
 // breaks parsing, declaration, or the guard's logic fails these tests.
 //
-// Everything else `wccmmud.lua` declares (`save_player`,
+// This section covers `M.declare{...}` resolving against a real (synthetic)
+// export table and `M.player`'s loaded-flag guard, through the `player`
+// probe command below. The other four declared names (`save_player`,
 // `cleanup_currency`, `addon_adjust_user_wealth`, `get_item_from_name`,
-// `add_item_to_inventory`) and every helper built on them
-// (`M.set_experience`, `M.grant_copper`, `M.deduct_wealth`, `M.summon`) is
-// untestable here: they all need a REAL player record's other fields
-// (`0x613`/`0x615`, `0x3c`/`0x3e`, ...) or the multi-call summon sequence
-// behind a synthetic export this crate's fixture-code helpers cannot
-// fabricate believably (a `mov`/`retf` stub can return a fixed pointer, but
-// cannot also perform `_ADD_ITEM_TO_INVENTORY`'s own OUT-count-cell write or
-// the module's own coin arithmetic). Task 5's rewritten commands, run
-// against a real `WCCMMUD.DLL`, are what actually exercises those -- this
-// is what IS testable now, per the task brief.
+// `add_item_to_inventory`) and the helpers built on them (`M.set_experience`,
+// `M.grant_copper`, `M.deduct_wealth`, `M.summon`) were untestable at the
+// time this section was written -- they need a REAL player record's other
+// fields (`0x613`/`0x615`, `0x3c`/`0x3e`, ...) or the multi-call summon
+// sequence behind a synthetic export believable enough to fabricate (a
+// `mov`/`retf` stub can return a fixed pointer, but not also perform
+// `_ADD_ITEM_TO_INVENTORY`'s own OUT-count-cell write or the module's own
+// coin arithmetic). See the `wccmmud_lib_*` tests below (starting with
+// `wccmmud_lib_set_experience_writes_all_three_fields_for_a_sub_billion_total`)
+// for that coverage, added once `get_item_from_name_ambiguous_code`'s own
+// `les`/`mov es:[bx]` write-through-a-far-pointer technique made it possible.
 // ---------------------------------------------------------------------
 
 /// A synthetic module exporting all six names `wccmmud.lua`'s own
