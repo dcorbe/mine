@@ -1035,7 +1035,7 @@ impl Store {
     /// record's own pair; otherwise this is [`Map::pair_position`]'s formula,
     /// inverted: a page whose distance from physical 2, modulo one block's
     /// stride, is 0 or 1 is that block's own pair half.
-    pub(crate) fn structural_pair_of(physical: usize, page_size: usize) -> Option<(usize, usize)> {
+    fn structural_pair_of(physical: usize, page_size: usize) -> Option<(usize, usize)> {
         if physical < 2 {
             return Some((0, 1));
         }

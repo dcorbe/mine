@@ -2536,18 +2536,6 @@ impl<A: Abi> Host<A> {
         std::mem::take(&mut self.audit)
     }
 
-    /// End of a pass: commit whatever Btrieve bundles have aged out, or
-    /// all of them when the driver is about to block with no timer to
-    /// wake it -- nothing else would ever land them. A disk error is a
-    /// note naming the file, not a stop: the module's own next write will
-    /// report it again, and the host keeps serving.
-    fn settle_bundles(&mut self, idle: bool) {
-        let result = if idle { self.btrieve.flush_bundles() } else { self.btrieve.tick() };
-        if let Err(e) = result {
-            self.note(format!("btrieve: committing staged writes failed: {e}"));
-        }
-    }
-
     /// Record something the module cannot be told. See [`Host::notes`].
     pub(crate) fn note(&mut self, what: String) {
         self.notes.push(what);
@@ -4652,15 +4640,14 @@ impl<A: Abi> Host<A> {
             // was the whole of the old busy-wait.
             if !self.gsbl().pending() && self.polls_left == 0 {
                 let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
-                let ended = match next_kick {
-                    Some(next_kick) => Ended::Waiting { next_kick },
-                    None => Ended::Idle,
-                };
-                // The pass is over: land the Btrieve bundles that have aged
-                // out -- all of them if the driver is about to block with no
-                // timer to wake it. See `settle_bundles`.
-                self.settle_bundles(matches!(ended, Ended::Idle));
-                return Ok(Cycles { iterations, dispatched, ended });
+                return Ok(Cycles {
+                    iterations,
+                    dispatched,
+                    ended: match next_kick {
+                        Some(next_kick) => Ended::Waiting { next_kick },
+                        None => Ended::Idle,
+                    },
+                });
             }
 
             // **The interrupt, consulted here and nowhere else.** After the
@@ -4686,7 +4673,6 @@ impl<A: Abi> Host<A> {
             // question.
             if interrupted() {
                 let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
-                self.settle_bundles(false);
                 return Ok(Cycles {
                     iterations,
                     dispatched,
@@ -7978,77 +7964,6 @@ mod tests {
     /// has elapsed yet within it, so nothing is granted) -- rather than
     /// `Clock::stepped`, which would advance on every one of the several
     /// passes a `cycle` call needs to spend a grant one firing at a time.
-    /// A fixture whose root holds a scratch copy of the btrieve crate's
-    /// `V6DUP.DAT`, opened through `opnbtv` exactly as a module opens it.
-    fn v6_fixture(tag: &str) -> (crate::testing::Fixture, mbbs_machine::m16::Module, std::path::PathBuf, u16) {
-        let root = crate::testing::scratch_with(tag, &[]);
-        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../btrieve/tests/data/variable/V6DUP.DAT");
-        let path = root.join("V6DUP.DAT");
-        std::fs::copy(&source, &path).expect("the v6 fixture copies");
-        let reclen = ::btrieve::Geometry::read("V6DUP.DAT", &path).expect("reads").reclen;
-        let mut f = crate::testing::Fixture::rooted(root);
-        let module = f.minimal_module();
-        f.machine.load_code(&[0xcb]).expect("a retf fits");
-        let name = f.text("V6DUP.DAT");
-        f.invoke(crate::shims::btrieve::opnbtv, &[name.offset, name.selector, reclen]).expect("opens");
-        (f, module, path, reclen)
-    }
-
-    fn insert_one(f: &mut crate::testing::Fixture, reclen: u16, key: u32) {
-        let mut record = vec![0u8; usize::from(reclen)];
-        record[..4].copy_from_slice(&key.to_le_bytes());
-        let at = f.bytes(&record, false);
-        f.invoke(crate::shims::btrieve::dinsbtv, &[at.offset, at.selector]).expect("inserts");
-    }
-
-    fn young() -> ::btrieve::Limits {
-        ::btrieve::Limits { ops: 100, age: std::time::Duration::MAX }
-    }
-
-    #[test]
-    fn an_idle_pass_flushes_a_young_bundle_before_the_driver_blocks() {
-        let (mut f, module, path, reclen) = v6_fixture("cycle-idle-flushes");
-        f.host.btrieve.set_bundle_limits(young());
-        let before = std::fs::read(&path).expect("reads");
-        insert_one(&mut f, reclen, 900_001);
-        assert_eq!(std::fs::read(&path).expect("reads"), before, "staged, not on disk");
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
-        assert_eq!(cycles.ended, Ended::Idle, "no kicks, no input: the driver would block");
-        assert_ne!(std::fs::read(&path).expect("reads"), before, "flushed before blocking");
-    }
-
-    #[test]
-    fn a_waiting_pass_ticks_so_an_aged_bundle_commits_and_a_young_one_does_not() {
-        let (mut f, module, path, reclen) = v6_fixture("cycle-waiting-ticks");
-        let rou = f.machine.code_ptr(0);
-        f.host.kicks.push(crate::shims::system::Kick { delay: 5, dstrou: rou });
-        f.host.btrieve.set_bundle_limits(young());
-        let before = std::fs::read(&path).expect("reads");
-        insert_one(&mut f, reclen, 900_001);
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
-        assert!(matches!(cycles.ended, Ended::Waiting { .. }), "{:?}", cycles.ended);
-        assert_eq!(std::fs::read(&path).expect("reads"), before, "young: ticked, not flushed");
-        f.host.btrieve.set_bundle_limits(::btrieve::Limits { ops: 100, age: std::time::Duration::ZERO });
-        f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
-        assert_ne!(std::fs::read(&path).expect("reads"), before, "aged: the tick committed it");
-    }
-
-    #[test]
-    fn a_commit_that_fails_becomes_a_note_naming_the_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let (mut f, module, path, reclen) = v6_fixture("cycle-commit-fails");
-        f.host.btrieve.set_bundle_limits(young());
-        insert_one(&mut f, reclen, 900_001);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("read-only");
-        let notes_before = f.host.notes().len();
-        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("restored");
-        assert_eq!(cycles.ended, Ended::Idle);
-        let notes = &f.host.notes()[notes_before..];
-        assert!(notes.iter().any(|n| n.contains("V6DUP.DAT")), "{notes:?}");
-    }
-
     #[test]
     fn a_routine_that_stops_polling_itself_is_not_re_armed() {
         let mut f = crate::testing::Fixture::new();

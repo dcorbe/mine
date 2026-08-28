@@ -2855,7 +2855,6 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
-            bundle: crate::bundle::Bundle::default(),
             // A test-only fixture, not `Block::open` -- see
             // `Block::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
@@ -2918,7 +2917,6 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
-            bundle: crate::bundle::Bundle::default(),
             // A test-only fixture, not `Block::open` -- see
             // `Block::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
@@ -2970,7 +2968,6 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
-            bundle: crate::bundle::Bundle::default(),
             // A test-only fixture, not `Block::open` -- see
             // `Block::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
