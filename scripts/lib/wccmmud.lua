@@ -19,22 +19,48 @@
 
 local M = mmud.bind("wccmmud")
 
+-- `_ADD_ITEM_TO_INVENTORY` is the one export whose shape differs per build
+-- (doc, "The PE32 build"): five parameters on 16-bit, `(usrnum, 0, 0,
+-- charges, item)`, but FOUR on PE32, `(usrnum, 0, charges, item)` -- every
+-- one of the PE32 module's 13 call sites cleans 16 bytes, and its own
+-- `sysop summon` handler pushes `item, -2, 0, usrnum`. Passing the 16-bit
+-- shape to the PE32 export put the charges seed in the item-pointer slot
+-- and the module dereferenced address 0xfffe (SIGSEGV at
+-- `_add_item_to_inventory+0x39`, three times on the live board).
+--
+-- The charges seed is `-2` on both builds: the 16-bit call site's `0xfffe`
+-- IS -2 at 16-bit width, and the PE32 site pushes `0xfffffffe`. Written
+-- as `-2` so the `int` marshaller produces each ABI's own width of it.
+local ADD_ITEM = ({
+  wg16 = {
+    sig = "int(int, int, int, int, ptr)",
+    call = function(chan, item) return M.add_item_to_inventory(chan, 0, 0, -2, item) end,
+  },
+  wg32 = {
+    sig = "int(int, int, int, ptr)",
+    call = function(chan, item) return M.add_item_to_inventory(chan, 0, -2, item) end,
+  },
+})[mmud.abi]
+if not ADD_ITEM then
+  error("wccmmud.lua: the summon recipe is unmeasured for ABI " .. tostring(mmud.abi))
+end
+
 -- Six words, three far-pointer arguments (doc, "`_GET_ITEM_FROM_NAME` -- 6
 -- words, 3 far-pointer arguments"): the search-name string, a shop-record
 -- pointer (nil/nil = search the whole catalogue), and an OUT match-count
--- word. `_ADD_ITEM_TO_INVENTORY`'s `0xfffe` charges-seed argument is an
--- `int`, not a `long` -- it fits one word (doc, "the plan is exactly
--- right"). `_ADDON_ADJUST_USER_WEALTH`'s amount is declared `long` (doc,
--- "Task 7 conflict"): a single Lua argument the marshaller itself splits
--- into low/high words, low word first -- exactly the `CONCAT22(param_3,
--- param_2)` shape the export wants, with no manual splitting needed here.
+-- cell -- the same three arguments, one dword each, on PE32 (doc, "The
+-- PE32 build"). `_ADDON_ADJUST_USER_WEALTH`'s amount is declared `long`
+-- (doc, "Task 7 conflict"): a single Lua argument the marshaller itself
+-- splits into low/high words, low word first -- exactly the
+-- `CONCAT22(param_3, param_2)` shape the export wants, with no manual
+-- splitting needed here.
 M.declare {
   get_player              = "ptr(int)",
   save_player             = "int(int)",
   cleanup_currency        = "int(int)",
   addon_adjust_user_wealth = "int(int, long)",
   get_item_from_name      = "ptr(str, ptr, ptr)",
-  add_item_to_inventory   = "int(int, int, int, int, ptr)",
+  add_item_to_inventory   = ADD_ITEM.sig,
 }
 
 -- `load_player` is declared nowhere here: neither the milestone-1 Rust
@@ -263,7 +289,10 @@ function M.summon(c, name)
     return false, "item name too long"
   end
 
-  local cell = c:buffer(2)
+  -- Four bytes, not two: the PE32 build stores the match count as a dword
+  -- (doc, "The PE32 build"); the 16-bit build's word lands in the low half
+  -- of the zeroed cell, so one `u32` read is right on either ABI.
+  local cell = c:buffer(4)
   local item = M.get_item_from_name(name, nil, cell)
 
   if item == nil then
@@ -271,7 +300,7 @@ function M.summon(c, name)
     -- matched, and the module already printed its own disambiguation
     -- prompt" -- the OUT count cell is what tells them apart (doc: "Null
     -- return is ambiguous and the OUT count disambiguates it").
-    local count = cell:u16(0)
+    local count = cell:u32(0)
     if count ~= 0 then
       -- Already handled by the module's own output -- say nothing more.
       return false, "ambiguous"
@@ -279,10 +308,11 @@ function M.summon(c, name)
     return false, "no such item"
   end
 
-  -- `0xfffe` (-2) is the charges seed, not a quantity or slot: it tells
-  -- the module to take the item's own default charge count (doc:
-  -- "`_ADD_ITEM_TO_INVENTORY` -- the plan is exactly right").
-  local ok = M.add_item_to_inventory(c.chan, 0, 0, 0xfffe, item)
+  -- The per-build call shape (`ADD_ITEM`, top of this file); `-2` is the
+  -- charges seed, not a quantity or slot: it tells the module to take the
+  -- item's own default charge count (doc: "`_ADD_ITEM_TO_INVENTORY` --
+  -- the plan is exactly right").
+  local ok = ADD_ITEM.call(c.chan, item)
   if ok & 0xff ~= 0 then
     return true
   end
