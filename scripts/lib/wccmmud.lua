@@ -19,31 +19,55 @@
 
 local M = mmud.bind("wccmmud")
 
--- `_ADD_ITEM_TO_INVENTORY` is the one export whose shape differs per build
--- (doc, "The PE32 build"): five parameters on 16-bit, `(usrnum, 0, 0,
--- charges, item)`, but FOUR on PE32, `(usrnum, 0, charges, item)` -- every
--- one of the PE32 module's 13 call sites cleans 16 bytes, and its own
--- `sysop summon` handler pushes `item, -2, 0, usrnum`. Passing the 16-bit
--- shape to the PE32 export put the charges seed in the item-pointer slot
--- and the module dereferenced address 0xfffe (SIGSEGV at
--- `_add_item_to_inventory+0x39`, three times on the live board).
+-- Everything that differs between the two builds of this module, keyed on
+-- the ABI this machine runs. Same source, different compiler: the 16-bit
+-- record is 1998 bytes of word fields; the PE32 record is 2028 bytes with
+-- the same fields dword-aligned, so most offsets past the first few
+-- hundred bytes move. Every number here is measured from the build's own
+-- writers (doc, "The PE32 build"; the 16-bit sections above it). An
+-- unmeasured ABI is a hard boot failure, not a guess.
 --
--- The charges seed is `-2` on both builds: the 16-bit call site's `0xfffe`
--- IS -2 at 16-bit width, and the PE32 site pushes `0xfffffffe`. Written
--- as `-2` so the `int` marshaller produces each ABI's own width of it.
-local ADD_ITEM = ({
+-- `add_item`: `_ADD_ITEM_TO_INVENTORY` takes five parameters on 16-bit,
+-- `(usrnum, 0, 0, charges, item)`, but FOUR on PE32, `(usrnum, 0, charges,
+-- item)` -- every one of the PE32 module's 13 call sites cleans 16 bytes,
+-- and its own `sysop summon` handler pushes `item, -2, 0, usrnum`. Passing
+-- the 16-bit shape to the PE32 export put the charges seed in the
+-- item-pointer slot and the module dereferenced address 0xfffe (SIGSEGV at
+-- `_add_item_to_inventory+0x39`, three times on the live board). The seed
+-- is `-2` on both builds (`0xfffe` at 16-bit width; PE32 pushes
+-- `0xfffffffe`), written as `-2` so the `int` marshaller produces each
+-- ABI's own width of it.
+--
+-- `rec`: player-record offsets. `loaded` is the byte
+-- `_ADDON_ADJUST_USER_WEALTH` tests before touching wealth (both builds).
+-- The experience invariant is THREE fields -- `exp_raw` the unreduced
+-- total, `exp_mod` the same total MODULO 1,000,000,000, `exp_bil` the
+-- count of billions -- maintained by `_RESTRUCTURE_EXPERIENCE` and
+-- `_ADD_EXPERIENCE` and displayed by `_SHOW_STATUS`. `coin` is the copper
+-- accumulator `_CLEANUP_CURRENCY` mints from. All are 32-bit values, low
+-- byte first, on both builds: the 16-bit build stores each as a word pair
+-- (`0x3c/0x3e`, `0x46f/0x471`, `0x46b/0x46d`, `0x613/0x615`), PE32 as one
+-- dword.
+local BUILD = ({
   wg16 = {
-    sig = "int(int, int, int, int, ptr)",
-    call = function(chan, item) return M.add_item_to_inventory(chan, 0, 0, -2, item) end,
+    add_item = {
+      sig = "int(int, int, int, int, ptr)",
+      call = function(chan, item) return M.add_item_to_inventory(chan, 0, 0, -2, item) end,
+    },
+    rec = { loaded = 0x1e, exp_raw = 0x3c, exp_mod = 0x46f, exp_bil = 0x46b, coin = 0x613 },
   },
   wg32 = {
-    sig = "int(int, int, int, ptr)",
-    call = function(chan, item) return M.add_item_to_inventory(chan, 0, -2, item) end,
+    add_item = {
+      sig = "int(int, int, int, ptr)",
+      call = function(chan, item) return M.add_item_to_inventory(chan, 0, -2, item) end,
+    },
+    rec = { loaded = 0x1e, exp_raw = 0x3c, exp_mod = 0x474, exp_bil = 0x470, coin = 0x620 },
   },
 })[mmud.abi]
-if not ADD_ITEM then
-  error("wccmmud.lua: the summon recipe is unmeasured for ABI " .. tostring(mmud.abi))
+if not BUILD then
+  error("wccmmud.lua: this module is unmeasured for ABI " .. tostring(mmud.abi))
 end
+local ADD_ITEM, REC = BUILD.add_item, BUILD.rec
 
 -- Six words, three far-pointer arguments (doc, "`_GET_ITEM_FROM_NAME` -- 6
 -- words, 3 far-pointer arguments"): the search-name string, a shop-record
@@ -68,23 +92,6 @@ M.declare {
 -- doc's own recipes ever call it. `_GET_PLAYER` alone resolves an
 -- already-resident channel's record; nothing in this branch's ported
 -- behaviour ever needed to force a load.
-
--- Record offsets, measured against the 16-bit build only
--- (docs/2026-08-20-wccmmud-export-facts.md, "The coin field layout" and
--- "Both offsets are 32-bit, low word first" + the controller's own
--- correction on the three-field experience invariant). The PE32 record has
--- NOT been measured -- the fsdfld precedent (23 vs 36 bytes for the same
--- struct under the two ABIs) says never assume the layout carries over.
--- Every helper below that touches one of these offsets gates on
--- `mmud.abi == "wg16"` first.
-local REC = {
-  loaded  = 0x1e,  -- doc: "_ADDON_ADJUST_USER_WEALTH ... tests pcVar3[0x1e] != '\0'"
-  exp_raw = 0x3c,  -- / 0x3e -- the raw, unreduced total (32-bit, low word first)
-  exp_mod = 0x46f, -- / 0x471 -- the same total MODULO 1,000,000,000
-  exp_bil = 0x46b, -- / 0x46d -- the count of billions
-  coin_lo = 0x613, -- / 0x615 -- the copper accumulator (32-bit, low word first)
-  coin_hi = 0x615,
-}
 
 -- Every value written into these fields is `math.floor`-ed onto a whole
 -- number and range-checked to `0 .. 0xffffffff` before it ever reaches a
@@ -119,7 +126,6 @@ end
 -- loaded flag is clear) report the SAME honest reason: the caller has no
 -- way to act on which one happened, only that no character is loaded.
 function M.player(c)
-  if mmud.abi ~= "wg16" then return nil, "offsets unmeasured for this build" end
 
   local p = M.get_player(c.chan)
   if p == nil then
@@ -154,7 +160,6 @@ end
 -- re-normalisation. `p:w32` writes low-endian bytes -- "low word first" is
 -- exactly what that already does, with no manual word-splitting needed.
 function M.set_experience(c, total)
-  if mmud.abi ~= "wg16" then return nil, "offsets unmeasured for this build" end
 
   local exp, reason = whole_u32(total)
   if not exp then
@@ -192,8 +197,6 @@ end
 -- granting copper and letting it normalise needs no manual denomination
 -- choice), then `save_player` persists it.
 function M.grant_copper(c, n)
-  if mmud.abi ~= "wg16" then return nil, "offsets unmeasured for this build" end
-
   local amount, reason = whole_u32(n)
   if not amount then
     return false, reason
@@ -204,19 +207,10 @@ function M.grant_copper(c, n)
     return false, player_reason
   end
 
-  local low = record:u16(REC.coin_lo)
-  local hi = record:u16(REC.coin_hi)
-  local amount_lo = amount & 0xffff
-  local amount_hi = (amount >> 16) & 0xffff
-
-  local sum = low + amount_lo
-  local new_low = sum & 0xffff
-  local carry = (sum > 0xffff) and 1 or 0
-  local new_hi = (hi + amount_hi + carry) & 0xffff
-
-  record:w16(REC.coin_lo, new_low)
-  record:w16(REC.coin_hi, new_hi)
-
+  -- The accumulator is a 32-bit value on both builds (see `BUILD.rec`), so
+  -- this is plain modular addition -- what the 16-bit code used to spell
+  -- as a low word, a high word and a carry.
+  record:w32(REC.coin, (record:u32(REC.coin) + amount) & 0xffffffff)
   M.cleanup_currency(c.chan)
   M.save_player(c.chan)
   return true
