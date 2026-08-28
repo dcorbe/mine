@@ -81,7 +81,7 @@ use std::path::{Path, PathBuf};
 
 use crate::mem::{Alloc, BlockAbi, Mem};
 
-pub use bundle::Limits;
+pub use crate::bundle::Limits;
 pub use crate::create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use crate::keys::Key;
 pub use crate::ops::{BlockId, Delivery, LockMode, LockTable, Op, OpError, Step};
