@@ -26,6 +26,16 @@
 //! conflation is the design's own accepted cost (see the design doc's
 //! "Cost accepted" note): this module cannot and does not try to tell the
 //! two apart.
+//!
+//! **That conflation is scoped to script files, not lib files.** [`install`]
+//! takes the `__index` handler OFF `globals` for the duration of a lib
+//! file's own top-level `.eval()` (a review caught the hole: without this,
+//! a lib's own accidental bare-global read -- a missing `local`, above all
+//! -- was misdiagnosed as the CALLING SCRIPT's own bind attempt failing,
+//! wrong note and all). A lib's own undefined-global read gets ordinary Lua
+//! `nil` semantics instead, so a missing `local` becomes an ordinary,
+//! correctly-attributed Lua runtime error -- see [`install`]'s own doc
+//! comment on the swap itself.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -40,6 +50,17 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 /// life lasts (one `LuaExtension` = one `Lua` VM = one cache; a restart
 /// rebuilds a fresh `LuaExtension` and so a fresh, empty cache -- see
 /// `LuaExtension::load_with_modules`).
+///
+/// Keyed by bare name only, with no ABI tag -- unlike `bind.rs`'s
+/// `DeclaredEntry::abi_name`/`check_abi`, which guards a declared export
+/// against being rebound under a different `Abi` than it was declared
+/// with. Safe here for a narrower reason, not because the concern doesn't
+/// apply: `namespace::install` runs once, inside `load_with_modules::<A>`,
+/// for a single concrete `A` for this `LuaExtension`'s whole life, so there
+/// is no path for one cache to be consulted under two different ABIs the
+/// way a declared entry's *rebind* (called fresh every invocation) could
+/// be. Worth re-checking if this module ever stops being a strict
+/// single-`A`-per-instance cache.
 pub(crate) type Cache = Rc<RefCell<HashMap<String, Table>>>;
 
 /// Raised by the `__index` handler installed by [`install`] when a bare
@@ -88,53 +109,90 @@ pub(crate) fn install(lua: &Lua, scripts_dir: PathBuf, module_names: Vec<String>
     let globals = lua.globals();
     let metatable = lua.create_table()?;
 
-    let index = lua.create_function(move |lua, (_globals, key): (Table, Value)| -> LuaResult<Value> {
-        // Only a string key can ever be a bare identifier a script wrote --
-        // anything else (a numeric index into `_G`, say) is not this
-        // handler's business; answer plain `nil`, ordinary Lua behaviour
-        // for an absent key, rather than raising over it.
-        let Value::String(key) = &key else {
-            return Ok(Value::Nil);
-        };
-        let key = key.to_string_lossy();
+    let index = {
+        // Cloned into the closure alongside everything else it captures --
+        // `mlua::Table` clones are cheap handle copies, not deep copies, so
+        // this is the SAME globals table and the SAME metatable `install`
+        // installs at the bottom of this function; see the swap below for
+        // why the closure needs to reach both.
+        let globals = globals.clone();
+        let metatable = metatable.clone();
+        lua.create_function(move |lua, (_globals, key): (Table, Value)| -> LuaResult<Value> {
+            // Only a string key can ever be a bare identifier a script wrote --
+            // anything else (a numeric index into `_G`, say) is not this
+            // handler's business; answer plain `nil`, ordinary Lua behaviour
+            // for an absent key, rather than raising over it.
+            let Value::String(key) = &key else {
+                return Ok(Value::Nil);
+            };
+            let key = key.to_string_lossy();
 
-        if let Some(cached) = cache.borrow().get(&key) {
-            return Ok(Value::Table(cached.clone()));
-        }
+            if let Some(cached) = cache.borrow().get(&key) {
+                return Ok(Value::Table(cached.clone()));
+            }
 
-        if !module_names.contains(&key) {
-            return Err(mlua::Error::external(NamespaceSkip {
-                wanted: key.clone(),
-                reason: "has no Lua surface on this machine (module not loaded)".to_owned(),
-            }));
-        }
+            if !module_names.contains(&key) {
+                return Err(mlua::Error::external(NamespaceSkip {
+                    wanted: key.clone(),
+                    reason: "has no Lua surface on this machine (module not loaded)".to_owned(),
+                }));
+            }
 
-        let lib_path = scripts_dir.join("lib").join(format!("{key}.lua"));
-        if !lib_path.exists() {
-            return Err(mlua::Error::external(NamespaceSkip {
-                wanted: key.clone(),
-                reason: format!("has no declarations lib ({} does not exist)", lib_path.display()),
-            }));
-        }
+            let lib_path = scripts_dir.join("lib").join(format!("{key}.lua"));
+            if !lib_path.exists() {
+                return Err(mlua::Error::external(NamespaceSkip {
+                    wanted: key.clone(),
+                    reason: format!("has no declarations lib ({} does not exist)", lib_path.display()),
+                }));
+            }
 
-        // A lib file that exists but cannot even be READ (permissions, a
-        // race with something deleting it) is a real host problem, not a
-        // missing-plumbing soft skip -- reported plainly, not wrapped as a
-        // `NamespaceSkip`, so `exec_scripts` treats it as the hard error
-        // it is.
-        let source = std::fs::read_to_string(&lib_path).map_err(mlua::Error::external)?;
+            // A lib file that exists but cannot even be READ (permissions, a
+            // race with something deleting it) is a real host problem, not a
+            // missing-plumbing soft skip -- reported plainly, not wrapped as a
+            // `NamespaceSkip`, so `exec_scripts` treats it as the hard error
+            // it is.
+            let source = std::fs::read_to_string(&lib_path).map_err(mlua::Error::external)?;
 
-        // Deliberately NOT wrapped: whatever `.eval()` returns propagates
-        // exactly as raised. A lib's own hard error (an unknown `declare`d
-        // export, a bad signature) must reach `exec_scripts` unchanged, so
-        // it is recognised as "not a `NamespaceSkip`" and stays hard -- see
-        // this module's own doc comment and `commands.rs`'s own
-        // `a_lib_files_own_hard_error_is_not_swallowed_by_the_skip_catch`.
-        let table: Table = lua.load(&source).set_name(format!("lib/{key}.lua")).eval()?;
+            // Run the lib file with THIS handler taken OFF `globals`,
+            // restored unconditionally (success or error) before this
+            // function returns. Without this, the lib's own top-level code
+            // runs under the exact same `__index` a script does, and a
+            // lib's accidental bare-global read -- a missing `local`, or
+            // the `X = (X or 0) + 1` first-use idiom, the single most
+            // common Lua footgun -- raises `NamespaceSkip{wanted: "REC"}`
+            // (say) from INSIDE this call, indistinguishable from the
+            // OUTER script's own attempted bind failing. `exec_scripts`
+            // would then catch it as if the calling script had failed to
+            // bind `key`, discard that script's registrations, and log a
+            // note naming the wrong symbol entirely -- broken lib plumbing
+            // silently misreported as "this script's namespace is
+            // unavailable." With the metatable off, a lib's own undefined
+            // global read gets ordinary Lua `nil` semantics instead: a
+            // missing `local` becomes an ordinary "attempt to index/call a
+            // nil value" error, raised by the Lua VM itself (not this
+            // module), correctly attributed to the lib file's own
+            // `set_name` and caught by the existing hard-error path (this
+            // is NOT a `NamespaceSkip`, so `exec_scripts`'s
+            // `chain().find_map` never matches it).
+            //
+            // Reentrancy: a lib that itself reads ANOTHER bare namespace
+            // name is not a supported pattern (the design doc's own
+            // multi-module story is one SCRIPT binding two namespaces, not
+            // one lib depending on another) -- with the handler off, such a
+            // read is indistinguishable from any other undefined global:
+            // plain `nil`, and whatever the lib does with that `nil` next
+            // (index it, call it) is a clean, attributable Lua error, the
+            // same as the missing-`local` case above. Not corrupted, not
+            // silently wrong -- just not resolved.
+            globals.set_metatable(None);
+            let result: LuaResult<Table> = lua.load(&source).set_name(format!("lib/{key}.lua")).eval();
+            globals.set_metatable(Some(metatable.clone()));
+            let table = result?;
 
-        cache.borrow_mut().insert(key.clone(), table.clone());
-        Ok(Value::Table(table))
-    })?;
+            cache.borrow_mut().insert(key.clone(), table.clone());
+            Ok(Value::Table(table))
+        })?
+    };
 
     metatable.set("__index", index)?;
     globals.set_metatable(Some(metatable));

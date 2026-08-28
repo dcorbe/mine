@@ -1323,6 +1323,49 @@ fn a_lib_files_own_hard_error_is_not_swallowed_by_the_skip_catch() {
     assert!(err.to_string().contains("ghost"), "got: {err}");
 }
 
+/// The review-round fix: a lib file's OWN accidental bare-global read (a
+/// missing `local`, the single most common Lua footgun) must be a hard
+/// load error attributed to the LIB file -- never caught by the per-script
+/// skip machinery as if the CALLING script had failed to bind `testmod`.
+///
+/// Before the fix, `REC.loaded` (with `REC` never assigned, a stand-in for
+/// `scripts/lib/wccmmud.lua`'s own real `REC` table written without its
+/// `local`) read through the SAME `__index` a script's own bare namespace
+/// bind uses: `module_names` does not contain `"REC"`, so it raised
+/// `NamespaceSkip{wanted: "REC"}` from INSIDE the recursive lib eval,
+/// indistinguishable from `cmd.lua` itself failing to bind some namespace
+/// called `REC` -- wrong note, wrong symbol, and `cmd.lua`'s own real
+/// registrations silently discarded instead of the load failing loudly.
+#[test]
+fn a_libs_own_undefined_global_read_is_a_hard_error_not_a_misattributed_skip() {
+    let dir = tempdir_with(
+        "a_libs_own_undefined_global_read_is_a_hard_error_not_a_misattributed_skip",
+        &[
+            (
+                "lib/testmod.lua",
+                r#"local x = REC.loaded
+                local M = mmud.bind("testmod")
+                M.declare { ping = "int()" }
+                return M"#,
+            ),
+            ("cmd.lua", "local mod = testmod\n"),
+        ],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+
+    let err = LuaExtension::load_with_modules::<Wg16>(&dir, &[("testmod", &module)])
+        .expect_err("a lib's own undefined-global read must be a hard load error, not a silent skip");
+
+    let msg = err.to_string();
+    assert!(msg.contains("testmod.lua"), "must attribute the failure to the lib file, got: {msg}");
+    assert!(!msg.contains("script skipped"), "must not be treated as a soft skip, got: {msg}");
+    assert!(
+        !msg.to_lowercase().contains("binds rec"),
+        "must not misattribute the failure as some script's own attempted bind of a namespace called REC, got: {msg}"
+    );
+}
+
 /// Two scripts binding the same module get back the SAME namespace table --
 /// the lib file's own top-level code runs exactly once per machine, not
 /// once per script that binds it. Observed the way `bind.rs`'s own
@@ -1330,15 +1373,17 @@ fn a_lib_files_own_hard_error_is_not_swallowed_by_the_skip_catch() {
 /// lib bumps, read back through a THIRD command.
 ///
 /// `__lib_runs` is pre-set to `0` by a script that runs FIRST (lexical
-/// order), rather than the more natural `_G.x = (_G.x or 0) + 1`: reading
-/// an as-yet-undefined `_G.x` would itself be an undefined-global read,
-/// which this crate's own `__index` handler cannot tell apart from an
-/// attempted namespace bind (see `namespace.rs`'s own doc comment, "Cost
-/// accepted") -- it would raise its own `NamespaceSkip` for `x`, not
-/// silently answer `nil` the way an ordinary Lua global miss does. Real
-/// binding libs never hit this: `scripts/lib/<name>.lua` only ever
-/// declares locals and fields on its own returned table, never bare,
-/// unset globals.
+/// order), rather than the more natural `_G.x = (_G.x or 0) + 1`, mostly
+/// to keep this test's own intent (once-per-machine caching) uncoupled
+/// from a second property: `namespace::install` now takes its `__index`
+/// handler OFF `globals` for the duration of a LIB file's own top-level
+/// eval (see `namespace.rs`'s own doc comment on the fix, and
+/// `a_libs_own_undefined_global_read_is_a_hard_error_not_a_misattributed_skip`
+/// below), so `_G.x = (_G.x or 0) + 1` inside a lib is actually fine today
+/// -- but this test's own `_G.__lib_runs` write happens from a SCRIPT
+/// (`00-init.lua`), not the lib, where the conflation this crate's own
+/// `__index` handler cannot resolve (see `namespace.rs`'s own doc comment,
+/// "Cost accepted") still applies.
 #[test]
 fn two_scripts_binding_the_same_module_share_one_cached_namespace() {
     let code = [0xb8, 0x2a, 0x00, 0xcb]; // mov ax, 42 ; retf
