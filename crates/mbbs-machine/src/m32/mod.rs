@@ -54,6 +54,7 @@ compile_error!("m32 enters 32-bit code via __USER32_CS: x86_64 only");
 
 mod asm;
 pub mod dpmi;
+mod exports;
 mod fault;
 pub mod flatptr;
 mod image;
@@ -67,6 +68,7 @@ use std::io;
 use std::time::Duration;
 
 use asm::{USER32_CS, current_cs, trampoline};
+pub use exports::Exports;
 pub use flatptr::{Flat32Ptr, Flat32PtrError};
 pub use image::{AbsoluteImport, Image, Import32, ImportResolver};
 pub use map::Mapping;
@@ -357,18 +359,36 @@ impl Ret {
 /// whether a module has been loaded yet -- see
 /// `crates/mbbs/src/abi/wg32.rs`'s own module doc comment ("Collision 2").
 /// This only needs to carry what `crate::abi::Abi::import`/
-/// `crate::abi::Abi::caller` read: the bound import table, in thunk-index
-/// order, and the entry point's linear address.
+/// `crate::abi::Abi::caller`/`crate::abi::Abi::export_address` read: the
+/// bound import table, in thunk-index order, the entry point's linear
+/// address, and the module's own [`Exports`], rebased. The table is
+/// `Arc`-shared so the clones `Host` keeps (its cross-module registry, the
+/// extension builder's per-life list) do not each copy a thousand names.
 #[derive(Debug, Clone)]
 pub struct Module {
     entry: u32,
     init: Option<u32>,
     imports: Vec<crate::module::ImportSite>,
+    exports: std::sync::Arc<Exports>,
 }
 
 impl Module {
-    pub fn new(entry: u32, init: Option<u32>, imports: Vec<crate::module::ImportSite>) -> Self {
-        Self { entry, init, imports }
+    pub fn new(entry: u32, init: Option<u32>, imports: Vec<crate::module::ImportSite>, exports: Exports) -> Self {
+        Self { entry, init, imports, exports: std::sync::Arc::new(exports) }
+    }
+
+    /// The linear address of the module's own named export -- see
+    /// [`Exports::by_name`].
+    #[must_use]
+    pub fn export_by_name(&self, name: &str) -> Option<u32> {
+        self.exports.by_name(name)
+    }
+
+    /// The linear address of the module's own export at a public ordinal
+    /// -- see [`Exports::by_ordinal`].
+    #[must_use]
+    pub fn export_by_ordinal(&self, ordinal: u16) -> Option<u32> {
+        self.exports.by_ordinal(ordinal)
     }
 
     /// The linear address `DllMain`/the module's own entry point sits at --

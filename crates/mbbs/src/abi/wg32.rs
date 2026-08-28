@@ -499,13 +499,17 @@ impl Abi for Wg32 {
         // sits at ordinal 352).
         let init = pe.init_rva().map(|rva| image.base().wrapping_add(rva));
 
+        // The whole export table, rebased the same way -- what
+        // [`Abi::export_address`] answers from once the `PeImage` is gone.
+        let exports = mbbs_machine::m32::Exports::rebased(&pe, image.base());
+
         // Every step above succeeded -- commit. `replace_image` swaps in
         // `image` without touching `cpu.mem`'s arena -- see this method's
         // own doc comment ("Only the image is replaced -- the arena is
         // not.").
         cpu.mem.replace_image(image);
 
-        Ok(mbbs_machine::m32::Module::new(entry, init, thunks))
+        Ok(mbbs_machine::m32::Module::new(entry, init, thunks, exports))
     }
 
     /// Direct delegation -- `mbbs_machine::m32::Module::import` (this task).

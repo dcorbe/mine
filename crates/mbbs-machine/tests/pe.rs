@@ -4,7 +4,7 @@
 //! file exercises exactly one path through each branch, and the error paths need
 //! an input built to reach them.
 
-use mbbs_machine::m32::{Export, ExportAddress, Import, PeError, PeImage, Relocation, Symbol};
+use mbbs_machine::m32::{Export, ExportAddress, Exports, Import, Module, PeError, PeImage, Relocation, Symbol};
 
 /// The smallest thing that parses: an MZ stub, a PE signature, a COFF header
 /// saying i386, a PE32 optional header, and no sections.
@@ -1448,4 +1448,101 @@ fn no_exports_is_not_an_error() {
     let image = PeImage::parse(&with_one_section()).unwrap();
     assert_eq!(image.exports, Vec::new());
     assert_eq!(image.export_base, None);
+}
+
+/// The export table `Exports::rebased` is built from, with every symmetry a
+/// lookup could silently lean on broken: `Base = 5`, a non-identity
+/// `AddressOfNameOrdinals` (`Alpha -> 3`, `Beta -> 0`, `Gamma -> 2`), a
+/// nameless function slot at index 1, and `Alpha` a forwarder (its
+/// "address" points into the directory's own range). Same shape as
+/// `exports_resolve_through_the_name_ordinal_indirection_not_position_or_base`
+/// above, plus the forwarder.
+fn rebase_fixture() -> PeImage {
+    let mut v = with_one_export_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    let to_rva = |file_off: usize| 0x1000u32 + (file_off - raw) as u32;
+
+    let dir = raw;
+    let functions = dir + 40;
+    let names = functions + 4 * 4;
+    let ordinals = names + 3 * 4;
+    let name_alpha = ordinals + 3 * 2;
+    let name_beta = name_alpha + 6; // "Alpha\0"
+    let name_gamma = name_beta + 5; // "Beta\0"
+    let forward_str = name_gamma + 6; // "Gamma\0"
+
+    put_u32(&mut v, dir + 16, 5); // Base
+    put_u32(&mut v, dir + 20, 4); // NumberOfFunctions
+    put_u32(&mut v, dir + 24, 3); // NumberOfNames
+    put_u32(&mut v, dir + 28, to_rva(functions));
+    put_u32(&mut v, dir + 32, to_rva(names));
+    put_u32(&mut v, dir + 36, to_rva(ordinals));
+
+    put_u32(&mut v, functions, 0x2000);
+    put_u32(&mut v, functions + 4, 0x2010); // nameless
+    put_u32(&mut v, functions + 8, 0x2020);
+    put_u32(&mut v, functions + 12, to_rva(forward_str)); // forwarder
+
+    put_u32(&mut v, names, to_rva(name_alpha));
+    put_u32(&mut v, names + 4, to_rva(name_beta));
+    put_u32(&mut v, names + 8, to_rva(name_gamma));
+
+    put_u16(&mut v, ordinals, 3); // Alpha -> functions[3], the forwarder
+    put_u16(&mut v, ordinals + 2, 0); // Beta  -> functions[0] == 0x2000
+    put_u16(&mut v, ordinals + 4, 2); // Gamma -> functions[2] == 0x2020
+
+    put_bytes(&mut v, name_alpha, b"Alpha\0");
+    put_bytes(&mut v, name_beta, b"Beta\0");
+    put_bytes(&mut v, name_gamma, b"Gamma\0");
+    put_bytes(&mut v, forward_str, b"OTHER.Fn\0");
+
+    // 0x100 covers the strings above (so `forward_str` is inside the
+    // directory and reads as a forwarder) and nothing at 0x2000+.
+    set_export_directory(&mut v, to_rva(dir), 0x100);
+
+    PeImage::parse(&v).unwrap()
+}
+
+/// A loaded module's export table answers **linear addresses** -- the RVA
+/// plus wherever `Image::load` actually landed -- exactly as
+/// `Module::init`/`Module::entry` already do. A non-zero base is the
+/// point: an un-rebased answer (the RVA itself) is off by `0x7000_0000`
+/// here and fails every assertion below.
+#[test]
+fn rebased_exports_answer_a_name_with_the_images_linear_address_not_an_rva() {
+    let base = 0x7000_0000;
+    let exports = Exports::rebased(&rebase_fixture(), base);
+
+    assert_eq!(exports.by_name("Beta"), Some(base + 0x2000));
+    assert_eq!(exports.by_name("Gamma"), Some(base + 0x2020));
+    assert_eq!(exports.by_name("Alpha"), None, "a forwarder has no address to rebase");
+    assert_eq!(exports.by_name("beta"), None, "exact-case, like PeImage::export_rva");
+    assert_eq!(exports.by_name("Missing"), None);
+
+    // `Module` exposes the same table unchanged -- what `Abi::export_address`
+    // reads from.
+    let module = Module::new(base + 0x1000, None, Vec::new(), exports);
+    assert_eq!(module.export_by_name("Beta"), Some(base + 0x2000));
+    assert_eq!(module.export_by_name("Alpha"), None);
+}
+
+/// By *public* ordinal (`Base` + function index), reaching the nameless
+/// slot no name lookup can -- mirroring `PeImage::export_rva_by_ordinal`,
+/// forwarder and range refusals included.
+#[test]
+fn rebased_exports_answer_a_public_ordinal_including_the_nameless_slot() {
+    let base = 0x7000_0000;
+    let exports = Exports::rebased(&rebase_fixture(), base);
+
+    assert_eq!(exports.by_ordinal(5), Some(base + 0x2000), "Base(5) + index 0");
+    assert_eq!(exports.by_ordinal(6), Some(base + 0x2010), "the nameless slot");
+    assert_eq!(exports.by_ordinal(7), Some(base + 0x2020));
+    assert_eq!(exports.by_ordinal(8), None, "index 3 is the forwarder");
+    assert_eq!(exports.by_ordinal(4), None, "below Base -- refused, not wrapped");
+    assert_eq!(exports.by_ordinal(9), None, "past NumberOfFunctions(4)");
+
+    let module = Module::new(base + 0x1000, None, Vec::new(), exports);
+    assert_eq!(module.export_by_ordinal(6), Some(base + 0x2010));
+    assert_eq!(module.export_by_ordinal(8), None);
 }
