@@ -762,10 +762,10 @@ pub trait Abi {
     /// [`mbbs_machine::m16::Module::name`], the NE resident name table's own
     /// first entry -- see that method's own doc comment for where the string
     /// comes from. `Wg32` has no override yet: `mbbs_machine::m32::Module`
-    /// does not carry its own declared name today (nothing before this
-    /// method existed ever needed one), so a `Wg32` module can be loaded but
-    /// not yet *depended on* by a later one -- see `Abi::export_address`'s
-    /// own doc comment for the matching half of this gap.
+    /// does not carry its own declared name today (only one `Wg32` module
+    /// can be loaded at all, so nothing has needed one), so a `Wg32` module
+    /// can be loaded but not yet *depended on* by a later one. The read
+    /// half, [`Abi::export_address`], `Wg32` does answer.
     fn module_name(module: &Self::Module) -> Option<&str>
     where
         Self: Sized,
@@ -776,9 +776,9 @@ pub trait Abi {
 
     /// Where `symbol` lives in `module`'s own export table, in this ABI's
     /// pointer type -- the read half of the cross-module registry
-    /// [`Abi::module_name`] is the write half of. `None` for a symbol
-    /// `module` does not export, or for an `Abi` that cannot yet answer this
-    /// at all (see [`Abi::module_name`]'s own doc comment on `Wg32`'s gap).
+    /// [`Abi::module_name`] is the write half of, and what `mbbs-lua`'s
+    /// declare-time probe resolves a lib's names against. `None` for a
+    /// symbol `module` does not export.
     ///
     /// Only ever consulted for a symbol the host's own tables (`shims::entry`
     /// and friends) had no answer for -- see `Resolver::resolve`'s own doc
@@ -789,8 +789,10 @@ pub trait Abi {
     /// (`abi/wg16.rs`) delegates to [`mbbs_machine::m16::Module::entry`] for
     /// an ordinal symbol and [`mbbs_machine::m16::Module::entry_by_name`]
     /// for a named one -- both of which this crate's loader already builds
-    /// for every module it maps; nothing new is parsed or retained to answer
-    /// this, only exposed.
+    /// for every module it maps. `Wg32`'s (`abi/wg32.rs`) reads the
+    /// [`mbbs_machine::m32::Exports`] table `Wg32::load` rebases from the
+    /// PE export directory -- the one thing a loaded `m32::Module` retains
+    /// beyond what the import path needs, kept precisely for this.
     fn export_address(module: &Self::Module, symbol: &mbbs_machine::module::Symbol) -> Option<Self::Ptr>
     where
         Self: Sized,

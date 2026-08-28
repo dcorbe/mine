@@ -561,6 +561,26 @@ impl Abi for Wg32 {
     fn init_entry(module: &Self::Module) -> Option<Self::Ptr> {
         module.init().map(mbbs_machine::m32::Flat32Ptr)
     }
+
+    /// The module's own export table, rebased at load
+    /// ([`mbbs_machine::m32::Exports`], built in [`Wg32::load`]): a named
+    /// symbol exact-case, an ordinal one `Base`-relative -- the two
+    /// lookups `PeImage::export_rva`/`export_rva_by_ordinal` make against
+    /// the file, answered from the mapped image instead. `None` for a
+    /// forwarder as well as for an absent symbol, since a forwarder has no
+    /// code of this module's to point at.
+    ///
+    /// Before this override `Wg32` inherited the trait's default `None`,
+    /// which left `mbbs-lua`'s declare-time probe unable to resolve a
+    /// single name on a PE32 board -- see `crates/mbbs/tests/wg32_abi.rs`'s
+    /// `exports` module for the measured failure.
+    fn export_address(module: &Self::Module, symbol: &mbbs_machine::module::Symbol) -> Option<Self::Ptr> {
+        match symbol {
+            mbbs_machine::module::Symbol::Ordinal(n) => module.export_by_ordinal(*n),
+            mbbs_machine::module::Symbol::Name(name) => module.export_by_name(name),
+        }
+        .map(mbbs_machine::m32::Flat32Ptr)
+    }
 }
 
 /// [`mbbs_machine::m32::Ret`] has no `Far` counterpart -- this ABI is flat, so

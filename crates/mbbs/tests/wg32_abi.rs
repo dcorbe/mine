@@ -874,3 +874,155 @@ mod boot_bug {
         );
     }
 }
+
+/// `<Wg32 as Abi>::export_address`, through `Wg32::load` -- the same loader
+/// `mbbs-server` uses -- rather than a hand-built `Module`.
+///
+/// Until this existed `Wg32` inherited the trait's default `None`, so
+/// `mbbs-lua`'s declare-time probe could not resolve a single name on the
+/// PE32 board: `M.declare{...}` failed at boot on whichever name Lua's
+/// `pairs` visited first (`get_item_from_name`, in the live report) even
+/// though `objdump -p` showed `_get_item_from_name` at ordinal 59.
+mod exports {
+    use super::*;
+
+    fn put_u32(v: &mut [u8], at: usize, val: u32) {
+        v[at..at + 4].copy_from_slice(&val.to_le_bytes());
+    }
+
+    fn put_u16(v: &mut [u8], at: usize, val: u16) {
+        v[at..at + 2].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// `minimal_with_one_section` grown to 0x400 bytes, with an export
+    /// directory at the section's start: `exports[i]` is exported by name at
+    /// RVA `exports[i].1`, public ordinal `i + 1` (`Base = 1`). Data
+    /// directory 0 covers exactly the directory and its strings, so a
+    /// function RVA anywhere else in the section is code, not a forwarder.
+    fn exporting(exports: &[(&str, u32)]) -> Vec<u8> {
+        let mut v = minimal_with_one_section();
+        let sec = 0x98 + 0xe0;
+        let raw = sec + 40;
+        put_u32(&mut v, sec + 8, 0x400); // VirtualSize
+        put_u32(&mut v, sec + 16, 0x400); // SizeOfRawData
+        v.resize(raw + 0x400, 0);
+        let to_rva = |off: usize| 0x1000u32 + (off - raw) as u32;
+
+        let n = exports.len();
+        let dir = raw;
+        let functions = dir + 40;
+        let names = functions + 4 * n;
+        let ordinals = names + 4 * n;
+        let mut strings = ordinals + 2 * n;
+
+        put_u32(&mut v, dir + 16, 1); // Base
+        put_u32(&mut v, dir + 20, n as u32); // NumberOfFunctions
+        put_u32(&mut v, dir + 24, n as u32); // NumberOfNames
+        put_u32(&mut v, dir + 28, to_rva(functions));
+        put_u32(&mut v, dir + 32, to_rva(names));
+        put_u32(&mut v, dir + 36, to_rva(ordinals));
+        for (i, (name, rva)) in exports.iter().enumerate() {
+            put_u32(&mut v, functions + 4 * i, *rva);
+            put_u32(&mut v, names + 4 * i, to_rva(strings));
+            put_u16(&mut v, ordinals + 2 * i, i as u16);
+            v[strings..strings + name.len()].copy_from_slice(name.as_bytes());
+            strings += name.len() + 1;
+        }
+
+        let data_dir = 0x98 + 96; // optional header + 96: data directory 0 (export)
+        put_u32(&mut v, data_dir, to_rva(dir));
+        put_u32(&mut v, data_dir + 4, (strings - dir) as u32);
+        v
+    }
+
+    /// Answers `None` for every import, exactly like `boot_bug::no_host`
+    /// (duplicated: integration-test modules do not share private items).
+    fn no_host(
+        _library: &str,
+        _symbol: &mbbs_machine::module::Symbol,
+    ) -> Option<mbbs_machine::module::Import<mbbs_machine::m32::Flat32Ptr>> {
+        None
+    }
+
+    fn name(s: &str) -> mbbs_machine::module::Symbol {
+        mbbs_machine::module::Symbol::Name(s.to_owned())
+    }
+
+    /// A named export resolves to the image's **linear** address for its
+    /// RVA -- exact-case, which is what `mbbs-lua`'s four-spelling probe
+    /// relies on to tell `_get_player` (PE32) from `_GET_PLAYER` (NE).
+    #[test]
+    fn export_address_answers_a_named_export_at_its_linear_address() {
+        let file = exporting(&[("_alpha", 0x1300), ("_beta", 0x1310)]);
+        let mut cpu = cpu();
+        let module = Wg32::load(&mut cpu, &file, &no_host).expect("a PE with no imports loads");
+        let base = cpu.mem.image().base();
+
+        assert_eq!(
+            <Wg32 as Abi>::export_address(&module, &name("_alpha")),
+            Some(mbbs_machine::m32::Flat32Ptr(base + 0x1300))
+        );
+        assert_eq!(
+            <Wg32 as Abi>::export_address(&module, &name("_beta")),
+            Some(mbbs_machine::m32::Flat32Ptr(base + 0x1310))
+        );
+        assert_eq!(<Wg32 as Abi>::export_address(&module, &name("_ALPHA")), None, "exact-case");
+        assert_eq!(<Wg32 as Abi>::export_address(&module, &name("alpha")), None);
+    }
+
+    /// An ordinal symbol resolves through the same table, `Base`-relative.
+    #[test]
+    fn export_address_answers_a_public_ordinal() {
+        let file = exporting(&[("_alpha", 0x1300), ("_beta", 0x1310)]);
+        let mut cpu = cpu();
+        let module = Wg32::load(&mut cpu, &file, &no_host).expect("a PE with no imports loads");
+        let base = cpu.mem.image().base();
+        let ordinal = mbbs_machine::module::Symbol::Ordinal;
+
+        assert_eq!(
+            <Wg32 as Abi>::export_address(&module, &ordinal(2)),
+            Some(mbbs_machine::m32::Flat32Ptr(base + 0x1310))
+        );
+        assert_eq!(<Wg32 as Abi>::export_address(&module, &ordinal(0)), None, "below Base(1)");
+        assert_eq!(<Wg32 as Abi>::export_address(&module, &ordinal(3)), None, "past the table");
+    }
+
+    /// The board's own module. `~/peepeebbs/wccmmud.dll` is byte-identical
+    /// (md5 `4c73ad7b…`) to this archive copy; every RVA below was measured
+    /// from it with `objdump -p` before this test was written:
+    /// `_init__wccmmud` ordinal 1 at `0x1aaa`, `_get_item_from_name`
+    /// ordinal 59 at `0x1ad5c`, `_get_player` ordinal 201 at `0x320d9`.
+    /// Skips when the archive copy is not in this tree.
+    #[test]
+    fn the_pe32_majormud_module_resolves_the_names_the_declared_lib_probes_for() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../archive/modules/github-sysopnetwork-majormud/v1.11p/wccmmud.dll");
+        let Ok(file) = std::fs::read(&path) else {
+            eprintln!("skipping: {} is not in this tree", path.display());
+            return;
+        };
+        let mut cpu = cpu();
+        let module = Wg32::load(&mut cpu, &file, &no_host)
+            .expect("MajorMUD NT's imports all bind -- unresolved ones just get a thunk");
+        let base = cpu.mem.image().base();
+        let at = |rva: u32| Some(mbbs_machine::m32::Flat32Ptr(base + rva));
+
+        assert_eq!(<Wg32 as Abi>::export_address(&module, &name("_get_item_from_name")), at(0x1ad5c));
+        assert_eq!(<Wg32 as Abi>::export_address(&module, &name("_get_player")), at(0x320d9));
+        assert_eq!(
+            <Wg32 as Abi>::export_address(&module, &name("_GET_ITEM_FROM_NAME")),
+            None,
+            "the NE spelling is not this module's; the probe must fall through to the lower-case one"
+        );
+        assert_eq!(
+            <Wg32 as Abi>::export_address(&module, &mbbs_machine::module::Symbol::Ordinal(1)),
+            at(0x1aaa),
+            "ordinal 1 is _init__wccmmud"
+        );
+        assert_eq!(
+            <Wg32 as Abi>::init_entry(&module),
+            at(0x1aaa),
+            "and it is the same address init_entry already answers"
+        );
+    }
+}
