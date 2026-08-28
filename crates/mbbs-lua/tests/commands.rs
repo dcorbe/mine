@@ -448,3 +448,235 @@ fn two_scripts_registering_the_same_command_name_fails_the_load() {
     assert!(err.to_string().contains("dup"), "got: {err}");
     assert!(err.to_string().contains("20-second.lua"), "got: {err}");
 }
+
+/// `c:buffer(n)` and the pointer-handle primitives it hands back (`p:add`,
+/// `p:u8/u16/u32`, `p:w8/w16/w32`) -- Task 1 of the declared-bindings plan.
+/// `c:buffer` is the only handle source these tests need: it is a clean,
+/// Rust-minted `A::Ptr` with no MajorMUD knowledge attached, exactly what
+/// Task 2's `bind`-declared exports will also hand back as a `ptr`-typed
+/// return.
+///
+/// Writes `w8=0xAB` at offset 0, `w16=0xBEEF` at offset 2, and
+/// `w32=0xDEADBEEF` at offset 4 -- three different widths at three
+/// non-overlapping, asymmetric offsets, with no two values equal to each
+/// other or to any offset -- then reads all three back through the *same*
+/// handle at the *same* offsets. A read/write pair that silently shared one
+/// scratch cell, or that transposed offset and value somewhere, would show
+/// up here as a wrong number, not just an error.
+#[test]
+fn buffer_round_trips_asymmetric_writes_and_reads_at_asymmetric_offsets() {
+    let dir = tempdir_with(
+        "buffer_round_trips_asymmetric_writes_and_reads_at_asymmetric_offsets",
+        &[(
+            "roundtrip.lua",
+            r#"mmud.command("roundtrip", function(c)
+                local p = c:buffer(8)
+                p:w8(0, 0xAB)
+                p:w16(2, 0xBEEF)
+                p:w32(4, 0xDEADBEEF)
+                c:print(tostring(p:u8(0)) .. "," .. tostring(p:u16(2)) .. "," .. tostring(p:u32(4)) .. "\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut ext = LuaExtension::load(&dir).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "roundtrip", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), format!("{},{},{}\r\n", 0xABu8, 0xBEEFu16, 0xDEADBEEFu32));
+    assert!(fixture.host.notes().is_empty(), "a clean round trip must never disable the handler, got: {:?}", fixture.host.notes());
+}
+
+/// Proves two things at once, both required by the task brief:
+///
+/// 1. Two `c:buffer` calls in one invocation hand back the same underlying
+///    region (`Host::command_scratch` is allocated once and reused -- see
+///    `CommandCtx::write_scratch`'s own doc comment). Handles are
+///    deliberately opaque (no raw address ever reaches Lua, by design -- see
+///    `crates/mbbs-lua/src/ptr.rs`'s own module doc comment), so this cannot
+///    be shown by comparing addresses the way
+///    `write_scratch_reuses_the_same_buffer_across_calls`
+///    (`crates/mbbs/tests/extension_seam.rs`) compares `FarPtr`s directly.
+///    Instead: write through `p1` at an offset *past* `p1`'s own declared
+///    size (`c:buffer` only promises to zero its first `n` bytes, not to cap
+///    what a handle can reach -- bounds are enforced by `read_at`/`write_at`
+///    against the real region, not by `n`), then read that same offset back
+///    through `p2`, a handle from a *second*, later `c:buffer` call. If the
+///    two calls got different regions, `p2` would see a freshly zeroed byte,
+///    not what `p1` wrote.
+/// 2. The value observed this way did not come from some per-handle Lua-side
+///    cache: `p1` and `p2` are two independent Lua tables with no shared
+///    Lua-visible state (see this module's own "no field a script could
+///    forge" design). The only way `p2` can see what `p1` wrote is if both
+///    writes and reads went through real host memory.
+#[test]
+fn buffer_calls_in_one_invocation_reuse_the_same_underlying_region() {
+    let dir = tempdir_with(
+        "buffer_calls_in_one_invocation_reuse_the_same_underlying_region",
+        &[(
+            "reuse.lua",
+            r#"mmud.command("reuse", function(c)
+                local p1 = c:buffer(2)
+                p1:w8(50, 0x42)
+                local p2 = c:buffer(2)
+                c:print(tostring(p2:u8(50)) .. "\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut ext = LuaExtension::load(&dir).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "reuse", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "66\r\n", "a second c:buffer call must reuse the first call's region");
+    assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
+}
+
+/// `c:buffer`'s own refusal, named per this crate's own doc comment: over
+/// the scratch buffer's fixed capacity is an error naming both sizes, not a
+/// truncation and not a fresh unbounded allocation.
+#[test]
+fn buffer_refuses_a_size_over_the_scratch_capacity_and_names_both_sizes() {
+    let dir = tempdir_with(
+        "buffer_refuses_a_size_over_the_scratch_capacity_and_names_both_sizes",
+        &[("big.lua", r#"mmud.command("big", function(c) c:buffer(4096) return mmud.HANDLED end)"#)],
+    );
+    let mut ext = LuaExtension::load(&dir).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "big", &module);
+
+    assert_eq!(verdict, Verdict::Pass, "a broken handler must never swallow the line");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("4096"), "must name the requested size, got: {notes:?}");
+    assert!(notes[0].contains("128"), "must name the scratch buffer's own capacity, got: {notes:?}");
+}
+
+/// An out-of-range write is refused, not truncated -- `w16` given a value
+/// past `0xffff` is exactly the brief's own example.
+#[test]
+fn w16_refuses_a_value_that_does_not_fit_16_bits() {
+    let dir = tempdir_with(
+        "w16_refuses_a_value_that_does_not_fit_16_bits",
+        &[(
+            "toobig.lua",
+            r#"mmud.command("toobig", function(c)
+                local p = c:buffer(4)
+                p:w16(0, 0x10000)
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut ext = LuaExtension::load(&dir).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "toobig", &module);
+
+    assert_eq!(verdict, Verdict::Pass, "a broken handler must never swallow the line");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("65536"), "got: {notes:?}");
+    assert!(notes[0].contains("16-bit"), "got: {notes:?}");
+}
+
+/// A pointer handle is a table, but nothing about it is a plain integer a
+/// script could fabricate -- see `crates/mbbs-lua/src/ptr.rs`'s own module
+/// doc comment. Two angles on "cannot forge":
+///
+/// - A bare Lua number has no `add` method at all -- indexing it errors,
+///   the same as indexing any other non-table value.
+/// - A script that *does* get its hands on a real handle's `add` function
+///   (`p.add`, bypassing `:` sugar) and calls it with a table of its own
+///   choosing as `self` learns nothing: `add`'s closure ignores `self`
+///   entirely and answers only for the `A::Ptr` it closed over when `p`
+///   itself was minted. This is asserted by proving the forged call reaches
+///   the *same* byte a legitimate `p:add(...)` call would.
+#[test]
+fn a_handle_cannot_be_forged_from_a_number_or_from_a_fabricated_self() {
+    let dir = tempdir_with(
+        "a_handle_cannot_be_forged_from_a_number_or_from_a_fabricated_self",
+        &[(
+            "forge.lua",
+            r#"mmud.command("forge", function(c)
+                local number_ok = pcall(function() return (5):add(1) end)
+
+                local p = c:buffer(16)
+                p:w8(5, 9)
+                local via_dot_call = p:add(5):u8(0)
+                local fake_self = { add = function() end, u8 = function() end }
+                local via_forged_self = p.add(fake_self, 5):u8(0)
+
+                c:print(tostring(number_ok) .. "," .. tostring(via_dot_call) .. "," .. tostring(via_forged_self) .. "\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut ext = LuaExtension::load(&dir).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "forge", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "false,9,9\r\n",
+        "indexing a number must fail, and a fabricated self must not change which byte add() reaches"
+    );
+}
+
+/// The scoped-invalidation property this whole design rests on: a handle
+/// created inside one invocation's `Lua::scope` is torn down when that
+/// invocation returns, so a script that stashes one in a global sees an
+/// error -- never a stale read -- the next time it is used. Driven through
+/// two separate `run_command` calls, matching the fixture pattern for
+/// exactly this kind of cross-call state in the rest of this file.
+#[test]
+fn a_stashed_handle_errors_in_a_later_invocation_instead_of_reading_stale_memory() {
+    let dir = tempdir_with(
+        "a_stashed_handle_errors_in_a_later_invocation_instead_of_reading_stale_memory",
+        &[(
+            "stash.lua",
+            r#"mmud.command("stash", function(c)
+                STASHED = c:buffer(4)
+                return mmud.HANDLED
+            end)
+            mmud.command("use", function(c)
+                local v = STASHED:u8(0)
+                c:print(tostring(v) .. "\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut ext = LuaExtension::load(&dir).expect("loads");
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let chan = fixture.console();
+
+    let first = fixture.run_command(&mut ext, chan, "stash", &module);
+    assert_eq!(first, Verdict::Handled, "stashing a handle must not itself fail");
+
+    let second = fixture.run_command(&mut ext, chan, "use", &module);
+    assert_eq!(second, Verdict::Pass, "a stashed handle used later must disable the handler, not read stale memory");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("use"), "got: {notes:?}");
+    assert!(notes[0].contains("destructed"), "must be mlua's own scope-invalidation error, got: {notes:?}");
+}

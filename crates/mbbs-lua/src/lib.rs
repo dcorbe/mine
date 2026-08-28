@@ -92,6 +92,7 @@
 //! version of that logic should still find it, and know why it differs.
 
 mod api;
+mod ptr;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -616,10 +617,11 @@ impl<A: Abi> Extension<A> for LuaExtension {
                 let cell = Rc::clone(&cell);
                 scope.create_function(move |_, (_this, amount): (mlua::Table, f64)| adjust_wealth(&cell, amount))?
             })?;
-            t.set(
-                "set_exp",
-                scope.create_function(move |_, (_this, amount): (mlua::Table, f64)| set_exp(&cell, amount))?,
-            )?;
+            t.set("set_exp", {
+                let cell = Rc::clone(&cell);
+                scope.create_function(move |_, (_this, amount): (mlua::Table, f64)| set_exp(&cell, amount))?
+            })?;
+            t.set("buffer", ptr::install_buffer(scope, Rc::clone(&cell))?)?;
             handler.call::<Value>(t)
         });
 
