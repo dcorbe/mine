@@ -533,7 +533,46 @@ mod tests {
     use mbbs::abi::{Abi, Wg16, Wg32};
     use mlua::Value;
 
-    use super::{Type, check_abi, int_arg, parse_signature};
+    use super::{Type, check_abi, int_arg, parse_signature, probe};
+
+    /// The design's PE32 acceptance claim -- "lower-case exports found via
+    /// normalisation" -- tested at the layer that makes it, for the first
+    /// time: [`probe`] under `Wg32` against a module whose one export is
+    /// spelled `_get_player`, as the Borland-linked PE32 build spells it
+    /// (RVA `0x320d9` in the board's own `wccmmud.dll`). The bare and
+    /// upper-case spellings miss and the probe falls through to the third.
+    /// No `Fixture`/`Machine`: a loaded `m32::Module` is plain data.
+    ///
+    /// Until `Wg32` answered `Abi::export_address` at all this failed with
+    /// `None` -- every PE32 declare did, which is how the live board
+    /// reported "no export named get_item_from_name" for a name `objdump`
+    /// plainly listed.
+    #[test]
+    fn probe_under_wg32_falls_through_to_the_lower_case_underscore_spelling() {
+        use mbbs_machine::m32::{Export, ExportAddress, Exports, Flat32Ptr, Module, PeImage};
+        let pe = PeImage {
+            image_base: 0x40_0000,
+            size_of_image: 0,
+            section_alignment: 0,
+            file_alignment: 0,
+            entry_point: 0,
+            characteristics: 0,
+            sections: Vec::new(),
+            relocations: Vec::new(),
+            imports: Vec::new(),
+            exports: vec![Export { name: "_get_player".to_owned(), address: ExportAddress::Rva(0x320d9) }],
+            export_table: vec![ExportAddress::Rva(0x320d9)],
+            export_base: Some(1),
+            export_name: None,
+        };
+        let module = Module::new(0, None, Vec::new(), Exports::rebased(&pe, 0x7000_0000));
+
+        assert_eq!(
+            probe::<Wg32>(&module, "get_player"),
+            Some((Flat32Ptr(0x7000_0000 + 0x320d9), "_get_player".to_owned()))
+        );
+        assert_eq!(probe::<Wg32>(&module, "get_item_from_name"), None, "not exported at all");
+    }
 
     /// [`check_abi`]'s whole reason to exist: a `LuaExtension`'s declared
     /// entries carry no compile-time `Abi` tag (see `DeclaredEntry`'s own
