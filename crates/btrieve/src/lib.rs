@@ -1281,7 +1281,8 @@ fn index_entries(
     reason = "the shared prefix is the meaning: each names a moment *after* a               phase, which is where an interruption is staged"
 )]
 pub(crate) enum Stop {
-    /// Content pages are down and flushed; nothing live points at them.
+    /// Content pages are down -- not yet flushed, that comes after the
+    /// bodies -- and nothing live points at them.
     AfterContent = 1,
     /// Structural bodies are down, still carrying losing generations.
     AfterBodies = 2,
@@ -1440,7 +1441,7 @@ thread_local! {
     /// failed whenever it was not run alone.
     pub(crate) static WROTE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
-    /// `sync_all` calls [`Block::write_changed_pages_attempt`] or
+    /// `sync_data` calls [`Block::write_changed_pages_attempt`] or
     /// [`Block::write_changed_pages_single_phase`] has made -- Task 8's own
     /// evidence that `ACCLBV` flushes once where every other mode flushes
     /// up to three times. Thread-local for the identical reason [`WROTE`] is.
@@ -1828,7 +1829,15 @@ impl<M: Mem> Block<M> {
     /// 3. **The flip.** Two bytes per page -- the generation words, control
     ///    record first, then the allocation table.
     ///
-    /// Each phase is flushed before the next begins.
+    /// Phases 1 and 2 go down together and are flushed once: nothing in
+    /// either is visible until phase 3, so their order on the platter is
+    /// immaterial, and what the invariant needs is only that all of it is
+    /// durable before the first flip. Phase 3 is flushed after the control
+    /// record's flip and again after the rest. Every flush is `sync_data`,
+    /// not `sync_all`: the ordering needs the pages themselves (and the
+    /// file's length, when it grew -- `fdatasync` covers that), never the
+    /// inode's timestamps, and on the live board's NVMe the difference is
+    /// 7 ms against 4.5 ms per call, three calls per write.
     ///
     /// ## Why the generations are held back
     ///
@@ -2075,20 +2084,24 @@ impl<M: Mem> Block<M> {
         let flush = |out: &std::fs::File| -> Result<(), BtvError> {
             #[cfg(test)]
             FLUSHES.with(|flushes| flushes.set(flushes.get() + 1));
-            out.sync_all()
+            out.sync_data()
                 .map_err(|e| fail(format!("{}: flushing: {e}", self.path.display())))
         };
 
         // Phase 1 -- content, pre-existing or newly appended alike: every
         // dirty page not covered by a flip goes down whole, unconditionally.
+        // Not flushed on its own: nothing here is visible until phase 3, so
+        // whether content or bodies land first is immaterial, and the one
+        // flush after phase 2 covers both.
         for &number in &content {
             put(&mut out, (number * page) as u64, store.current(number))?;
         }
-        flush(&out)?;
         stop_here(Stop::AfterContent).map_err(&fail)?;
 
         // Phase 2 -- structural bodies, each still carrying the generation
-        // that loses to the half currently live.
+        // that loses to the half currently live. Flushed together with
+        // phase 1's content: every byte either phase wrote is durable before
+        // any of phase 3's two-byte flips can make it count.
         for flip in &flips {
             let mut held = flip.image.clone();
             let losing = generation(store.original(flip.page).expect("read above"));
@@ -2157,13 +2170,13 @@ impl<M: Mem> Block<M> {
     ///
     /// # What is measurably different
     ///
-    /// One `sync_all` instead of up to three, and -- for any write that
+    /// One `sync_data` instead of up to three, and -- for any write that
     /// touches at least one shadow pair, which every v6 write does (the
     /// file control record's own pair, at minimum) -- two fewer bytes
     /// written per pair: the three-phase path's phase 3 re-writes each
     /// flip's two generation bytes a second time after phase 2's held-back
     /// write; this writes them once. Both are visible to this module's own
-    /// `#[cfg(test)]` counters, `WROTE` (bytes) and `FLUSHES` (`sync_all`
+    /// `#[cfg(test)]` counters, `WROTE` (bytes) and `FLUSHES` (`sync_data`
     /// calls) -- see
     /// `tests::acclbv_commits_in_a_single_phase_with_fewer_writes_and_one_flush`.
     fn write_changed_pages_single_phase(&self, store: &mut v6::Store) -> Result<(), BtvError> {
@@ -2203,7 +2216,7 @@ impl<M: Mem> Block<M> {
 
         #[cfg(test)]
         FLUSHES.with(|flushes| flushes.set(flushes.get() + 1));
-        out.sync_all()
+        out.sync_data()
             .map_err(|e| fail(format!("{}: flushing: {e}", self.path.display())))?;
 
         // Same cache write-through as the three-phase path -- see that
@@ -10248,13 +10261,15 @@ mod tests {
         let (primbv_bytes, primbv_flushes) = run("acclbv-evidence-primbv", PRIMBV);
         let (acclbv_bytes, acclbv_flushes) = run("acclbv-evidence-acclbv", ACCLBV);
 
-        // Phase 1 and phase 2 each flush once, unconditionally; phase 3
-        // flushes once after its first flip (this fixture's insert always
-        // relocates at least the file control record's own pair -- v6
+        // Content and structural bodies go down together and flush once;
+        // phase 3 flushes once after its first flip (this fixture's insert
+        // always relocates at least the file control record's own pair -- v6
         // relocates a written key's root, and the FCR, on every write) and
-        // once more at the end -- four, not three, once there is any flip
-        // at all to trigger the first.
-        assert_eq!(primbv_flushes, 4, "PRIMBV's three-phase commit flushes four times here");
+        // once more at the end -- three, once there is any flip at all to
+        // trigger the first. A fourth flush here is the one this commit
+        // removed: content durable before the bodies are even written buys
+        // nothing, since neither is visible until phase 3.
+        assert_eq!(primbv_flushes, 3, "PRIMBV's three-phase commit flushes three times here");
         assert_eq!(acclbv_flushes, 1, "ACCLBV's single-phase commit flushes once");
         assert!(
             acclbv_bytes < primbv_bytes,
