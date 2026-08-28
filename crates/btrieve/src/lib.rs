@@ -1116,6 +1116,11 @@ pub struct Block<M: Mem> {
     /// to `self` at all.
     cache: Option<std::rc::Rc<std::cell::RefCell<cache::PageCache>>>,
 
+    /// Writes staged outside an explicit transaction, counted against the
+    /// vendor's system-transaction limits -- see [`bundle`]. Only a cached
+    /// v6 block in a mode other than `VERFBV` ever opens one.
+    pub(crate) bundle: bundle::Bundle,
+
     /// Each key's [`order::OrderIndex`] this block currently has cached,
     /// keyed by key number -- `RefCell` for the same reason [`Self::cache`]
     /// is one: [`Self::v6_ensure_order`]/[`Self::current`] read (and lazily
@@ -1945,9 +1950,12 @@ impl<M: Mem> Block<M> {
     ///
     /// # Autocommit versus a transaction in progress (Task 7)
     ///
-    /// Outside a transaction (`!self.txn_active`), this is unchanged: the
-    /// write lands on disk before this returns, exactly as every task before
-    /// this one built it. Inside one, with a cache actually attached to
+    /// Outside a transaction (`!self.txn_active`), a cached block stages
+    /// into its *bundle* -- the vendor's system transaction, see [`bundle`]
+    /// -- and commits when the bundle's count or age limit is reached, at
+    /// [`Btrieve::tick`], at `begin`, or at close; only an uncached or
+    /// `VERFBV` block still lands its write on disk before this returns.
+    /// Inside one, with a cache actually attached to
     /// defer into, this instead calls [`Self::stage_changed_pages`] -- the
     /// same canonicalised bytes, staged into the cache and left dirty,
     /// nothing touching disk. `Btrieve::end` is what turns every covered
@@ -1963,11 +1971,48 @@ impl<M: Mem> Block<M> {
             self.stage_changed_pages(store);
             return Ok(());
         }
+        // Outside a transaction: a system transaction, the vendor MKDE's
+        // default. Stage exactly as an explicit transaction would, then let
+        // the bundle say whether this write is the one that commits.
+        if self.bundles() && self.cache.is_some() {
+            self.stage_changed_pages(store);
+            if self.bundle.note_write(std::time::Instant::now()) == bundle::After::Commit {
+                self.commit_bundle()?;
+            }
+            return Ok(());
+        }
         let result = self.write_changed_pages_attempt(store);
         if result.is_err() {
             self.invalidate_cache();
         }
         result
+    }
+
+    /// Whether writes outside a transaction bundle: `VERFBV` verifies the
+    /// file after every op, so its ops stay one commit each.
+    fn bundles(&self) -> bool {
+        self.mode != VERFBV
+    }
+
+    /// Commit whatever the open bundle staged; a no-op with none open.
+    /// Failure handling is [`Self::commit_deferred`]'s: the cache is
+    /// invalidated and the error goes to whoever asked for the commit.
+    pub(crate) fn commit_bundle(&mut self) -> Result<(), BtvError> {
+        if !self.bundle.is_open() {
+            return Ok(());
+        }
+        self.bundle.clear();
+        self.commit_deferred()
+    }
+
+    /// [`Btrieve::tick`]'s half: commit only a bundle that is `age` old at
+    /// `now`.
+    pub(crate) fn commit_bundle_if_expired(&mut self, now: std::time::Instant) -> Result<(), BtvError> {
+        if self.bundle.expired(now) {
+            self.commit_bundle()
+        } else {
+            Ok(())
+        }
     }
 
     /// The deferred half of [`Self::write_changed_pages`]: compute the same
@@ -7242,6 +7287,7 @@ impl<M: Mem> Btrieve<M> {
             // rolled back on abort the same as one opened before `begin`.
             txn_active: self.transaction,
             pre_image: None,
+            bundle: bundle::Bundle::default(),
             // A real module's `opnbtv` reached this constructor -- the only
             // one that did -- so this is the one place verification is worth
             // its cost, in a debug build by default, and unconditionally
@@ -8688,6 +8734,7 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            bundle: bundle::Bundle::default(),
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
@@ -9844,6 +9891,7 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            bundle: bundle::Bundle::default(),
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
@@ -10286,6 +10334,113 @@ mod tests {
              two flips for this fixture's insert (the file control record's own pair, \
              plus its one key's root, relocated on every v6 write), 2 bytes each"
         );
+    }
+
+    /// A v6 block opened the way `Btrieve::open` opens one -- with a cache --
+    /// on a scratch copy of `V6DUP.DAT`, with the bundle limits given.
+    fn cached_v6_block(tag: &str, limits: bundle::Limits) -> (Block<Flat>, PathBuf) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variable/V6DUP.DAT");
+        let dir = crate::testing::scratch(tag);
+        let path = dir.join("V6DUP.DAT");
+        std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        let mut block = block_from_file(path.clone(), "V6DUP.DAT");
+        block.cache = Some(std::rc::Rc::new(std::cell::RefCell::new(
+            cache::PageCache::open(&path, block.geometry.page).expect("a cache opens"),
+        )));
+        block.bundle = bundle::Bundle::new(limits);
+        (block, path)
+    }
+
+    fn v6dup_record(block: &Block<Flat>, key: u32) -> Vec<u8> {
+        let mut record = vec![0u8; usize::from(block.geometry.reclen)];
+        record[..4].copy_from_slice(&key.to_le_bytes());
+        record
+    }
+
+    #[test]
+    fn ninety_nine_bundled_inserts_flush_nothing_and_the_hundredth_commits_once() {
+        let (mut block, path) = cached_v6_block("bundle-hundred", bundle::Limits::default());
+        let before = std::fs::read(&path).expect("reads");
+        FLUSHES.with(|f| f.set(0));
+        for key in 1..100u32 {
+            block.insert(&v6dup_record(&block, 900_000 + key)).expect("insert");
+        }
+        assert_eq!(FLUSHES.with(std::cell::Cell::get), 0, "99 staged writes flush nothing");
+        assert_eq!(std::fs::read(&path).expect("reads"), before, "disk is untouched while staged");
+        assert!(block.bundle.is_open());
+
+        block.insert(&v6dup_record(&block, 900_100)).expect("the 100th insert");
+        assert_eq!(FLUSHES.with(std::cell::Cell::get), 3, "one three-phase commit for 100 ops");
+        assert!(!block.bundle.is_open(), "the bundle is closed by its commit");
+        assert_ne!(std::fs::read(&path).expect("reads"), before, "the commit landed");
+
+        block.insert(&v6dup_record(&block, 900_101)).expect("the 101st insert");
+        assert_eq!(FLUSHES.with(std::cell::Cell::get), 3, "the 101st opens a new bundle");
+        assert_eq!(block.bundle.ops(), 1);
+    }
+
+    #[test]
+    fn a_zero_age_limit_is_per_op_commit_again() {
+        let limits = bundle::Limits { ops: 100, age: std::time::Duration::ZERO };
+        let (mut block, _) = cached_v6_block("bundle-zero-age", limits);
+        FLUSHES.with(|f| f.set(0));
+        block.insert(&v6dup_record(&block, 900_001)).expect("insert");
+        block.insert(&v6dup_record(&block, 900_002)).expect("insert");
+        assert_eq!(FLUSHES.with(std::cell::Cell::get), 6, "every op commits at age zero");
+    }
+
+    #[test]
+    fn a_keyed_read_sees_a_staged_insert_exactly_as_it_sees_a_committed_one() {
+        let (mut staged, _) = cached_v6_block("bundle-read-staged", bundle::Limits::default());
+        let (mut committed, _) = cached_v6_block(
+            "bundle-read-committed",
+            bundle::Limits { ops: 1, age: std::time::Duration::from_secs(1) },
+        );
+        let record = v6dup_record(&staged, 900_042);
+        staged.insert(&record).expect("staged insert");
+        committed.insert(&record).expect("committed insert");
+        assert!(staged.bundle.is_open() && !committed.bundle.is_open());
+        let key = 900_042u32.to_le_bytes();
+        let reclen = staged.geometry.reclen;
+        let mut locks = ops::LockTable::default();
+        let a = staged.get(0, Op::Equal, &key, 0, &mut locks, reclen).expect("staged read");
+        let b = committed.get(0, Op::Equal, &key, 0, &mut locks, reclen).expect("committed read");
+        assert_eq!(a, b, "a staged write is visible to the reads this engine serves");
+        assert!(a.is_some(), "and it is found");
+    }
+
+    #[test]
+    fn a_verfbv_block_never_bundles() {
+        let (mut block, _) = cached_v6_block("bundle-verfbv", bundle::Limits::default());
+        block.mode = VERFBV;
+        FLUSHES.with(|f| f.set(0));
+        block.insert(&v6dup_record(&block, 900_001)).expect("insert");
+        assert_eq!(FLUSHES.with(std::cell::Cell::get), 3, "read-after-write verification is per op");
+        assert!(!block.bundle.is_open());
+    }
+
+    #[test]
+    fn an_uncached_block_never_bundles() {
+        let (mut block, _) = cached_v6_block("bundle-uncached", bundle::Limits::default());
+        block.cache = None;
+        FLUSHES.with(|f| f.set(0));
+        block.insert(&v6dup_record(&block, 900_001)).expect("insert");
+        assert_eq!(FLUSHES.with(std::cell::Cell::get), 3, "no cache, nothing to stage into");
+        assert!(!block.bundle.is_open());
+    }
+
+    #[test]
+    fn commit_bundle_if_expired_commits_only_an_aged_bundle() {
+        let (mut block, path) = cached_v6_block("bundle-expired", bundle::Limits::default());
+        let before = std::fs::read(&path).expect("reads");
+        block.insert(&v6dup_record(&block, 900_001)).expect("insert");
+        let young = std::time::Instant::now();
+        block.commit_bundle_if_expired(young).expect("ok");
+        assert!(block.bundle.is_open(), "a young bundle is left alone");
+        assert_eq!(std::fs::read(&path).expect("reads"), before);
+        block.commit_bundle_if_expired(young + std::time::Duration::from_secs(1)).expect("ok");
+        assert!(!block.bundle.is_open(), "an aged bundle commits");
+        assert_ne!(std::fs::read(&path).expect("reads"), before);
     }
 
     /// **A v6 variable-length record can be updated.** Task 6: closes the
@@ -12411,6 +12566,7 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            bundle: bundle::Bundle::default(),
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
@@ -12671,6 +12827,7 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            bundle: bundle::Bundle::default(),
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
@@ -13180,6 +13337,7 @@ mod tests {
             dirty: false,
             txn_active: false,
             pre_image: None,
+            bundle: bundle::Bundle::default(),
             // A test-only fixture, not `Self::open` -- see
             // `Self::verify_writes`'s doc comment for why this stays off.
             verify_writes: false,
@@ -14442,6 +14600,7 @@ mod tests {
             .v6_resolve_logical(logical)
             .expect("resolves before the transaction");
 
+        btrieve.block_mut(at).expect("open").commit_bundle().expect("the baseline lands before the transaction");
         btrieve.begin().expect("begin");
         let bytes = v6_record(b"ABRT");
         btrieve
@@ -14544,6 +14703,7 @@ mod tests {
         // the transaction even starts.
         btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("baseline");
 
+        btrieve.block_mut(at).expect("open").commit_bundle().expect("the baseline lands before the transaction");
         btrieve.begin().expect("begin");
         btrieve.block_mut(at).expect("open").insert(&v6_record(b"BBBB")).expect("in-transaction insert");
 
@@ -14679,6 +14839,9 @@ mod tests {
         let at = btrieve
             .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, maxlen)
             .expect("opens");
+        // Written when every write was its own commit; the failure under
+        // test is a *flush* failure, so keep this block per-op.
+        btrieve.block_mut(at).expect("open").bundle.set_limits(bundle::Limits { ops: 1, ..bundle::Limits::default() });
         assert!(
             btrieve.block(at).expect("open").cache.is_some(),
             "a real v6 open attaches a cache -- this test is meaningless without one"
@@ -14980,6 +15143,11 @@ mod tests {
         // `write(2)` put down for the whole sequence.
         fn run(path: &Path, new_keys: &[u32], deferred: bool) -> (u32, usize) {
             let (mut btrieve, at, _mem, _heap) = open_it(path);
+            if !deferred {
+                // The reference run is one commit per op -- the contrast the
+                // deferred run is measured against.
+                btrieve.block_mut(at).expect("open").bundle.set_limits(bundle::Limits { ops: 1, ..bundle::Limits::default() });
+            }
             assert!(
                 btrieve.block(at).expect("open").v6_fast_reads(),
                 "PP2BLOCK.DAT is fixed-length v6 -- meaningless if this is not the fast path"
