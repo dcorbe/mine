@@ -541,6 +541,7 @@ name = "mbbs-lua"
 version = "0.1.0"
 dependencies = [
  "mbbs",
+ "mbbs-machine",
  "mlua",
 ]
 

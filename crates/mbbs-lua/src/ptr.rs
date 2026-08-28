@@ -92,6 +92,32 @@ use mlua::{Function, Lua, Result as LuaResult, Scope, Table};
 /// `'q`, so it cannot be silently shortened to match the shorter `'p`.
 pub(crate) type Ctx<'p, 'q, A> = Rc<RefCell<&'p mut CommandCtx<'q, A>>>;
 
+/// Every pointer [`handle`] has minted so far this invocation, in mint
+/// order -- Task 2's handle -> `A::Ptr` extraction path. A handle table
+/// carries its position in this list as a plain field ([`IDX_FIELD`]); the
+/// declared-bindings marshaller (`crate::bind`) resolves a `ptr`-typed
+/// argument by reading that field back out and indexing here, since it has
+/// no other way to reach the `A::Ptr` a table's own closures keep private
+/// (see this module's own "Unforgeable despite being 'just a table'"
+/// section).
+///
+/// Built fresh, empty, once per invocation (`Extension::command` owns the
+/// only `Rc::new` site), which is what keeps a *stale* handle's index from
+/// resolving to a different, live pointer this invocation never actually
+/// minted for it: an index into an empty (or shorter) registry is simply
+/// out of bounds, not a wrong answer -- see
+/// `commands.rs`'s own
+/// `a_stale_handles_index_does_not_resolve_against_a_later_invocations_registry`
+/// for the property this buys, and the brief's own "no new capability"
+/// framing for why a *plain* field is an acceptable place to carry this
+/// index at all: the worst a forged or stale index can do is name a
+/// pointer Rust already minted THIS invocation, never memory a script had
+/// no route to already.
+pub(crate) type Registry<A> = Rc<RefCell<Vec<<A as Abi>::Ptr>>>;
+
+/// The table field a handle's registry index lives at.
+pub(crate) const IDX_FIELD: &str = "__idx";
+
 /// Resolve `off` (bytes past `ptr`, as a script wrote it) into a concrete
 /// pointer, refusing rather than wrapping.
 ///
@@ -150,6 +176,7 @@ pub(crate) fn handle<'scope, 'env, 'p, 'q, A: Abi>(
     scope: &'scope Scope<'scope, 'env>,
     lua: &Lua,
     ctx: Ctx<'p, 'q, A>,
+    registry: Registry<A>,
     ptr: A::Ptr,
 ) -> LuaResult<Table>
 where
@@ -158,11 +185,23 @@ where
 {
     let t = lua.create_table()?;
 
+    // Register this pointer under the invocation's own registry and stamp
+    // the resulting index onto the table -- see [`Registry`]'s own doc
+    // comment for what this buys and what it deliberately does not
+    // pretend to guard against.
+    let idx = {
+        let mut reg = registry.borrow_mut();
+        reg.push(ptr);
+        reg.len() - 1
+    };
+    t.set(IDX_FIELD, idx as i64)?;
+
     t.set("add", {
         let ctx = Rc::clone(&ctx);
+        let registry = Rc::clone(&registry);
         scope.create_function(move |lua, (_this, n): (Table, i64)| {
             let new_ptr = checked_offset::<A>(ptr, n)?;
-            handle(scope, lua, Rc::clone(&ctx), new_ptr)
+            handle(scope, lua, Rc::clone(&ctx), Rc::clone(&registry), new_ptr)
         })?
     })?;
 
@@ -194,6 +233,7 @@ fn buffer<'scope, 'env, 'p, 'q, A: Abi>(
     scope: &'scope Scope<'scope, 'env>,
     lua: &Lua,
     ctx: Ctx<'p, 'q, A>,
+    registry: Registry<A>,
     n: i64,
 ) -> LuaResult<Table>
 where
@@ -202,7 +242,7 @@ where
 {
     let len = usize::try_from(n).map_err(|_| mlua::Error::RuntimeError(format!("buffer: size {n} must not be negative")))?;
     let base = ctx.borrow_mut().write_scratch(&vec![0u8; len]).map_err(mlua::Error::external)?;
-    handle(scope, lua, ctx, base)
+    handle(scope, lua, ctx, registry, base)
 }
 
 /// `c:buffer` itself -- a `Function` built once per invocation, the same way
@@ -224,10 +264,11 @@ where
 pub(crate) fn install_buffer<'scope, 'env, 'p, 'q, A: Abi>(
     scope: &'scope Scope<'scope, 'env>,
     ctx: Ctx<'p, 'q, A>,
+    registry: Registry<A>,
 ) -> LuaResult<Function>
 where
     'p: 'scope,
     'q: 'scope,
 {
-    scope.create_function(move |lua, (_this, n): (Table, i64)| buffer(scope, lua, Rc::clone(&ctx), n))
+    scope.create_function(move |lua, (_this, n): (Table, i64)| buffer(scope, lua, Rc::clone(&ctx), Rc::clone(&registry), n))
 }

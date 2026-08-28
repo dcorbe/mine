@@ -152,6 +152,27 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
         let symbol = mbbs_machine::module::Symbol::Name(name.to_owned());
         let entry = A::export_address(self.module, &symbol)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no such export: {name:?}")))?;
+        self.call_entry(entry, args)
+    }
+
+    /// [`CommandCtx::call_export`]'s sibling for a caller that already has
+    /// `entry` in hand -- a declared-bindings namespace (`mmud-lua`'s Task
+    /// 2), which resolves each declared name to an [`Abi::Ptr`] once, at
+    /// declare time (see that crate's own module doc for why: the four-
+    /// spelling probe and the "hard error if this build has no such export"
+    /// rule both belong at declare time, not at every call), and must not
+    /// pay `A::export_address`'s lookup again on every invocation.
+    /// `call_export` is now this plus the resolve step, not a separate
+    /// implementation -- so the two can never drift on what "calling an
+    /// export" means.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Host::run`]'s own `# Errors`, and its `# A faulting
+    /// export ends the board` note applies here identically -- `entry` is
+    /// trusted to be a real, resolvable address; nothing here re-validates
+    /// it.
+    pub fn call_entry(&mut self, entry: A::Ptr, args: &[Arg<A>]) -> io::Result<crate::Outcome<A>> {
         self.host.run(self.machine, self.module, entry, args, Some(self.chan))
     }
 

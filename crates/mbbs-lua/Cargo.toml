@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 mbbs = { path = "../mbbs" }
+mbbs-machine = { path = "../mbbs-machine" }
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 
 [lints]

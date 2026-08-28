@@ -29,6 +29,7 @@ impl Abi for Wg16 {
     const PTR_WIDTH: usize = 4;
     const INT_WIDTH: usize = 2;
     const LONG_WIDTH: usize = 4;
+    const NAME: &'static str = "wg16";
     const GCV2: bool = true;
 
     /// `INCLUDE/STDIO.H:104-114` -- two `int`s (`level`, `flags`), so

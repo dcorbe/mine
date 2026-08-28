@@ -136,6 +136,7 @@ impl Abi for Wg32 {
     const PTR_WIDTH: usize = 4;
     const INT_WIDTH: usize = 4;
     const LONG_WIDTH: usize = 4;
+    const NAME: &'static str = "wg32";
     const GCV2: bool = false;
 
     /// `cw3220mt`'s own runtime, not Borland 16-bit `STDIO.H`'s offset 2.

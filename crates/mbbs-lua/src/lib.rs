@@ -92,6 +92,7 @@
 //! version of that logic should still find it, and know why it differs.
 
 mod api;
+mod bind;
 mod ptr;
 
 use std::cell::RefCell;
@@ -134,6 +135,12 @@ pub struct LuaExtension {
     /// lookup and nothing else -- see `Extension::command`'s error arm for
     /// why a handler ends up here.
     disabled: HashSet<String>,
+    /// Every export a loaded `M.declare{...}` resolved, across every bound
+    /// namespace -- see `bind.rs`'s own module doc comment for why these
+    /// are stored ABI-erased (as bytes) rather than as `A::Ptr`, which
+    /// would force this whole struct to carry an `Abi` type parameter it
+    /// is deliberately built without (see the `assert_impl` check above).
+    declared: bind::Declared,
 }
 
 impl fmt::Debug for LuaExtension {
@@ -170,9 +177,52 @@ impl LuaExtension {
     pub fn load(dir: &Path) -> Result<LuaExtension, LoadError> {
         let lua = Lua::new();
         let handlers: Handlers = Rc::new(RefCell::new(Vec::new()));
+        let declared: bind::Declared = Rc::new(RefCell::new(Vec::new()));
         api::install(&lua, Rc::clone(&handlers))
             .map_err(|source| LoadError(format!("installing the mmud table: {source}")))?;
 
+        Self::exec_scripts(&lua, dir)?;
+
+        Ok(LuaExtension { lua, handlers, disabled: HashSet::new(), declared })
+    }
+
+    /// Like [`LuaExtension::load`], but also installs `mmud.bind`/
+    /// `mmud.abi`, resolved against exactly one already-loaded module --
+    /// `module_name` is the bare name a script passes to `mmud.bind`,
+    /// `module` is what `M.declare{...}` resolves exports against.
+    ///
+    /// **Task 2's provisional entry point.** The design's real boot-order
+    /// (`mmud.bind` resolving against whichever module of that name is
+    /// loaded on THIS machine, a missing module or a missing
+    /// `scripts/lib/<name>.lua` both a soft skip, script loading moved
+    /// after module init) is Task 3's "wires the machinery into
+    /// `mbbs-server`" work, not this one's -- see this crate's own
+    /// declared-bindings design doc, "Boot-order consequence". This method
+    /// is what Task 3 calls once it has a real, loaded `A::Module` in
+    /// hand; today it is exercised directly by this crate's own tests.
+    pub fn load_with_module<A: Abi>(dir: &Path, module_name: &str, module: &A::Module) -> Result<LuaExtension, LoadError>
+    where
+        A::Module: 'static,
+    {
+        let lua = Lua::new();
+        let handlers: Handlers = Rc::new(RefCell::new(Vec::new()));
+        let declared: bind::Declared = Rc::new(RefCell::new(Vec::new()));
+        api::install(&lua, Rc::clone(&handlers))
+            .map_err(|source| LoadError(format!("installing the mmud table: {source}")))?;
+        bind::install::<A>(&lua, module_name.to_owned(), module.clone(), Rc::clone(&declared))
+            .map_err(|source| LoadError(format!("installing mmud.bind: {source}")))?;
+
+        Self::exec_scripts(&lua, dir)?;
+
+        Ok(LuaExtension { lua, handlers, disabled: HashSet::new(), declared })
+    }
+
+    /// Loads every `*.lua` file directly inside `dir` into `lua`, sorted by
+    /// filename, so `10-a.lua` runs before `20-b.lua` -- the file-walking
+    /// half [`LuaExtension::load`] and [`LuaExtension::load_with_module`]
+    /// share; everything before this call is what differs between them
+    /// (which primitives are installed before any script gets to run).
+    fn exec_scripts(lua: &Lua, dir: &Path) -> Result<(), LoadError> {
         let mut entries: Vec<_> = fs::read_dir(dir)
             .map_err(|source| LoadError(format!("reading {}: {source}", dir.display())))?
             .filter_map(|entry| entry.ok())
@@ -190,7 +240,7 @@ impl LuaExtension {
                 .map_err(|source| LoadError(format!("{file_name}: {source}")))?;
         }
 
-        Ok(LuaExtension { lua, handlers, disabled: HashSet::new() })
+        Ok(())
     }
 
     /// Registered command names, in registration order (the order scripts
@@ -598,6 +648,10 @@ impl<A: Abi> Extension<A> for LuaExtension {
             // same cell -- still one `RefCell<&mut CommandCtx>`, still one
             // thread, no `Mutex` needed.
             let cell = Rc::new(RefCell::new(&mut *ctx));
+            // Fresh and empty every invocation -- see `ptr::Registry`'s own
+            // doc comment for why that emptiness is exactly what keeps a
+            // stale handle's index from resolving to a wrong pointer here.
+            let registry: ptr::Registry<A> = Rc::new(RefCell::new(Vec::new()));
             let t = self.lua.create_table()?;
             t.set("line", line.clone())?;
             t.set("args", args.clone())?;
@@ -621,7 +675,8 @@ impl<A: Abi> Extension<A> for LuaExtension {
                 let cell = Rc::clone(&cell);
                 scope.create_function(move |_, (_this, amount): (mlua::Table, f64)| set_exp(&cell, amount))?
             })?;
-            t.set("buffer", ptr::install_buffer(scope, Rc::clone(&cell))?)?;
+            t.set("buffer", ptr::install_buffer(scope, Rc::clone(&cell), Rc::clone(&registry))?)?;
+            bind::rebind::<A>(scope, Rc::clone(&cell), Rc::clone(&registry), &self.declared.borrow())?;
             handler.call::<Value>(t)
         });
 

@@ -1,8 +1,10 @@
 //! Script loading and command registration, exercised through `LuaExtension`.
 
+use mbbs::abi::{Abi, ModuleMem, Wg16};
 use mbbs::extension::Verdict;
-use mbbs::testing::{Fixture, module_bytes_exporting};
+use mbbs::testing::{Fixture, module_bytes_exporting, module_bytes_exporting_many};
 use mbbs_lua::LuaExtension;
+use mbbs_machine::m16::FarPtr;
 
 /// Creates a fresh directory under this crate's `target/` scratch area (never
 /// `/tmp`, per this repository's standing rule) and writes the given
@@ -724,4 +726,403 @@ fn a_stashed_handle_errors_in_a_later_invocation_instead_of_reading_stale_memory
     assert_eq!(notes.len(), 1, "got: {notes:?}");
     assert!(notes[0].contains("use"), "got: {notes:?}");
     assert!(notes[0].contains("destructed"), "must be mlua's own scope-invalidation error, got: {notes:?}");
+}
+
+// ---------------------------------------------------------------------
+// Task 2: signature parser, marshaller, `mmud.bind`/`declare`.
+// ---------------------------------------------------------------------
+
+/// `AX = ptr.offset`, `DX = ptr.selector`, `retf` -- the far-pointer return
+/// convention every `ptr`-returning test module below uses. Mirrors
+/// `crates/mbbs/tests/extension_seam.rs`'s own `get_player_code`, duplicated
+/// rather than shared per this crate family's own convention for small
+/// fixture-code helpers (see `crates/mbbs/src/testing.rs`'s own
+/// `wg32_skeleton` doc comment for the precedent).
+fn far_ptr_return_code(ptr: FarPtr) -> Vec<u8> {
+    let mut code = vec![0xb8];
+    code.extend_from_slice(&ptr.offset.to_le_bytes());
+    code.push(0xba);
+    code.extend_from_slice(&ptr.selector.to_le_bytes());
+    code.push(0xcb);
+    code
+}
+
+/// A declared fn round-trips asymmetric `int`/`long` arguments through a
+/// real code segment and a real `long` return.
+///
+/// `mov bp, sp` first (nothing sets `bp` to the call frame's own base on
+/// entry -- see `Machine::call`'s own doc comment: the frame starts
+/// *at* `sp`, with no prologue run for it), then reads the `int` argument
+/// (one word at `bp+4`) into `ax`, zeroes `dx`, and adds the `long`
+/// argument (two words at `bp+6`/`bp+8`) with carry -- `ax:dx` ends up
+/// holding `int_arg + long_arg` as a genuine 32-bit sum, split the same
+/// `DX:AX` way `Ret::Long`'s own conversion expects
+/// (`mbbs_machine::m16::Ret::U32`'s own doc comment: "split `DX:AX` with
+/// the high half in `DX`"). `int_arg=300` and `long_arg=70000` are
+/// deliberately asymmetric (different widths, no shared digits) so a
+/// marshaller that swapped which argument went where, or truncated the
+/// `long` to 16 bits, would not produce `70300` by coincidence.
+#[test]
+fn a_declared_fn_round_trips_asymmetric_int_and_long_arguments() {
+    let code = [
+        0x89, 0xe5, // mov bp, sp
+        0x8b, 0x46, 0x04, // mov ax, [bp+4]   -- int arg
+        0x33, 0xd2, // xor dx, dx
+        0x03, 0x46, 0x06, // add ax, [bp+6]   -- long arg, low word
+        0x13, 0x56, 0x08, // adc dx, [bp+8]   -- long arg, high word (with carry)
+        0xcb, // retf
+    ];
+    let dir = tempdir_with(
+        "a_declared_fn_round_trips_asymmetric_int_and_long_arguments",
+        &[(
+            "roundtrip.lua",
+            r#"local M = mmud.bind("TESTMOD")
+            M.declare { addem = "long(int, long)" }
+            mmud.command("addtest", function(c)
+                c:print(tostring(M.addem(300, 70000)) .. "\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("ADDEM", &code)).expect("loads");
+    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "addtest", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "70300\r\n");
+    assert!(fixture.host.notes().is_empty(), "a clean round trip must never disable the handler, got: {:?}", fixture.host.notes());
+}
+
+/// The four-spelling probe resolves a declared name against the module's
+/// own EXACT NE spelling (`_GET_PLAYER`, leading underscore, upper case --
+/// the fourth and last candidate tried).
+///
+/// This is the test that dies under the mutation the task brief requires:
+/// narrowing the probe to try only the declared name verbatim (dropping
+/// the `_name`/`NAME`/`_NAME` candidates) makes `get_player` resolve
+/// against nothing in a module that only exports `_GET_PLAYER`, and
+/// `M.declare{...}` hard-errors at load time -- `load_with_module` itself
+/// returns `Err`, so this test's own `.expect("loads and binds")` panics.
+/// Verified by mutation (see this crate's Task 2 report), not just
+/// asserted here.
+#[test]
+fn the_case_probe_resolves_the_modules_own_exact_ne_spelling() {
+    let dir = tempdir_with(
+        "the_case_probe_resolves_the_modules_own_exact_ne_spelling",
+        &[("bind.lua", r#"mmud.bind("TESTMOD").declare { get_player = "int()" }"#)],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("_GET_PLAYER", &[0xcb])).expect("loads");
+
+    LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+}
+
+/// The probe's second candidate (`NAME`, upper case, no leading
+/// underscore) resolving too -- a module exporting `GET_PLAYER` (no
+/// underscore, matching neither the exact declared name nor the
+/// underscore-prefixed candidates) still binds. Distinct from the test
+/// above: that one exercises the fourth candidate, this one the third,
+/// between them covering every non-trivial candidate the probe tries.
+#[test]
+fn the_case_probe_also_resolves_an_upper_case_export_with_no_leading_underscore() {
+    let dir = tempdir_with(
+        "the_case_probe_also_resolves_an_upper_case_export_with_no_leading_underscore",
+        &[("bind.lua", r#"mmud.bind("TESTMOD").declare { get_player = "int()" }"#)],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("GET_PLAYER", &[0xcb])).expect("loads");
+
+    LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+}
+
+/// An unknown export after all four spellings is a hard error at declare
+/// time, naming the declared export, the module, and every spelling
+/// tried.
+#[test]
+fn declaring_an_unknown_export_names_the_export_the_module_and_the_spellings_tried() {
+    let dir = tempdir_with(
+        "declaring_an_unknown_export_names_the_export_the_module_and_the_spellings_tried",
+        &[("bind.lua", r#"mmud.bind("TESTMOD").declare { ghost = "void()" }"#)],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+
+    let err = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect_err("no such export");
+
+    let msg = err.to_string();
+    assert!(msg.contains("ghost"), "must name the declared export, got: {msg}");
+    assert!(msg.contains("TESTMOD"), "must name the module, got: {msg}");
+    assert!(msg.contains("ghost"), "must list the exact-spelling candidate tried, got: {msg}");
+    assert!(msg.contains("_GHOST"), "must list the underscore+upper-case candidate tried, got: {msg}");
+}
+
+/// A signature parse error at declare time hard-errors the load, naming
+/// the declaration and the bad token -- `parse_signature`'s own unit
+/// tests (`bind.rs`) cover the parser in isolation; this proves the same
+/// failure reaches a script author through `M.declare{...}`.
+#[test]
+fn a_bad_signature_hard_errors_the_load_and_names_the_declaration() {
+    let dir = tempdir_with(
+        "a_bad_signature_hard_errors_the_load_and_names_the_declaration",
+        &[("bind.lua", r#"mmud.bind("TESTMOD").declare { get_player = "frobnicate(int)" }"#)],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("_GET_PLAYER", &[0xcb])).expect("loads");
+
+    let err = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect_err("bad signature");
+
+    let msg = err.to_string();
+    assert!(msg.contains("get_player"), "must name the declaration, got: {msg}");
+    assert!(msg.contains("frobnicate"), "must name the bad token, got: {msg}");
+}
+
+/// Declaring the same name twice on one namespace is a hard error.
+#[test]
+fn declaring_the_same_name_twice_on_one_namespace_is_a_hard_error() {
+    let dir = tempdir_with(
+        "declaring_the_same_name_twice_on_one_namespace_is_a_hard_error",
+        &[(
+            "bind.lua",
+            r#"local M = mmud.bind("TESTMOD")
+            M.declare { get_player = "int()" }
+            M.declare { get_player = "int()" }"#,
+        )],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("_GET_PLAYER", &[0xcb])).expect("loads");
+
+    let err = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect_err("duplicate declaration");
+
+    assert!(err.to_string().contains("get_player"), "got: {err}");
+}
+
+/// `70000` as an `int` argument is out of range and errors, naming the
+/// argument position and the range; the identical value as a `long`
+/// argument passes -- the task brief's own worked example, and the
+/// concrete evidence that `int`/`long` marshalling actually use different
+/// range checks rather than one shared one.
+#[test]
+fn an_out_of_range_int_argument_errors_but_the_same_value_as_a_long_passes() {
+    let dir = tempdir_with(
+        "an_out_of_range_int_argument_errors_but_the_same_value_as_a_long_passes",
+        &[(
+            "bind.lua",
+            r#"local M = mmud.bind("TESTMOD")
+            M.declare { asint = "int(int)", aslong = "int(long)" }
+            mmud.command("asint", function(c) M.asint(70000) return mmud.HANDLED end)
+            mmud.command("aslong", function(c) M.aslong(70000) return mmud.HANDLED end)"#,
+        )],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture
+        .host
+        .load(&mut fixture.machine, &module_bytes_exporting_many(&[("ASINT", &[0xcb]), ("ASLONG", &[0xcb])]))
+        .expect("loads");
+    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let chan = fixture.console();
+
+    let bad = fixture.run_command(&mut ext, chan, "asint", &module);
+    assert_eq!(bad, Verdict::Pass, "a broken handler must never swallow the line");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("arg 0"), "must name the argument position, got: {notes:?}");
+    assert!(notes[0].contains("range"), "must name the range, got: {notes:?}");
+
+    let good = fixture.run_command(&mut ext, chan, "aslong", &module);
+    assert_eq!(good, Verdict::Handled, "the identical value as a long must pass");
+    assert_eq!(fixture.host.notes().len(), 1, "the long call must not add a second note, got: {:?}", fixture.host.notes());
+}
+
+/// A raw Lua number is refused as a `ptr` argument -- never constructed
+/// into a pointer, per the brief's own explicit warning.
+#[test]
+fn a_ptr_argument_refuses_a_raw_number() {
+    let dir = tempdir_with(
+        "a_ptr_argument_refuses_a_raw_number",
+        &[(
+            "bind.lua",
+            r#"local M = mmud.bind("TESTMOD")
+            M.declare { takesptr = "int(ptr)" }
+            mmud.command("ptrnum", function(c) M.takesptr(5) return mmud.HANDLED end)"#,
+        )],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("TAKESPTR", &[0xcb])).expect("loads");
+    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "ptrnum", &module);
+
+    assert_eq!(verdict, Verdict::Pass, "a broken handler must never swallow the line");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("arg 0"), "got: {notes:?}");
+    assert!(notes[0].contains("number"), "must name the offending kind, got: {notes:?}");
+}
+
+/// The registry-structural half of "a stale handle errors": a handle
+/// stashed in one invocation, passed as a `ptr` argument in a *later*
+/// invocation whose own registry has not yet minted anything, must not
+/// resolve to a wrong pointer -- it must simply fail to resolve at all.
+/// Distinct from `a_stashed_handle_errors_in_a_later_invocation_...`
+/// above: that test calls a method (`:u8`) on the stashed handle, which
+/// fails because `mlua::Scope` already destructed the closure. This test
+/// instead passes the stashed *table* itself as an ordinary argument value
+/// -- no scoped closure involved at all -- so the only thing standing
+/// between it and a wrong-pointer read is the registry being empty at the
+/// point of the call, exactly the "fresh, empty every invocation"
+/// property `ptr::Registry`'s own doc comment describes.
+#[test]
+fn a_stale_handles_index_does_not_resolve_against_a_later_invocations_registry() {
+    let dir = tempdir_with(
+        "a_stale_handles_index_does_not_resolve_against_a_later_invocations_registry",
+        &[(
+            "bind.lua",
+            r#"local M = mmud.bind("TESTMOD")
+            M.declare { takesptr = "int(ptr)" }
+            mmud.command("stash", function(c)
+                STASHED = c:buffer(4)
+                return mmud.HANDLED
+            end)
+            mmud.command("usestale", function(c)
+                M.takesptr(STASHED)
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("TAKESPTR", &[0xcb])).expect("loads");
+    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let chan = fixture.console();
+
+    let first = fixture.run_command(&mut ext, chan, "stash", &module);
+    assert_eq!(first, Verdict::Handled, "stashing a handle must not itself fail");
+
+    let second = fixture.run_command(&mut ext, chan, "usestale", &module);
+    assert_eq!(second, Verdict::Pass, "a stale handle must never resolve to a live pointer in a later invocation");
+    let notes = fixture.host.notes();
+    assert_eq!(notes.len(), 1, "got: {notes:?}");
+    assert!(notes[0].contains("stale") || notes[0].contains("invalid"), "got: {notes:?}");
+}
+
+/// Two `str` arguments in one call land at distinct, non-overlapping
+/// offsets within the shared scratch region -- the chosen layout (see
+/// `bind.rs`'s own "`str` argument layout" doc comment), proven by a real
+/// callee that reads the FIRST BYTE of *each* string through its own far
+/// pointer (`les bx, [bp+N]` then `mov al/ah, es:[bx]`) and returns both
+/// bytes packed into one word. A callee that saw the second string's
+/// pointer collide with the first's, or read the wrong offset, would not
+/// produce the two strings' own first bytes here.
+#[test]
+fn two_str_arguments_in_one_call_land_at_distinct_offsets() {
+    let code = [
+        0x89, 0xe5, // mov bp, sp
+        0xc4, 0x5e, 0x04, // les bx, [bp+4]      -- first str arg's far pointer
+        0x26, 0x8a, 0x07, // mov al, es:[bx]     -- its first byte
+        0xc4, 0x5e, 0x08, // les bx, [bp+8]      -- second str arg's far pointer
+        0x26, 0x8a, 0x27, // mov ah, es:[bx]     -- its first byte
+        0xcb, // retf
+    ];
+    let dir = tempdir_with(
+        "two_str_arguments_in_one_call_land_at_distinct_offsets",
+        &[(
+            "bind.lua",
+            r#"local M = mmud.bind("TESTMOD")
+            M.declare { firstbytes = "int(str, str)" }
+            mmud.command("twostr", function(c)
+                c:print(tostring(M.firstbytes("AB", "CD")) .. "\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("FIRSTBYTES", &code)).expect("loads");
+    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "twostr", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    // al = 'A' (0x41), ah = 'C' (0x43) -> ax = 0x4341 = 17217.
+    assert_eq!(String::from_utf8_lossy(&out), "17217\r\n");
+    assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
+}
+
+/// A null `ptr` return arrives as `nil`; a non-null one arrives as a live
+/// handle a script can immediately read through (`p:u16`), proving it is
+/// a real, registered pointer -- not merely a non-nil value.
+#[test]
+fn a_null_ptr_return_is_nil_and_a_real_one_is_a_live_handle() {
+    let mut fixture = Fixture::new();
+    let real = Wg16::mem(&mut fixture.machine).alloc_region(16).expect("alloc real backing memory");
+    Wg16::mem(&mut fixture.machine).write(real, &0xBEEFu16.to_le_bytes()).expect("seed a known value");
+
+    let null_code = far_ptr_return_code(FarPtr { offset: 0, selector: 0 });
+    let real_code = far_ptr_return_code(real);
+    let dir = tempdir_with(
+        "a_null_ptr_return_is_nil_and_a_real_one_is_a_live_handle",
+        &[(
+            "bind.lua",
+            r#"local M = mmud.bind("TESTMOD")
+            M.declare { getnull = "ptr()", getreal = "ptr()" }
+            mmud.command("nulltest", function(c)
+                c:print(tostring(M.getnull() == nil) .. "\r\n")
+                return mmud.HANDLED
+            end)
+            mmud.command("realtest", function(c)
+                local p = M.getreal()
+                c:print(tostring(p:u16(0)) .. "\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let module = fixture
+        .host
+        .load(&mut fixture.machine, &module_bytes_exporting_many(&[("GETNULL", &null_code), ("GETREAL", &real_code)]))
+        .expect("loads");
+    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let chan = fixture.console();
+
+    let null_verdict = fixture.run_command(&mut ext, chan, "nulltest", &module);
+    assert_eq!(null_verdict, Verdict::Handled);
+    let null_out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&null_out), "true\r\n");
+
+    let real_verdict = fixture.run_command(&mut ext, chan, "realtest", &module);
+    assert_eq!(real_verdict, Verdict::Handled);
+    let real_out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&real_out), "48879\r\n"); // 0xBEEF
+
+    assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
+}
+
+/// `mmud.abi` reports `"wg16"` under a `Wg16` fixture -- the DSL's own
+/// per-ABI branch point.
+#[test]
+fn mmud_abi_reports_wg16() {
+    let dir = tempdir_with(
+        "mmud_abi_reports_wg16",
+        &[(
+            "abi.lua",
+            r#"mmud.command("abitest", function(c)
+                c:print(tostring(mmud.abi) .. "\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "abitest", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "wg16\r\n");
 }

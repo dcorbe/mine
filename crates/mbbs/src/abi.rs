@@ -151,6 +151,14 @@ pub trait Abi {
     /// Bytes a C `long` occupies in this ABI's argument frame: 4 in both.
     const LONG_WIDTH: usize;
 
+    /// This ABI's own name, exactly as `mmud.abi` reports it to a Lua
+    /// script -- `"wg16"` or `"wg32"`. Lets one `scripts/lib/<module>.lua`
+    /// declarations file branch on which build it is running against (the
+    /// design's own `if mmud.abi ~= "wg16" then ...` example) without this
+    /// crate growing any Lua-facing type of its own -- a `&'static str` is
+    /// the whole surface `mbbs-lua` needs.
+    const NAME: &'static str;
+
     /// Whether this ABI's host was built with Galacticomm's `GCV2` flag set.
     ///
     /// **Not a width, and not derivable from one.** `GCV2` is a compile-time
@@ -1251,6 +1259,7 @@ mod tests {
         const PTR_WIDTH: usize = Wg16::PTR_WIDTH;
         const INT_WIDTH: usize = Wg16::INT_WIDTH;
         const LONG_WIDTH: usize = Wg16::LONG_WIDTH;
+        const NAME: &'static str = Wg16::NAME;
         const GCV2: bool = Wg16::GCV2;
         const FILE_FLAGS_OFFSET: u16 = Wg16::FILE_FLAGS_OFFSET;
         const FILE_SIZE: usize = Wg16::FILE_SIZE;
@@ -1471,4 +1480,17 @@ mod tests {
     // `Cursor`/`Call`, which stay here too, and need nothing Wg16-specific
     // beyond its width constants and decode functions (delegated, not
     // reimplemented).
+
+    /// `mmud.abi`'s whole surface: a plain associated const, both `Abi`
+    /// implementations. Reading it needs no `Machine`/`Cpu` of either
+    /// ABI's own (unlike most of `Wg32`'s own tests -- see this file's own
+    /// module doc comment on why `Wg32`'s real construction stays out of
+    /// `cargo test -p mbbs --lib`), so both go here rather than split
+    /// across `abi/wg16.rs` and a `crates/mbbs/tests/*.rs` integration
+    /// binary.
+    #[test]
+    fn each_abi_names_itself_for_mmud_abi() {
+        assert_eq!(Wg16::NAME, "wg16");
+        assert_eq!(Wg32::NAME, "wg32");
+    }
 }
