@@ -179,20 +179,23 @@ pub(crate) struct DeclaredEntry {
 /// only ever appends, [`rebind`] only ever reads.
 pub(crate) type Declared = Rc<RefCell<Vec<DeclaredEntry>>>;
 
-/// Installs `mmud.bind`/`mmud.abi` against exactly one `(module_name,
-/// module)` pair -- Task 2's provisional entry point; see
-/// `LuaExtension::load_with_module`'s own doc comment for what calls this
-/// and what Task 3 replaces it with.
+/// Installs `mmud.bind`/`mmud.abi` against every `(module_name, module)`
+/// pair loaded on this machine -- Task 3's real entry point (Task 2's
+/// `install` took exactly one pair; see `LuaExtension::load_with_modules`'s
+/// own doc comment for why this grew to a list: a Wg16 machine can load
+/// WCCMMUD + WCCMMPLS together, and each gets its own binding lib).
 ///
-/// `mmud.bind(name)` hard-errors if `name` does not match `module_name`
-/// (this task builds no multi-module registry, and no soft-skip -- both
-/// are Task 3's "real loading after module init" work, per the brief's own
-/// scope note). On a match it returns a fresh namespace table `M` whose
+/// `mmud.bind(name)` hard-errors if `name` matches none of `modules` --
+/// this is lib-file plumbing, called only from inside a lib file
+/// `namespace::install`'s `__index` handler has already decided IS loaded
+/// on this machine (its own soft-skip already ran before a lib is ever
+/// executed), so this is a defensive check, not the seam that decides
+/// availability. On a match it returns a fresh namespace table `M` whose
 /// `M.declare{...}` resolves each declared name via [`probe`] and appends
 /// a [`DeclaredEntry`] to `declared` -- never installing a callable
 /// directly, since only [`rebind`] (invocation-scoped) can build one that
 /// actually reaches a `CommandCtx`.
-pub(crate) fn install<A: Abi>(lua: &Lua, module_name: String, module: A::Module, declared: Declared) -> LuaResult<()>
+pub(crate) fn install<A: Abi>(lua: &Lua, modules: Vec<(String, A::Module)>, declared: Declared) -> LuaResult<()>
 where
     A::Module: 'static,
 {
@@ -200,11 +203,13 @@ where
     mmud.set("abi", A::NAME)?;
 
     let bind = lua.create_function(move |lua, name: String| {
-        if name != module_name {
+        let Some((_, module)) = modules.iter().find(|(n, _)| *n == name) else {
+            let loaded = modules.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
             return Err(mlua::Error::RuntimeError(format!(
-                "mmud.bind({name:?}): no module named {name:?} is available on this machine (bound module is {module_name:?})"
+                "mmud.bind({name:?}): no module named {name:?} is loaded on this machine (loaded: {loaded})"
             )));
-        }
+        };
+        let module = module.clone();
 
         let m = lua.create_table()?;
         let seen: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));

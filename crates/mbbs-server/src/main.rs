@@ -464,15 +464,28 @@ fn build_wg32_cpu(module_path: PathBuf) -> impl Fn() -> io::Result<Wg32Cpu> + Se
 ///
 /// A directory that fails to load names both the directory and the
 /// underlying reason -- see [`Boot::extension`]'s own doc comment for why
-/// this must be a startup error, never a silent, unscripted board.
+/// this must be a startup error, never a silent, unscripted board. `host::life`
+/// calls this AFTER every module has loaded and initialised (see
+/// `ExtensionBuilder`'s own doc comment), so `modules` is never empty on a
+/// board that boots at all -- `load_with_modules` resolves a script's bare
+/// namespace against exactly these.
+///
+/// Any per-script soft-skip note `LuaExtension::load_with_modules` produced
+/// is printed here, before the concrete `LuaExtension` is boxed away as
+/// `Box<dyn Extension<A>>` -- that erasure is the last point anything
+/// outside `mbbs-lua` can still call `LuaExtension::notes()` at all.
 ///
 /// `Fn`, not `FnOnce`, the same way [`build_wg32_cpu`] is: [`host::run`]'s
 /// restart loop calls this once per life, so a restarted machine gets its
 /// scripts freshly loaded rather than losing them after the first restart.
 fn build_lua_extension<A: mbbs::abi::Abi + 'static>(dir: PathBuf) -> ExtensionBuilder<A> {
-    Box::new(move || {
-        let ext = mbbs_lua::LuaExtension::load(&dir)
+    Box::new(move |modules: &[(String, A::Module)]| {
+        let named: Vec<(&str, &A::Module)> = modules.iter().map(|(name, module)| (name.as_str(), module)).collect();
+        let ext = mbbs_lua::LuaExtension::load_with_modules::<A>(&dir, &named)
             .map_err(|e| io::Error::other(format!("loading scripts from {}: {e}", dir.display())))?;
+        for note in ext.notes() {
+            eprintln!("mbbs-server: {note}");
+        }
         Ok(Box::new(ext) as Box<dyn mbbs::extension::Extension<A>>)
     })
 }
@@ -893,7 +906,11 @@ mod tests {
     fn build_lua_extension_produces_a_wg32_extension_from_the_shipped_scripts() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
         let builder = build_lua_extension::<Wg32>(dir);
-        builder().expect("the shipped scripts/ directory loads against Wg32 just as it does against Wg16");
+        // No modules given: none of the shipped scripts bind a bare
+        // namespace today, so an empty list still loads cleanly -- this
+        // test's own job is proving the generic builder itself produces a
+        // real `Extension<Wg32>`, not exercising namespace resolution.
+        builder(&[]).expect("the shipped scripts/ directory loads against Wg32 just as it does against Wg16");
     }
 
     /// `--scripts` together with a `Wg16` machine (the default, plain

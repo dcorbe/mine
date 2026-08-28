@@ -72,7 +72,15 @@ use crate::pool::{MachineId, Pool};
 /// building one (`main.rs`'s `--scripts` wiring today) can name it too. See
 /// that field's own doc for why this is a builder, not the extension
 /// itself.
-pub type ExtensionBuilder<A> = Box<dyn Fn() -> io::Result<Box<dyn mbbs::extension::Extension<A>>> + Send>;
+///
+/// Takes every `(name, module)` pair [`life`] has loaded onto this machine
+/// by the time it calls this -- see [`Boot::extension`]'s own doc comment
+/// for why this receives them at all (a `declare`d export must validate
+/// against a LIVE export table, so the extension can only be built AFTER
+/// every module has loaded and initialised, not before). `name` is each
+/// entry's own [`Boot::modules`] path stem, lowercased -- see that field's
+/// own doc for the exact derivation `life` uses.
+pub type ExtensionBuilder<A> = Box<dyn Fn(&[(String, <A as Abi>::Module)]) -> io::Result<Box<dyn mbbs::extension::Extension<A>>> + Send>;
 
 /// Everything the host thread needs, all of it `Send`. `A::Cpu` is not
 /// here and cannot be: it is `!Send`, and the thread builds its own -- see
@@ -319,6 +327,16 @@ pub struct Boot<A: Abi> {
     /// `FnOnce`, so a restart (see the module doc, "Surviving a module
     /// stop") rebuilds a fresh extension for the fresh `Host` it is
     /// installed on, the same way `Boot::build` rebuilds a fresh `A::Cpu`.
+    ///
+    /// **Built AFTER `boot.modules` load and initialise, not before.** A
+    /// script's `M.declare{...}` (`mbbs-lua`'s own declared-bindings
+    /// surface) validates every declared export against the module's LIVE
+    /// export table, so the extension cannot be built until every module
+    /// [`life`] loads has actually finished loading and running its own
+    /// init -- see the declared-bindings design doc's "Boot-order
+    /// consequence". [`life`] calls this builder with every `(name,
+    /// module)` pair it loaded, right after the module-loading loop (and
+    /// `Host::finish_init`) completes, never before.
     ///
     /// `None` is the supported default: a board given no builder here runs
     /// exactly as it did before this field existed.
@@ -777,6 +795,17 @@ fn collapse(notes: &[String]) -> Vec<String> {
     out
 }
 
+/// The bare name a `Boot::extension` builder sees for a loaded module: the
+/// module's own path stem (`WCCMMUD.DLL` -> `WCCMMUD`), lowercased
+/// (-> `wccmmud`) -- exactly what a script or lib file writes as a bare
+/// global (`local mud = wccmmud`). A path with no stem at all (empty, or
+/// `..`) names as an empty string rather than panicking; an extension
+/// builder that receives one is free to treat it as unresolvable, the same
+/// as any other name nothing binds.
+fn module_name(path: &std::path::Path) -> String {
+    path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default()
+}
+
 /// Drain everything the host has recorded since the last call and print it.
 ///
 /// `Host::notes` is the host's only way to say something the *module* cannot
@@ -847,15 +876,6 @@ fn life<A: Abi>(
     //    be handed in.
     let mut machine = (boot.build)()?;
     let mut host = Host::<A>::new(&mut machine, boot.root.clone(), boot.terms)?;
-    // Build and install this life's own extension, on this thread, the way
-    // `boot.build` builds this life's own `A::Cpu` above -- see
-    // `Boot::extension`'s own doc for why this cannot be handed in
-    // ready-made. A directory that fails to load is this life's own boot
-    // failure, reported and *not* retried, exactly like a module that
-    // cannot load (see this function's own doc, "Errors").
-    if let Some(build_ext) = &boot.extension {
-        host.set_extension(build_ext()?);
-    }
     // `MAJORBBS.C:999` -- the real `WGSERVER.EXE` opens its own generic data
     // file and publishes `genbb` before any module initialises, and modules
     // dereference that global without ever assigning it. A board is exactly the
@@ -950,6 +970,35 @@ fn life<A: Abi>(
     // `dclvda` total happened to be visible at that module's own turn, never
     // the sum every module actually needs.
     host.finish_init(&mut machine)?;
+
+    // 3. Build and install this life's own extension, on this thread, the
+    //    way `boot.build` builds this life's own `A::Cpu` above -- see
+    //    `Boot::extension`'s own doc for why this cannot be handed in
+    //    ready-made, and why it must run HERE, after every module has
+    //    loaded AND initialised, not before: `M.declare{...}` validates
+    //    against a module's LIVE export table, so building the extension
+    //    any earlier (as this driver did before this reorder) would
+    //    validate against a table that was not fully populated yet. A
+    //    directory that fails to load is this life's own boot failure,
+    //    reported and *not* retried, exactly like a module that cannot
+    //    load (see this function's own doc, "Errors").
+    //
+    //    `loaded.iter()`, not `loaded.into_iter()` -- `loaded` is still
+    //    needed just below, to pick out the primary module. Each pair's
+    //    own name is its `boot.modules` path's stem, lowercased (matching
+    //    a bare `local mud = wccmmud` a script or lib file would write),
+    //    zipped positionally with `loaded` since both vectors are built by
+    //    the SAME loop above, in the SAME order.
+    if let Some(build_ext) = &boot.extension {
+        let named: Vec<(String, A::Module)> = boot
+            .modules
+            .iter()
+            .zip(loaded.iter())
+            .map(|(path, module)| (module_name(path), module.clone()))
+            .collect();
+        host.set_extension(build_ext(&named)?);
+    }
+
     let module = loaded
         .into_iter()
         .next()

@@ -783,20 +783,22 @@ async fn a_module_that_faults_during_boot_is_not_restarted() {
 /// immediately, with no restart attempted, and the message must be the
 /// builder's own reason, not a generic failure.
 ///
-/// The module path here (`/nonexistent/DOES-NOT-EXIST.DLL`) is never read:
-/// `life` builds and installs the extension *before* it ever touches
-/// `boot.modules` (see `host.rs`'s own ordering), so a real module is not
-/// needed to prove this half of the contract, exactly as `host.rs`'s own
-/// `Boot::extension` doc says an extension failure belongs in the same
-/// "startup error, not a warning" bucket a module-load failure does.
+/// A REAL, successfully-booting module is used here, unlike a version of
+/// this test that predates the boot reorder: `life` now builds and installs
+/// the extension AFTER `boot.modules` load and initialise, not before (see
+/// `host.rs`'s own `ExtensionBuilder`/`Boot::extension` doc comments and the
+/// declared-bindings design doc's "Boot-order consequence"), so a builder
+/// that fails no longer has to be reached before any module read -- proving
+/// the failure is attributable purely to the builder itself, with a module
+/// that loaded and ran cleanly.
 #[tokio::test]
 async fn an_extension_that_fails_to_build_is_a_boot_failure_not_restarted() {
-    let mut b = boot(
-        PathBuf::from("/nonexistent/DOES-NOT-EXIST.DLL"),
-        "mbbs-server-host-supervisor-extension-boot-fault-root",
-        1,
+    let module = module_file(
+        "mbbs-server-host-supervisor-extension-boot-fault",
+        &builder::boots_and_runs_forever(),
     );
-    b.extension = Some(Box::new(|| {
+    let mut b = boot(module, "mbbs-server-host-supervisor-extension-boot-fault-root", 1);
+    b.extension = Some(Box::new(|_modules| {
         Err(std::io::Error::other("stub extension refuses to build, on purpose"))
     }));
 
@@ -813,6 +815,59 @@ async fn an_extension_that_fails_to_build_is_a_boot_failure_not_restarted() {
     assert!(
         err.to_string().contains("stub extension refuses to build, on purpose"),
         "the error should be the builder's own reason, not a generic failure: {err}"
+    );
+}
+
+/// The discriminating test for the boot reorder itself: the extension
+/// builder receives a module whose export table is ALREADY populated,
+/// proving `life` calls it after `Host::load` (not before). Deliberately
+/// reuses the "builder fails on purpose" shape
+/// (`an_extension_that_fails_to_build_is_a_boot_failure_not_restarted`)
+/// rather than driving a live board to a clean shutdown: the builder itself
+/// resolves a real, named export against the module it was handed and
+/// turns the answer into the boot error's own message, so the assertion
+/// below is a direct read of what the builder actually saw -- not an
+/// inference from timing or a side channel.
+///
+/// This test CANNOT pass if `life` still builds the extension before
+/// `Host::load` runs (the way it did before this reorder): `PING` would not
+/// exist in the module's export table yet, `export_address` would answer
+/// `None`, and the builder would report "NOT resolved" instead.
+#[tokio::test]
+async fn the_extension_builder_receives_modules_whose_export_table_is_already_populated() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-extension-sees-populated-exports",
+        &mbbs::testing::module_bytes_exporting("PING", &[0xcb]), // retf
+    );
+    let mut b = boot(
+        module,
+        "mbbs-server-host-supervisor-extension-sees-populated-exports-root",
+        1,
+    );
+    b.extension = Some(Box::new(|modules: &[(String, <Wg16 as mbbs::abi::Abi>::Module)]| {
+        let Some((_, module)) = modules.first() else {
+            return Err(std::io::Error::other("proof-of-reorder: the builder received no modules at all"));
+        };
+        let symbol = mbbs_machine::module::Symbol::Name("PING".to_string());
+        match <Wg16 as mbbs::abi::Abi>::export_address(module, &symbol) {
+            Some(_) => Err(std::io::Error::other("proof-of-reorder: PING resolved")),
+            None => Err(std::io::Error::other("proof-of-reorder: PING NOT resolved -- extension built before module load")),
+        }
+    }));
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || mbbs_server::host::run(b, rx, no_bell())),
+    )
+    .await
+    .expect("boot failing must return promptly, not hang the host thread")
+    .expect("the host thread did not panic");
+
+    let err = result.expect_err("the deliberate builder failure must still fail the boot");
+    assert!(
+        err.to_string().contains("proof-of-reorder: PING resolved"),
+        "the builder must see a module whose export table is already populated, got: {err}"
     );
 }
 

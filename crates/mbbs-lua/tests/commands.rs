@@ -8,14 +8,20 @@ use mbbs_machine::m16::FarPtr;
 
 /// Creates a fresh directory under this crate's `target/` scratch area (never
 /// `/tmp`, per this repository's standing rule) and writes the given
-/// `(filename, contents)` pairs into it.
+/// `(filename, contents)` pairs into it. `filename` may include a `/`
+/// (e.g. `"lib/wccmmud.lua"`, for the namespace tests below) -- its parent
+/// is created first.
 ///
 /// Each caller passes a distinct `name` so parallel tests do not collide.
 fn tempdir_with(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     for (filename, contents) in files {
-        std::fs::write(dir.join(filename), contents).expect("write script");
+        let path = dir.join(filename);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create script's parent dir");
+        }
+        std::fs::write(path, contents).expect("write script");
     }
     dir
 }
@@ -790,7 +796,7 @@ fn a_declared_fn_round_trips_asymmetric_int_and_long_arguments() {
     );
     let mut fixture = Fixture::new();
     let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("ADDEM", &code)).expect("loads");
-    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
     let verdict = fixture.run_command(&mut ext, chan, "addtest", &module);
@@ -809,7 +815,7 @@ fn a_declared_fn_round_trips_asymmetric_int_and_long_arguments() {
 /// narrowing the probe to try only the declared name verbatim (dropping
 /// the `_name`/`NAME`/`_NAME` candidates) makes `get_player` resolve
 /// against nothing in a module that only exports `_GET_PLAYER`, and
-/// `M.declare{...}` hard-errors at load time -- `load_with_module` itself
+/// `M.declare{...}` hard-errors at load time -- `load_with_modules` itself
 /// returns `Err`, so this test's own `.expect("loads and binds")` panics.
 /// Verified by mutation (see this crate's Task 2 report), not just
 /// asserted here.
@@ -822,7 +828,7 @@ fn the_case_probe_resolves_the_modules_own_exact_ne_spelling() {
     let mut fixture = Fixture::new();
     let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("_GET_PLAYER", &[0xcb])).expect("loads");
 
-    LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
 }
 
 /// The probe's second candidate (`NAME`, upper case, no leading
@@ -840,7 +846,7 @@ fn the_case_probe_also_resolves_an_upper_case_export_with_no_leading_underscore(
     let mut fixture = Fixture::new();
     let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("GET_PLAYER", &[0xcb])).expect("loads");
 
-    LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
 }
 
 /// An unknown export after all four spellings is a hard error at declare
@@ -855,7 +861,7 @@ fn declaring_an_unknown_export_names_the_export_the_module_and_the_spellings_tri
     let mut fixture = Fixture::new();
     let module = fixture.minimal_module();
 
-    let err = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect_err("no such export");
+    let err = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect_err("no such export");
 
     let msg = err.to_string();
     assert!(msg.contains("ghost"), "must name the declared export, got: {msg}");
@@ -877,7 +883,7 @@ fn a_bad_signature_hard_errors_the_load_and_names_the_declaration() {
     let mut fixture = Fixture::new();
     let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("_GET_PLAYER", &[0xcb])).expect("loads");
 
-    let err = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect_err("bad signature");
+    let err = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect_err("bad signature");
 
     let msg = err.to_string();
     assert!(msg.contains("get_player"), "must name the declaration, got: {msg}");
@@ -899,7 +905,7 @@ fn declaring_the_same_name_twice_on_one_namespace_is_a_hard_error() {
     let mut fixture = Fixture::new();
     let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("_GET_PLAYER", &[0xcb])).expect("loads");
 
-    let err = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect_err("duplicate declaration");
+    let err = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect_err("duplicate declaration");
 
     assert!(err.to_string().contains("get_player"), "got: {err}");
 }
@@ -926,7 +932,7 @@ fn an_out_of_range_int_argument_errors_but_the_same_value_as_a_long_passes() {
         .host
         .load(&mut fixture.machine, &module_bytes_exporting_many(&[("ASINT", &[0xcb]), ("ASLONG", &[0xcb])]))
         .expect("loads");
-    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
     let bad = fixture.run_command(&mut ext, chan, "asint", &module);
@@ -956,7 +962,7 @@ fn a_ptr_argument_refuses_a_raw_number() {
     );
     let mut fixture = Fixture::new();
     let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("TAKESPTR", &[0xcb])).expect("loads");
-    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
     let verdict = fixture.run_command(&mut ext, chan, "ptrnum", &module);
@@ -1000,7 +1006,7 @@ fn a_stale_handles_index_does_not_resolve_against_a_later_invocations_registry()
     );
     let mut fixture = Fixture::new();
     let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("TAKESPTR", &[0xcb])).expect("loads");
-    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
     let first = fixture.run_command(&mut ext, chan, "stash", &module);
@@ -1045,7 +1051,7 @@ fn two_str_arguments_in_one_call_land_at_distinct_offsets() {
     );
     let mut fixture = Fixture::new();
     let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("FIRSTBYTES", &code)).expect("loads");
-    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
     let verdict = fixture.run_command(&mut ext, chan, "twostr", &module);
@@ -1101,7 +1107,7 @@ fn a_str_argument_and_a_live_buffer_in_one_call_do_not_collide() {
     );
     let mut fixture = Fixture::new();
     let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("GETITEM", &code)).expect("loads");
-    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
     let verdict = fixture.run_command(&mut ext, chan, "canonical", &module);
@@ -1145,7 +1151,7 @@ fn a_null_ptr_return_is_nil_and_a_real_one_is_a_live_handle() {
         .host
         .load(&mut fixture.machine, &module_bytes_exporting_many(&[("GETNULL", &null_code), ("GETREAL", &real_code)]))
         .expect("loads");
-    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
     let null_verdict = fixture.run_command(&mut ext, chan, "nulltest", &module);
@@ -1177,7 +1183,7 @@ fn mmud_abi_reports_wg16() {
     );
     let mut fixture = Fixture::new();
     let module = fixture.minimal_module();
-    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
     let verdict = fixture.run_command(&mut ext, chan, "abitest", &module);
@@ -1185,4 +1191,257 @@ fn mmud_abi_reports_wg16() {
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
     assert_eq!(String::from_utf8_lossy(&out), "wg16\r\n");
+}
+
+// Task 3: bare-name namespaces (`local mud = wccmmud`), the per-script soft
+// skip, and the multi-module `load_with_modules` entry point. See this
+// crate's own `namespace.rs` module doc and the design doc's "The
+// namespace"/"Boot-order consequence" sections.
+
+/// The whole happy path, end to end: a script writes `local mod = testmod`,
+/// `scripts/lib/testmod.lua` exists and declares a real export, and the
+/// script's own command actually calls through the resolved namespace.
+#[test]
+fn a_script_binding_a_present_module_with_a_lib_registers_and_its_command_works() {
+    let code = [0xb8, 0x2a, 0x00, 0xcb]; // mov ax, 42 ; retf
+    let dir = tempdir_with(
+        "a_script_binding_a_present_module_with_a_lib_registers_and_its_command_works",
+        &[
+            (
+                "lib/testmod.lua",
+                r#"local M = mmud.bind("testmod")
+                M.declare { ping = "int()" }
+                return M"#,
+            ),
+            (
+                "cmd.lua",
+                r#"local mod = testmod
+                mmud.command("pingcmd", function(c)
+                    c:print(tostring(mod.ping()) .. "\r\n")
+                    return mmud.HANDLED
+                end)"#,
+            ),
+        ],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("PING", &code)).expect("loads");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("testmod", &module)]).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "pingcmd", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "42\r\n");
+    assert!(ext.notes().is_empty(), "a resolved namespace must not produce a skip note, got: {:?}", ext.notes());
+}
+
+/// A script binding a module that is not loaded on this machine is a soft
+/// skip -- its own registrations vanish, one note names it, and a sibling
+/// script in the SAME directory (no bare-name bind at all) still registers.
+/// Both halves are the discriminating property: a loader that failed the
+/// whole directory, or one that silently kept the ghost script's handler,
+/// would each pass only one half.
+#[test]
+fn a_script_binding_an_absent_module_skips_with_a_note_while_a_sibling_registers() {
+    let dir = tempdir_with(
+        "a_script_binding_an_absent_module_skips_with_a_note_while_a_sibling_registers",
+        &[
+            (
+                "10-ghost.lua",
+                r#"local mod = ghostmod
+                mmud.command("ghostcmd", function(c) return mmud.HANDLED end)"#,
+            ),
+            ("20-sibling.lua", r#"mmud.command("siblingcmd", function(c) return mmud.HANDLED end)"#),
+        ],
+    );
+
+    let ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[]).expect("a soft skip must not fail the load");
+
+    assert_eq!(ext.command_names(), vec!["siblingcmd"], "the ghost script's own registration must be discarded");
+    assert_eq!(ext.notes().len(), 1, "exactly one skip note, got: {:?}", ext.notes());
+    let note = &ext.notes()[0];
+    assert!(note.contains("10-ghost.lua"), "must name the script, got: {note}");
+    assert!(note.contains("ghostmod"), "must name the namespace it wanted, got: {note}");
+    assert!(note.contains("not loaded"), "must name the failed condition, got: {note}");
+}
+
+/// A module that IS loaded but has no `scripts/lib/<name>.lua` beside the
+/// scripts is also a soft skip -- the other half of the design's "both
+/// true" rule -- and the note names the exact missing path, not just the
+/// module name.
+#[test]
+fn a_present_module_with_no_lib_skips_naming_the_missing_lib_path() {
+    let dir = tempdir_with(
+        "a_present_module_with_no_lib_skips_naming_the_missing_lib_path",
+        &[(
+            "cmd.lua",
+            r#"local mod = testmod
+            mmud.command("cmd", function(c) return mmud.HANDLED end)"#,
+        )],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+
+    let ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("testmod", &module)]).expect("a soft skip must not fail the load");
+
+    assert!(ext.command_names().is_empty(), "got: {:?}", ext.command_names());
+    assert_eq!(ext.notes().len(), 1, "got: {:?}", ext.notes());
+    let note = &ext.notes()[0];
+    assert!(note.contains("testmod"), "must name the namespace, got: {note}");
+    assert!(
+        note.contains("lib") && note.contains("testmod.lua"),
+        "must name the missing lib path, got: {note}"
+    );
+}
+
+/// A lib file that exists and RUNS but raises its own hard error (here:
+/// `M.declare` naming an export the module does not have) must fail the
+/// whole load, exactly like any other script-time error -- never caught by
+/// the per-script skip machinery. This is the required mutation target: a
+/// skip catch broadened to swallow every error (not just `NamespaceSkip`)
+/// makes this test fail (the load would succeed instead of erroring).
+#[test]
+fn a_lib_files_own_hard_error_is_not_swallowed_by_the_skip_catch() {
+    let dir = tempdir_with(
+        "a_lib_files_own_hard_error_is_not_swallowed_by_the_skip_catch",
+        &[
+            (
+                "lib/testmod.lua",
+                r#"local M = mmud.bind("testmod")
+                M.declare { ghost = "void()" }
+                return M"#,
+            ),
+            ("cmd.lua", "local mod = testmod\n"),
+        ],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+
+    let err = LuaExtension::load_with_modules::<Wg16>(&dir, &[("testmod", &module)]).expect_err("a lib's own declare error must be a hard load error");
+
+    assert!(err.to_string().contains("ghost"), "got: {err}");
+}
+
+/// Two scripts binding the same module get back the SAME namespace table --
+/// the lib file's own top-level code runs exactly once per machine, not
+/// once per script that binds it. Observed the way `bind.rs`'s own
+/// scratch-cursor tests observe a side effect: a plain global counter the
+/// lib bumps, read back through a THIRD command.
+///
+/// `__lib_runs` is pre-set to `0` by a script that runs FIRST (lexical
+/// order), rather than the more natural `_G.x = (_G.x or 0) + 1`: reading
+/// an as-yet-undefined `_G.x` would itself be an undefined-global read,
+/// which this crate's own `__index` handler cannot tell apart from an
+/// attempted namespace bind (see `namespace.rs`'s own doc comment, "Cost
+/// accepted") -- it would raise its own `NamespaceSkip` for `x`, not
+/// silently answer `nil` the way an ordinary Lua global miss does. Real
+/// binding libs never hit this: `scripts/lib/<name>.lua` only ever
+/// declares locals and fields on its own returned table, never bare,
+/// unset globals.
+#[test]
+fn two_scripts_binding_the_same_module_share_one_cached_namespace() {
+    let code = [0xb8, 0x2a, 0x00, 0xcb]; // mov ax, 42 ; retf
+    let dir = tempdir_with(
+        "two_scripts_binding_the_same_module_share_one_cached_namespace",
+        &[
+            ("00-init.lua", "_G.__lib_runs = 0"),
+            (
+                "lib/testmod.lua",
+                r#"_G.__lib_runs = __lib_runs + 1
+                local M = mmud.bind("testmod")
+                M.declare { ping = "int()" }
+                return M"#,
+            ),
+            ("10-a.lua", "local mod_a = testmod\nmmud.command(\"a\", function(c) return mmud.HANDLED end)"),
+            (
+                "20-b.lua",
+                r#"local mod_b = testmod
+                mmud.command("report", function(c)
+                    c:print(tostring(__lib_runs) .. "\r\n")
+                    return mmud.HANDLED
+                end)"#,
+            ),
+        ],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("PING", &code)).expect("loads");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("testmod", &module)]).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "report", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "1\r\n", "the lib file's own top-level code must run exactly once");
+    assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
+}
+
+/// A genuine Lua syntax error is still a hard load failure under
+/// `load_with_modules`, exactly as it is under plain `load` (see
+/// `a_syntax_error_names_the_file_and_fails_the_load` above) -- the
+/// `__index` namespace machinery this method installs must not change that.
+#[test]
+fn a_syntax_error_is_still_a_hard_error_under_load_with_modules() {
+    let dir = tempdir_with("a_syntax_error_is_still_a_hard_error_under_load_with_modules", &[("bad.lua", "this is not lua")]);
+    let mut fixture = Fixture::new();
+    let module = fixture.minimal_module();
+
+    let err = LuaExtension::load_with_modules::<Wg16>(&dir, &[("testmod", &module)]).expect_err("must not load");
+
+    assert!(err.to_string().contains("bad.lua"), "got: {err}");
+}
+
+/// Task 3's own "multi-module machines" requirement: a Wg16 machine can load
+/// two modules together, and a single script binding BOTH bare namespaces in
+/// one file resolves both, with no special wiring -- the `__index` handler
+/// consults every `(name, module)` pair given to `load_with_modules`, not
+/// just whichever one a particular lib happens to know about.
+#[test]
+fn one_script_binding_two_namespaces_on_a_multi_module_machine_resolves_both() {
+    let ping_code = [0xb8, 0x01, 0x00, 0xcb]; // mov ax, 1 ; retf
+    let pong_code = [0xb8, 0x02, 0x00, 0xcb]; // mov ax, 2 ; retf
+    let dir = tempdir_with(
+        "one_script_binding_two_namespaces_on_a_multi_module_machine_resolves_both",
+        &[
+            (
+                "lib/first.lua",
+                r#"local M = mmud.bind("first")
+                M.declare { ping = "int()" }
+                return M"#,
+            ),
+            (
+                "lib/second.lua",
+                r#"local M = mmud.bind("second")
+                M.declare { pong = "int()" }
+                return M"#,
+            ),
+            (
+                "cmd.lua",
+                r#"local a = first
+                local b = second
+                mmud.command("both", function(c)
+                    c:print(tostring(a.ping()) .. "," .. tostring(b.pong()) .. "\r\n")
+                    return mmud.HANDLED
+                end)"#,
+            ),
+        ],
+    );
+    let mut fixture = Fixture::new();
+    let first = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("PING", &ping_code)).expect("loads");
+    let second = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("PONG", &pong_code)).expect("loads");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("first", &first), ("second", &second)]).expect("loads and binds both");
+    let chan = fixture.console();
+
+    // `run_command` takes one module to resolve calls against -- both
+    // namespaces' own declared entries were resolved independently at
+    // declare time (each against its OWN module), so either module handle
+    // works here; `first` is passed since it is the "primary" the way
+    // `Boot::modules[0]` is in `mbbs-server`.
+    let verdict = fixture.run_command(&mut ext, chan, "both", &first);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "1,2\r\n");
+    assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
 }

@@ -93,6 +93,7 @@
 
 mod api;
 mod bind;
+mod namespace;
 mod ptr;
 
 use std::cell::RefCell;
@@ -141,6 +142,13 @@ pub struct LuaExtension {
     /// would force this whole struct to carry an `Abi` type parameter it
     /// is deliberately built without (see the `assert_impl` check above).
     declared: bind::Declared,
+    /// One line per script file whose bare namespace bind was a soft skip
+    /// (see `namespace.rs`'s own doc comment and the design doc's "The
+    /// namespace") -- built once, at load time, by `exec_scripts`; never
+    /// grows again after that. `LuaExtension::load` never populates this
+    /// (it installs no `__index` handler at all, so a `NamespaceSkip` can
+    /// never be raised through it); only `load_with_modules` can.
+    notes: Vec<String>,
 }
 
 impl fmt::Debug for LuaExtension {
@@ -181,26 +189,47 @@ impl LuaExtension {
         api::install(&lua, Rc::clone(&handlers))
             .map_err(|source| LoadError(format!("installing the mmud table: {source}")))?;
 
-        Self::exec_scripts(&lua, dir)?;
+        // No `mmud.bind`, no `__index` namespace resolution -- a script
+        // loaded through this entry point has no declared-bindings surface
+        // at all, exactly as before Task 2/3 existed. `notes` therefore
+        // stays empty: `exec_scripts`'s own skip-catch is a no-op here,
+        // since a `NamespaceSkip` can only ever be raised by the `__index`
+        // handler `load_with_modules` installs.
+        let notes = Self::exec_scripts(&lua, dir, &handlers)?;
 
-        Ok(LuaExtension { lua, handlers, disabled: HashSet::new(), declared })
+        Ok(LuaExtension { lua, handlers, disabled: HashSet::new(), declared, notes })
     }
 
     /// Like [`LuaExtension::load`], but also installs `mmud.bind`/
-    /// `mmud.abi`, resolved against exactly one already-loaded module --
-    /// `module_name` is the bare name a script passes to `mmud.bind`,
-    /// `module` is what `M.declare{...}` resolves exports against.
+    /// `mmud.abi` and the bare-name namespace `__index` handler (see
+    /// `namespace.rs`'s own module doc), resolved against every
+    /// already-loaded `(name, module)` pair in `modules`.
     ///
-    /// **Task 2's provisional entry point.** The design's real boot-order
-    /// (`mmud.bind` resolving against whichever module of that name is
-    /// loaded on THIS machine, a missing module or a missing
-    /// `scripts/lib/<name>.lua` both a soft skip, script loading moved
-    /// after module init) is Task 3's "wires the machinery into
-    /// `mbbs-server`" work, not this one's -- see this crate's own
-    /// declared-bindings design doc, "Boot-order consequence". This method
-    /// is what Task 3 calls once it has a real, loaded `A::Module` in
-    /// hand; today it is exercised directly by this crate's own tests.
-    pub fn load_with_module<A: Abi>(dir: &Path, module_name: &str, module: &A::Module) -> Result<LuaExtension, LoadError>
+    /// **This is the design's real boot-order entry point.** `declare`
+    /// validates a declared export against the live export table, so
+    /// `modules` must already be loaded AND initialised -- calling this
+    /// before that (the way Task 2's `load_with_module` provisionally did)
+    /// would validate against an export table that is not fully populated
+    /// yet. See this crate's own declared-bindings design doc, "Boot-order
+    /// consequence", and `mbbs-server`'s `host::life`, which is the real
+    /// caller.
+    ///
+    /// A script binding a module named here (and finding
+    /// `scripts/lib/<name>.lua` beside `dir`) resolves it; a script binding
+    /// anything else is a soft skip, recorded in [`LuaExtension::notes`],
+    /// not a load failure -- see `namespace.rs`'s own doc comment for the
+    /// mechanism, and this method's own "Errors" note below for what still
+    /// IS hard.
+    ///
+    /// # Errors
+    ///
+    /// A Lua syntax error, a lib file's own hard error (an unknown
+    /// `declare`d export, a bad signature -- "broken plumbing," not a
+    /// missing module), or two scripts registering the same command name
+    /// all still fail the whole load, exactly as [`LuaExtension::load`]'s
+    /// own doc comment describes. Only a bare-name bind whose module is not
+    /// loaded, or whose lib file does not exist, is soft.
+    pub fn load_with_modules<A: Abi>(dir: &Path, modules: &[(&str, &A::Module)]) -> Result<LuaExtension, LoadError>
     where
         A::Module: 'static,
     {
@@ -209,20 +238,44 @@ impl LuaExtension {
         let declared: bind::Declared = Rc::new(RefCell::new(Vec::new()));
         api::install(&lua, Rc::clone(&handlers))
             .map_err(|source| LoadError(format!("installing the mmud table: {source}")))?;
-        bind::install::<A>(&lua, module_name.to_owned(), module.clone(), Rc::clone(&declared))
+
+        let owned_modules: Vec<(String, A::Module)> = modules.iter().map(|(name, module)| ((*name).to_owned(), (*module).clone())).collect();
+        let module_names: Vec<String> = owned_modules.iter().map(|(name, _)| name.clone()).collect();
+        bind::install::<A>(&lua, owned_modules, Rc::clone(&declared))
             .map_err(|source| LoadError(format!("installing mmud.bind: {source}")))?;
 
-        Self::exec_scripts(&lua, dir)?;
+        let cache: namespace::Cache = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        namespace::install(&lua, dir.to_path_buf(), module_names, cache)
+            .map_err(|source| LoadError(format!("installing the namespace __index handler: {source}")))?;
 
-        Ok(LuaExtension { lua, handlers, disabled: HashSet::new(), declared })
+        let notes = Self::exec_scripts(&lua, dir, &handlers)?;
+
+        Ok(LuaExtension { lua, handlers, disabled: HashSet::new(), declared, notes })
     }
 
     /// Loads every `*.lua` file directly inside `dir` into `lua`, sorted by
     /// filename, so `10-a.lua` runs before `20-b.lua` -- the file-walking
-    /// half [`LuaExtension::load`] and [`LuaExtension::load_with_module`]
+    /// half [`LuaExtension::load`] and [`LuaExtension::load_with_modules`]
     /// share; everything before this call is what differs between them
     /// (which primitives are installed before any script gets to run).
-    fn exec_scripts(lua: &Lua, dir: &Path) -> Result<(), LoadError> {
+    /// Returns one operator-facing note per script whose bare namespace
+    /// bind was a soft skip, in the order those scripts ran.
+    ///
+    /// # Per-script soft skip -- what is caught and what is not
+    ///
+    /// Before each file runs, `checkpoint` records how many handlers were
+    /// registered so far. If the file's own `.exec()` raises a
+    /// [`namespace::NamespaceSkip`] (found anywhere in [`mlua::Error::chain`],
+    /// since a metamethod's error can arrive wrapped in a `CallbackError` --
+    /// verified against `mlua` 0.10's own `Chain` traversal, not assumed),
+    /// every handler THIS file registered before the sentinel fired is
+    /// discarded (`handlers.truncate(checkpoint)`) and one note is pushed;
+    /// loading moves on to the next file. Any other error -- a syntax
+    /// error, a lib file's own hard error (never wrapped as
+    /// `NamespaceSkip`, so `chain().find_map` never matches it), a
+    /// duplicate command name -- still fails the WHOLE load immediately, as
+    /// it always has.
+    fn exec_scripts(lua: &Lua, dir: &Path, handlers: &Handlers) -> Result<Vec<String>, LoadError> {
         let mut entries: Vec<_> = fs::read_dir(dir)
             .map_err(|source| LoadError(format!("reading {}: {source}", dir.display())))?
             .filter_map(|entry| entry.ok())
@@ -231,22 +284,38 @@ impl LuaExtension {
             .collect();
         entries.sort();
 
+        let mut notes = Vec::new();
+
         for path in entries {
             let file_name = path.file_name().expect("filtered by extension, so has a name").to_string_lossy().into_owned();
             let source = fs::read_to_string(&path).map_err(|source| LoadError(format!("{file_name}: {source}")))?;
-            lua.load(&source)
-                .set_name(&file_name)
-                .exec()
-                .map_err(|source| LoadError(format!("{file_name}: {source}")))?;
+            let checkpoint = handlers.borrow().len();
+
+            if let Err(err) = lua.load(&source).set_name(&file_name).exec() {
+                if let Some(skip) = err.chain().find_map(|e| e.downcast_ref::<namespace::NamespaceSkip>()) {
+                    handlers.borrow_mut().truncate(checkpoint);
+                    notes.push(format!("{file_name} {skip} -- script skipped"));
+                    continue;
+                }
+                return Err(LoadError(format!("{file_name}: {err}")));
+            }
         }
 
-        Ok(())
+        Ok(notes)
     }
 
     /// Registered command names, in registration order (the order scripts
     /// ran in, and the order each called `mmud.command`).
     pub fn command_names(&self) -> Vec<String> {
         self.handlers.borrow().iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    /// One operator-facing line per script whose bare namespace bind was a
+    /// soft skip, in the order those scripts ran -- see
+    /// [`LuaExtension::load_with_modules`]'s own doc comment. Always empty
+    /// for a [`LuaExtension::load`]-built extension.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
     }
 }
 
