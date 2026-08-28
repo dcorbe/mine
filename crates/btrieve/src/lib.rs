@@ -14741,6 +14741,116 @@ mod tests {
         assert_eq!(again.block_mut(at).expect("open").records().expect("reads").len(), 0);
     }
 
+    /// The same mixed sequence -- inserts, an update, a delete, an insert
+    /// -- run once under the default bundle and once committing every op,
+    /// then closed. Every content page is byte-identical: staging leaves
+    /// the cache "holding exactly the bytes a real flush would have left",
+    /// relocations included, which is what keeps the per-op oracle
+    /// recordings meaningful under bundling. The shadow pairs are the one
+    /// designed difference: a bundle flips each pair once per commit where
+    /// the per-op run flips it once per op, so their generation words and
+    /// which half is live differ -- exactly as an explicit transaction's
+    /// commit already does
+    /// (`deferred_writes_across_two_allocation_table_blocks_collapse_to_one_flip_each`).
+    /// The live half's image, generation word aside, is identical, and so
+    /// is every record read back.
+    #[test]
+    fn a_bundled_run_and_a_per_op_run_differ_only_in_the_shadow_pairs_generations() {
+        let run = |tag: &str, limits: Limits| -> (Vec<u8>, PathBuf) {
+            let (mut btrieve, _mem, _heap, at, path) = session_with_v6(tag);
+            btrieve.set_bundle_limits(limits);
+            let mut positions = Vec::new();
+            for key in [b"AAAA", b"BBBB", b"CCCC", b"DDDD", b"EEEE"] {
+                positions.push(btrieve.block_mut(at).expect("open").insert(&v6_record(key)).expect("insert"));
+            }
+            btrieve.block_mut(at).expect("open").update(positions[2], &v6_record(b"cccc")).expect("update");
+            btrieve.block_mut(at).expect("open").delete(positions[1]).expect("delete");
+            btrieve.block_mut(at).expect("open").insert(&v6_record(b"FFFF")).expect("insert");
+            btrieve.close_all_files().expect("closes");
+            (std::fs::read(&path).expect("reads"), path)
+        };
+        let (bundled, bundled_path) = run("bundle-identity-bundled", Limits::default());
+        let (per_op, per_op_path) = run("bundle-identity-per-op", Limits { ops: 1, ..Limits::default() });
+        assert_eq!(bundled.len(), per_op.len(), "same file length");
+        let page = usize::from(u16::from_le_bytes([bundled[0x08], bundled[0x09]]));
+        let pages = bundled.len() / page;
+
+        let mut pairs = std::collections::BTreeSet::new();
+        for n in 0..pages {
+            match v6::Store::structural_pair_of(n, page) {
+                None => assert_eq!(
+                    bundled[n * page..][..page],
+                    per_op[n * page..][..page],
+                    "content page {n} must be byte-identical"
+                ),
+                Some(pair) => {
+                    pairs.insert(pair);
+                }
+            }
+        }
+        assert!(!pairs.is_empty(), "a v6 file has at least its control record's pair");
+
+        let live_image = |bytes: &[u8], (a, b): (usize, usize)| -> Vec<u8> {
+            let image = |p: usize| &bytes[p * page..][..page];
+            let generation =
+                |p: usize| u16::from_le_bytes([image(p)[at::GENERATION], image(p)[at::GENERATION + 1]]);
+            let live = if generation(a) >= generation(b) { a } else { b };
+            let mut masked = image(live).to_vec();
+            masked[at::GENERATION..at::GENERATION + 2].fill(0);
+            masked
+        };
+        for &pair in &pairs {
+            assert_eq!(
+                live_image(&bundled, pair),
+                live_image(&per_op, pair),
+                "pair {pair:?}: the live half must agree, generation word aside"
+            );
+        }
+
+        let read_back = |path: &Path| -> Vec<(u32, Vec<u8>)> {
+            let mut mem = FlatMem::new(64 * 1024);
+            let mut heap = FlatHeap::new(0x100);
+            let mut again = Btrieve::<Flat>::default();
+            let geometry = Geometry::read("V6EMPTY1KEY.DAT", path).expect("reads");
+            let at = again
+                .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", path, geometry, geometry.reclen)
+                .expect("opens");
+            let records = again.block_mut(at).expect("open").records().expect("reads");
+            records
+                .positions()
+                .into_iter()
+                .map(|p| (p, at_position(records, p).expect("listed").bytes.clone()))
+                .collect()
+        };
+        let records = read_back(&bundled_path);
+        assert_eq!(records, read_back(&per_op_path), "every record reads back the same");
+        assert_eq!(records.len(), 5, "AAAA cccc DDDD EEEE FFFF");
+    }
+
+    /// Kill the process (`Stop::AfterBodies`) inside a bundle's commit: the
+    /// file reads as its pre-bundle self, exactly as it would for one op.
+    #[test]
+    fn a_crash_inside_a_bundles_commit_leaves_the_pre_bundle_file() {
+        let (mut btrieve, mut mem, mut heap, at, path) = session_with_v6("bundle-crash");
+        btrieve.set_bundle_limits(young());
+        let before = std::fs::read(&path).expect("reads");
+        for key in [b"AAAA", b"BBBB", b"CCCC"] {
+            btrieve.block_mut(at).expect("open").insert(&v6_record(key)).expect("insert");
+        }
+        STOP_AT.with(|at| at.set(Some(Stop::AfterBodies)));
+        let err = btrieve.flush_bundles().expect_err("the injected stop fails the commit");
+        STOP_AT.with(|at| at.set(None));
+        assert!(err.to_string().contains("staged interruption"), "{err}");
+        assert_ne!(std::fs::read(&path).expect("reads"), before, "content and bodies did land");
+        drop(btrieve);
+        let mut again = Btrieve::<Flat>::default();
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let at = again
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, geometry.reclen)
+            .expect("opens clean");
+        assert_eq!(again.block_mut(at).expect("open").records().expect("reads").len(), 0, "its old self");
+    }
+
     #[test]
     fn abort_invalidates_the_v6_cache_not_just_disk_and_the_model() {
         let mut mem = FlatMem::new(64 * 1024);
