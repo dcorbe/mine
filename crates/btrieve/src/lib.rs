@@ -52,6 +52,7 @@
 
 pub mod acs;
 pub mod btrcall;
+pub mod bundle;
 mod cache;
 pub mod canvas;
 pub mod corpus;
@@ -80,6 +81,7 @@ use std::path::{Path, PathBuf};
 
 use crate::mem::{Alloc, BlockAbi, Mem};
 
+pub use bundle::Limits;
 pub use crate::create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use crate::keys::Key;
 pub use crate::ops::{BlockId, Delivery, LockMode, LockTable, Op, OpError, Step};
