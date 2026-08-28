@@ -9,10 +9,10 @@
 //! export's resolved entry is exactly an `A::Ptr` -- an ABI-specific type
 //! that cannot live in a non-generic struct's own field. [`Abi::ptr_to_bytes`]/
 //! [`Abi::ptr_from_bytes`] are already the crate's own answer to "a generic
-//! pointer needs a storable representation" (`CommandCtx`'s own
-//! `get_player`/`mbbs-lua`'s own `summon` both round-trip a far pointer
-//! through exactly these bytes today); [`DeclaredEntry`] reuses that same
-//! pair rather than inventing a second one. The entry is still resolved
+//! pointer needs a storable representation" -- this module's own
+//! `call_declared` uses the identical pair to hand a `ptr`-typed export
+//! return back to a script; [`DeclaredEntry`] reuses that same pair rather
+//! than inventing a second one. The entry is still resolved
 //! exactly once, at declare time -- decoding bytes back into `A::Ptr` at
 //! call time is not a second resolve, it is reading back what declare time
 //! already decided.
@@ -405,11 +405,11 @@ fn long_arg(value: &Value, pos: usize) -> LuaResult<u32> {
     Ok(n as u32)
 }
 
-/// `str` argument marshalling: the raw bytes only -- NUL-checked here
-/// (the same reasoning `mbbs-lua`'s own `summon` already documents for an
-/// embedded NUL: it would silently truncate what the module reads), copied
-/// into scratch by the caller ([`call_declared`]), which is the one that
-/// knows this call's own running offset.
+/// `str` argument marshalling: the raw bytes only -- NUL-checked here (the
+/// same reasoning `scripts/lib/wccmmud.lua`'s own `M.summon` documents for an
+/// embedded NUL in an item name: it would silently truncate what the module
+/// reads), copied into scratch by the caller ([`call_declared`]), which is
+/// the one that knows this call's own running offset.
 fn str_arg(value: &Value, pos: usize) -> LuaResult<Vec<u8>> {
     let s = value
         .as_string()

@@ -827,10 +827,11 @@ pub fn module_bytes_exporting(name: &str, code: &[u8]) -> Vec<u8> {
 
 /// [`module_bytes_exporting`], generalised to more than one real export.
 ///
-/// `set_experience`'s own test needs two genuine module calls to chain in
-/// one run -- `_GET_PLAYER`'s real far-pointer return, then `_SAVE_PLAYER`
-/// called against it -- and `module_bytes_exporting` can only ever build
-/// one. Each `(name, code)` pair in `exports` becomes its own fixed
+/// A declared-bindings namespace's own tests need several genuine module
+/// calls to chain in one run -- `mbbs-lua`'s `wccmmud_test_module` helper,
+/// say, needs a real `_GET_PLAYER` far-pointer return alongside five other
+/// declared exports -- and `module_bytes_exporting` can only ever build one.
+/// Each `(name, code)` pair in `exports` becomes its own fixed
 /// entry-table bundle entry, exported at consecutive ordinals starting at
 /// 1, with `code` placed at the next free offset in one shared code
 /// segment (segment 2) -- so a pointer computed from one export's own code

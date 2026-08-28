@@ -14,16 +14,18 @@
 -- resolves abbreviations, so a short name captures every command it prefixes.
 --
 -- Set the caller's own total experience OUTRIGHT -- this overwrites the
--- total, it does not add to it (see c:set_exp's own doc comment, and the
--- doc comment on the Rust CommandCtx::set_experience it delegates to, for
--- why the record stores experience TWICE and both copies must always agree).
+-- total, it does not add to it (see `scripts/lib/wccmmud.lua`'s own
+-- `M.set_experience` doc comment for why the record stores experience
+-- THREE times and all three copies must always agree).
+local mud = wccmmud
+
 mmud.command("setexp", function(c)
   local n = tonumber(c.args)
   if not n then
     c:print("setexp <total>\r\n")
     return mmud.HANDLED
   end
-  local ok, reason = c:set_exp(n)
+  local ok, reason = mud.set_experience(c, n)
   if ok then
     c:print("done.\r\n")
   else

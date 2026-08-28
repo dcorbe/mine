@@ -8,11 +8,15 @@
 -- refuses when the item would put the player over their weight cap, or
 -- when there is no free inventory slot.
 --
--- `c:summon` answers three different ways, not one boolean, because the
+-- `mud.summon` answers three different ways, not one boolean, because the
 -- three failures mean different things to the player: no such item exists,
 -- several items matched and the module has ALREADY told the player so (in
 -- which case this script must say nothing more), or the item was found but
--- would not fit.
+-- would not fit. The recipe itself -- the six-word/three-far-pointer call
+-- shape, the null-return disambiguation -- lives in `scripts/lib/wccmmud.lua`
+-- now, not here; this script is just the player-facing wording.
+local mud = wccmmud
+
 mmud.command("summon", function(c)
   local name = c.args
   if name == "" then
@@ -20,7 +24,7 @@ mmud.command("summon", function(c)
     return mmud.HANDLED
   end
 
-  local ok, reason = c:summon(name)
+  local ok, reason = mud.summon(c, name)
   if not ok then
     if reason == "ambiguous" then
       -- The module already prompted the player to narrow it down --

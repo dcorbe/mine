@@ -300,8 +300,8 @@ where
 }
 
 /// `c:buffer` itself -- a `Function` built once per invocation, the same way
-/// `Extension::command`'s own `print`/`summon`/`adjust_wealth`/`set_exp`
-/// entries are.
+/// `Extension::command`'s own `print` entry, and `bind::rebind`'s own
+/// declared-export closures, are.
 ///
 /// Takes `scope` by value (`&mut Scope`, reborrowed to `&Scope` right here,
 /// at this call boundary) rather than letting the caller do it: a `let`

@@ -18,26 +18,18 @@
 //! `mbbs-lua`'s own crate doc for the fuller account and what it means for
 //! a script author picking a command name.
 //!
-//! Where a new command's business logic should live -- `mbbs-lua` versus a
-//! `CommandCtx` method here -- is also written down, in `mbbs-lua`'s own
-//! crate doc, not repeated here.
-//!
-//! # These record offsets are a 16-bit measurement, not a fact about the ABI
-//!
-//! `CommandCtx` is generic over `A: Abi`, but its private `get_player`'s
-//! loaded-flag check (`+0x1e`) and [`CommandCtx::set_experience`]'s three
-//! experience fields (`0x3c`/`0x3e`, `0x46f`/`0x471`, `0x46b`/`0x46d`) are
-//! raw offsets measured against the 16-bit MajorMUD player record, not
-//! derived from the `Abi` trait. Being generic means this code will now
-//! compile and run against a 32-bit module and apply those same numbers --
-//! which are **not known to hold** there. This repo already has a case of
-//! exactly that kind of number differing by ABI: `struct fsdfld` is 23
-//! bytes in the 16-bit build and 36 bytes in the 32-bit build of the same
-//! product (`crate::fsd`, `abi.rs`'s `FsdField` layout), and a shared
-//! constant of 23 let 32-bit MajorMUD overwrite the stat min/max columns.
-//! Treat every offset in this file the same way: unverified on any ABI but
-//! `Wg16`, and due for re-measurement before this seam is trusted on
-//! another one.
+//! Where a new command's business logic should live -- a
+//! `scripts/lib/<module>.lua` declared-bindings file, never here -- is also
+//! written down, in `mbbs-lua`'s own crate doc, not repeated here. This
+//! module carries no module-specific knowledge of its own: no export name,
+//! no record offset, no command recipe. [`CommandCtx`] is the marshaller's
+//! engine (`call_export`/`call_entry`, `read_at`/`write_at`,
+//! `write_scratch`), generic over `A: Abi` and otherwise inert -- a record
+//! layout that differs by ABI (this repo has direct precedent: `struct
+//! fsdfld` is 23 bytes in the 16-bit build and 36 bytes in the 32-bit build
+//! of the same product, `crate::fsd`/`abi.rs`'s `FsdField`) is exactly the
+//! kind of fact that belongs in a lib file's own `REC` table, gated on
+//! `mmud.abi`, not hard-coded in this generic-over-`Abi` Rust module.
 
 use std::io;
 
@@ -46,12 +38,13 @@ use mbbs_machine::ptr::ModulePtr;
 use crate::Chan;
 use crate::abi::{Abi, Arg, ModuleMem};
 
-/// The most bytes [`CommandCtx::write_scratch`] will ever place. `mbbs-lua`'s
-/// `summon`, this seam's only caller today, needs an item search name plus
-/// a trailing NUL plus a 2-byte OUT match count; 128 bytes is generous
-/// headroom over any real `WCCITEMS.VIR` item name. See `write_scratch`'s
-/// own doc comment for why this is a fixed, reused buffer rather than an
-/// unbounded allocation per call.
+/// The most bytes [`CommandCtx::write_scratch`] will ever place. A `str`-typed
+/// declared-binding argument plus a `c:buffer` cell together, this seam's
+/// only callers today, need an item search name plus a trailing NUL plus a
+/// 2-byte OUT match count; 128 bytes is generous headroom over any real
+/// `WCCITEMS.VIR` item name. See `write_scratch`'s own doc comment for why
+/// this is a fixed, reused buffer rather than an unbounded allocation per
+/// call.
 const COMMAND_SCRATCH_BYTES: usize = 128;
 
 /// What an extension decided about an event.
@@ -237,9 +230,9 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
     /// which always writes through this seam's own persistent buffer, this
     /// resolves *any* pointer, module-owned or seam-owned alike: the read
     /// half of `write_scratch` for an OUT parameter a call just wrote
-    /// through (a match count, say), and equally the way
-    /// [`CommandCtx::player_record`]'s caller reads a coin field out of the
-    /// player record itself.
+    /// through (a match count, say), and equally the way a declared
+    /// binding's `p:u8/u16/u32` reads a field out of a struct pointer it
+    /// resolved through `M.declare{...}`.
     ///
     /// # Errors
     ///
@@ -255,7 +248,7 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
     /// write counterpart, and [`CommandCtx::write_scratch`]'s generic
     /// sibling: `write_scratch` always targets this seam's own persistent
     /// buffer, while this targets whatever pointer the caller already has in
-    /// hand, such as a field inside [`CommandCtx::player_record`]'s record.
+    /// hand, such as a field inside a declared binding's own struct pointer.
     ///
     /// # Errors
     ///
@@ -263,238 +256,6 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
     /// this module owns.
     pub fn write_at(&mut self, ptr: A::Ptr, bytes: &[u8]) -> io::Result<()> {
         ptr.write(A::mem(self.machine), bytes).map_err(|e| io::Error::other(format!("write_at: {e}")))
-    }
-
-    /// The calling channel's own player record: `_GET_PLAYER(usrnum)`,
-    /// through [`CommandCtx::call_export`].
-    ///
-    /// Introduced here because two tasks need the same base pointer --
-    /// `cash`'s coin-field arithmetic and a later task's own read of the
-    /// same record -- and a pointer this fundamental should be derived once,
-    /// not re-derived per caller.
-    ///
-    /// # `_GET_PLAYER` takes one argument, not two
-    ///
-    /// `re/exports/WCCMMUD_named.c:29982` declares it
-    /// `_GET_PLAYER(int param_1)` -- one parameter -- and its body only ever
-    /// reads `param_1`. Most call sites in the same file render as
-    /// `_GET_PLAYER(param_1,0x1280)`, but several do not
-    /// (`re/exports/WCCMMUD_named.c:1802,1839,2853,4483`, each a bare
-    /// `_GET_PLAYER(param_1)`), against the same binary and the same
-    /// definition -- a real second argument could not be optional call site
-    /// to call site. `0x1280` is also identical at every two-argument call
-    /// site regardless of context, which is not how a real per-call-site
-    /// argument behaves. Both facts point the same way: `0x1280` is a
-    /// decompiler artefact (most likely a data-segment value Ghidra
-    /// misattributed as a pushed argument ahead of a far call), not a
-    /// genuine parameter. This method calls it with one argument, `usrnum`.
-    ///
-    /// # Errors
-    ///
-    /// As [`CommandCtx::call_export`], if `_GET_PLAYER` is not an export the
-    /// module's own tables answer for, or if the call stops the machine.
-    ///
-    /// If `_GET_PLAYER` answers with a null far pointer -- the player is not
-    /// loaded on this channel -- that is an error naming the channel, never
-    /// a silent no-op: a caller that went on to write through a null pointer
-    /// would corrupt segment 0 of whatever the selector half happened to be.
-    pub fn player_record(&mut self) -> io::Result<A::Ptr> {
-        self.get_player()?.ok_or_else(|| {
-            io::Error::other(format!("_GET_PLAYER({}) returned a null pointer -- no player loaded on this channel", self.chan))
-        })
-    }
-
-    /// [`CommandCtx::player_record`]'s sibling: a null `_GET_PLAYER` return
-    /// comes back as `Ok(None)` here instead of an `Err`.
-    ///
-    /// `player_record` is right that a null return deserves a loud, named
-    /// error for a caller with no plan for it -- that contract is unchanged,
-    /// and most callers should keep using it. This exists for the caller
-    /// that *does* have a plan: "no character loaded on this channel" is a
-    /// routine, player-reachable condition (nothing this seam does is
-    /// scoped to in-game input -- see the extension seam's own module doc),
-    /// not a sign of a broken script or a broken module, so a caller like
-    /// `mbbs-lua`'s `adjust_wealth`/`set_exp` needs to tell it apart from a
-    /// genuine failure (`_GET_PLAYER` itself unresolved, or the machine
-    /// stopping underneath it) in order to report the former to the player
-    /// instead of disabling itself over it. Both of those genuine failures
-    /// still come back `Err` here, exactly as [`CommandCtx::player_record`]
-    /// reports them -- only the null-pointer case changes shape.
-    ///
-    /// # Errors
-    ///
-    /// Anything other than a null return: as [`CommandCtx::player_record`]'s
-    /// own `# Errors`.
-    pub fn try_player_record(&mut self) -> io::Result<Option<A::Ptr>> {
-        self.get_player()
-    }
-
-    /// `_GET_PLAYER(usrnum)`, decoded into a far pointer, with the
-    /// null-vs-real-pointer decision left to the caller -- the one piece of
-    /// logic [`CommandCtx::player_record`] and [`CommandCtx::try_player_record`]
-    /// share, so the two public methods cannot drift apart on what counts as
-    /// "null" or how the far pointer is assembled.
-    fn get_player(&mut self) -> io::Result<Option<A::Ptr>> {
-        let usrnum = A::Int::from(self.chan.number() as u16);
-        let outcome = self.call_export("_GET_PLAYER", &[Arg::Int(usrnum)])?;
-        let (lo, hi) = match outcome {
-            crate::Outcome::Returned { lo, hi } => (lo, hi),
-            crate::Outcome::Stopped(poison) => {
-                return Err(io::Error::other(format!("_GET_PLAYER stopped the machine: {poison}")));
-            }
-        };
-        let mut bytes = (lo as u16).to_le_bytes().to_vec();
-        bytes.extend_from_slice(&(hi as u16).to_le_bytes());
-        let ptr = A::ptr_from_bytes(&bytes);
-        if ptr == A::null_ptr() {
-            return Ok(None);
-        }
-
-        // A non-null pointer does NOT mean a character is loaded. `_GET_PLAYER`
-        // is `ptrtile` into the module's own `alctile(nterms, 1998)` table
-        // (`WCCMMUD_named.c:29982`), i.e. a bounds-checked array index -- it
-        // answers with this channel's SLOT, and every in-range channel has one
-        // whether or not anybody is playing on it. Treating non-null as "loaded"
-        // means a command typed at the login prompt writes into an empty slot.
-        //
-        // The module's own guard is a separate flag byte at record `+0x1e`:
-        // `_ADDON_ADJUST_USER_WEALTH` (`WCCMMUD_named.c:73421`) tests
-        // `pcVar3[0x1e] != '\0'` before it will touch the record or save it.
-        // Use the same flag, so "no character loaded" is a real answer rather
-        // than a check that can never fire.
-        //
-        // Measured on a live board 2026-08-20: without this, `exp 5000` typed
-        // at "Enter your user ID:" answered "done." and wrote four words into an
-        // unloaded slot.
-        const LOADED_FLAG: usize = 0x1e;
-        let flag = self.read_at(A::ptr_offset(ptr, LOADED_FLAG as u16), 1)?;
-        Ok(if flag.first().copied().unwrap_or(0) == 0 { None } else { Some(ptr) })
-    }
-
-    /// Overwrite (not add to) the caller's own total experience.
-    ///
-    /// # No export sets experience -- the 591-entry table was searched
-    ///
-    /// The spec's tier-1 rule prefers a module accessor over an offset poke.
-    /// One does not exist here: every export touching experience was
-    /// checked (case-insensitively, for `EXP`/`XP`/`ADJUST`/`ADDON_`/`GAIN`/
-    /// `AWARD`/`LEVEL`/`SET`; `GAIN` and `AWARD` have zero matches anywhere
-    /// in the whole table). What exists instead:
-    ///
-    /// - `_ADD_EXPERIENCE` (ordinal 12), `_ADD_QUEST_EXP` (572),
-    ///   `_DISTRIBUTE_EXPERIENCE` (383) -- all additive, taking a delta, not
-    ///   a total.
-    /// - `_CALC_EXP_NEEDED` (63), `_NEW_CALC_EXP_NEEDED` (564) -- pure
-    ///   calculators, no side effect.
-    /// - `_CMD_EXPERIENCE` (469) -- only displays.
-    /// - `_RESTRUCTURE_EXPERIENCE` (565) -- writes the field, but takes only
-    ///   a player pointer, no amount: a migration routine, not a setter.
-    ///
-    /// So writing by offset is the correct route here, not a shortcut
-    /// around the rule -- it is what the rule's own escape hatch is for
-    /// once the search comes up empty. Do not repeat this search; if a
-    /// setter is ever added to the module, this comment is now wrong and
-    /// should be replaced with a call to it.
-    ///
-    /// # Three fields, six words -- the module's own invariant, replicated
-    ///
-    /// The record stores experience in THREE places, not two:
-    /// `0x3c`/`0x3e` (32-bit, low word first) is the raw total; `0x46f`/
-    /// `0x471` is that same total **modulo 1,000,000,000**; `0x46b`/`0x46d`
-    /// is the **count of billions** (the quotient). This is not this
-    /// method's own invention -- it is exactly what
-    /// `_RESTRUCTURE_EXPERIENCE` computes, in full
-    /// (`re/exports/WCCMMUD_named.c:72415-72442`):
-    ///
-    ///
-    /// An earlier version of this comment (and this method) read only the
-    /// first three lines and concluded `_RESTRUCTURE_EXPERIENCE` performs a
-    /// flat copy -- **that reading was wrong.** It performs a copy AND a
-    /// reduction; the `while` loop is not incidental cleanup, it is the
-    /// step that keeps `0x46f`/`0x471` a bounded remainder rather than an
-    /// unbounded total, and it is what every other writer in the module
-    /// (`_ADD_EXPERIENCE`'s own delta-processing loop,
-    /// `re/exports/WCCMMUD_named.c:1378-1401`, subtracts the identical
-    /// `0x3b9aca00` and increments the identical `0x46b`/`0x46d` counter)
-    /// already agrees with. This method now replicates the full
-    /// three-field invariant: `0x3c`/`0x3e` = `exp`, `0x46f`/`0x471` =
-    /// `exp % 1_000_000_000`, `0x46b`/`0x46d` = `exp / 1_000_000_000`. No
-    /// clamping, no rejecting large values -- `exp` is `u32` and every value
-    /// it can hold is handled, the same way `_RESTRUCTURE_EXPERIENCE`
-    /// itself handles every value already on a record it is given.
-    ///
-    /// **Neither `0x3c`/`0x3e` nor `0x46f`/`0x471`/`0x46b`/`0x46d` is
-    /// authoritative alone.** `_RESTRUCTURE_EXPERIENCE` runs from five
-    /// places -- `_LOAD_PLAYER` itself (`:318-320`, the load-bearing one:
-    /// every character load runs it), `_SHOW_STATUS` (`:32438`),
-    /// `_CMD_EXPERIENCE` (`:54425`), `_CMD_SYSOP` (`:63219`),
-    /// `_GENERATE_TOP_LIST` (`:76200`) -- each guarded by a per-record flag
-    /// (`base + 0x7b8` bit `0x20`) that is set once restructuring has run.
-    /// On a record whose flag is still clear, writing only
-    /// `0x46f`/`0x471`/`0x46b`/`0x46d` is silently reverted back to
-    /// `0x3c`/`0x3e` (reduced afresh) the next time the character loads. On
-    /// a record whose flag is already set -- the normal state of any
-    /// actively played character, since `_LOAD_PLAYER` restructures
-    /// unconditionally the first time -- writing only `0x3c`/`0x3e` does
-    /// nothing live: **`_SHOW_STATUS` formats `0x46b`/`0x46d`/`0x46f`/
-    /// `0x471` straight to the player's status screen with no
-    /// re-normalisation when the flag is set** (`:32438-32455`), so a stale
-    /// or under-written value there is visible on the player's very next
-    /// `st`, not deferred to some later event. Writing all three fields
-    /// unconditionally is correct in either flag state, which is why this
-    /// never branches on the flag itself.
-    ///
-    /// A prior session's own live-board measurement
-    /// (`majormud-character-record-layout` memory, verified twice against
-    /// real characters) independently reaches part of the same requirement
-    /// from the opposite direction: "`0x46f` -- the live value `st`
-    /// displays... [p]atching only `0x03c` silently fails." That
-    /// measurement predates this comment's correction and did not exercise
-    /// a total past 1,000,000,000, so it does not by itself confirm the
-    /// `0x46b`/`0x46d` billions field -- the decompile above is this
-    /// method's authority for that field.
-    ///
-    /// # Persistence
-    ///
-    /// A raw offset write with no save leaves the change in memory only, so
-    /// this ends with `_SAVE_PLAYER(usrnum)` -- the same export
-    /// [`CommandCtx::player_record`]'s own caller (`cash`'s grant path,
-    /// Task 7) already relies on for exactly this reason.
-    ///
-    /// # Errors
-    ///
-    /// As [`CommandCtx::player_record`], if the caller's own record cannot
-    /// be resolved. As [`CommandCtx::write_at`], if any of the six writes
-    /// runs off the resolved record (should never happen against a real
-    /// 1998-byte record, but never silently skipped either way). As
-    /// [`CommandCtx::call_export`]/[`CommandCtx::player_record`]'s own
-    /// pattern, if `_SAVE_PLAYER` is not an export the module answers for,
-    /// or stops the machine.
-    pub fn set_experience(&mut self, exp: u32) -> io::Result<()> {
-        /// `_RESTRUCTURE_EXPERIENCE`'s own reduction modulus
-        /// (`0x3b9aca00`, `re/exports/WCCMMUD_named.c:72426-72439`) --
-        /// named so the three field computations below read as "the same
-        /// one number," not three independent literals that could drift
-        /// apart under a later edit.
-        const BILLION: u32 = 1_000_000_000;
-
-        let record = self.player_record()?;
-        let write_u32 = |ctx: &mut Self, delta: u16, value: u32| -> io::Result<()> {
-            ctx.write_at(A::ptr_offset(record, delta), &(value as u16).to_le_bytes())?;
-            ctx.write_at(A::ptr_offset(record, delta + 2), &((value >> 16) as u16).to_le_bytes())
-        };
-
-        write_u32(self, 0x3c, exp)?;
-        write_u32(self, 0x46f, exp % BILLION)?;
-        write_u32(self, 0x46b, exp / BILLION)?;
-
-        let usrnum = A::Int::from(self.chan.number() as u16);
-        match self.call_export("_SAVE_PLAYER", &[Arg::Int(usrnum)])? {
-            crate::Outcome::Returned { .. } => Ok(()),
-            crate::Outcome::Stopped(poison) => {
-                Err(io::Error::other(format!("_SAVE_PLAYER stopped the machine: {poison}")))
-            }
-        }
     }
 }
 
