@@ -1052,6 +1052,34 @@ fn init_falls_back_to_ordinal_one_when_no_named_init_export_exists() {
     );
 }
 
+/// The ordinal-1 fallback must not hand back a pointer into a *data*
+/// segment. `entry(1)` still resolves it -- that call has no way to know
+/// the caller means to execute it -- but `init()`'s fallback does, and a
+/// far jump into a non-executable descriptor is a fault the sandbox
+/// cannot recover from (`m16::fault`'s claim test reads the *interrupted*
+/// `CS`, which a jump that never completed never changed). Measured
+/// against `CXO-LORD.DLL`, whose ordinal 1 sits in a segment its own NE
+/// header marks `SEG_DATA`.
+#[test]
+fn init_refuses_ordinal_one_when_its_segment_is_data() {
+    let ne = Ne {
+        segments: vec![Seg::code(vec![0xcbu8; 4]), Seg::data(vec![0; 4])],
+        entries: vec![Some((2, 0x00))],
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    let mut machine = Machine::new().expect("16-bit machine");
+    let module = machine.load_ne(&ne.finish(), &nothing).expect("loaded");
+
+    assert!(module.entry(1).is_some(), "ordinal 1 is exported and resolves fine on its own");
+    assert_eq!(
+        module.init(),
+        None,
+        "no _INIT__TESTMOD export exists and ordinal 1 names a data segment, so init() must refuse rather than guess"
+    );
+}
+
 #[test]
 fn a_file_that_is_not_ne_is_rejected() {
     assert_eq!(NeImage::parse(b"not an executable"), Err(NeError::NotNe));
