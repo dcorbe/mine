@@ -1445,3 +1445,123 @@ fn one_script_binding_two_namespaces_on_a_multi_module_machine_resolves_both() {
     assert_eq!(String::from_utf8_lossy(&out), "1,2\r\n");
     assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
 }
+
+// ---------------------------------------------------------------------
+// Task 4: `scripts/lib/wccmmud.lua` -- the real, shipped lib file, loaded
+// through the whole stack (`__index` namespace resolution, `mmud.bind`/
+// `M.declare` against a real export table, `M.player`'s loaded-flag guard).
+// `include_str!` pulls in the actual file at `scripts/lib/wccmmud.lua`, not
+// a copy that could drift from what ships -- a change to that file that
+// breaks parsing, declaration, or the guard's logic fails these tests.
+//
+// Everything else `wccmmud.lua` declares (`save_player`,
+// `cleanup_currency`, `addon_adjust_user_wealth`, `get_item_from_name`,
+// `add_item_to_inventory`) and every helper built on them
+// (`M.set_experience`, `M.grant_copper`, `M.deduct_wealth`, `M.summon`) is
+// untestable here: they all need a REAL player record's other fields
+// (`0x613`/`0x615`, `0x3c`/`0x3e`, ...) or the multi-call summon sequence
+// behind a synthetic export this crate's fixture-code helpers cannot
+// fabricate believably (a `mov`/`retf` stub can return a fixed pointer, but
+// cannot also perform `_ADD_ITEM_TO_INVENTORY`'s own OUT-count-cell write or
+// the module's own coin arithmetic). Task 5's rewritten commands, run
+// against a real `WCCMMUD.DLL`, are what actually exercises those -- this
+// is what IS testable now, per the task brief.
+// ---------------------------------------------------------------------
+
+/// A synthetic module exporting all six names `wccmmud.lua`'s own
+/// `M.declare{...}` requires -- declaring hard-errors at load time on ANY
+/// missing name, so every one of the six must resolve even though this
+/// pair of tests only ever calls through `_GET_PLAYER`. The other five are
+/// bare `retf` stubs (`[0xcb]`); `_GET_PLAYER` alone gets real behaviour
+/// (`far_ptr_return_code`, itself already mirroring
+/// `crates/mbbs/tests/extension_seam.rs`'s `get_player_code`, per that
+/// helper's own doc comment).
+fn wccmmud_test_module(fixture: &mut Fixture<Wg16>, record_ptr: FarPtr) -> <Wg16 as Abi>::Module {
+    let get_player_code = far_ptr_return_code(record_ptr);
+    let stub = [0xcbu8]; // retf
+    fixture
+        .host
+        .load(
+            &mut fixture.machine,
+            &module_bytes_exporting_many(&[
+                ("_GET_PLAYER", &get_player_code),
+                ("_SAVE_PLAYER", &stub),
+                ("_CLEANUP_CURRENCY", &stub),
+                ("_ADDON_ADJUST_USER_WEALTH", &stub),
+                ("_GET_ITEM_FROM_NAME", &stub),
+                ("_ADD_ITEM_TO_INVENTORY", &stub),
+            ]),
+        )
+        .expect("loads")
+}
+
+fn wccmmud_lib_dir(test_name: &str) -> std::path::PathBuf {
+    tempdir_with(
+        test_name,
+        &[
+            ("lib/wccmmud.lua", include_str!("../../../scripts/lib/wccmmud.lua")),
+            (
+                "cmd.lua",
+                r#"local mud = wccmmud
+                mmud.command("player", function(c)
+                    local p, reason = mud.player(c)
+                    if p == nil then
+                        c:print("nil:" .. reason .. "\r\n")
+                    else
+                        c:print("ok:" .. tostring(p:u8(0x1e)) .. "\r\n")
+                    end
+                    return mmud.HANDLED
+                end)"#,
+            ),
+        ],
+    )
+}
+
+/// The lib parses, `M.declare{...}` resolves every declared name against a
+/// real (synthetic) export table, and `M.player` reports the honest reason
+/// string on an UNLOADED slot -- `_GET_PLAYER` answers with a real, non-null
+/// pointer (a slot every in-range channel has), but the record's own
+/// `+0x1e` flag byte is left clear, so `M.player` must still say "no
+/// character loaded," never hand back a handle for a slot nobody is
+/// actually playing on.
+#[test]
+fn wccmmud_lib_player_reports_no_character_loaded_on_an_unloaded_slot() {
+    let dir = wccmmud_lib_dir("wccmmud_lib_player_reports_no_character_loaded_on_an_unloaded_slot");
+    let mut fixture = Fixture::new();
+    // Real backing memory so `+0x1e` exists to be read at all -- deliberately
+    // NOT written, which is the whole point (mirrors extension_seam.rs's own
+    // `an_unloaded_slot_is_no_character_even_though_get_player_answers_with_a_pointer`).
+    let record_ptr = Wg16::mem(&mut fixture.machine).alloc_region(2000).expect("alloc real backing memory");
+    let module = wccmmud_test_module(&mut fixture, record_ptr);
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "player", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "nil:no character loaded on this channel\r\n");
+    assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
+}
+
+/// The other half: a MARKED slot (`+0x1e` set to a nonzero byte) makes
+/// `M.player` hand back a real, working handle -- read through it
+/// (`p:u8(0x1e)`) to prove it is genuinely the same record `_GET_PLAYER`
+/// answered with, not merely "not nil."
+#[test]
+fn wccmmud_lib_player_returns_a_working_handle_on_a_loaded_slot() {
+    let dir = wccmmud_lib_dir("wccmmud_lib_player_returns_a_working_handle_on_a_loaded_slot");
+    let mut fixture = Fixture::new();
+    let record_ptr = Wg16::mem(&mut fixture.machine).alloc_region(2000).expect("alloc real backing memory");
+    Wg16::mem(&mut fixture.machine).write(Wg16::ptr_offset(record_ptr, 0x1e), &[1]).expect("mark loaded");
+    let module = wccmmud_test_module(&mut fixture, record_ptr);
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "player", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "ok:1\r\n");
+    assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
+}
