@@ -125,14 +125,44 @@ per-invocation cursor -- not independent bookkeeping each. This is
 deliberate: it is what keeps a `c:buffer` cell and a `str` argument in the
 same call (`M.get_item_from_name(name, nil, cell)`, the canonical shape) from
 silently landing on the same bytes. The budget resets to empty at the start
-of every command invocation. Running past what is left is refused outright,
-never silently truncated -- a single write bigger than the whole 128-byte
-region is refused by `write_scratch` itself, which names both the byte count
-requested and the region's 128-byte capacity; a write that only overflows
-because of what earlier consumers in the same invocation already took is
-refused by the same bounds check `p:w8/w16/w32` goes through. Keep buffer
-sizes and string arguments conservative -- there is no way to grow the
-region.
+of every command invocation. A single write bigger than the whole 128-byte
+region is always refused by `write_scratch` itself, which names both the
+byte count requested and the region's 128-byte capacity, on either ABI.
+
+**A cumulative overrun -- writing past what an earlier consumer in the same
+invocation already claimed, through `p:w8/w16/w32` on a handle you already
+hold -- behaves differently per ABI, and only one of the two is actually
+safe:**
+
+- **Wg16**: refused. `write_scratch`'s backing region is a dedicated 16-bit
+  segment sized exactly 128 bytes (`ModuleMem::alloc_region` ->
+  `Segments::alloc_segment`), and every access -- including a stray
+  `p:w32(off, v)` at an `off` past 128 -- is bounded by that segment's own
+  descriptor limit. There is no way to reach memory outside the region.
+- **Wg32 -- KNOWN GAP, not a guarantee**: NOT refused. Wg32's
+  `alloc_region` (`crates/mbbs/src/abi/wg32.rs`) is a bump allocation out of
+  one large shared arena (`mbbs-machine/src/m32/mem.rs`'s `Memory::arena`,
+  16 MiB in `mbbs-server`), and `Memory::read_at`/`write_at` bounds-check
+  against the *whole arena*, not the 128-byte scratch region a handle
+  logically owns. `p:w8/w16/w32` only know the raw pointer a handle closed
+  over, never the byte-length `c:buffer(n)` allocated it with -- so
+  `cell:w32(200, value)` on a Wg32 board silently lands 72 bytes past the
+  scratch region, inside whatever else the arena is holding, and succeeds.
+  This is a real gap against this house's own "runtime crashes are better
+  than undefined behavior" rule -- it is not undefined behavior in the
+  memory-safety sense (still a bounds-checked Rust slice write, just against
+  the wrong bound), but it is exactly the kind of silent, wrong-address write
+  that rule exists to rule out. The fix is length-carrying handles (a handle
+  that remembers how many bytes it is allowed to touch, checked in
+  `p:w8/w16/w32` themselves, independent of the arena's own bound) -- not
+  implemented yet; treat any offset past a `c:buffer(n)`'s own `n`, or past
+  128 minus what earlier consumers already took, as a bug in the *calling*
+  Lua on a Wg32 board today, because nothing downstream will catch it for
+  you.
+
+Keep buffer sizes and string arguments conservative regardless of ABI --
+there is no way to grow the region, and on Wg32 there is currently nothing
+stopping you from writing past it by mistake.
 
 ## Soft-skip rules
 

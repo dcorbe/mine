@@ -62,6 +62,35 @@
 //! this module enforces by hand -- see
 //! `commands.rs`'s `a_stashed_handle_errors_in_a_later_invocation` test.
 //!
+//! # A handle's own bound is a Wg16 segment property, not a handle property
+//!
+//! `read_width`/`write_width` (what `p:u8/u16/u32`/`p:w8/w16/w32` call
+//! through) refuse an out-of-bounds access purely because
+//! [`CommandCtx::read_at`]/[`CommandCtx::write_at`] do -- this module carries
+//! no length alongside a handle's `A::Ptr` to check against; there is
+//! nothing here that knows a `c:buffer(n)` handle is only supposed to be
+//! `n` bytes wide once `handle` has built it.
+//!
+//! Under `Wg16` that omission costs nothing: `write_scratch`'s backing
+//! region is its own dedicated LDT segment sized to exactly
+//! `COMMAND_SCRATCH_BYTES`, and every `Wg16` far-pointer access is bounded
+//! by that segment's own descriptor limit regardless of what this module
+//! does or does not track -- an offset past the region simply cannot
+//! resolve. **Under `Wg32` it is a real gap, not yet closed**:
+//! `mbbs_machine::m32::mem::Memory::read_at`/`write_at` bounds-check
+//! against the whole shared arena the scratch region was bump-allocated
+//! from, not against any per-handle region, so `p:w32(off, v)` at an `off`
+//! well past a handle's own logical length still resolves -- silently, into
+//! whatever else the arena holds -- rather than refusing. This crate's own
+//! rule ("Runtime crashes are better than undefined behavior") is violated
+//! in spirit here even though nothing is memory-unsafe: the write lands
+//! bounds-checked against the *wrong* bound, not against no bound at all.
+//! The fix is a length-carrying handle -- `handle`/`buffer` stamping the
+//! byte length they were built with onto the table, checked in
+//! `read_width`/`write_width` before ever reaching `read_at`/`write_at` --
+//! not yet implemented; see `scripts/lib/README.md`'s own scratch-budget
+//! section for the operator-facing version of this same gap.
+//!
 //! # `w8`/`w16`/`w32` are unsigned only
 //!
 //! `v` in `p:w8/w16/w32(off, v)` must fit `0..=0xff`/`0xffff`/`0xffff_ffff`;
