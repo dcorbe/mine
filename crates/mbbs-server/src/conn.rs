@@ -128,8 +128,9 @@ const OUT_CHANNEL_BOUND: usize = 32;
 /// is the actual seam, because who gets what keys is a login-backend decision
 /// this crate has no business making for its caller.
 ///
-/// **`WCCSYSOP` is in here, and that grants the sysop command set to every
-/// connection.** It is deliberate and it is not a permanent answer. This host
+/// **`SYSOP` and `WCCSYSOP` are in here, and they grant the host's and
+/// MajorMUD's sysop command sets to every connection.** It is deliberate and
+/// it is not a permanent answer. This host
 /// is headless -- there is no logon, no `bbsusr.dat` and no `bbsk.dat`, so
 /// nothing upstream of a connection has an opinion about who anyone is yet
 /// (see [`mbbs::Connection::with_keys`]'s own doc on that seam). Until
@@ -142,7 +143,7 @@ const OUT_CHANNEL_BOUND: usize = 32;
 /// else must pass `--keys` and leave this out: the flag exists precisely so
 /// that this default never has to be the policy.
 pub fn default_keys() -> Vec<String> {
-    ["DEMO", "NORMAL", "USER", "WCCSYSOP"]
+    ["DEMO", "NORMAL", "USER", "SYSOP", "WCCSYSOP"]
         .into_iter()
         .map(String::from)
         .collect()
@@ -739,15 +740,16 @@ mod tests {
     /// `DEMO`/`NORMAL`/`USER` are what a player needs to reach the Realm and
     /// come from `crates/mbbs/tests/wccmmud.rs:2450`, which is the source of
     /// truth; they are checked by containment so that this test fails if the
-    /// fixture and the default ever drift apart. `WCCSYSOP` is an addition on
-    /// top, checked separately because it is a deliberate local-board choice
-    /// rather than anything the fixture says -- see [`default_keys`].
+    /// fixture and the default ever drift apart. `SYSOP` and `WCCSYSOP` are
+    /// additions on top, checked separately because they are a deliberate
+    /// local-board choice rather than anything the fixture says -- see
+    /// [`default_keys`].
     ///
     /// The length check is the third invariant: without it, containment would
     /// let a fifth key in unnoticed, and a key nobody meant to grant is
     /// exactly the thing this test exists to catch.
     #[test]
-    fn default_keys_holds_the_realm_fixture_plus_the_sysop_key_and_nothing_else() {
+    fn default_keys_holds_the_realm_fixture_plus_the_sysop_keys_and_nothing_else() {
         let keys = default_keys();
 
         for needed in ["DEMO", "NORMAL", "USER"] {
@@ -757,12 +759,15 @@ mod tests {
                  Realm keys, and {needed} is missing from {keys:?}"
             );
         }
-        assert!(
-            keys.iter().any(|k| k == "WCCSYSOP"),
-            "the sysop key is deliberate -- MajorMUD's own diagnostics are \
-             unreachable without it on a headless host: {keys:?}"
-        );
-        assert_eq!(keys.len(), 4, "no key nobody meant to grant: {keys:?}");
+        for sysop in ["SYSOP", "WCCSYSOP"] {
+            assert!(
+                keys.iter().any(|k| k == sysop),
+                "the sysop keys are deliberate -- the host's and MajorMUD's own \
+                 diagnostics are unreachable without them on a headless host: \
+                 {sysop} is missing from {keys:?}"
+            );
+        }
+        assert_eq!(keys.len(), 5, "no key nobody meant to grant: {keys:?}");
     }
 
     /// Typing builds the line and echoes every printable byte back.
