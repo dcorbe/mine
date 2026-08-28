@@ -73,7 +73,7 @@
 //! 32), the same way `p:u8/u16/u32`'s own reads hand back an unsigned value
 //! a caller reinterprets itself if the field is signed.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use mbbs::abi::Abi;
@@ -117,6 +117,59 @@ pub(crate) type Registry<A> = Rc<RefCell<Vec<<A as Abi>::Ptr>>>;
 
 /// The table field a handle's registry index lives at.
 pub(crate) const IDX_FIELD: &str = "__idx";
+
+/// A per-invocation bump cursor over [`CommandCtx::write_scratch`]'s one
+/// shared, persistent scratch region -- see [`take_scratch`]'s own doc
+/// comment for why every consumer of that region this invocation, `c:buffer`
+/// and a declared call's own `str` arguments alike, shares exactly one of
+/// these rather than each independently assuming it owns the region's
+/// start. Built fresh, at zero, once per invocation (`Extension::command`
+/// owns the only `Rc::new` site), mirroring [`Registry`]'s own "fresh, empty
+/// every invocation" contract.
+pub(crate) type ScratchCursor = Rc<Cell<u16>>;
+
+/// Writes `bytes` into [`CommandCtx::write_scratch`]'s persistent region at
+/// `cursor`'s current position, advances `cursor` past them, and returns a
+/// pointer to where they landed.
+///
+/// # Why one shared cursor, not one caller assuming it owns offset 0
+///
+/// `write_scratch` itself always targets the exact same base address -- one
+/// region, allocated once, reused for the `Host`'s whole lifetime (see its
+/// own doc comment). Before declared bindings existed, `c:buffer` was the
+/// only caller, one consumer laying out one allocation at a time -- nothing
+/// else in the same invocation could also want scratch, so "always offset
+/// 0" and "the one and only consumer" were the same fact. Declared bindings
+/// added a second, independent writer (a declared call's `str` arguments),
+/// and a review caught what that created: with both still assuming they
+/// alone own offset 0, a script's `c:buffer` handle and a `str` argument's
+/// marshalled bytes in the same call would land on the identical address,
+/// each write undoing the other's, silently and deterministically -- the
+/// exact "sword"/OUT-count-cell collision the canonical declared-bindings
+/// pattern (`M.get_item_from_name(name, nil, cell)`) hits on every call.
+/// Every consumer of scratch this invocation now takes its bytes from here,
+/// at a running offset, so two consumers in the same call are guaranteed
+/// disjoint regardless of which one runs first -- including two `c:buffer`
+/// calls in the same invocation, which is why [`buffer`] no longer hands
+/// back the same base on a second call the way it did before this fix (see
+/// `commands.rs`'s own test on that point).
+///
+/// The region's real, fixed capacity is never hard-coded here or anywhere
+/// else in this crate: writing past it is refused by
+/// [`CommandCtx::write_at`]'s own bounds check (the real memory
+/// resolution), which this function surfaces directly rather than
+/// duplicating as a second, hand-maintained limit.
+pub(crate) fn take_scratch<A: Abi>(ctx: &Ctx<'_, '_, A>, cursor: &ScratchCursor, bytes: &[u8]) -> LuaResult<A::Ptr> {
+    let base = ctx.borrow_mut().write_scratch(&[]).map_err(mlua::Error::external)?;
+    let at = checked_offset::<A>(base, i64::from(cursor.get()))?;
+    ctx.borrow_mut().write_at(at, bytes).map_err(mlua::Error::external)?;
+    let advance = u16::try_from(bytes.len())
+        .ok()
+        .and_then(|n| cursor.get().checked_add(n))
+        .ok_or_else(|| mlua::Error::RuntimeError("scratch: this invocation's cursor overflowed a 16-bit offset".to_owned()))?;
+    cursor.set(advance);
+    Ok(at)
+}
 
 /// Resolve `off` (bytes past `ptr`, as a script wrote it) into a concrete
 /// pointer, refusing rather than wrapping.
@@ -220,20 +273,21 @@ where
     Ok(t)
 }
 
-/// `c:buffer(n) -> handle` -- `n` bytes of [`CommandCtx::write_scratch`]'s
-/// persistent host scratch, zeroed on every call.
-///
-/// Not a per-call guest allocation: `write_scratch` reuses one region for the
-/// `Host`'s whole lifetime (see its own doc comment), which is exactly why
-/// two calls in one invocation hand back the same base -- `Host` only ever
-/// allocates the underlying LDT descriptor (`Wg16`) or region (`Wg32`) once.
-/// An `n` over the scratch buffer's fixed capacity is refused by
-/// `write_scratch` itself, naming both sizes in the error.
+/// `c:buffer(n) -> handle` -- `n` zeroed bytes of [`CommandCtx::write_scratch`]'s
+/// persistent host scratch, taken from this invocation's own [`ScratchCursor`]
+/// so a second `c:buffer` call, or a `str` argument marshalled later in the
+/// same invocation, gets a disjoint slice rather than colliding with this
+/// one -- see [`take_scratch`]'s own doc comment for why. Not a per-call
+/// guest allocation: `write_scratch`'s own *region* is still one allocation
+/// for the `Host`'s whole lifetime; only the offset *within* it advances
+/// per call. Running past the region's fixed capacity is refused by the
+/// real memory bounds check `take_scratch` surfaces.
 fn buffer<'scope, 'env, 'p, 'q, A: Abi>(
     scope: &'scope Scope<'scope, 'env>,
     lua: &Lua,
     ctx: Ctx<'p, 'q, A>,
     registry: Registry<A>,
+    cursor: ScratchCursor,
     n: i64,
 ) -> LuaResult<Table>
 where
@@ -241,7 +295,7 @@ where
     'q: 'scope,
 {
     let len = usize::try_from(n).map_err(|_| mlua::Error::RuntimeError(format!("buffer: size {n} must not be negative")))?;
-    let base = ctx.borrow_mut().write_scratch(&vec![0u8; len]).map_err(mlua::Error::external)?;
+    let base = take_scratch::<A>(&ctx, &cursor, &vec![0u8; len])?;
     handle(scope, lua, ctx, registry, base)
 }
 
@@ -265,10 +319,13 @@ pub(crate) fn install_buffer<'scope, 'env, 'p, 'q, A: Abi>(
     scope: &'scope Scope<'scope, 'env>,
     ctx: Ctx<'p, 'q, A>,
     registry: Registry<A>,
+    cursor: ScratchCursor,
 ) -> LuaResult<Function>
 where
     'p: 'scope,
     'q: 'scope,
 {
-    scope.create_function(move |lua, (_this, n): (Table, i64)| buffer(scope, lua, Rc::clone(&ctx), Rc::clone(&registry), n))
+    scope.create_function(move |lua, (_this, n): (Table, i64)| {
+        buffer(scope, lua, Rc::clone(&ctx), Rc::clone(&registry), Rc::clone(&cursor), n)
+    })
 }

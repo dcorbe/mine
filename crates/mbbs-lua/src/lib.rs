@@ -652,6 +652,11 @@ impl<A: Abi> Extension<A> for LuaExtension {
             // doc comment for why that emptiness is exactly what keeps a
             // stale handle's index from resolving to a wrong pointer here.
             let registry: ptr::Registry<A> = Rc::new(RefCell::new(Vec::new()));
+            // Fresh, at zero, every invocation too -- shared by `c:buffer`
+            // and a declared call's own `str` arguments, so the two can
+            // never land on the same scratch bytes. See
+            // `ptr::ScratchCursor`'s own doc comment.
+            let cursor: ptr::ScratchCursor = Rc::new(std::cell::Cell::new(0u16));
             let t = self.lua.create_table()?;
             t.set("line", line.clone())?;
             t.set("args", args.clone())?;
@@ -675,8 +680,8 @@ impl<A: Abi> Extension<A> for LuaExtension {
                 let cell = Rc::clone(&cell);
                 scope.create_function(move |_, (_this, amount): (mlua::Table, f64)| set_exp(&cell, amount))?
             })?;
-            t.set("buffer", ptr::install_buffer(scope, Rc::clone(&cell), Rc::clone(&registry))?)?;
-            bind::rebind::<A>(scope, Rc::clone(&cell), Rc::clone(&registry), &self.declared.borrow())?;
+            t.set("buffer", ptr::install_buffer(scope, Rc::clone(&cell), Rc::clone(&registry), Rc::clone(&cursor))?)?;
+            bind::rebind::<A>(scope, Rc::clone(&cell), Rc::clone(&registry), Rc::clone(&cursor), &self.declared.borrow())?;
             handler.call::<Value>(t)
         });
 

@@ -34,30 +34,28 @@
 //!
 //! # `str` argument layout
 //!
-//! Every `str`-typed argument in one call is copied, NUL-terminated, into
-//! [`CommandCtx::write_scratch`]'s persistent scratch region -- the same
-//! 128-byte buffer `c:buffer` draws from (`crate::ptr`'s own doc comment).
-//! Two `str` arguments in the same call get **distinct, back-to-back
-//! offsets** within that one region (first argument's bytes at offset 0,
-//! second's immediately after its NUL, and so on) rather than either
-//! colliding or being refused outright: the first argument's `write_scratch`
-//! call establishes the region's base, every subsequent `str` argument
-//! writes through [`CommandCtx::write_at`] at a computed offset instead of
-//! calling `write_scratch` again (which would overwrite offset 0 every
-//! time). Running past the region's real, fixed capacity surfaces as
-//! `write_at`'s own bounds-check error -- this module does not hard-code
-//! the buffer's size anywhere; the real memory resolution is the only
-//! authority on how much room there is.
+//! Every `str`-typed argument is copied, NUL-terminated, into
+//! [`CommandCtx::write_scratch`]'s persistent scratch region through
+//! [`crate::ptr::take_scratch`] -- the SAME per-invocation bump cursor
+//! `c:buffer` itself now draws from (`crate::ptr::ScratchCursor`'s own doc
+//! comment). This is a fix, not the original shape: an earlier version of
+//! this module gave `str` marshalling its own, private offset bookkeeping,
+//! independent of `c:buffer`'s -- both assumed they alone owned the
+//! region's start, so the canonical declared-bindings pattern (a script
+//! holds a `c:buffer` cell for an OUT parameter and passes a `str` in the
+//! *same* call, e.g. `M.get_item_from_name(name, nil, cell)`) silently
+//! aliased the two: marshalling `name` overwrote `cell`'s own bytes before
+//! the call ever ran. Sharing one cursor between every scratch consumer
+//! this invocation -- `str` arguments and `c:buffer` handles alike --
+//! closes that structurally: whichever one runs first simply claims the
+//! next slice, and the other cannot land on the same bytes. See
+//! `commands.rs`'s own `a_str_argument_and_a_live_buffer_in_one_call_do_not_collide`
+//! for the test that catches a regression back to independent bookkeeping.
 //!
-//! **What this does not guard against**: `c:buffer` draws from the exact
-//! same physical region. A script that holds a `c:buffer` handle and, in
-//! the same call, invokes a declared export with a `str` argument can see
-//! its buffer's content overwritten -- this is an existing property of
-//! `write_scratch` being one persistent, reused buffer (`crate::ptr`'s own
-//! doc comment: "One buffer for the seam's whole lifetime, not one
-//! allocation per call"), not something Task 2 introduces or closes. A
-//! script mixing `c:buffer` and a `str`-taking declared call in one
-//! invocation should not assume the two coexist.
+//! Running past the region's real, fixed capacity surfaces as
+//! `write_at`'s own bounds-check error, via `take_scratch` -- this module
+//! does not hard-code the buffer's size anywhere; the real memory
+//! resolution is the only authority on how much room there is.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -66,7 +64,7 @@ use std::rc::Rc;
 use mbbs::abi::{Abi, Arg};
 use mlua::{Lua, MultiValue, Result as LuaResult, Scope, Table, Value};
 
-use crate::ptr::{self, Ctx, Registry};
+use crate::ptr::{self, Ctx, Registry, ScratchCursor};
 
 /// One argument or return type in the signature mini-language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,13 +158,17 @@ fn probe<A: Abi>(module: &A::Module, name: &str) -> Option<(A::Ptr, String)> {
 /// `table` is the namespace (`M`) this name lives on; `entry_bytes` is
 /// [`Abi::ptr_to_bytes`]'s own encoding of the resolved `A::Ptr` -- see
 /// this module's own doc comment for why bytes rather than the pointer
-/// itself. `spelling` is which of the four [`spellings`] actually matched,
-/// kept for `Debug`/diagnostic purposes -- the plan's own "record which
-/// spelling matched (the namespace should be able to report it)."
+/// itself. `abi_name` is [`Abi::NAME`], stamped at the same declare time
+/// `entry_bytes` is -- see [`check_abi`]'s own doc comment for what it
+/// guards against and why `entry_bytes` alone cannot. `spelling` is which
+/// of the four [`spellings`] actually matched, kept for `Debug`/diagnostic
+/// purposes -- the plan's own "record which spelling matched (the
+/// namespace should be able to report it)."
 pub(crate) struct DeclaredEntry {
     table: Table,
     name: String,
     entry_bytes: Vec<u8>,
+    abi_name: &'static str,
     #[allow(dead_code)] // Debug/diagnostic only for now -- see this struct's own doc comment.
     spelling: String,
     signature: Signature,
@@ -232,6 +234,7 @@ where
                     table: declare_table.clone(),
                     name: decl_name,
                     entry_bytes: A::ptr_to_bytes(ptr),
+                    abi_name: A::NAME,
                     spelling,
                     signature,
                 });
@@ -247,13 +250,44 @@ where
     Ok(())
 }
 
+/// Refuses to rebind a [`DeclaredEntry`] under an `Abi` other than the one
+/// it was declared against.
+///
+/// `entry_bytes` alone cannot catch this: [`Abi::PTR_WIDTH`] is 4 for both
+/// `Wg16` and `Wg32` today, so `A::ptr_from_bytes` never fails on a
+/// mismatched entry -- it just silently reinterprets a `Wg16` `FarPtr`'s
+/// `offset:selector` bytes as a `Wg32` flat address, or the reverse,
+/// producing a pointer that happens to typecheck and is wrong. Nothing
+/// about `LuaExtension`'s own shape prevents `rebind::<A>` from ever being
+/// called with a different `A` than `install::<A>` was -- Task 3's real
+/// wiring is expected to keep the two paired 1:1 per machine, but "probably
+/// paired by the caller" is not a structural guarantee, and this repo's own
+/// rule is that a runtime error beats undefined-but-typechecking behaviour.
+///
+/// A pure function, not folded into [`rebind`] itself, so it can be
+/// unit-tested directly against `Wg32` with no `Fixture`/`Machine` at all
+/// (`Fixture<Wg32>` is off-limits outside `crates/mbbs/tests/*.rs` -- see
+/// `mbbs::testing::Fixture`'s own doc comment).
+fn check_abi<A: Abi>(entry_name: &str, entry_abi: &str) -> LuaResult<()> {
+    if entry_abi != A::NAME {
+        return Err(mlua::Error::RuntimeError(format!(
+            "{entry_name}: declared against ABI {entry_abi:?} but this LuaExtension is running under {:?} -- \
+             a LuaExtension's declared bindings must not be rebound under a different ABI than they were declared with",
+            A::NAME
+        )));
+    }
+    Ok(())
+}
+
 /// Rebinds every entry in `declared` onto its namespace table, fresh for
 /// this invocation -- see this module's own doc comment ("Why a declared
-/// export is rebound every invocation").
+/// export is rebound every invocation"). Refuses outright, per entry, if
+/// [`check_abi`] finds it was declared against a different `Abi` than `A`.
 pub(crate) fn rebind<'scope, 'env, 'p, 'q, A: Abi>(
     scope: &'scope Scope<'scope, 'env>,
     ctx: Ctx<'p, 'q, A>,
     registry: Registry<A>,
+    cursor: ScratchCursor,
     declared: &[DeclaredEntry],
 ) -> LuaResult<()>
 where
@@ -261,13 +295,15 @@ where
     'q: 'scope,
 {
     for entry in declared {
+        check_abi::<A>(&entry.name, entry.abi_name)?;
         let entry_ptr = A::ptr_from_bytes(&entry.entry_bytes);
         let signature = entry.signature.clone();
         let name = entry.name.clone();
         let ctx = Rc::clone(&ctx);
         let registry = Rc::clone(&registry);
+        let cursor = Rc::clone(&cursor);
         let f = scope.create_function(move |lua, args: MultiValue| {
-            call_declared::<A>(scope, lua, &ctx, &registry, entry_ptr, &signature, &name, args)
+            call_declared::<A>(scope, lua, &ctx, &registry, &cursor, entry_ptr, &signature, &name, args)
         })?;
         entry.table.set(entry.name.as_str(), f)?;
     }
@@ -417,6 +453,7 @@ fn call_declared<'scope, 'env, 'p, 'q, A: Abi>(
     lua: &Lua,
     ctx: &Ctx<'p, 'q, A>,
     registry: &Registry<A>,
+    cursor: &ScratchCursor,
     entry: A::Ptr,
     signature: &Signature,
     name: &str,
@@ -434,13 +471,6 @@ where
         )));
     }
 
-    // `str` layout: the first `str` argument's `write_scratch` call
-    // establishes the base; every later one writes at a running offset
-    // through `write_at` instead -- see this module's own doc comment
-    // ("`str` argument layout").
-    let mut str_base: Option<A::Ptr> = None;
-    let mut next_str_offset: u16 = 0;
-
     let mut marshalled = Vec::with_capacity(signature.args.len());
     for (i, (ty, value)) in signature.args.iter().zip(args).enumerate() {
         let arg = match ty {
@@ -448,22 +478,13 @@ where
             Type::Long => Arg::Long(long_arg(&value, i)?),
             Type::Ptr => Arg::Ptr(ptr_arg::<A>(&value, i, registry)?),
             Type::Str => {
-                let bytes = str_arg(&value, i)?;
-                let base = match str_base {
-                    Some(b) => b,
-                    None => {
-                        let b = ctx.borrow_mut().write_scratch(&[]).map_err(mlua::Error::external)?;
-                        str_base = Some(b);
-                        b
-                    }
-                };
-                let mut buf = bytes;
+                // Shares this invocation's ONE scratch cursor with
+                // `c:buffer` -- see this module's own doc comment ("`str`
+                // argument layout") for why that sharing is the fix, not
+                // an implementation detail.
+                let mut buf = str_arg(&value, i)?;
                 buf.push(0);
-                let at = A::ptr_offset(base, next_str_offset);
-                ctx.borrow_mut().write_at(at, &buf).map_err(mlua::Error::external)?;
-                next_str_offset = next_str_offset
-                    .checked_add(buf.len() as u16)
-                    .ok_or_else(|| mlua::Error::RuntimeError(format!("{name}: arg {i}: str arguments overflow the scratch region")))?;
+                let at = ptr::take_scratch::<A>(ctx, cursor, &buf)?;
                 Arg::Ptr(at)
             }
             Type::Void => unreachable!("parse_signature refuses void as an argument type"),
@@ -504,10 +525,34 @@ where
 
 #[cfg(test)]
 mod tests {
-    use mbbs::abi::{Wg16, Wg32};
+    use mbbs::abi::{Abi, Wg16, Wg32};
     use mlua::Value;
 
-    use super::{Type, int_arg, parse_signature};
+    use super::{Type, check_abi, int_arg, parse_signature};
+
+    /// [`check_abi`]'s whole reason to exist: a `LuaExtension`'s declared
+    /// entries carry no compile-time `Abi` tag (see `DeclaredEntry`'s own
+    /// doc comment on why -- `LuaExtension` is deliberately non-generic),
+    /// so a `Wg16`-declared entry rebound under `Wg32` must be refused, not
+    /// silently reinterpreted. No `Fixture<Wg32>` needed -- `check_abi` is
+    /// a pure function of two strings.
+    #[test]
+    fn rebinding_a_declared_entry_under_a_different_abi_is_a_named_error() {
+        let err = check_abi::<Wg32>("get_player", Wg16::NAME).expect_err("must refuse a cross-ABI rebind");
+        let msg = err.to_string();
+        assert!(msg.contains("get_player"), "must name the entry, got: {msg}");
+        assert!(msg.contains("wg16"), "must name the ABI it was declared against, got: {msg}");
+        assert!(msg.contains("wg32"), "must name the ABI it is being rebound under, got: {msg}");
+    }
+
+    /// The non-mismatch case must not be refused -- every existing
+    /// `Wg16`-only integration test in `commands.rs` depends on this
+    /// passing silently.
+    #[test]
+    fn rebinding_a_declared_entry_under_its_own_abi_succeeds() {
+        check_abi::<Wg16>("get_player", Wg16::NAME).expect("same-ABI rebind must succeed");
+        check_abi::<Wg32>("get_player", Wg32::NAME).expect("same-ABI rebind must succeed");
+    }
 
     /// The recorded `int_from_u16` sentinel trap, closed: a negative Lua
     /// number must come out as *this ABI's own* all-ones pattern, not a

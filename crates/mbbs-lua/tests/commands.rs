@@ -494,39 +494,39 @@ fn buffer_round_trips_asymmetric_writes_and_reads_at_asymmetric_offsets() {
     assert!(fixture.host.notes().is_empty(), "a clean round trip must never disable the handler, got: {:?}", fixture.host.notes());
 }
 
-/// Proves two things at once, both required by the task brief:
+/// **Superseded by Task 2's Critical fix review.** Task 1 originally proved
+/// two `c:buffer` calls in one invocation hand back the *same* underlying
+/// base -- true when `c:buffer` was the region's only consumer, but the
+/// exact aliasing bug a Task 2 review caught between `c:buffer` and a
+/// declared call's `str` arguments (`ptr::take_scratch`'s own doc comment)
+/// applies equally between two `c:buffer` calls themselves: sharing offset
+/// 0 always meant a second `c:buffer` silently overwrote whatever a first
+/// one already held. The fix (one shared, invocation-scoped bump cursor --
+/// `ptr::ScratchCursor`) closes that too, so this test now proves the
+/// opposite, and stronger, property: two `c:buffer` calls in one invocation
+/// get **disjoint** regions, each independently writable without the other
+/// clobbering it.
 ///
-/// 1. Two `c:buffer` calls in one invocation hand back the same underlying
-///    region (`Host::command_scratch` is allocated once and reused -- see
-///    `CommandCtx::write_scratch`'s own doc comment). Handles are
-///    deliberately opaque (no raw address ever reaches Lua, by design -- see
-///    `crates/mbbs-lua/src/ptr.rs`'s own module doc comment), so this cannot
-///    be shown by comparing addresses the way
-///    `write_scratch_reuses_the_same_buffer_across_calls`
-///    (`crates/mbbs/tests/extension_seam.rs`) compares `FarPtr`s directly.
-///    Instead: write through `p1` at an offset *past* `p1`'s own declared
-///    size (`c:buffer` only promises to zero its first `n` bytes, not to cap
-///    what a handle can reach -- bounds are enforced by `read_at`/`write_at`
-///    against the real region, not by `n`), then read that same offset back
-///    through `p2`, a handle from a *second*, later `c:buffer` call. If the
-///    two calls got different regions, `p2` would see a freshly zeroed byte,
-///    not what `p1` wrote.
-/// 2. The value observed this way did not come from some per-handle Lua-side
-///    cache: `p1` and `p2` are two independent Lua tables with no shared
-///    Lua-visible state (see this module's own "no field a script could
-///    forge" design). The only way `p2` can see what `p1` wrote is if both
-///    writes and reads went through real host memory.
+/// Two independent Lua tables (`p1`, `p2`) with no shared Lua-visible state
+/// (see this module's own "no field a script could forge" design) each get
+/// their own distinct byte written at the same LOCAL offset (`0`); reading
+/// both back afterward and finding each still holds its OWN value --
+/// neither the other's, neither a freshly-zeroed default -- is only
+/// possible if both writes and reads went through real, disjoint host
+/// memory. A regression back to "always offset 0" would make `p2`'s write
+/// clobber `p1`'s, and both would read back `p2`'s value.
 #[test]
-fn buffer_calls_in_one_invocation_reuse_the_same_underlying_region() {
+fn two_c_buffer_calls_in_one_invocation_get_disjoint_regions() {
     let dir = tempdir_with(
-        "buffer_calls_in_one_invocation_reuse_the_same_underlying_region",
+        "two_c_buffer_calls_in_one_invocation_get_disjoint_regions",
         &[(
-            "reuse.lua",
-            r#"mmud.command("reuse", function(c)
+            "disjoint.lua",
+            r#"mmud.command("disjoint", function(c)
                 local p1 = c:buffer(2)
-                p1:w8(50, 0x42)
+                p1:w8(0, 0x42)
                 local p2 = c:buffer(2)
-                c:print(tostring(p2:u8(50)) .. "\r\n")
+                p2:w8(0, 0x99)
+                c:print(tostring(p1:u8(0)) .. "," .. tostring(p2:u8(0)) .. "\r\n")
                 return mmud.HANDLED
             end)"#,
         )],
@@ -536,11 +536,15 @@ fn buffer_calls_in_one_invocation_reuse_the_same_underlying_region() {
     let module = fixture.minimal_module();
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "reuse", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "disjoint", &module);
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(String::from_utf8_lossy(&out), "66\r\n", "a second c:buffer call must reuse the first call's region");
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "66,153\r\n",
+        "a second c:buffer call must not clobber the first call's own region"
+    );
     assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
 }
 
@@ -1050,6 +1054,62 @@ fn two_str_arguments_in_one_call_land_at_distinct_offsets() {
     let out = fixture.host.gsbl_mut().drain_output(chan);
     // al = 'A' (0x41), ah = 'C' (0x43) -> ax = 0x4341 = 17217.
     assert_eq!(String::from_utf8_lossy(&out), "17217\r\n");
+    assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
+}
+
+/// The Critical fix's own canonical scenario, proven end to end: a script
+/// holds a `c:buffer` cell (the shape a `ptr`-typed OUT parameter takes),
+/// then in the SAME call passes a `str` argument to a declared export --
+/// exactly `M.get_item_from_name(name, nil, cell)`'s shape, minus the
+/// `nil`. Before the fix (`ptr::ScratchCursor`, shared by `c:buffer` and
+/// `str` marshalling), `cell`'s registered pointer and the `str`
+/// argument's marshalled bytes were BOTH `command_scratch + 0`, so
+/// marshalling the string silently overwrote `cell` before the call ever
+/// ran.
+///
+/// Two disjoint facts, both asserted from the Rust side (not merely
+/// printed and eyeballed): the callee reads the `str` argument's own first
+/// byte through a real far pointer (`les`/`mov es:[bx]`, the same
+/// technique `two_str_arguments_in_one_call_land_at_distinct_offsets`
+/// uses) and returns it, proving the string landed at ITS OWN address with
+/// the right content; `cell:u16(0)`, read back from Lua *after* the call
+/// returns, proves `cell`'s own two bytes -- written before the call --
+/// were never touched by the string's write.
+#[test]
+fn a_str_argument_and_a_live_buffer_in_one_call_do_not_collide() {
+    let code = [
+        0x89, 0xe5, // mov bp, sp
+        0x33, 0xc0, // xor ax, ax        -- so an untouched ah reads back as 0
+        0xc4, 0x5e, 0x04, // les bx, [bp+4]    -- the str arg's far pointer
+        0x26, 0x8a, 0x07, // mov al, es:[bx]   -- its first byte
+        0xcb, // retf
+    ];
+    let dir = tempdir_with(
+        "a_str_argument_and_a_live_buffer_in_one_call_do_not_collide",
+        &[(
+            "bind.lua",
+            r#"local M = mmud.bind("TESTMOD")
+            M.declare { getitem = "int(str, ptr)" }
+            mmud.command("canonical", function(c)
+                local cell = c:buffer(2)
+                cell:w16(0, 0xBEEF)
+                local firstbyte = M.getitem("sword", cell)
+                c:print(tostring(firstbyte) .. "," .. tostring(cell:u16(0)) .. "\r\n")
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let mut fixture = Fixture::new();
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("GETITEM", &code)).expect("loads");
+    let mut ext = LuaExtension::load_with_module::<Wg16>(&dir, "TESTMOD", &module).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "canonical", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    // 's' = 0x73 = 115; 0xBEEF = 48879, unchanged by the str write.
+    assert_eq!(String::from_utf8_lossy(&out), "115,48879\r\n");
     assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
 }
 
