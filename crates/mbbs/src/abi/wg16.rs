@@ -204,6 +204,13 @@ impl Abi for Wg16 {
         mbbs_machine::m16::Poison::Unimplemented { module, symbol }
     }
 
+    fn unimplemented_library(poison: &Self::Poison) -> Option<&str> {
+        match poison {
+            mbbs_machine::m16::Poison::Unimplemented { module, .. } => Some(module),
+            _ => None,
+        }
+    }
+
     fn refused(module: String, symbol: String, why: String) -> Self::Poison {
         mbbs_machine::m16::Poison::Refused { module, symbol, why }
     }

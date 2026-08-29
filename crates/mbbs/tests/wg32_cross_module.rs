@@ -31,9 +31,9 @@
 //! `wg32_round_trip.rs` rather than shared, because two test binaries have
 //! no module to share them through.
 
-use mbbs::abi::{Wg32, Wg32Cpu};
-use mbbs::{Host, Outcome, Terms};
-use mbbs_machine::m32::{Flat32Ptr, Machine, Memory};
+use mbbs::abi::{Abi, Exit, Ret, Wg32, Wg32Cpu};
+use mbbs::{Cleans, Host, Outcome, Terms};
+use mbbs_machine::m32::{Flat32Ptr, Machine, Mapping, Memory};
 use mbbs_machine::ptr::ModulePtr as _;
 
 /// `size_of_image`, generous enough that a one-section image with a whole
@@ -366,4 +366,80 @@ fn prefer_matches_the_import_tables_spelling_case_insensitively() {
         "a preferred import must not get a thunk site: {:?}",
         importer_mod.imports()
     );
+}
+
+/// The `__ftol` capture is armed at a **machine-wide** slot, not at the
+/// local index `bind_imports` numbered it.
+///
+/// `cw3220mt.DLL!__ftol` takes its argument in x87 `ST0`, and `Wg32::load`
+/// rewrites that one thunk's own bytes to pop it
+/// (`mbbs_machine::m32::Machine::arm_st0_capture`). The slot it arms has to
+/// be `thunk_base + local`, and with only one module loaded those two are
+/// always equal -- the bug is invisible until a second module's `__ftol`
+/// is the first import of *its* slice. Here the first module burns slot 0,
+/// so the second's only import is local 0 and machine-wide 1, and arming
+/// the local index would rewrite the *first* module's thunk instead.
+///
+/// Driven the way `wg32_math_st0.rs` drives `__ftol`: guest code `fld`s a
+/// known double and calls the thunk address the second module's own IAT
+/// holds. An unarmed thunk crosses without popping anything, so
+/// `take_st0` answers whatever the scratch qword still holds (`0.0` out of
+/// `Mapping::new`'s zeroed page), never `144.0` by accident.
+#[test]
+fn the_ftol_capture_is_armed_at_the_second_modules_machine_wide_slot() {
+    const VALUE: f64 = 144.0;
+    const VALUE_OFF: usize = 512;
+
+    let mut cpu = machine();
+    // Module one, purely to consume slot 0.
+    let first = module_with_import(&[0xC3], "NOWHERE.DLL", "_first");
+    let (_first_mod, mut host) = load_module_and_host(&mut cpu, &first);
+
+    let second_file = module_with_import(&[0xC3], "cw3220mt.DLL", "__ftol");
+    let second = host.load(&mut cpu, &second_file).expect("the second module loads");
+    assert_eq!(second.thunk_base(), 1, "the first module's one import took slot 0");
+
+    // The second module's only import is local index 0; `thunk_base` is
+    // what makes it machine-wide slot 1.
+    let iat = Flat32Ptr(cpu.mem.images()[1].base() + 0x1068);
+    let bound = u32::from_le_bytes(iat.resolve(&cpu.mem, 4).expect("iat").try_into().unwrap());
+    assert_eq!(
+        bound,
+        cpu.machine.thunk_addr(second.thunk_base()),
+        "the IAT must hold slot thunk_base + 0, not slot 0"
+    );
+    assert_eq!(
+        cpu.machine.st0_capture_slots(),
+        [1],
+        "arming must land on the machine-wide slot, not the local index"
+    );
+
+    // And the armed thunk really pops `ST0`: `fld qword [value]` (DD /0,
+    // disp32), `call rel32` to the address the IAT holds, `ret`.
+    let mut mapping = Mapping::new(4096).expect("a code mapping");
+    let base = mapping.base() as usize as u32;
+    mapping.as_mut_slice()[VALUE_OFF..VALUE_OFF + 8].copy_from_slice(&VALUE.to_le_bytes());
+
+    let mut code = vec![0xdd, 0x05];
+    code.extend_from_slice(&(base + VALUE_OFF as u32).to_le_bytes());
+    let call_at = base + code.len() as u32;
+    code.push(0xe8);
+    code.extend_from_slice(&bound.wrapping_sub(call_at + 5).to_le_bytes());
+    code.push(0xc3);
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    let exit = Wg32::call(&mut cpu, Flat32Ptr(base), &[]).expect("the call is recovered, not fatal");
+    match exit {
+        Exit::Call { index } => assert_eq!(index, 1, "stopped at the second module's own slot"),
+        other => panic!("expected Exit::Call {{ index: 1 }}, got {other:?}"),
+    }
+    assert_eq!(
+        cpu.machine.take_st0(),
+        VALUE,
+        "the armed thunk did not pop the module's ST0 -- arming landed on the wrong slot"
+    );
+
+    // Resume so the crossing finishes rather than being torn down mid-call.
+    Wg32::resume(&mut cpu, Ret::Long(0), Cleans::Caller).expect("the module resumes");
+    drop(mapping);
 }

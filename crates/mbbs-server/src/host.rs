@@ -52,7 +52,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
@@ -795,6 +795,25 @@ fn report_notes<A: Abi>(host: &mut Host<A>) {
 /// crate does not understand would hide it, not fix it.
 ///
 /// [`LoadError::Globals`]: mbbs::LoadError::Globals
+/// The extra clause an init stop earns when the library it could not serve
+/// is a module the operator listed *later* on the command line.
+///
+/// `--module` order is load order (see [`Boot::modules`]): an import binds
+/// against what is already loaded and against nothing else, so
+/// `--module wccmmpls.dll --module wccmmud.dll` stops on `WCCMMUD.dll`'s
+/// own symbols with nothing in the message to say the file is right there,
+/// one argument to the right. Matched on the file stem, case-insensitively:
+/// a PE import directory spells the library `WCCMMUD.dll` and the file on
+/// disk is `wccmmud.dll`.
+fn later_module_hint(library: &str, remaining: &[PathBuf]) -> Option<String> {
+    let want = Path::new(library).file_stem()?.to_str()?;
+    remaining
+        .iter()
+        .filter_map(|p| p.file_stem()?.to_str())
+        .any(|stem| stem.eq_ignore_ascii_case(want))
+        .then(|| format!(" -- {library} is given later on the command line; --module order is load order"))
+}
+
 fn life<A: Abi>(
     boot: &Boot<A>,
     rx: &std::sync::mpsc::Receiver<In>,
@@ -856,7 +875,7 @@ fn life<A: Abi>(
     //    doc, "Thunk ownership across modules", for exactly what that does
     //    and does not promise.
     let mut loaded: Vec<A::Module> = Vec::with_capacity(boot.modules.len());
-    for path in &boot.modules {
+    for (index, path) in boot.modules.iter().enumerate() {
         let file = std::fs::read(path)
             .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))?;
         let module = host
@@ -893,8 +912,18 @@ fn life<A: Abi>(
                     Some(at) => format!(" ({at})"),
                     None => String::new(),
                 };
+                // The commonest way to get here is the operator naming the
+                // modules in the wrong order, and the raw stop cannot say
+                // so: "WCCMMUD.mmlog is not implemented" reads as a host
+                // gap when the module supplying it is sitting in the very
+                // next `--module`. Read out of the poison itself
+                // (`Abi::unimplemented_library`), never off the formatted
+                // message.
+                let hint = A::unimplemented_library(&poison)
+                    .and_then(|library| later_module_hint(library, &boot.modules[index + 1..]))
+                    .unwrap_or_default();
                 return Err(io::Error::other(format!(
-                    "{}: module init stopped before boot completed: {poison}{site}",
+                    "{}: module init stopped before boot completed: {poison}{site}{hint}",
                     path.display()
                 )));
             }
@@ -2025,5 +2054,33 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Out>(4);
         drop(rx);
         assert!(!offer(&mut gsbl, &tx, chan), "a closed connection is the hangup signal");
+    }
+
+    /// The reversed-order hint: a missing library that is a module still to
+    /// come earns the clause, and nothing else does. The spellings differ on
+    /// purpose (`WCCMMUD.dll` in the import directory, `wccmmud.dll` on
+    /// disk) -- a case-sensitive match here would never fire on the real
+    /// board.
+    #[test]
+    fn later_module_hint_fires_only_for_a_module_still_to_be_loaded() {
+        use std::path::PathBuf;
+
+        let remaining =
+            vec![PathBuf::from("/b/wccmmpls.dll"), PathBuf::from("/b/wccmmud.dll")];
+        let hint = super::later_module_hint("WCCMMUD.dll", &remaining)
+            .expect("the missing library is still to come");
+        assert!(hint.contains("WCCMMUD.dll"), "the hint names the library: {hint}");
+        assert!(hint.contains("--module order is load order"), "{hint}");
+
+        assert_eq!(
+            super::later_module_hint("WCCMMUD.dll", &[]),
+            None,
+            "nothing comes later: the library really is a host gap"
+        );
+        assert_eq!(
+            super::later_module_hint("WCCMMUD.dll", &[PathBuf::from("/b/rcirose.dll")]),
+            None,
+            "an unrelated module later on the line explains nothing"
+        );
     }
 }

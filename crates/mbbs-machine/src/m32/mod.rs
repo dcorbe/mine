@@ -1244,6 +1244,14 @@ impl Machine {
         f64::from_le_bytes(bytes)
     }
 
+    /// The thunk slots [`Machine::arm_st0_capture`] has armed, in the order
+    /// they were armed. Machine-wide indices, not per-module ones: a caller
+    /// that reserved a slice via [`Machine::reserve_thunks`] must add its
+    /// own base before looking for a slot in here.
+    pub fn st0_capture_slots(&self) -> &[u16] {
+        &self.st0_capture_slots
+    }
+
     /// Call 32-bit code the way the real host does: a flat cdecl frame,
     /// entered fresh.
     ///

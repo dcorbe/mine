@@ -184,6 +184,42 @@ fn data_ptr_is_the_images_own_base() {
     assert_eq!(Wg32::data_ptr(&cpu), mbbs_machine::m32::Flat32Ptr(cpu.mem.image().expect("image").base()));
 }
 
+/// And it stays the *first* image's base once a second module is loaded
+/// onto the same machine.
+///
+/// `Memory` holds a `Vec<Image>` now and `Host::load` appends to it, so
+/// "the image" is a choice `data_ptr` makes rather than the only answer
+/// available. It has to be `images()[0]`: `data_ptr` is what every shim
+/// that hands a module a pointer to host-built data resolves against, and
+/// `Host::first_module()` -- the module those shims are serving -- is the
+/// first one loaded. Answering with the last image would silently
+/// re-point the whole host at an addon the moment a board booted two
+/// modules.
+///
+/// Two loads of the same inert fixture: they differ only in where the
+/// kernel put them, which is exactly the difference under test.
+#[test]
+fn data_ptr_stays_the_first_loaded_modules_base_with_two_modules_on_the_machine() {
+    // 256 KiB, not `cpu_for_load`'s 4 KiB: `Host::new` reserves out of the
+    // arena before either load -- see `alcmem_and_alczer_still_pack_ordinary_wg32_sizes`.
+    let mem = mbbs_machine::m32::Memory::new(256 * 1024).expect("arena mapping");
+    let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
+    let mut cpu = Wg32Cpu::new(machine, mem);
+    let mut host = mbbs::Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), mbbs::Terms::new(1))
+        .expect("host builds against the empty memory");
+
+    let file = minimal_with_one_section();
+    host.load(&mut cpu, &file).expect("the first module loads");
+    host.load(&mut cpu, &file).expect("the second module loads");
+    assert_eq!(cpu.mem.images().len(), 2, "both loads appended, neither replaced");
+
+    let first = mbbs_machine::m32::Flat32Ptr(cpu.mem.images()[0].base());
+    let second = mbbs_machine::m32::Flat32Ptr(cpu.mem.images()[1].base());
+    assert_ne!(first, second, "two mappings, two bases -- otherwise this proves nothing");
+    assert_eq!(Wg32::data_ptr(&cpu), first, "data_ptr must name the first image");
+    assert_ne!(Wg32::data_ptr(&cpu), second, "never the most recently loaded one");
+}
+
 /// `ModuleMem::alloc_region` reaches `mbbs_machine::m32::Memory`'s real allocator -- not
 /// a stub that always errors, and not a pointer into the image by mistake.
 /// The generic `Heap<A>`/`Arena<A>` core (`crates/mbbs/src/heap.rs`,

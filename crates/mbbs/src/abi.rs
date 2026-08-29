@@ -575,6 +575,18 @@ pub trait Abi {
     /// and its `mbbs_machine::m32` mirror.
     fn unimplemented(module: String, symbol: String) -> Self::Poison;
 
+    /// The library an [`Abi::unimplemented`] poison names, or `None` for
+    /// every other stop.
+    ///
+    /// The inverse of the constructor above, and the only way a caller
+    /// generic over `A: Abi` can read the library back out: `Self::Poison`
+    /// is an opaque associated type, so a driver that wants to say
+    /// something about *which* DLL went missing would otherwise have to
+    /// re-parse the `Display` string. `mbbs-server`'s boot driver uses it
+    /// to notice that the missing library is a module the operator listed
+    /// later on the command line.
+    fn unimplemented_library(poison: &Self::Poison) -> Option<&str>;
+
     /// Build the poison that says a routine this host **does** implement
     /// refused to answer.
     ///
@@ -1362,6 +1374,13 @@ mod tests {
 
         fn unimplemented(_module: String, _symbol: String) -> Self::Poison {
             unreachable!("Call's read tests never call Abi::unimplemented")
+        }
+
+        fn unimplemented_library(poison: &Self::Poison) -> Option<&str> {
+            match poison {
+                mbbs_machine::m16::Poison::Unimplemented { module, .. } => Some(module),
+                _ => None,
+            }
         }
 
         // Same reasoning as `mem`/`data_ptr`/`call`/`resume` above: `Call`'s
