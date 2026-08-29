@@ -14630,6 +14630,14 @@ mod tests {
     /// A session with one cached v6 file open, on a scratch copy of the
     /// oracle's `V6EMPTY1KEY.DAT`, plus that file's path.
     fn session_with_v6(tag: &str) -> (Btrieve<Flat>, FlatMem, FlatHeap, FlatPtr, PathBuf) {
+        session_with_v6_grown_to(tag, 0)
+    }
+
+    /// [`session_with_v6`] with the file's end walked up to `pages` first --
+    /// unclaimed `[0x00, 0x44]` pages, the way a run of abandoned relocations
+    /// leaves it -- so the session's first append lands exactly where the
+    /// test wants it. `0` leaves the fixture as shipped.
+    fn session_with_v6_grown_to(tag: &str, pages: usize) -> (Btrieve<Flat>, FlatMem, FlatHeap, FlatPtr, PathBuf) {
         let mut mem = FlatMem::new(64 * 1024);
         let mut heap = FlatHeap::new(0x100);
         let mut btrieve = Btrieve::<Flat>::default();
@@ -14638,6 +14646,15 @@ mod tests {
             .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
         let path = dir.join("V6EMPTY1KEY.DAT");
         std::fs::copy(&source, &path).expect("the fixture copies into scratch");
+        if pages > 0 {
+            let mut file = std::fs::read(&path).expect("reads");
+            while file.len() / 512 < pages {
+                let mut content = vec![0u8; 512];
+                content[1] = 0x44;
+                file.extend_from_slice(&content);
+            }
+            std::fs::write(&path, file).expect("writes");
+        }
         crate::testing::make_keys_modifiable(&path);
         let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
         let at = btrieve
@@ -14718,6 +14735,31 @@ mod tests {
         btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("insert");
         btrieve.flush_bundles().expect("ok");
         assert_ne!(std::fs::read(&path).expect("reads"), before);
+    }
+
+    /// The live crash end to end: a bundle whose first append lands on block
+    /// 2's position (physical 130 for this fixture's 512-byte pages) used to
+    /// refuse at commit -- `physical page 131, and the file is 131 pages` --
+    /// and take the module down with it. Now the block goes down first, the
+    /// commit lands, and the file reopens with two table blocks and the record.
+    #[test]
+    fn a_bundle_that_grows_the_file_onto_the_next_table_blocks_position_commits() {
+        let (mut btrieve, mut mem, mut heap, at, path) = session_with_v6_grown_to("bundle-grows-onto-block-2", 130);
+        btrieve.set_bundle_limits(young());
+        let pos = btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("insert");
+        btrieve.flush_bundles().expect("the commit lays block 2 down rather than refusing");
+        let file = std::fs::read(&path).expect("reads");
+        assert_eq!(v6::Map::table_pages(&file, 512), vec![2, 3, 130, 131]);
+
+        drop(btrieve);
+        let mut again = Btrieve::<Flat>::default();
+        let geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let at = again
+            .open(&mut mem, &mut heap, "V6EMPTY1KEY.DAT", &path, geometry, geometry.reclen)
+            .expect("reopens");
+        let recs = again.block_mut(at).expect("open").records().expect("reads");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(&at_position(recs, pos).expect("the bundled insert survived the commit").bytes[..4], b"AAAA");
     }
 
     #[test]

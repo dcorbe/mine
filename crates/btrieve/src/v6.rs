@@ -939,6 +939,23 @@ impl Store {
     /// [`Map::table_pages`] already walks, so it costs nothing to ask it of
     /// every dirty page rather than trying to remember which ones mattered.
     ///
+    /// **Position and magic, not position alone.** [`Map::table_pages`]
+    /// stops at the first formula position with no `"PP"` on either page,
+    /// and this applies the same rule per page: a dirty page at a block's
+    /// position is a pair half only if it carries the magic (physical 0 and
+    /// 1 excepted -- the control record's pair is unconditional). Measured
+    /// 2026-08-29 on a live board: `WCCACMS2.DAT`'s bundle had appended an
+    /// ordinary data page at physical 1026 -- block 2's position, before
+    /// [`Map::append_content`] existed to lay the block down there first --
+    /// and this asked the cache for its "partner" 1027, which nothing had
+    /// created, so the commit refused (`physical page 1027, and the file is
+    /// 1027 pages`) and MajorMUD stopped mid-purchase. `WCCMP002.DAT` on
+    /// the same board already carried content at 14338 and 15362; had
+    /// either page been rewritten, the flip below would have stamped a
+    /// generation into a data page. A file with that shape stays readable
+    /// -- its table simply ends where the magic does -- and this keeps
+    /// writing such pages as the content they are.
+    ///
     /// # Errors
     ///
     /// If `path` cannot be opened, its length is not a whole number of
@@ -980,11 +997,20 @@ impl Store {
         let mut structural_pairs = std::collections::BTreeSet::new();
         let mut touched: std::collections::BTreeSet<usize> = dirty.iter().copied().collect();
         for &n in &dirty {
-            if let Some(pair) = Self::structural_pair_of(n, page_size_usize) {
-                structural_pairs.insert(pair);
-                touched.insert(pair.0);
-                touched.insert(pair.1);
+            let Some(pair) = Self::structural_pair_of(n, page_size_usize) else {
+                continue;
+            };
+            // Physical 0 and 1 are the file control record's own pair, always
+            // (this module's doc comment). Anywhere else, position says where
+            // a block *would* be and only the magic says one is; a dirty page
+            // is resident, so `peek` answers without a read.
+            let physical = u32::try_from(n).map_err(|_| format!("physical page {n} does not fit a u32"))?;
+            if n >= 2 && !cache.borrow().peek(physical).is_some_and(|bytes| bytes[..2] == *MAGIC) {
+                continue;
             }
+            structural_pairs.insert(pair);
+            touched.insert(pair.0);
+            touched.insert(pair.1);
         }
 
         let mut pages = HashMap::with_capacity(touched.len());
@@ -1340,6 +1366,95 @@ impl Map {
         (page_size - ENTRIES) / ENTRY
     }
 
+    /// Append `page` as the file's next physical page -- after first laying
+    /// down the next allocation-table block's shadow pair, if that is where
+    /// the file's end has arrived. Every append of content goes through
+    /// here ([`Self::claim`], [`Self::relocate`], [`Self::reclaim`]);
+    /// [`Store::append_page`] itself knows nothing of the table.
+    ///
+    /// Block `k` lives at [`Self::pair_position`]`(k)` and nowhere else (this
+    /// module's own doc comment: measured at three page sizes with no
+    /// exceptions), so a file whose end reaches that position has to put the
+    /// pair there *now*. Content written there instead is stranded: nothing
+    /// can move it aside later, [`Self::pair_of`] and [`Self::table_pages`]
+    /// find no block where the format says one is, and the table can never
+    /// grow past the blocks it already has.
+    ///
+    /// Measured 2026-08-29 on a live board, `WCCACMS2.DAT` at 4096-byte
+    /// pages: [`Self::claim`] appended an ordinary data page at physical
+    /// 1026 -- block 2's own position -- and the next bundle commit refused
+    /// (`physical page 1027, and the file is 1027 pages`,
+    /// [`Store::for_commit`]), which stopped the module mid-purchase.
+    /// `WCCMP002.DAT` on the same board already carried content at 14338 and
+    /// 15362, blocks 15 and 16's positions, from the same omission.
+    ///
+    /// Only an end *exactly at* the pair's first page triggers this. One past
+    /// it means the first page is already content (a file grown before this
+    /// rule existed) and the block can never live there; the file keeps
+    /// growing as content, its table ending at the last block that does.
+    fn append_content(store: &mut Store, page_size: usize, page: &[u8]) -> Result<usize, String> {
+        let next = store.total_pages();
+        if let Some((first, _)) = Store::structural_pair_of(next, page_size) {
+            if next == first {
+                Self::create_block(store, page_size, first)?;
+            }
+        }
+        store.append_page(page)
+    }
+
+    /// Lay down a brand-new allocation-table block's shadow pair at `first`
+    /// and `first + 1`, both appended, in the shape the genuine engine leaves
+    /// one it has just created.
+    ///
+    /// Read off the vendor's own files (`archive/modules/majormud-nt`,
+    /// `wccnt8pj`): `"PP"`, the 1-based block index, a generation, then every
+    /// entry a marker of zero (never claimed) over physical page
+    /// `first + 2 + slot` -- slot `i` pre-assigned the page that would
+    /// follow the pair if claims arrived in order. `wccmp002.vir` block 1
+    /// (4096-byte pages) still shows it from slot 2 on: `(0, 6), (0, 7) ...
+    /// (0, 1025)`; `wcctext2.vir` block 8 (2048-byte, at 3586/3587) shows a
+    /// whole untouched half, generation 0 and `(0, 3588) ... (0, 4097)` --
+    /// pages past the end of a 3634-page file, so the numbers are a
+    /// convention, not a promise the file already holds them. In every
+    /// measured pair the first page carries the creating write's generation
+    /// and the second carries 0: `wcctext2.vir` 3586/3587 = 34/0, and
+    /// `wccknms2.vir` 386/387 = 8/12, `wccmp002.vir` 3074/3075 = 68/91 after
+    /// later flips. This host stamps 1 and 0: its generations are per block
+    /// rather than the file-global counter the genuine engine uses (this
+    /// module's doc comment), and only the comparison *within* the pair is
+    /// load-bearing.
+    ///
+    /// The pre-assigned physical numbers are decorative to this engine -- a
+    /// claim takes the slot's id and appends its page wherever the file ends,
+    /// as [`Self::claim`] always has -- and are written so a slot reads the
+    /// way the genuine engine writes one. A slot whose page would not fit
+    /// the format's `u16` is left at zero: nothing can ever address it.
+    fn create_block(store: &mut Store, page_size: usize, first: usize) -> Result<(), String> {
+        let entries = Self::entries_per_block(page_size);
+        let index = u16::try_from((first - 2) / (entries + 2) + 1).map_err(|_| {
+            format!("the allocation-table block at physical {first} has no index that fits this format's u16")
+        })?;
+        let mut stale = vec![0u8; page_size];
+        stale[..2].copy_from_slice(MAGIC);
+        stale[BLOCK..BLOCK + 2].copy_from_slice(&index.to_le_bytes());
+        for slot in 0..entries {
+            let physical = u16::try_from(first + 2 + slot).unwrap_or(0);
+            let at = ENTRIES + slot * ENTRY;
+            stale[at + 2..at + 4].copy_from_slice(&physical.to_le_bytes());
+        }
+        let mut live = stale.clone();
+        live[GENERATION..GENERATION + 2].copy_from_slice(&1u16.to_le_bytes());
+
+        let at = store.append_page(&live)?;
+        if at != first {
+            return Err(format!(
+                "allocation-table block {index} belongs at physical {first}, and the file's next page is {at}"
+            ));
+        }
+        store.append_page(&stale)?;
+        Ok(())
+    }
+
     /// The (block, slot) an already-claimed or about-to-be-claimed logical id
     /// belongs to, both 1-based and 0-based respectively.
     ///
@@ -1632,12 +1747,12 @@ impl Map {
         // past this point (none exist below, but the order still matters if
         // this function ever grows one) never leaves a claim pointing at a
         // page that was never written.
-        let new_physical16 = u16::try_from(pages)
-            .map_err(|_| format!("physical page {pages} does not fit in this format's u16"))?;
         let mut page = content.to_vec();
         page[..2].copy_from_slice(&tag);
         page[LOGICAL..LOGICAL + 2].copy_from_slice(&new_logical16.to_le_bytes());
-        store.append_page(&page)?;
+        let new_physical = Self::append_content(store, page_size_usize, &page)?;
+        let new_physical16 = u16::try_from(new_physical)
+            .map_err(|_| format!("physical page {new_physical} does not fit in this format's u16"))?;
 
         // Copy-on-write, the same shape the file control record's own shadow
         // pair already uses (Task 1): the stale copy becomes a full copy of
@@ -1899,17 +2014,18 @@ impl Map {
             }
         }
 
-        let new_physical16 = u16::try_from(twin.unwrap_or(pages))
-            .map_err(|_| format!("physical page {pages} does not fit in this format's u16"))?;
         let mut page = content.to_vec();
         page[..2].copy_from_slice(&tag);
         page[LOGICAL..LOGICAL + 2].copy_from_slice(&logical16.to_le_bytes());
-        match twin {
-            Some(at) => store.write_page(at, &page)?,
-            None => {
-                store.append_page(&page)?;
+        let new_physical = match twin {
+            Some(at) => {
+                store.write_page(at, &page)?;
+                at
             }
-        }
+            None => Self::append_content(store, page_size_usize, &page)?,
+        };
+        let new_physical16 = u16::try_from(new_physical)
+            .map_err(|_| format!("physical page {new_physical} does not fit in this format's u16"))?;
 
         // Copy-on-write into the stale copy, exactly `Self::claim`'s shape:
         // the live copy's own bytes, plus this one change, plus a higher
@@ -2076,17 +2192,18 @@ impl Map {
             }
         }
 
-        let new_physical16 = u16::try_from(twin.unwrap_or(pages))
-            .map_err(|_| format!("physical page {pages} does not fit in this format's u16"))?;
         let mut page = content.to_vec();
         page[..2].copy_from_slice(&tag);
         page[LOGICAL..LOGICAL + 2].copy_from_slice(&logical16.to_le_bytes());
-        match twin {
-            Some(at) => store.write_page(at, &page)?,
-            None => {
-                store.append_page(&page)?;
+        let new_physical = match twin {
+            Some(at) => {
+                store.write_page(at, &page)?;
+                at
             }
-        }
+            None => Self::append_content(store, page_size_usize, &page)?,
+        };
+        let new_physical16 = u16::try_from(new_physical)
+            .map_err(|_| format!("physical page {new_physical} does not fit in this format's u16"))?;
 
         store.note_structural_pair(stale, live);
         let live_page = store.page(live)?.to_vec();
@@ -2451,6 +2568,158 @@ mod tests {
         }
     }
 
+    /// `name` with unclaimed `[0x00, 0x44]` content pages appended until it
+    /// is `pages` long -- each stamped logical 0, so no allocation-table
+    /// entry, twin search or claim ever picks one. The shape a run of
+    /// abandoned relocations leaves behind, and the cheapest way to walk a
+    /// file's end up to an allocation-table block's formula position.
+    fn padded(name: &str, page: usize, pages: usize) -> Vec<u8> {
+        let mut file = fixture(name);
+        assert!(file.len() / page <= pages, "{name} is already longer than {pages} pages");
+        while file.len() / page < pages {
+            let mut content = vec![0u8; page];
+            content[1] = 0x44;
+            file.extend_from_slice(&content);
+        }
+        file
+    }
+
+    /// Block 2's shadow pair lives at physical 130/131 for 512-byte pages
+    /// (`pair_position`: `2 + 126 + 2`) and nowhere else. A file whose end
+    /// has arrived exactly there must lay the pair down before it appends
+    /// anything else: a data page written at 130 instead is stranded --
+    /// `pair_of` finds no magic where block 2 belongs, so the table can never
+    /// grow past block 1 -- and `Store::for_commit` used to demand the page's
+    /// "partner" 131 and refuse the whole commit. That refusal stopped a live
+    /// board's MajorMUD on 2026-08-29 (`WCCACMS2.DAT`, 4096-byte pages: data
+    /// at 1026, `physical page 1027, and the file is 1027 pages`).
+    #[test]
+    fn a_claim_whose_page_would_land_on_the_next_blocks_position_lays_the_block_down_first() {
+        const PAGE: usize = 512;
+        let mut file = padded("DUPKEY30.DAT", PAGE, 130);
+        let before = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16)
+            .expect("resolves");
+
+        let mut content = vec![0u8; PAGE];
+        content[32..40].fill(0xDD);
+        let logical = via_store(&mut file, PAGE as u16, |s| Map::claim(s, PAGE as u16, &content, [0x00, 0x44]))
+            .expect("claims");
+
+        assert_eq!(file.len() / PAGE, 133, "the pair, then the page");
+        assert_eq!(Map::table_pages(&file, PAGE as u16), vec![2, 3, 130, 131]);
+        for (physical, generation) in [(130usize, 1u16), (131, 0)] {
+            let page = &file[physical * PAGE..][..PAGE];
+            assert_eq!(&page[..2], &MAGIC[..], "physical {physical} is a table page");
+            assert_eq!(u16::from_le_bytes([page[BLOCK], page[BLOCK + 1]]), 2, "block index at {physical}");
+            assert_eq!(
+                u16::from_le_bytes([page[GENERATION], page[GENERATION + 1]]),
+                generation,
+                "generation at {physical}"
+            );
+            for slot in 0..Map::entries_per_block(PAGE) {
+                let at = ENTRIES + slot * ENTRY;
+                let marker = u16::from_le_bytes([page[at], page[at + 1]]);
+                let page_no = u16::from_le_bytes([page[at + 2], page[at + 3]]);
+                assert_eq!((marker, page_no), (0, (132 + slot) as u16), "slot {slot} at {physical}");
+            }
+        }
+
+        let after = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16)
+            .expect("resolves with two blocks");
+        assert_eq!(after.physical(logical), Some(132), "the claimed page went after the pair");
+        assert_eq!(&file[132 * PAGE + 32..][..8], &[0xDD; 8], "the caller's content reached it");
+        for (id, physical) in before.entries() {
+            assert_eq!(after.physical(id), Some(physical), "logical {id} moved");
+        }
+        // Block 2 is claimable, not merely present.
+        via_store(&mut file, PAGE as u16, |s| Map::pair_of(s, PAGE, 2)).expect("block 2 has a live pair");
+    }
+
+    /// `relocate` appends a fresh page when no abandoned twin is free, on the
+    /// same rule. Logical 5 is the one id this fixture stamps on exactly one
+    /// page (physical 8, its live claim), so there is no twin to find.
+    #[test]
+    fn a_relocation_whose_page_would_land_on_the_next_blocks_position_lays_the_block_down_first() {
+        const PAGE: usize = 512;
+        let mut file = padded("DUPKEY30.DAT", PAGE, 130);
+        let mut content = vec![0u8; PAGE];
+        content[32..40].fill(0xEE);
+        let physical = via_store(&mut file, PAGE as u16, |s| Map::relocate(s, PAGE as u16, 5, &content, [0x00, 0x44]))
+            .expect("relocates");
+
+        assert_eq!(physical, 132);
+        assert_eq!(Map::table_pages(&file, PAGE as u16), vec![2, 3, 130, 131]);
+        let after = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16)
+            .expect("resolves");
+        assert_eq!(after.physical(5), Some(132));
+        assert_eq!(&file[132 * PAGE + 32..][..8], &[0xEE; 8]);
+    }
+
+    /// A file whose end is one *past* a block's position already has content
+    /// where the pair's first half belongs -- an engine that did not know the
+    /// rule wrote it there; the live `WCCMP002.DAT` has data at 14338 and
+    /// 15362. Nothing can put block 2 there now, so the file keeps growing as
+    /// it was: content, with the table still ending at block 1.
+    #[test]
+    fn a_claim_one_past_the_next_blocks_position_keeps_growing_as_content() {
+        const PAGE: usize = 512;
+        let mut file = padded("DUPKEY30.DAT", PAGE, 131);
+        let content = vec![0u8; PAGE];
+        let logical = via_store(&mut file, PAGE as u16, |s| Map::claim(s, PAGE as u16, &content, [0x00, 0x44]))
+            .expect("claims");
+
+        assert_eq!(file.len() / PAGE, 132);
+        assert_eq!(Map::table_pages(&file, PAGE as u16), vec![2, 3]);
+        let after = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16)
+            .expect("resolves");
+        assert_eq!(after.physical(logical), Some(131));
+    }
+
+    /// The commit-time classifier on the exact shape that stopped the live
+    /// board: disk ends at 130 pages, the cache holds a dirty *data* page at
+    /// 130 (block 2's position) and nothing at 131. Position alone made it a
+    /// pair half and demanded 131; the magic says it is content.
+    #[test]
+    fn for_commit_takes_a_data_page_at_a_blocks_position_as_content() {
+        const PAGE: usize = 512;
+        let dir = crate::testing::scratch("v6-for-commit-content-at-block-position");
+        let path = dir.join("DUPKEY30.DAT");
+        std::fs::write(&path, padded("DUPKEY30.DAT", PAGE, 130)).expect("writes");
+        let cache = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::cache::PageCache::open(&path, PAGE as u16).expect("opens"),
+        ));
+        let mut data = vec![0u8; PAGE];
+        data[1] = 0x44;
+        cache.borrow_mut().put(130, data);
+
+        let store = Store::for_commit(&cache, &path, PAGE as u16).expect("content at 130 needs no partner");
+        assert!(store.structural_pairs().is_empty(), "a data page is not a shadow pair");
+        assert_eq!(store.total_pages(), 131);
+    }
+
+    /// ...while a pair that *is* one -- both halves fresh in the cache, magic
+    /// on -- is still recognised by position.
+    #[test]
+    fn for_commit_still_pairs_a_fresh_table_block_by_position() {
+        const PAGE: usize = 512;
+        let dir = crate::testing::scratch("v6-for-commit-fresh-block");
+        let path = dir.join("DUPKEY30.DAT");
+        std::fs::write(&path, padded("DUPKEY30.DAT", PAGE, 130)).expect("writes");
+        let cache = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::cache::PageCache::open(&path, PAGE as u16).expect("opens"),
+        ));
+        let mut stale = vec![0u8; PAGE];
+        stale[..2].copy_from_slice(MAGIC);
+        stale[BLOCK] = 2;
+        let mut live = stale.clone();
+        live[GENERATION] = 1;
+        cache.borrow_mut().put(130, live);
+        cache.borrow_mut().put(131, stale);
+
+        let store = Store::for_commit(&cache, &path, PAGE as u16).expect("a fresh pair");
+        assert_eq!(store.structural_pairs(), vec![(130, 131)]);
+    }
+
     /// Relocating a block-2 id must not pick a twin that **block 1** claims.
     ///
     /// [`Map::relocate`] chooses where to write by scanning for a page that
@@ -2531,7 +2800,9 @@ mod tests {
     /// entry under an id nothing will ever resolve to.
     ///
     /// Twelve-byte pages: one entry a block, stride three, so block 1's pair
-    /// is at physical 2/3 and block 2's at 5/6.
+    /// is at physical 2/3 and block 2's at 5/6 -- and block 3's at 8/9, which
+    /// is exactly where this eight-page file ends. So the claim lays block 3's
+    /// pair down first ([`Map::append_content`]) and its page lands at 10.
     #[test]
     fn a_claim_lands_in_the_second_block_once_the_first_is_full() {
         let page_size: usize = ENTRIES + ENTRY;
@@ -2563,8 +2834,9 @@ mod tests {
 
         assert_eq!(logical, 2, "block 2 slot 0 is logical entries_per_block + 1");
         let map = Map::read(&mut Store::from_bytes(&file, page_size as u16).expect("test fixture"), page_size as u16).expect("resolves");
-        assert_eq!(map.physical(2), Some(8), "the appended page, claimed by block 2");
+        assert_eq!(map.physical(2), Some(10), "the appended page, claimed by block 2, past block 3's new pair");
         assert_eq!(map.physical(1), Some(4), "block 1's claim is untouched");
+        assert_eq!(Map::table_pages(&file, page_size as u16), vec![2, 3, 5, 6, 8, 9], "block 3 went down at its position");
     }
 
     /// A logical id whose slot lives in allocation-table block **2** relocates
