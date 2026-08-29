@@ -281,11 +281,17 @@ impl Abi for Wg32 {
         &cpu.mem
     }
 
-    /// The module's own loaded image, at its own base -- there is no
-    /// near/far distinction left to collapse once every pointer is already
-    /// flat, so "the module's own data segment" and "an ordinary pointer
-    /// into it" are the same address. See [`Abi::data_ptr`]'s own doc
-    /// comment.
+    /// The **first** image's base -- the channel-owning module's. There is
+    /// no near/far distinction left to collapse once every pointer is
+    /// already flat, so "the module's own data segment" and "an ordinary
+    /// pointer into it" are the same address; see [`Abi::data_ptr`]'s own
+    /// doc comment.
+    ///
+    /// `%N` near-pointer formatting is the only consumer, and with N
+    /// modules loaded this names module 1's data. That is a real limit, not
+    /// an oversight: nothing in [`Abi`] can say which module a `Call` came
+    /// from, so there is no better answer available here. `0` when nothing
+    /// is loaded yet.
     fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr {
         mbbs_machine::m32::Flat32Ptr(cpu.mem.image().map_or(0, mbbs_machine::m32::Image::base))
     }
@@ -399,29 +405,35 @@ impl Abi for Wg32 {
     /// identical note). Task 9 left this reconciliation to this task because
     /// this is the file that owns the real PE arm.
     ///
-    /// **Only the image is replaced -- the arena is not.** `cpu.mem`'s
-    /// arena is the host's own allocation, not the module's: every pointer
-    /// [`ModuleMem::alloc_region`] has ever handed out (`Host::new`'s
-    /// `spr`/`mdf`/`l2as`/`empty` buffers among them) resolves against it,
-    /// and loading a module has no business freeing memory it does not own
-    /// -- see [`Abi::load`]'s own doc comment, which states that as the
-    /// border's general contract, not a `Wg32`-specific courtesy. This
-    /// method upholds it through
-    /// `mbbs_machine::m32::Memory::push_image`, which appends a freshly
-    /// loaded `Image` while leaving `cpu.mem`'s arena -- and every
-    /// pointer already carved from it -- exactly as they were; see that
-    /// method's own doc comment for why an outright `cpu.mem = Memory::new(image,
-    /// ..)` cannot do the same (it drops the old arena `Mapping`, and
-    /// `Mapping::drop` really does `munmap` it).
+    /// **Appends -- it never replaces.** The image goes on the end of
+    /// `cpu.mem`'s image list (`mbbs_machine::m32::Memory::push_image`),
+    /// leaving the arena and every image already there exactly as they
+    /// were. That is [`Abi::load`]'s general contract, not a `Wg32`
+    /// courtesy: every pointer [`ModuleMem::alloc_region`] has handed out
+    /// (`Host::new`'s `spr`/`mdf`/`l2as`/`empty` buffers among them)
+    /// resolves against that arena, and loading a module has no business
+    /// freeing memory it does not own. An earlier version of this method
+    /// assigned a whole fresh `Memory` to `cpu.mem` instead, and it was a
+    /// measured bug, not a theoretical one -- `Mapping::drop` really does
+    /// `munmap` the old arena; `crates/mbbs/tests/wg32_round_trip.rs`'s
+    /// module doc comment records the failure that produced.
     ///
-    /// **This was not always true.** An earlier version of this method did
-    /// exactly that -- replaced `cpu.mem` wholesale -- and it was a real,
-    /// measured bug, not a theoretical one:
-    /// `crates/mbbs/tests/wg32_round_trip.rs`'s module doc comment records
-    /// the failure it produced (a host-owned buffer pointer computed before
-    /// `load`, resolving as `Flat32PtrError::OutOfBounds` after it) and the
-    /// harness workaround Task 15 needed until this method was fixed to
-    /// call `replace_image` instead.
+    /// **The thunk slice is reserved from the machine, not numbered from
+    /// zero.** `mbbs_machine::m32::Machine::reserve_thunks` hands this load
+    /// a run of consecutive slots no other module can be given, and
+    /// `patch_thunk_addresses`'s closure adds that base -- because
+    /// `Exit::Call` reports the bare machine-wide index, and two modules
+    /// sharing one slot would be indistinguishable at the stop. The base
+    /// goes into the returned `Module`, which resolves an index only inside
+    /// its own slice (`mbbs_machine::m32::Module::import`).
+    ///
+    /// **The module registers under its PE export name.** `Host::load`
+    /// keys its cross-module registry by [`Abi::module_name`], which for
+    /// `Wg32` is the export directory's own `Name` string
+    /// (`wccmmud.DLL`) -- so a module loaded *later* can bind an import of
+    /// this one's exports. Load order is the caller's (`mbbs-server`'s
+    /// `--module` order): an import binds against what is already loaded,
+    /// and against nothing else.
     ///
     /// Unlike `Wg16::load`, which mutates the `Segments` a `Machine::new`
     /// scratch build already carries (`Machine::load_ne` appends), there is
@@ -430,8 +442,7 @@ impl Abi for Wg32 {
     /// comment, "why not fold this into `Image`"). So this method builds
     /// the whole `Image` first, against `file` alone, and only once
     /// loading, relocating, binding and patching have all succeeded does it
-    /// commit -- calling `cpu.mem.replace_image` in the same motion that
-    /// returns `Ok`. `cpu.machine` is never rebuilt: its thunk table,
+    /// commit. `cpu.machine` is never rebuilt: its thunk table,
     /// fault-recovery arming and TID binding all predate this call and must
     /// survive it, which is exactly why `cpu.machine.thunk_addr` is read
     /// from but `cpu.machine` itself is never reassigned.
@@ -443,9 +454,11 @@ impl Abi for Wg32 {
     /// did not land at its own preferred base). [`crate::LoadError::Absolute`]
     /// if `resolve` answers [`mbbs_machine::module::Import::Absolute`] for any
     /// import site -- see [`mbbs_machine::m32::AbsoluteImport`]'s own doc
-    /// comment for why a PE loader can never honour one. `cpu.mem` is
-    /// unchanged in every error case: nothing is assigned to it until every
-    /// step above has already succeeded.
+    /// comment for why a PE loader can never honour one. [`crate::LoadError::Image`]
+    /// again if the machine has no thunk slots left
+    /// ([`mbbs_machine::m32::ThunkExhausted`]). `cpu.mem` is unchanged in
+    /// every error case: nothing is pushed onto it until every step above
+    /// has already succeeded.
     fn load(
         cpu: &mut Self::Cpu,
         file: &[u8],
@@ -458,8 +471,16 @@ impl Abi for Wg32 {
 
         let thunks = image.bind_imports(&pe, resolve)?;
 
+        // This module's own run of machine-wide slots. `bind_imports`
+        // numbers its sites from zero; `base` is what turns those local
+        // indices into the machine-wide ones `Exit::Call` reports.
+        let base = cpu
+            .machine
+            .reserve_thunks(u16::try_from(thunks.len()).expect("bind_imports never exceeds MAX_THUNKS"))?;
+
         image.patch_thunk_addresses(&pe, &thunks, |index| {
-            cpu.machine.thunk_addr(u16::try_from(index).expect("bind_imports never exceeds MAX_THUNKS"))
+            cpu.machine
+                .thunk_addr(base + u16::try_from(index).expect("bind_imports never exceeds MAX_THUNKS"))
         });
 
         // `__ftol` takes its argument in x87 `ST0`, not in the call frame,
@@ -481,8 +502,9 @@ impl Abi for Wg32 {
             site.module.eq_ignore_ascii_case("cw3220mt.DLL")
                 && matches!(&site.symbol, mbbs_machine::module::Symbol::Name(n) if n == "__ftol")
         }) {
-            cpu.machine
-                .arm_st0_capture(u16::try_from(slot).expect("bind_imports never exceeds MAX_THUNKS"));
+            cpu.machine.arm_st0_capture(
+                base + u16::try_from(slot).expect("bind_imports never exceeds MAX_THUNKS"),
+            );
         }
 
         let entry = image.base().wrapping_add(pe.entry_point);
@@ -503,20 +525,32 @@ impl Abi for Wg32 {
         // [`Abi::export_address`] answers from once the `PeImage` is gone.
         let exports = mbbs_machine::m32::Exports::rebased(&pe, image.base());
 
-        // Every step above succeeded -- commit. `push_image` appends `image`
-        // without touching `cpu.mem`'s arena. Provisional: `Memory` no
-        // longer has a "replace the one image" operation (Task 1 of
-        // `docs/plans/2026-08-29-wg32-n-module-boot`), and this call has not
-        // yet been updated for what that means when `cpu.mem` already holds
-        // an image -- Task 3 owns fixing `Wg32::load` for real N-module
-        // semantics (see this method's own doc comment, which still
-        // describes the old `replace_image` behaviour).
+        // Every step above succeeded -- commit. `push_image` appends
+        // `image` without touching `cpu.mem`'s arena or any image already
+        // loaded.
         cpu.mem.push_image(image);
 
-        // `0` is provisional: this crate still numbers every load's thunks
-        // from zero (Task 3 of `docs/plans/2026-08-29-wg32-n-module-boot`
-        // replaces it with `Machine::reserve_thunks`'s answer).
-        Ok(mbbs_machine::m32::Module::new(entry, init, thunks, exports, 0, pe.export_name.clone()))
+        // `pe.export_name` is what `Host` keys its cross-module registry by
+        // -- `None` for an image with no export directory, which simply
+        // means nothing will ever find this one by name.
+        Ok(mbbs_machine::m32::Module::new(
+            entry,
+            init,
+            thunks,
+            exports,
+            base,
+            pe.export_name.clone(),
+        ))
+    }
+
+    /// The PE export directory's own `Name` string (`wccmmud.DLL`), or
+    /// `None` for an image with no export directory. What `Host::load` keys
+    /// its cross-module registry by -- see [`Abi::module_name`]'s own doc
+    /// comment, and `crates/mbbs/src/lib.rs`'s own `registry_key` for why
+    /// the key is uppercased (a PE exports `wccmmud.DLL` and imports
+    /// `WCCMMUD.dll`).
+    fn module_name(module: &Self::Module) -> Option<&str> {
+        module.name()
     }
 
     /// Direct delegation -- `mbbs_machine::m32::Module::import` (this task).

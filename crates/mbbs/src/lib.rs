@@ -760,6 +760,14 @@ impl From<mbbs_machine::m32::PeError> for LoadError {
     }
 }
 
+/// A machine with no thunk slots left cannot take another image -- which is
+/// exactly what [`LoadError::Image`] already means, so no new variant.
+impl From<mbbs_machine::m32::ThunkExhausted> for LoadError {
+    fn from(e: mbbs_machine::m32::ThunkExhausted) -> Self {
+        LoadError::Image(io::Error::other(e))
+    }
+}
+
 impl From<mbbs_machine::m32::AbsoluteImport> for LoadError {
     fn from(e: mbbs_machine::m32::AbsoluteImport) -> Self {
         Self::Absolute {
@@ -3008,12 +3016,15 @@ impl<A: Abi> Host<A> {
     /// cross-module registry `loaded_modules` is, and neither `mbbs_machine`
     /// machine has -- or should have -- any notion of "which modules has
     /// this host loaded" (see `Host::loaded_modules`'s own doc comment).
-    /// `Wg32` never populates `loaded_modules` at all (`Abi::module_name`'s
-    /// default `None`), so this degrades to exactly `A::import(entered,
-    /// index)` for it -- unchanged from before this method existed, which is
-    /// correct: only one `Wg32` module can be loaded today at all
-    /// (`Memory::replace_image` replaces the image wholesale), so there is
-    /// no second module a `Wg32` index could ever belong to.
+    /// `Wg32` populates `loaded_modules` too, since
+    /// `docs/plans/2026-08-29-wg32-n-module-boot`: its `Abi::module_name`
+    /// answers the PE export directory's own name, and `Machine::
+    /// reserve_thunks` hands each loaded image a disjoint slice of the one
+    /// machine-wide thunk table, so the "at most one candidate can answer
+    /// `Some`" argument above holds identically for it. A `Wg32` image with
+    /// no export directory has no name to be keyed by and so is not in the
+    /// registry -- for that one this still degrades to exactly
+    /// `A::import(entered, index)`.
     ///
     /// Returns owned copies (`A::Module: Clone`, already required for
     /// `Host::loaded_modules` itself), not borrows: `Host::run`'s caller
@@ -3272,11 +3283,13 @@ impl<A: Abi> Host<A> {
 
         // Make this module's own exports reachable to whatever `Host::load`
         // call comes next in this life -- see `Host::loaded_modules`'s own
-        // doc comment. `A::module_name` answering `None` (`Wg32`, today)
-        // just means nothing else will ever find this module by name, which
-        // is no worse than today's single-module reality.
+        // doc comment. Keyed through `registry_key`, because a PE exports
+        // `wccmmud.DLL` and its importer spells the same library
+        // `WCCMMUD.dll`. `A::module_name` answering `None` (an image with
+        // no name to declare -- a PE with no export directory) just means
+        // nothing else will ever find this module by name.
         if let Some(name) = A::module_name(&module) {
-            self.loaded_modules.insert(name.to_owned(), module.clone());
+            self.loaded_modules.insert(registry_key(name), module.clone());
         }
 
         Ok(module)
@@ -5678,6 +5691,18 @@ fn addend(reloc: &Relocation, segment: &[u8]) -> i16 {
     }
 }
 
+/// [`Host::loaded_modules`]' key for a module or import name: uppercased,
+/// because a PE export directory says `wccmmud.DLL` and an importer says
+/// `WCCMMUD.dll`. NE names are already uppercase, so this is the identity
+/// for them.
+///
+/// A free function, not a method, so `Resolver::resolve` -- generic over
+/// `A`, with no `Host<A>` to hand -- reaches the same one the insert side
+/// uses. One spelling of the rule, three call sites.
+fn registry_key(name: &str) -> String {
+    name.to_ascii_uppercase()
+}
+
 /// The C name of an imported symbol, or something that identifies it when
 /// `exports` has no name for it (`"#42"` for an ordinal no table names).
 ///
@@ -5827,7 +5852,7 @@ impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
         // through to the ordinary host-tables-first order below exactly as
         // if `prefer` had never named it.
         if self.prefer.contains(&module)
-            && let Some(loaded) = self.loaded.get(module)
+            && let Some(loaded) = self.loaded.get(&registry_key(module))
             && let Some(ptr) = A::export_address(loaded, symbol)
         {
             return Some(mbbs_machine::module::Import::Data(ptr));
@@ -5841,7 +5866,7 @@ impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
         // registry has never heard of falls straight through to the
         // existing `reach`/`entry` handling below, completely unchanged.
         if matches!(entry, Entry::Unimplemented)
-            && let Some(loaded) = self.loaded.get(module)
+            && let Some(loaded) = self.loaded.get(&registry_key(module))
         {
             return match A::export_address(loaded, symbol) {
                 Some(ptr) => Some(mbbs_machine::module::Import::Data(ptr)),

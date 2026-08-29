@@ -761,11 +761,11 @@ pub trait Abi {
     /// `Wg16`'s override (`abi/wg16.rs`) reads
     /// [`mbbs_machine::m16::Module::name`], the NE resident name table's own
     /// first entry -- see that method's own doc comment for where the string
-    /// comes from. `Wg32` has no override yet: `mbbs_machine::m32::Module`
-    /// does not carry its own declared name today (only one `Wg32` module
-    /// can be loaded at all, so nothing has needed one), so a `Wg32` module
-    /// can be loaded but not yet *depended on* by a later one. The read
-    /// half, [`Abi::export_address`], `Wg32` does answer.
+    /// comes from. `Wg32`'s (`abi/wg32.rs`) reads the PE export directory's
+    /// own `Name` string (`wccmmud.DLL`), `None` for an image with no
+    /// export directory. `Host` uppercases whatever this answers before
+    /// keying by it, because a PE exports `wccmmud.DLL` and its importer
+    /// spells the same library `WCCMMUD.dll`.
     fn module_name(module: &Self::Module) -> Option<&str>
     where
         Self: Sized,
