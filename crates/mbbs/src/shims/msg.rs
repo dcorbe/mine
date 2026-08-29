@@ -93,8 +93,7 @@ pub fn opnmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .open_mem(call.mem(), &name, &file)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-    let previous = current_mem(call.mem(), host)?;
-    host.messages.push(previous);
+    host.messages.set(cookie);
     set_current_mem(call.mem(), host, cookie)?;
     Ok(abi::Ret::Ptr(cookie))
 }
@@ -139,12 +138,13 @@ pub fn clsmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `void setmbk(FILE *mb)` -- read options from this file until told otherwise.
 ///
-/// `curmbk` is written in module memory, not remembered here. What is
-/// remembered is the value it held, so that `rstmbk` has something to put back.
+/// `curmbk` is written in module memory; the host's own record of it is
+/// slot 0 of [`Messages::set`](crate::msg::Messages::set)'s window, which is
+/// what `rstmbk` unwinds.
 ///
 /// Generic (Task 5): [`Messages::name`](crate::msg::Messages::name) and
-/// [`Messages::push`](crate::msg::Messages::push) never touched a `Machine`;
-/// only [`current_mem`]/[`set_current_mem`] read and write module memory.
+/// [`Messages::set`](crate::msg::Messages::set) never touched a `Machine`;
+/// only [`set_current_mem`] writes module memory.
 pub fn setmbk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let cookie = call.ptr();
 
@@ -153,19 +153,24 @@ pub fn setmbk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     // would land on whichever option was read next.
     host.messages.name(cookie).map_err(ShimError::Failed)?;
 
-    let previous = current_mem(call.mem(), host)?;
-    host.messages.push(previous);
+    host.messages.set(cookie);
     set_current_mem(call.mem(), host, cookie)?;
     Ok(abi::Ret::Void)
 }
 
 /// `void rstmbk(void)` -- go back to the message file that was current before.
 ///
-/// Generic (Task 5): [`Messages::pop`](crate::msg::Messages::pop) never
-/// touched a `Machine`; only [`set_current_mem`] writes module memory.
+/// Never refuses: [`Messages::restore`](crate::msg::Messages::restore) is the
+/// vendor's blind ten-slot window, and MajorMUD leans on it -- its `spells`
+/// handler for a Mystic pops three times for two `setmbk`s (measured; the
+/// test `majormuds_spells_command_pops_once_more_than_it_pushed_and_carries_on`
+/// has the trace).
+///
+/// Generic (Task 5): `Messages::restore` never touches a `Machine`; only
+/// [`set_current_mem`] writes module memory.
 pub fn rstmbk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let previous = host.messages.pop().map_err(ShimError::Failed)?;
-    set_current_mem(call.mem(), host, previous)?;
+    let restored = host.messages.restore();
+    set_current_mem(call.mem(), host, restored)?;
     Ok(abi::Ret::Void)
 }
 
@@ -889,12 +894,81 @@ mod tests {
         assert_eq!(curmbk(&f), before, "and left curmbk where it was");
     }
 
+    /// `MCVAPI.C:229`: `rstmbk` shifts a fixed ten-slot window and takes
+    /// whatever lands in slot 0 -- it cannot refuse. Nothing set means the
+    /// null every slot started as, so no block is current.
     #[test]
-    fn rstmbk_with_nothing_to_undo_refuses() {
-        // Rather than leaving `curmbk` at whatever seemed likely -- after which
-        // every option read would come from that guess.
+    fn rstmbk_with_nothing_to_undo_leaves_no_block_current() {
         let mut f = Fixture::new();
-        assert!(f.invoke(rstmbk, &[]).is_err());
+        let nothing = curmbk(&f);
+        f.invoke(rstmbk, &[]).expect("the genuine host never refuses this");
+        assert_eq!(curmbk(&f), nothing);
+    }
+
+    /// Traced on a live PE32 board, 2026-08-29 (`MBBS_TRACE_SHIMS`): a Mystic
+    /// typing `spells` gets `setmbk`, `setmbk`, "You may not list your
+    /// spells. You are KAI! You must list your powers.", `rstmbk`, `rstmbk`,
+    /// the prompt -- and then a third `rstmbk`. The module pops once more
+    /// than it pushed; this host used to answer `rstmbk with no setmbk to
+    /// undo` and stop it for every player. The genuine window hands back the
+    /// slot below -- here the block opened first -- and the module goes on.
+    #[test]
+    fn majormuds_spells_command_pops_once_more_than_it_pushed_and_carries_on() {
+        let mut f = Fixture::new();
+        let first = open(&mut f, "SAMPLE.MSG");
+        let second = open(&mut f, "OTHER.MSG");
+        f.invoke(setmbk, &Fixture::far(first)).expect("set");
+        f.invoke(setmbk, &Fixture::far(second)).expect("set");
+        f.invoke(rstmbk, &[]).expect("first pop");
+        assert_eq!(curmbk(&f), first);
+        f.invoke(rstmbk, &[]).expect("second pop");
+        assert_eq!(curmbk(&f), second);
+        f.invoke(rstmbk, &[]).expect("the extra pop must not stop the module");
+        assert_eq!(curmbk(&f), first, "the slot below, as the genuine window answers");
+
+        f.invoke(setmbk, &Fixture::far(first)).expect("set");
+        let Ret::Far(at) = f.invoke(stgopt, &[1]).expect("read") else {
+            panic!("stgopt returns a pointer");
+        };
+        assert_eq!(f.read(at), "DEMO", "and options read as before");
+    }
+
+    /// `DFSTSZ` is ten (`DFAAPI.H:24`): the current block and nine under it.
+    /// Two opens and eight nested `setmbk`s fill exactly that, so the ninth
+    /// `rstmbk` still reaches the block opened first.
+    #[test]
+    fn the_window_keeps_nine_blocks_under_the_current_one() {
+        let mut f = Fixture::new();
+        let first = open(&mut f, "SAMPLE.MSG");
+        let second = open(&mut f, "OTHER.MSG");
+        for _ in 0..8 {
+            f.invoke(setmbk, &Fixture::far(second)).expect("set");
+        }
+        for _ in 0..8 {
+            f.invoke(rstmbk, &[]).expect("restore");
+            assert_eq!(curmbk(&f), second);
+        }
+        f.invoke(rstmbk, &[]).expect("the ninth restore");
+        assert_eq!(curmbk(&f), first, "slot nine survived eight nested sets");
+    }
+
+    /// One more `setmbk` than [`the_window_keeps_nine_blocks_under_the_current_one`]
+    /// and the block opened first falls off the bottom: `MCVAPI.C:222`'s
+    /// `movmem` over `DFSTSZ-1` slots. Nine restores never reach it -- the
+    /// shift leaves the bottom slot duplicated, so they all answer `second`.
+    #[test]
+    fn a_tenth_block_pushes_the_oldest_off_the_window() {
+        let mut f = Fixture::new();
+        let first = open(&mut f, "SAMPLE.MSG");
+        let second = open(&mut f, "OTHER.MSG");
+        for _ in 0..9 {
+            f.invoke(setmbk, &Fixture::far(second)).expect("set");
+        }
+        for _ in 0..9 {
+            f.invoke(rstmbk, &[]).expect("restore");
+            assert_eq!(curmbk(&f), second);
+        }
+        assert_ne!(curmbk(&f), first, "the opened block is gone from the window");
     }
 
     #[test]

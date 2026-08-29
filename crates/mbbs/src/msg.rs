@@ -374,10 +374,10 @@ struct Block<A: Abi> {
 /// to change.
 /// # Generic throughout
 ///
-/// `Block::cookie`/`text` and `saved`'s addresses are typed `A::Ptr` rather
+/// `Block::cookie`/`text` and `stack`'s addresses are typed `A::Ptr` rather
 /// than `FarPtr`, and `arena` is `Arena<A>`, so this is genuinely
 /// `Messages<A>`. Every method that never touched a `Machine` -- `close`,
-/// `push`, `pop`, `text`, `name`, `len`, `is_empty`, and the private `find`
+/// `set`, `restore`, `text`, `name`, `len`, `is_empty`, and the private `find`
 /// -- lives on `impl<A: Abi> Messages<A>`, `FarPtr` widened to `A::Ptr`
 /// wherever one appears.
 ///
@@ -399,16 +399,21 @@ pub struct Messages<A: Abi> {
     arena: Arena<A>,
     open: Vec<Block<A>>,
 
-    /// What `curmbk` held before each unmatched `setmbk`, oldest first.
-    saved: Vec<A::Ptr>,
+    /// The `setmbk`/`rstmbk` window -- `MCVAPI.C:35`'s `mbstk[DFSTSZ]`. Slot
+    /// 0 mirrors the current block, slot 1 the one before it, and so on; see
+    /// [`Self::set`] for the rule and why it is a window rather than a stack.
+    stack: [A::Ptr; DEPTH],
 }
+
+/// `DFSTSZ` -- `DFAAPI.H:24`, the constant `MCVAPI.C:35` sizes `mbstk` by.
+const DEPTH: usize = 10;
 
 impl<A: Abi> Default for Messages<A> {
     fn default() -> Self {
         Self {
             arena: Arena::default(),
             open: Vec::new(),
-            saved: Vec::new(),
+            stack: [A::null_ptr(); DEPTH],
         }
     }
 }
@@ -490,10 +495,10 @@ impl<A: Abi> Messages<A> {
     /// to write in both cases, and writing it beats refusing.
     ///
     /// `curmbk` is a single value with a home in module memory, so closing
-    /// what it names is paired with putting it back to nothing. `saved` is a
-    /// stack `rstmbk` pops blindly, so an entry naming a closed block becomes
+    /// what it names is paired with putting it back to nothing. The window is
+    /// what `rstmbk` shifts blindly, so a slot naming a closed block becomes
     /// the null instead of disappearing -- depth is what `rstmbk` pairs
-    /// against, and removing an entry would re-point every later restore at
+    /// against, and removing a slot would re-point every later restore at
     /// the wrong block. Either way the end state is "no block is current",
     /// which this host answers cleanly rather than reading through a dangling
     /// pointer.
@@ -512,40 +517,55 @@ impl<A: Abi> Messages<A> {
         self.open.remove(at);
 
         // A block waiting under the current one is closed too, and every
-        // `saved` entry naming it becomes the null rather than disappearing.
-        // Depth is what `rstmbk` pairs against -- one pop per unmatched
-        // `setmbk` -- so removing an entry would silently re-point every
-        // `rstmbk` after it at the wrong block. Nulling keeps the pairing and
-        // makes the restore land on "no block is current", which this host
-        // already answers cleanly: every option read refuses, by name.
-        for saved in &mut self.saved {
-            if *saved == cookie {
-                *saved = A::null_ptr();
+        // window slot naming it becomes the null rather than disappearing.
+        // Depth is what `rstmbk` pairs against -- one shift per `setmbk` --
+        // so removing a slot would silently re-point every `rstmbk` after it
+        // at the wrong block. Nulling keeps the pairing and makes the restore
+        // land on "no block is current", which this host already answers
+        // cleanly: every option read refuses, by name.
+        for slot in &mut self.stack {
+            if *slot == cookie {
+                *slot = A::null_ptr();
             }
         }
         Ok(cookie == current)
     }
 
-    /// Remember what was current, so `rstmbk` can put it back.
+    /// Make `cookie` the window's current block: `setmbk`, and the half of
+    /// `opnmsg` that is `setmbk` (`MCVAPI.C:81`, `setmbk(alczer(...))`).
+    ///
+    /// `MCVAPI.C:219-225`: the window shifts down one slot -- the bottom
+    /// falls off -- and slot 0 takes the new block. `lclmbk` is
+    /// `(struct msgblk *)curmbk` (`MCVAPI.H:41`), so `mbstk[0]=lclmbk` after
+    /// `curmbk=mb` stores the *new* block, not the old one: slot 0 always
+    /// mirrors what is current. `curmbk` itself lives in module memory and
+    /// is written by the caller.
     ///
     /// Generic outright, for the same reason `close` is.
-    pub fn push(&mut self, previous: A::Ptr) {
-        self.saved.push(previous);
+    pub fn set(&mut self, cookie: A::Ptr) {
+        self.stack.copy_within(0..DEPTH - 1, 1);
+        self.stack[0] = cookie;
     }
 
-    /// What was current before the last unmatched `setmbk`.
+    /// `rstmbk`: shift the window up one slot and answer what lands in slot
+    /// 0 -- the block current before the last [`Self::set`], or, when there
+    /// was none, whatever stale slot lies below. `MCVAPI.C:229-233`, which
+    /// cannot fail: an unmatched `rstmbk` yields the null every slot starts
+    /// as, or the oldest surviving entry, which the shift leaves duplicated
+    /// in the bottom slot.
+    ///
+    /// This used to be a `Vec` that refused when empty (`rstmbk with no
+    /// setmbk to undo`), on the reasoning that guessing at `curmbk` was
+    /// worse than stopping. Measured otherwise on a live PE32 board,
+    /// 2026-08-29: a Mystic typing `spells` has MajorMUD `setmbk` twice and
+    /// `rstmbk` three times, and the refusal stopped the module for every
+    /// player on the board. The vendor's rule is a bounded, blind window,
+    /// and the module is written against it.
     ///
     /// Generic outright, for the same reason `close` is.
-    ///
-    /// # Errors
-    ///
-    /// If nothing was saved. The alternative is guessing at a value for
-    /// `curmbk`, and every option read afterwards would come from whichever
-    /// block that guess named.
-    pub fn pop(&mut self) -> Result<A::Ptr, String> {
-        self.saved
-            .pop()
-            .ok_or_else(|| "rstmbk with no setmbk to undo".to_owned())
+    pub fn restore(&mut self) -> A::Ptr {
+        self.stack.copy_within(1..DEPTH, 0);
+        self.stack[0]
     }
 
     /// Where message `n` of the block named by `cookie` was interned.
