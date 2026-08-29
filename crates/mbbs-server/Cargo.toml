@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 mbbs = { path = "../mbbs" }
 mbbs-lua = { path = "../mbbs-lua" }
 mbbs-machine = { path = "../mbbs-machine" }

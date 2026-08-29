@@ -558,6 +558,7 @@ name = "mbbs-server"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "mbbs",
  "mbbs-lua",
  "mbbs-machine",
