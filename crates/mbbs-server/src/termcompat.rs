@@ -23,6 +23,8 @@
 
 use textscreen::cp437;
 
+use crate::iac::Filter;
+
 /// Telnet's `IAC` byte (RFC 854) — coincides with CP437's non-breaking
 /// space, 0xFF. [`Stack::raw`] doubles it so a strict telnet client does not
 /// mistake the character for the start of a command.
@@ -46,6 +48,13 @@ const ESC_HOME: &[u8] = b"\x1b[H";
 /// carrying how far into the pattern the previous call got. `ed2_match`
 /// is that carry-over; it is the only state either variant holds.
 pub struct Stack {
+    /// Telnet framing on this wire: strip commands inbound, double `IAC`
+    /// outbound when the bytes are not transcoded. `false` for
+    /// [`Stack::door`], whose bytes a BBS has already de-framed.
+    telnet: bool,
+    /// The inbound command stripper, owned here so `conn::pump` has no
+    /// telnet knowledge of its own. Idle when `telnet` is `false`.
+    filter: Filter,
     transcode: bool,
     /// Rewrite `ESC[2J` to `ESC[2J ESC[H` on the way out. `true` only for
     /// [`Stack::modern`] -- see that constructor's doc comment for why.
@@ -106,6 +115,8 @@ impl Stack {
     /// differently elsewhere after this change is not a new bug.
     pub fn modern() -> Self {
         Stack {
+            telnet: true,
+            filter: Filter::default(),
             transcode: true,
             home_on_clear: true,
             ed2_match: 0,
@@ -124,6 +135,25 @@ impl Stack {
     /// stack has no way to tell apart from one the client actually needed.
     pub fn raw() -> Self {
         Stack {
+            telnet: true,
+            filter: Filter::default(),
+            transcode: false,
+            home_on_clear: false,
+            ed2_match: 0,
+            pending: Vec::new(),
+        }
+    }
+
+    /// A BBS door session: CP437 on the wire like [`Stack::raw`], but with
+    /// no telnet framing in either direction. The BBS in front of the door
+    /// (Synchronet's `xtrn.cpp`) strips negotiation and un-doubles `IAC IAC`
+    /// before the door sees a byte, and does not escape 0xFF on the way
+    /// out, so doubling here would reach the caller as two non-breaking
+    /// spaces and a filter here would eat the byte after every one.
+    pub fn door() -> Self {
+        Stack {
+            telnet: false,
+            filter: Filter::default(),
             transcode: false,
             home_on_clear: false,
             ed2_match: 0,
@@ -149,7 +179,7 @@ impl Stack {
             let mut out = Vec::with_capacity(bytes.len());
             for &b in &bytes {
                 out.push(b);
-                if b == IAC {
+                if b == IAC && self.telnet {
                     out.push(b);
                 }
             }
@@ -170,7 +200,7 @@ impl Stack {
     /// outside ASCII sees no difference between a `Stack` that does this
     /// and one that silently drops it on the floor.
     ///
-    /// **This must run after `crate::iac::Filter::feed`, never before.**
+    /// **The telnet filter runs first, inside this method, never after.**
     /// `cp437::encode` can *synthesize* a `0xFF` byte -- CP437's
     /// non-breaking space -- out of an ordinary typed character no
     /// different from any other (see `textscreen::cp437::TABLE`'s
@@ -180,10 +210,9 @@ impl Stack {
     /// telnet command and the filter would silently eat whatever character
     /// followed it -- the same `0xFF`/`IAC` collision `Stack::raw`'s IAC
     /// doubling exists to prevent outbound, now arriving from the other
-    /// direction. `crates/mbbs-server/src/conn.rs`'s `pump` calls
-    /// `Filter::feed` first for exactly this reason; see its
-    /// `iac_filter_runs_before_inbound_transcode` test, which is worth more
-    /// than this paragraph.
+    /// direction. `self.filter.feed` runs before any transcoding below for
+    /// exactly this reason; see `modern_inbound_filters_before_it_transcodes`,
+    /// which is worth more than this paragraph.
     ///
     /// **Invalid UTF-8 does not panic.** A raw-bytes client, or a scripted
     /// test, can send anything; malformed sequences are decoded lossily,
@@ -201,11 +230,12 @@ impl Stack {
     /// closes mid-character -- is simply lost with it, the same as any
     /// other buffered state a dropped connection abandons.
     pub fn inbound(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let bytes = if self.telnet { self.filter.feed(bytes) } else { bytes.to_vec() };
         if !self.transcode {
-            return bytes.to_vec();
+            return bytes;
         }
 
-        self.pending.extend_from_slice(bytes);
+        self.pending.extend_from_slice(&bytes);
 
         let mut text = String::new();
         loop {
@@ -903,5 +933,56 @@ mod tests {
         let mut stack = Stack::modern();
         let got = stack.inbound("◄".as_bytes());
         assert_eq!(got, vec![b'?']);
+    }
+
+    /// A door session's bytes were already un-doubled by the BBS in front
+    /// of it and are not escaped by it on the way out
+    /// (`/sbbs/repo/src/sbbs3/xtrn.cpp:1971-1988`): a 0xFF is CP437's
+    /// non-breaking space and nothing else, both ways.
+    #[test]
+    fn door_passes_0xff_through_undoubled_both_ways() {
+        let mut stack = Stack::door();
+        assert_eq!(stack.outbound(&[b'a', 0xFF, b'b']), vec![b'a', 0xFF, b'b']);
+        assert_eq!(stack.inbound(&[0xFF, b'X']), vec![0xFF, b'X']);
+    }
+
+    /// `door` is CP437 on the wire, like `raw`: the box-drawing bytes the
+    /// module emits reach the BBS unchanged, and high-bit bytes typed by
+    /// its caller reach the module unchanged.
+    #[test]
+    fn door_never_transcodes() {
+        let box_drawing: Vec<u8> = vec![0xC9, 0xCD, 0xBB, 0xBA, 0xC8, 0xBC];
+        let mut stack = Stack::door();
+        assert_eq!(stack.outbound(&box_drawing), box_drawing);
+        assert_eq!(stack.inbound(&box_drawing), box_drawing);
+    }
+
+    /// Telnet framing is a property of the wire, so it lives here now: a
+    /// `raw` stack strips a client's option negotiation itself and turns
+    /// `IAC IAC` into the one data byte it encodes.
+    #[test]
+    fn raw_inbound_strips_telnet_commands_itself() {
+        let mut stack = Stack::raw();
+        assert_eq!(stack.inbound(&[0xFF, 251, 1, b'a']), vec![b'a']);
+        assert_eq!(stack.inbound(&[0xFF, 0xFF, b'b']), vec![0xFF, b'b']);
+    }
+
+    /// The order `conn::pump` used to enforce by hand -- filter first, then
+    /// transcode -- is now internal to `modern`. U+00A0 typed as UTF-8 is
+    /// not an IAC and must survive to become CP437's 0xFF; if the transcode
+    /// ran first, the filter would eat the `X` as a bogus option byte.
+    #[test]
+    fn modern_inbound_filters_before_it_transcodes() {
+        let mut stack = Stack::modern();
+        assert_eq!(stack.inbound(&[0xC2, 0xA0, b'X']), vec![0xFF, b'X']);
+    }
+
+    /// A partial telnet command straddling two reads is held by the stack's
+    /// own filter, not lost at the chunk boundary.
+    #[test]
+    fn a_split_telnet_command_is_held_across_inbound_calls() {
+        let mut stack = Stack::raw();
+        assert_eq!(stack.inbound(&[b'a', 0xFF]), vec![b'a']);
+        assert_eq!(stack.inbound(&[251, 1, b'b']), vec![b'b']);
     }
 }

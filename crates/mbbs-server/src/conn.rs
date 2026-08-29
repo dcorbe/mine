@@ -21,15 +21,13 @@
 //! both directions: `outbound` on the way to the socket, `inbound` on the
 //! way from it.
 //!
-//! **`Filter::feed` must run before `Stack::inbound`, never after.**
-//! `cp437::encode` can synthesize a `0xFF` byte -- CP437's non-breaking
-//! space -- out of an ordinary typed character; `0xFF` also happens to be
-//! telnet's `IAC`. Feeding the IAC filter the client's real bytes first
-//! means it only ever sees genuine telnet commands, never one this
-//! translation layer invented downstream. `pump` below gets this right, but
-//! by construction rather than by anything that would stop a refactor
-//! getting it wrong -- see `iac_filter_runs_before_inbound_transcode` in
-//! this module's tests.
+//! **Telnet framing is a property of the wire, so `Stack` owns it, not
+//! `pump`.** `cp437::encode` can synthesize a `0xFF` byte -- CP437's
+//! non-breaking space -- out of an ordinary typed character; `0xFF` also
+//! happens to be telnet's `IAC`. `Stack::inbound` runs its own telnet
+//! filter before any transcoding for exactly this reason, so `pump` has no
+//! ordering to get wrong -- see `iac_filter_runs_before_inbound_transcode`
+//! in this module's tests and `termcompat::Stack::inbound`'s doc comment.
 //!
 //! **One host thread, however many listeners.** [`serve_on`] can bind more
 //! than one address -- a modern port and a period port, or several of either
@@ -58,7 +56,7 @@ use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
 
 use mbbs::{Chan, Connection};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -438,15 +436,14 @@ async fn read_user_id(
 /// `stack` was fixed at accept time by which listener this connection came
 /// in on ([`handle`]'s parameter of the same name) -- calling it here, once,
 /// is the one place a connection's transport translation is decided.
-async fn pump(
-    mut reader: OwnedReadHalf,
-    mut writer: OwnedWriteHalf,
+pub(crate) async fn pump(
+    mut reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
     host_tx: std_mpsc::Sender<In>,
     chan: Chan,
     mut out_rx: mpsc::Receiver<Out>,
     stack: fn() -> Stack,
 ) -> io::Result<()> {
-    let mut filter = Filter::default();
     let mut buf = [0u8; 4096];
     let mut termcompat = stack();
 
@@ -482,11 +479,10 @@ async fn pump(
                     return Ok(());
                 }
                 Ok(n) => {
-                    // Order matters: the IAC filter must see the client's
-                    // real bytes before `inbound` transcodes them -- see
-                    // the module doc.
-                    let bytes = filter.feed(&buf[..n]);
-                    let bytes = termcompat.inbound(&bytes);
+                    // Telnet framing and transcoding are both `Stack`'s
+                    // job now, in the right order internally -- see the
+                    // module doc and `termcompat::Stack::inbound`.
+                    let bytes = termcompat.inbound(&buf[..n]);
                     if !bytes.is_empty()
                         && host_tx.send(In::Input { chan, bytes }).is_err()
                     {
@@ -750,8 +746,9 @@ mod tests {
         );
     }
 
-    /// Task 7's pin: `pump`'s read arm must call `Filter::feed` before
-    /// `Stack::inbound`, never the other way around.
+    /// Task 7's pin: telnet filtering must run before CP437 transcoding,
+    /// never the other way around -- now enforced inside `Stack::inbound`
+    /// rather than by `pump`'s call order.
     ///
     /// `cp437::encode` can synthesize a `0xFF` byte from an ordinary typed
     /// character: U+00A0 (non-breaking space), typed as UTF-8 `0xC2 0xA0`,
@@ -762,10 +759,9 @@ mod tests {
     /// (`IAC WILL/WONT/DO/DONT <opt>`), and the filter would silently
     /// consume the very next byte -- the client's `X` -- as that command's
     /// option byte instead of forwarding it. This test drives the real
-    /// `pump`, not `Stack::inbound` or `Filter::feed` in isolation: a
-    /// primitive-level test would keep passing even if `pump`'s call order
-    /// were swapped, because neither primitive enforces the other runs
-    /// first -- only their order in `pump` does.
+    /// `pump`, not `Stack::inbound` in isolation, so it still proves the
+    /// end-to-end order even though the ordering itself now lives one
+    /// layer down.
     #[tokio::test]
     async fn iac_filter_runs_before_inbound_transcode() {
         use crate::msg::{In, Out};
