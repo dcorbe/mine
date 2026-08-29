@@ -10,10 +10,12 @@
 //! straight to `checkdir`, which is how we know it returns the destination and
 //! not the terminator.
 //!
-//! [`append`] is also where `crate::ifansi::process` runs -- see its doc
-//! comment. `prf` and `prfmsg` both call it, which is why this is the one
-//! place in the host that can consume the `ESC[[ansi|ascii]` construct before
-//! any of it reaches `prfbuf`, the GSBL, or the wire.
+//! [`append`] is where `crate::ifansi::process` runs for `prf` and `prfmsg`
+//! -- see its doc comment -- so the `ESC[[ansi|ascii]` construct is consumed
+//! before any of it reaches `prfbuf`. It is not the only way text reaches a
+//! channel: `shims::gsbl::btuxmt` is handed strings the module never passed
+//! through `prf`, and consumes the construct itself (its doc comment carries
+//! the trace that found it).
 
 use mbbs_machine::m16::Machine;
 // `Ret` is now named only by this file's `#[cfg(test)]` `_wg16` bridges --
@@ -232,11 +234,12 @@ pub fn prf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>
 /// makes `append` this host's `FormatOutput`
 /// (`ExportedModuleBase.cs:1133-1138`): [`crate::ifansi::process`] runs here,
 /// over the whole of `text`, before a byte of it is written into `prfbuf` --
-/// **not** downstream in the GSBL or the transport. `btutsw`'s wrap
-/// arithmetic in `crate::gsbl` counts every byte toward the column; running
+/// **not** in the transport, and never after [`crate::gsbl`]'s wrap.
+/// `btutsw`'s wrap arithmetic counts every byte toward the column; running
 /// this after that count has already happened would shrink the string GSBL
 /// wrapped without telling it, which is a wrap bug wearing an IF-ANSI
-/// costume, not a genuine fix.
+/// costume, not a genuine fix. `shims::gsbl::btuxmt` applies the same rule
+/// to the strings it is handed directly, ahead of the same wrap.
 ///
 /// **Never called with a construct split across two calls, for
 /// `WCCMMUD.DLL`.** `prf` and `prfmsg` each call [`format`] exactly once and
@@ -439,6 +442,16 @@ pub(crate) fn channel_ansi_mem<A: Abi>(mem: &A::Mem, host: &Host<A>) -> bool {
     let Ok(chan) = host.current_channel_mem(mem) else {
         return true;
     };
+    ansi_of_mem(mem, host, chan)
+}
+
+/// `chan`'s own `usracc.ansifl` bit -- [`channel_ansi_mem`] for a channel
+/// the caller names rather than the current one. `btuxmt` is why this is
+/// separate: it is handed a channel and writes to *that* player without
+/// `curusr`ing first (`shims::gsbl::btuxmt`'s three-channel test), so the
+/// ANSI/ASCII choice for what it carries belongs to its target, which need
+/// not agree with the channel the module is running as.
+pub(crate) fn ansi_of_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, chan: crate::chan::Chan) -> bool {
     let account = host.users().account(chan);
     let ansifl = A::ptr_offset(account, host.users().account_layout().ansifl);
     match ansifl.resolve(mem, 1) {

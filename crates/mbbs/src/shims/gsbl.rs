@@ -825,6 +825,28 @@ pub fn btuibw<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `int btuxmt(int chan, char *datstg)` -- transmit an ASCIIZ string.
 ///
+/// # IF-ANSI is consumed here too, with the target's flag
+///
+/// MajorMUD's messages to *other* players never pass through `prf` whole.
+/// Traced on a live PE32 board (`MBBS_TRACE_SHIMS`, 2026-08-29), Salad
+/// walking north out of Beef's room -- every `btuxmt` below is to Beef:
+///
+/// ```text
+/// prf "\x1b[[\x1b[79D\x1b[K| \b \b \b \b]"    btuxmt(prfbuf)                       clrprf
+/// prf "Salad"                                 btuxmt("\x1b[[\x1b[1;31m| \b \b \b \b]")  btuxmt(prfbuf)  clrprf
+/// prf " just left to t \bhe nN\borth."        btuxmt("\x1b[[\x1b[0;32m| \b \b \b \b]")  btuxmt(prfbuf)
+/// ```
+///
+/// The `prf` pieces had their construct consumed by [`crate::shims::text::append`];
+/// the two colour literals are handed straight to this routine and reached
+/// the wire raw, which a terminal renders as `|]Salad|]` (the terminal
+/// swallows `ESC[[` as a CSI with final byte `[` and prints the rest). The
+/// genuine host emits no `ESC[[` at all -- 0 in 214 `re/oracle/` captures
+/// against 269 constructs in the module -- so this route consumes it as
+/// well, before [`Gsbl::transmit`]'s wrap counts a byte, and with the
+/// **target** channel's ANSI flag ([`crate::shims::text::ansi_of_mem`]):
+/// the module is running as one channel and writing to another.
+///
 /// This is MajorMUD's whole output path. It has no `outprf`: it formats with
 /// `prf` into `prfbuf` and calls `btuxmt(chan, prfbuf)` itself, through
 /// `_TELL_USER` at 677 sites.
@@ -838,6 +860,7 @@ pub fn btuxmt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
+    let text = crate::ifansi::process(&text, super::text::ansi_of_mem(call.mem(), host, chan));
     host.gsbl_mut().transmit(chan, &text);
     Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
@@ -2183,6 +2206,67 @@ mod tests {
                 Vec::new()
             ],
             "the argument names the ring -- not the current channel, and not zero"
+        );
+    }
+
+    /// The module runs as channel 2 (ANSI) and writes to channel 1 (line
+    /// mode) and channel 0 (ANSI) -- the literal is `WCCMMUD.DLL`'s own,
+    /// byte for byte. Each target gets the form *its* flag selects; a shim
+    /// that consulted the current channel would send the ANSI form to both.
+    #[test]
+    fn btuxmt_consumes_ifansi_with_the_target_channels_flag() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(3));
+        let terms = f.host.gsbl().terms();
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+        let two = terms.chan(2).expect("channel 2");
+        f.host
+            .connect_state(&mut f.machine, zero, &crate::users::Connection::ansi("kaimon"))
+            .expect("channel 0 is an ANSI player");
+        f.host
+            .connect_state(&mut f.machine, one, &crate::users::Connection::line_mode("beef"))
+            .expect("channel 1 is a line-mode player");
+        f.host
+            .connect_state(&mut f.machine, two, &crate::users::Connection::ansi("salad"))
+            .expect("channel 2 is an ANSI player");
+        f.host.point_curusr(&mut f.machine, two).expect("channel 2 is current");
+
+        let red = f.bytes(b"\x1b[[\x1b[1;31m| \x08 \x08 \x08 \x08]", true);
+        f.invoke(btuxmt, &[0, red.offset, red.selector]).expect("to the ANSI channel");
+        f.invoke(btuxmt, &[1, red.offset, red.selector]).expect("to the line-mode channel");
+
+        assert_eq!(f.host.gsbl_mut().drain_output(zero), b"\x1b[1;31m".to_vec(), "the ANSI form");
+        assert_eq!(
+            f.host.gsbl_mut().drain_output(one),
+            b" \x08 \x08 \x08 \x08".to_vec(),
+            "the ASCII form, by the target's flag, while the current channel is ANSI"
+        );
+        assert_eq!(f.host.gsbl_mut().drain_output(two), Vec::<u8>::new(), "nothing to the current channel");
+    }
+
+    /// The traced sequence from `btuxmt`'s doc comment, on one channel: what
+    /// reaches the player is the genuine host's shape -- colour codes, and
+    /// no `ESC[[`, `|` or `]` from the construct.
+    #[test]
+    fn btuxmt_carries_a_room_message_the_way_the_genuine_host_did() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host
+            .connect_state(&mut f.machine, console, &crate::users::Connection::ansi("beef"))
+            .expect("connected");
+        for piece in [
+            &b"\x1b[[\x1b[79D\x1b[K| \x08 \x08 \x08 \x08]"[..],
+            b"\x1b[[\x1b[1;31m| \x08 \x08 \x08 \x08]",
+            b"Salad",
+            b"\x1b[[\x1b[0;32m| \x08 \x08 \x08 \x08]",
+            b" just left to the north.",
+        ] {
+            let text = f.bytes(piece, true);
+            f.invoke(btuxmt, &[0, text.offset, text.selector]).expect("transmitted");
+        }
+        assert_eq!(
+            f.host.gsbl_mut().drain_output(console),
+            b"\x1b[79D\x1b[K\x1b[1;31mSalad\x1b[0;32m just left to the north.".to_vec()
         );
     }
 
