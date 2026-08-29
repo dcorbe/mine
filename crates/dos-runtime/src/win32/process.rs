@@ -964,14 +964,17 @@ mod tests {
     /// on `.\WCCACMS2.DAT`, which real Btrieve status 12 answers ("cannot
     /// find the specified file") because this fixture directory carries only
     /// `WCCMMUD.MCV`. That is a real status, not a gap, so the program
-    /// carries on -- and throws on it, landing in the same
-    /// `cw3220mt.DLL!__Return_unwind` this test's own history already
-    /// describes: Borland's C++ exception unwind, which restores a saved
-    /// register set and resumes at a stored address that
-    /// `mbbs_machine::m32::Machine` has no setters for. That register-setter
-    /// wall is real and out of this task's scope; supplying `WCCACMS2.DAT`
-    /// so the program does not need to throw at all is future work, not
-    /// something this task's marshalling edge should paper over.
+    /// carries on -- reports it, unwinds, and exits with its own error code,
+    /// 90. The unwind goes through `cw3220mt.DLL!__Return_unwind`, which
+    /// used to be where this run stopped: this test's history called that
+    /// "Borland's C++ exception unwind, which restores a saved register set
+    /// ... that `mbbs_machine::m32::Machine` has no setters for", and
+    /// `docs/2026-08-17-borland-unwind-layout.md` corrected it -- it is
+    /// twelve instructions of cdecl and a table walk. `crt::return_unwind`
+    /// now walks that table (2026-08-29), and the frame this exit pops has
+    /// only scope-marker entries, so nothing stands between the throw and
+    /// the exit code. Supplying `WCCACMS2.DAT` so the program does not need
+    /// to throw at all is still not this test's job.
     #[test]
     fn with_a_catalogue_it_runs_past_the_unwind_into_the_c_runtime() {
         let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
@@ -1005,15 +1008,11 @@ mod tests {
         let out = run(&mut loaded, &mut p, 500_000).expect("the machine runs");
         assert_eq!(
             out,
-            Outcome::Unimplemented {
-                module: "cw3220mt.DLL".to_owned(),
-                symbol: "__Return_unwind".to_owned(),
-            },
+            Outcome::Exited(90),
             "with a catalogue present the program reaches BTRCALL, opens it, \
              gets a real \"file not found\" status back rather than a gap, \
-             and throws on it -- landing at the same register-setter wall \
-             this test's own history already found by a different route; \
-             see this test's comment"
+             throws on it, unwinds through __Return_unwind, and exits with \
+             its own error code; see this test's comment"
         );
     }
 

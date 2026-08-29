@@ -373,6 +373,7 @@ pub fn dispatch(
             process.exit(status);
             Some(Answer::cdecl(0))
         }
+        "__Return_unwind" => return_unwind(process, machine, mem),
         // void abort(void)
         //
         // Exit code 3, which is what a Borland `abort` leaves behind -- it is
@@ -549,6 +550,85 @@ pub fn dispatch(
     }
 }
 
+/// `void __Return_unwind(struct erp *frame)` -- Borland's normal-return
+/// cleanup for a function that registered an SEH frame: walk the frame's
+/// outstanding unwind entries, then pop the chain.
+///
+/// `re/wg/CW3220MT.DLL` export 430 (`docs/2026-08-17-borland-unwind-layout.md`):
+/// twelve instructions of cdecl -- `walk(frame, 0)` at `0x4047e3`, then
+/// `mov (%ebx),%eax; mov %eax,%fs:0` -- so the record's `prev` is both the
+/// new chain head and what is left in `EAX`.
+///
+/// The walk, disassembled 2026-08-29: the frame's current state is the `u16`
+/// at `+0x10`, an offset into the unwind table at `+0x08`; each entry there
+/// is `{ next: u16, kind: u16, .. }`, the state is stepped to `next`
+/// *before* the entry is acted on (`0x404827`), and the loop ends at state
+/// zero. Kinds **1, 2 and 3 are skipped outright** (`0x404833`, `sub $3,%ecx;
+/// jb` to the step) -- scope markers with nothing to do on a normal return.
+/// Kind 0 calls a cleanup thunk with `EBP` set to the frame (through
+/// `0x405c23`), kind 4 unregisters an exception object and calls through
+/// `0x1c(%ebx)`, kind 5 runs a destructor array via `0x4050a8`: all three
+/// run module code from inside this import, a nested entry this host does
+/// not make, so they are refused by name rather than skipped -- a skipped
+/// destructor is a wrong answer nothing downstream can detect.
+///
+/// Measured where it matters: `wccmmutl.exe -recover` ends with one entry,
+/// `state 8: kind 1 -> 0`, so its exit is a pop and the run reports
+/// `Exited` instead of stopping after the recovery is already complete.
+fn return_unwind(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Option<Answer> {
+    let frame = machine.arg_u32(mem.stack(), 0);
+    let Ok(record) = Flat32Ptr(frame).resolve(mem, 0x14) else {
+        process.unwind_gap = Some(format!(
+            "__Return_unwind: no SEH registration record at {frame:#010x}"
+        ));
+        return None;
+    };
+    let prev = u32::from_le_bytes(record[..4].try_into().expect("4 bytes"));
+    let table = u32::from_le_bytes(record[8..12].try_into().expect("4 bytes"));
+    let mut state = u16::from_le_bytes([record[0x10], record[0x11]]);
+    let mut walked = 0;
+    while state != 0 {
+        walked += 1;
+        if walked > 64 {
+            process.unwind_gap = Some(format!(
+                "__Return_unwind at frame {frame:#010x}: the unwind table at {table:#010x} \
+                 does not reach state 0 within 64 entries"
+            ));
+            return None;
+        }
+        let Ok(entry) = Flat32Ptr(table.wrapping_add(u32::from(state))).resolve(mem, 12) else {
+            process.unwind_gap = Some(format!(
+                "__Return_unwind at frame {frame:#010x}: unwind table entry at state {state} \
+                 (table at {table:#010x}) is unreadable"
+            ));
+            return None;
+        };
+        let next = u16::from_le_bytes([entry[0], entry[1]]);
+        let kind = u16::from_le_bytes([entry[2], entry[3]]);
+        match kind {
+            1..=3 => {}
+            _ => {
+                let a = u32::from_le_bytes(entry[4..8].try_into().expect("4 bytes"));
+                let b = u32::from_le_bytes(entry[8..12].try_into().expect("4 bytes"));
+                process.unwind_gap = Some(format!(
+                    "__Return_unwind at frame {frame:#010x}: state {state} is a kind {kind} entry \
+                     ({a:#010x}, {b:#010x}) that runs module code from inside this import"
+                ));
+                return None;
+            }
+        }
+        state = next;
+    }
+    if Flat32Ptr(frame.wrapping_add(0x10)).write(mem, &0u16.to_le_bytes()).is_err() {
+        process.unwind_gap = Some(format!(
+            "__Return_unwind: cannot write state 0 back into the record at {frame:#010x}"
+        ));
+        return None;
+    }
+    machine.set_seh_head(prev);
+    Some(Answer::cdecl(prev))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +781,103 @@ mod tests {
             );
         }
     }
+
+    /// A hand-built registration record on the module's stack, at `state`,
+    /// with an unwind table of `entries` (`(offset, next, kind)`, each
+    /// written as twelve bytes, so offsets must be twelve apart) behind it
+    /// and the chain head pointing at the record; the frame pushed and the
+    /// import called exactly as the compiler's epilogue does.
+    fn frame_with_table(
+        state: u16,
+        entries: &[(u16, u16, u16)],
+    ) -> (crate::win32::load::Loaded, Process, u32, mbbs_machine::m32::Mapping) {
+        use mbbs_machine::m32::{Exit, Mapping};
+        const CALLER: u16 = 43;
+        const PREV: u32 = 0x00c0_ffee;
+        let mut l = loaded();
+        let p = Process::new("X.EXE", &[]);
+        let (stack_limit, _) = l.machine.stack_range();
+        let record_at = stack_limit + 64;
+        let table_at = record_at + 0x40;
+        let mut record = vec![0u8; 0x14];
+        record[..4].copy_from_slice(&PREV.to_le_bytes());
+        record[8..12].copy_from_slice(&table_at.to_le_bytes());
+        record[0x10..0x12].copy_from_slice(&state.to_le_bytes());
+        Flat32Ptr(record_at).write(&mut l.mem, &record).expect("the stack is writable");
+        for &(offset, next, kind) in entries {
+            let mut entry = vec![0u8; 12];
+            entry[..2].copy_from_slice(&next.to_le_bytes());
+            entry[2..4].copy_from_slice(&kind.to_le_bytes());
+            entry[4..8].copy_from_slice(&0x0041_1234u32.to_le_bytes());
+            Flat32Ptr(table_at + u32::from(offset)).write(&mut l.mem, &entry).expect("writable");
+        }
+        l.machine.set_seh_head(record_at);
+
+        let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+        let base = code_mapping.base() as usize as u32;
+        let mut code = vec![0x68u8];
+        code.extend_from_slice(&record_at.to_le_bytes()); // push frame
+        let next_ip = base + code.len() as u32 + 5;
+        code.push(0xe8);
+        code.extend_from_slice(&l.machine.thunk_addr(CALLER).wrapping_sub(next_ip).to_le_bytes());
+        code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let exit = l.machine.call_on(l.mem.stack_mut(), base, &[]).expect("traps");
+        assert_eq!(exit, Exit::Call { index: CALLER });
+        (l, p, record_at, code_mapping)
+    }
+
+    fn state_of(mem: &Memory, record_at: u32) -> u16 {
+        let bytes = Flat32Ptr(record_at + 0x10).resolve(mem, 2).expect("readable");
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    /// State zero: nothing to walk, so the record is popped -- `FS:[0]`
+    /// becomes its `prev`, and `EAX` carries the same value, as the
+    /// runtime's own epilogue leaves it.
+    #[test]
+    fn return_unwind_pops_the_chain_when_the_frame_has_nothing_to_run() {
+        let (mut l, mut p, record_at, mapping) = frame_with_table(0, &[]);
+        let answer = dispatch(&mut p, &mut l.machine, &mut l.mem, "__Return_unwind")
+            .expect("a frame with nothing to run is answered");
+        assert_eq!(answer.value, 0x00c0_ffee, "EAX is the popped record's prev");
+        assert_eq!(answer.cleans, 0, "cdecl");
+        assert_eq!(l.machine.seh_head(), 0x00c0_ffee, "the chain head moved past the record");
+        assert_ne!(l.machine.seh_head(), record_at);
+        assert!(p.unwind_gap.is_none());
+        drop(mapping);
+    }
+
+    /// The shape `wccmmutl.exe -recover` ends on, and one deeper: entries
+    /// of kinds 1, 2 and 3 are walked without running anything, the state
+    /// is written back as 0, and the chain is popped.
+    #[test]
+    fn return_unwind_walks_scope_markers_and_pops() {
+        let (mut l, mut p, record_at, mapping) =
+            frame_with_table(36, &[(36, 24, 1), (24, 12, 3), (12, 0, 2)]);
+        let answer = dispatch(&mut p, &mut l.machine, &mut l.mem, "__Return_unwind")
+            .unwrap_or_else(|| panic!("scope markers need nothing run: {:?}", p.unwind_gap));
+        assert_eq!(answer.value, 0x00c0_ffee);
+        assert_eq!(l.machine.seh_head(), 0x00c0_ffee);
+        assert_eq!(state_of(&l.mem, record_at), 0, "the runtime writes the state back");
+        assert!(p.unwind_gap.is_none());
+        drop(mapping);
+    }
+
+    /// A kind 0 entry is a cleanup thunk that must run with `EBP` at the
+    /// frame -- module code from inside an import. Refused by name, and
+    /// neither the state nor the chain is touched, so nothing is skipped.
+    #[test]
+    fn return_unwind_refuses_an_entry_that_runs_module_code() {
+        let (mut l, mut p, record_at, mapping) =
+            frame_with_table(24, &[(24, 12, 1), (12, 0, 0)]);
+        assert!(
+            dispatch(&mut p, &mut l.machine, &mut l.mem, "__Return_unwind").is_none(),
+            "a cleanup thunk must not be skipped"
+        );
+        let why = p.unwind_gap.take().expect("and it must say why");
+        assert!(why.contains("state 12") && why.contains("kind 0") && why.contains("00411234"), "{why}");
+        assert_eq!(l.machine.seh_head(), record_at, "nothing popped");
+        assert_eq!(state_of(&l.mem, record_at), 24, "nothing stepped");
+        drop(mapping);
+    }
 }
-
-
