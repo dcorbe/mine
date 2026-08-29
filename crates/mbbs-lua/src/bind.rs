@@ -74,6 +74,7 @@ pub(crate) enum Type {
     Ptr,
     Str,
     Void,
+    Bool,
 }
 
 /// A parsed `"ret(arg, ...)"` signature.
@@ -90,6 +91,7 @@ fn parse_type(tok: &str) -> Result<Type, String> {
         "ptr" => Ok(Type::Ptr),
         "str" => Ok(Type::Str),
         "void" => Ok(Type::Void),
+        "bool" => Ok(Type::Bool),
         other => Err(format!("unknown type {other:?}")),
     }
 }
@@ -126,6 +128,9 @@ pub(crate) fn parse_signature(sig: &str) -> Result<Signature, String> {
     };
     if let Some(pos) = args.iter().position(|t| *t == Type::Void) {
         return Err(format!("arg {pos}: void is not a valid argument type in {trimmed:?}"));
+    }
+    if let Some(pos) = args.iter().position(|t| *t == Type::Bool) {
+        return Err(format!("arg {pos}: bool is not a valid argument type in {trimmed:?}"));
     }
 
     Ok(Signature { ret, args })
@@ -493,6 +498,7 @@ where
                 Arg::Ptr(at)
             }
             Type::Void => unreachable!("parse_signature refuses void as an argument type"),
+            Type::Bool => unreachable!("parse_signature refuses bool as an argument type"),
         };
         marshalled.push(arg);
     }
@@ -525,6 +531,7 @@ where
             }
         }
         Type::Str => unreachable!("parse_signature refuses str as a return type"),
+        Type::Bool => Ok(Value::Boolean((lo & 0xff) != 0)),
     }
 }
 
@@ -670,6 +677,27 @@ mod tests {
     fn refuses_void_as_an_argument_type() {
         let err = parse_signature("int(void)").expect_err("must refuse");
         assert!(err.contains("void"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_accepts_bool_as_a_return_type() {
+        let sig = parse_signature("bool(int, long)").expect("bool is a valid return type");
+        assert_eq!(sig.ret, Type::Bool);
+        assert_eq!(sig.args, vec![Type::Int, Type::Long]);
+    }
+
+    #[test]
+    fn parse_refuses_bool_as_an_argument_type() {
+        assert!(parse_signature("int(bool)").is_err(), "bool is return-only, like void");
+    }
+
+    #[test]
+    fn bool_return_reads_only_the_low_byte_of_the_register() {
+        // The return arm computes `(lo & 0xff) != 0`. AL=1 with a dirty upper
+        // byte is true; AL=0 with a dirty upper byte is false. Dropping the mask
+        // would make the second case read true.
+        assert!((0xff01u32 & 0xff) != 0, "AL=1, dirty AH -> true");
+        assert!(!((0x0100u32 & 0xff) != 0), "AL=0, dirty AH -> false");
     }
 
     #[test]

@@ -1184,6 +1184,37 @@ fn a_null_ptr_return_is_nil_and_a_real_one_is_a_live_handle() {
     assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
 }
 
+/// A `bool` return masks to the low byte -- `AL=0` with a dirty (nonzero)
+/// `AH` must read `false`, never `true`. Mutation-proof: dropping the
+/// `& 0xff` mask in the return arm turns this into "t".
+#[test]
+fn a_bool_return_masks_off_a_dirty_high_byte() {
+    let mut fixture = Fixture::new();
+    let code = [0xb8, 0x00, 0x01, 0xcb]; // mov ax, 0x0100 ; retf -- AL=0, AH dirty
+    let dir = tempdir_with(
+        "a_bool_return_masks_off_a_dirty_high_byte",
+        &[(
+            "bind.lua",
+            r#"local M = mmud.bind("TESTMOD")
+            M.declare { declared_bool = "bool()" }
+            mmud.command("booltest", function(c)
+                if M.declared_bool() then c:print("t") else c:print("f") end
+                return mmud.HANDLED
+            end)"#,
+        )],
+    );
+    let module = fixture.host.load(&mut fixture.machine, &module_bytes_exporting("DECLARED_BOOL", &code)).expect("loads");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("TESTMOD", &module)]).expect("loads and binds");
+    let chan = fixture.console();
+
+    let verdict = fixture.run_command(&mut ext, chan, "booltest", &module);
+
+    assert_eq!(verdict, Verdict::Handled);
+    let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "f");
+    assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
+}
+
 /// `mmud.abi` reports `"wg16"` under a `Wg16` fixture -- the DSL's own
 /// per-ABI branch point.
 #[test]
