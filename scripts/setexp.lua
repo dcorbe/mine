@@ -14,22 +14,29 @@
 -- resolves abbreviations, so a short name captures every command it prefixes.
 --
 -- Set the caller's own total experience OUTRIGHT -- this overwrites the
--- total, it does not add to it (see `scripts/lib/wccmmud.lua`'s own
--- `M.set_experience` doc comment for why the record stores experience
--- THREE times and all three copies must always agree).
+-- total, it does not add to it (see `scripts/lib/wccmmud.lua`'s own record
+-- object doc comment for why experience is stored THREE times and all three
+-- copies must always agree).
 local mud = wccmmud
 
+local function whole_u32(n)
+  if type(n) ~= "number" or n ~= n or n == math.huge or n == -math.huge or n % 1 ~= 0 then
+    return nil, "amount must be a whole number"
+  end
+  if n < 0 then return nil, "amount must not be negative" end
+  if n > 0xffffffff then return nil, "amount is too large" end
+  return math.floor(n)
+end
+
 mmud.command("setexp", function(c)
-  local n = tonumber(c.args)
-  if not n then
-    c:print("setexp <total>\r\n")
-    return mmud.HANDLED
-  end
-  local ok, reason = mud.set_experience(c, n)
-  if ok then
-    c:print("done.\r\n")
-  else
-    c:print(reason .. ".\r\n")
-  end
+  local raw = tonumber(c.args)
+  if not raw then c:print("setexp <total>\r\n"); return mmud.HANDLED end
+  local total, reason = whole_u32(raw)
+  if not total then c:print(reason .. ".\r\n"); return mmud.HANDLED end
+  local p = mud.player(c)
+  if not p then c:print("no character loaded on this channel.\r\n"); return mmud.HANDLED end
+  p.experience = total
+  p:save()
+  c:print("done.\r\n")
   return mmud.HANDLED
 end)

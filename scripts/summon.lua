@@ -1,20 +1,11 @@
--- Summon an item into the caller's inventory by name.
+-- Summon an item into the caller's inventory by name. Acquisition is not
+-- level-gated (that check is at wear/wield time); encumbrance and a free
+-- slot are enforced by _ADD_ITEM_TO_INVENTORY, whose bool return this reads.
 --
--- Acquisition is NOT level- or class-gated: `user_can_use`, where that
--- check lives, is only reached at wear/wield time (`wear_armour`,
--- `user_is_wearing`, `update_allowed_worn_items`), never here. A summoned
--- item lands in inventory regardless of level; the player just cannot
--- equip it. What IS enforced here is encumbrance -- `_ADD_ITEM_TO_INVENTORY`
--- refuses when the item would put the player over their weight cap, or
--- when there is no free inventory slot.
---
--- `mud.summon` answers three different ways, not one boolean, because the
--- three failures mean different things to the player: no such item exists,
--- several items matched and the module has ALREADY told the player so (in
--- which case this script must say nothing more), or the item was found but
--- would not fit. The recipe itself -- the six-word/three-far-pointer call
--- shape, the null-return disambiguation -- lives in `scripts/lib/wccmmud.lua`
--- now, not here; this script is just the player-facing wording.
+-- An over-long or NUL-embedded name is refused here, before ever calling
+-- `mud.find_item` (whose own refusal is indistinguishable from "no such
+-- item" -- it exists so the str marshaller never throws, not to report a
+-- reason to the player).
 local mud = wccmmud
 
 mmud.command("summon", function(c)
@@ -23,19 +14,20 @@ mmud.command("summon", function(c)
     c:print("summon what?\r\n")
     return mmud.HANDLED
   end
-
-  local ok, reason = mud.summon(c, name)
-  if not ok then
-    if reason == "ambiguous" then
-      -- The module already prompted the player to narrow it down --
-      -- saying anything more here would talk over that prompt.
-    elseif reason == "no such item" then
-      c:print("no such item.\r\n")
-    elseif reason == "item name too long" or reason == "item name must not contain a NUL byte" then
-      c:print("not a valid item name.\r\n")
-    else
-      c:print("too heavy, or no room in your inventory.\r\n")
-    end
+  if string.find(name, "\0", 1, true) or #name > 100 then
+    c:print("not a valid item name.\r\n")
+    return mmud.HANDLED
+  end
+  local item, count = mud.find_item(c, name)
+  if not item then
+    -- A null return with a nonzero count means the module already printed
+    -- its own disambiguation prompt; say nothing more.
+    if count ~= 0 then return mmud.HANDLED end
+    c:print("no such item.\r\n")
+    return mmud.HANDLED
+  end
+  if not mud.add_item(c.chan, item) then
+    c:print("too heavy, or no room in your inventory.\r\n")
   end
   return mmud.HANDLED
 end)

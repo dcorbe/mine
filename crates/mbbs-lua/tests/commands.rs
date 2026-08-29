@@ -388,13 +388,14 @@ fn exp_with_no_character_loaded_reports_it_and_leaves_the_handler_enabled() {
 }
 
 /// Critical #2 from the whole-branch review, the item-name-length refusal
-/// half: any item name over `M.summon`'s own 100-byte bound (see
-/// `scripts/lib/wccmmud.lua`'s own doc comment on that bound) used to raise
-/// an `mlua` error and disable `summon` board-wide, over an input trivially
-/// reachable by pasting or holding a key. The length check now lives in the
-/// lib, not `summon.lua`, so `mud` must resolve for this test to reach it.
-/// As with the `cash`/`exp` tests above, the load-bearing assertion is that
-/// the handler is still enabled on a second attempt, not just that the
+/// half: any item name over `summon.lua`'s own 100-byte bound (see that
+/// script's own doc comment on it) used to raise an `mlua` error and
+/// disable `summon` board-wide, over an input trivially reachable by
+/// pasting or holding a key. The length check lives in `summon.lua` now
+/// (mirroring `mud.find_item`'s own internal bound, so the `str` marshaller
+/// never throws either way), so `mud` must resolve for this test to reach
+/// it. As with the `cash`/`exp` tests above, the load-bearing assertion is
+/// that the handler is still enabled on a second attempt, not just that the
 /// message is right once.
 #[test]
 fn summon_with_a_too_long_name_reports_it_and_leaves_the_handler_enabled() {
@@ -402,7 +403,7 @@ fn summon_with_a_too_long_name_reports_it_and_leaves_the_handler_enabled() {
     let module = wccmmud_module(&mut fixture, &[]);
     let mut ext = LuaExtension::load_with_modules::<Wg16>(&shipped_scripts(), &[("wccmmud", &module)]).expect("loads and binds");
     let chan = fixture.console();
-    // `M.summon`'s own bound is 100 bytes; 126 is comfortably over it.
+    // `summon.lua`'s own bound is 100 bytes; 126 is comfortably over it.
     let too_long = "x".repeat(126);
 
     for attempt in 0..2 {
@@ -415,39 +416,26 @@ fn summon_with_a_too_long_name_reports_it_and_leaves_the_handler_enabled() {
 }
 
 /// Critical #2's other half: an embedded NUL byte in an item name used to
-/// raise an `mlua` error too. Exercised directly against `mud.summon`,
-/// rather than through `scripts/summon.lua`'s own argument parsing, since a
-/// NUL byte cannot arrive via this test's own `run_command(..., line: &str,
-/// ...)` (a Rust `&str` embeds one just fine, but `split_command` and the
-/// line-to-args plumbing have no reason to strip it -- the point here is
-/// `M.summon`'s own defence, not how a NUL reaches it).
+/// raise an `mlua` error too. Driven straight through the real shipped
+/// `summon.lua` via `run_command` -- a Rust `&str` embeds a NUL byte just
+/// fine, and `split_command`/the line-to-args plumbing have no reason to
+/// strip it, so the line carries it all the way to `summon.lua`'s own
+/// length/NUL guard (the same guard, and the same message, `find_item`'s
+/// own over-long refusal shares -- see that script's own doc comment: its
+/// lib-level distinction no longer exists once `mud.find_item` collapses
+/// both refusals into the same `(nil, 0)`).
 #[test]
 fn summon_with_an_embedded_nul_reports_it_and_leaves_the_handler_enabled() {
-    let dir = tempdir_with(
-        "summon_with_an_embedded_nul_reports_it_and_leaves_the_handler_enabled",
-        &[
-            ("lib/wccmmud.lua", include_str!("../../../scripts/lib/wccmmud.lua")),
-            (
-                "nul.lua",
-                r#"local mud = wccmmud
-                mmud.command("nultest", function(c)
-                    local ok, reason = mud.summon(c, "a\0b")
-                    c:print(reason .. ".\r\n")
-                    return mmud.HANDLED
-                end)"#,
-            ),
-        ],
-    );
     let mut fixture = Fixture::new();
     let module = wccmmud_module(&mut fixture, &[]);
-    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&shipped_scripts(), &[("wccmmud", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
     for attempt in 0..2 {
-        let verdict = fixture.run_command(&mut ext, chan, "nultest", &module);
+        let verdict = fixture.run_command(&mut ext, chan, "summon a\0b", &module);
         assert_eq!(verdict, Verdict::Handled, "attempt {attempt}: an embedded NUL is a player/script-input mistake, not a reason to disable the handler");
         let out = fixture.host.gsbl_mut().drain_output(chan);
-        assert_eq!(String::from_utf8_lossy(&out), "item name must not contain a NUL byte.\r\n", "attempt {attempt}");
+        assert_eq!(String::from_utf8_lossy(&out), "not a valid item name.\r\n", "attempt {attempt}");
     }
     assert!(fixture.host.notes().is_empty(), "must never disable the handler over an embedded NUL, got: {:?}", fixture.host.notes());
 }
@@ -1600,11 +1588,11 @@ fn wccmmud_lib_dir(test_name: &str) -> std::path::PathBuf {
                 "cmd.lua",
                 r#"local mud = wccmmud
                 mmud.command("player", function(c)
-                    local p, reason = mud.player(c)
+                    local p = mud.player(c)
                     if p == nil then
-                        c:print("nil:" .. reason .. "\r\n")
+                        c:print("nil\r\n")
                     else
-                        c:print("ok:" .. tostring(p:u8(0x1e)) .. "\r\n")
+                        c:print("ok:" .. tostring(p.copper) .. "\r\n")
                     end
                     return mmud.HANDLED
                 end)"#,
@@ -1614,12 +1602,11 @@ fn wccmmud_lib_dir(test_name: &str) -> std::path::PathBuf {
 }
 
 /// The lib parses, `M.declare{...}` resolves every declared name against a
-/// real (synthetic) export table, and `M.player` reports the honest reason
-/// string on an UNLOADED slot -- `_GET_PLAYER` answers with a real, non-null
-/// pointer (a slot every in-range channel has), but the record's own
-/// `+0x1e` flag byte is left clear, so `M.player` must still say "no
-/// character loaded," never hand back a handle for a slot nobody is
-/// actually playing on.
+/// real (synthetic) export table, and `M.player` answers `nil` on an
+/// UNLOADED slot -- `_GET_PLAYER` answers with a real, non-null pointer (a
+/// slot every in-range channel has), but the record's own `+0x1e` flag byte
+/// is left clear, so `M.player` must still answer `nil`, never hand back a
+/// record for a slot nobody is actually playing on.
 #[test]
 fn wccmmud_lib_player_reports_no_character_loaded_on_an_unloaded_slot() {
     let dir = wccmmud_lib_dir("wccmmud_lib_player_reports_no_character_loaded_on_an_unloaded_slot");
@@ -1636,13 +1623,13 @@ fn wccmmud_lib_player_reports_no_character_loaded_on_an_unloaded_slot() {
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(String::from_utf8_lossy(&out), "nil:no character loaded on this channel\r\n");
+    assert_eq!(String::from_utf8_lossy(&out), "nil\r\n");
     assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
 }
 
 /// The other half: a MARKED slot (`+0x1e` set to a nonzero byte) makes
-/// `M.player` hand back a real, working handle -- read through it
-/// (`p:u8(0x1e)`) to prove it is genuinely the same record `_GET_PLAYER`
+/// `M.player` hand back a real, working record object -- read through its
+/// `copper` field to prove it is genuinely the same record `_GET_PLAYER`
 /// answered with, not merely "not nil."
 #[test]
 fn wccmmud_lib_player_returns_a_working_handle_on_a_loaded_slot() {
@@ -1650,6 +1637,7 @@ fn wccmmud_lib_player_returns_a_working_handle_on_a_loaded_slot() {
     let mut fixture = Fixture::new();
     let record_ptr = Wg16::mem(&mut fixture.machine).alloc_region(2000).expect("alloc real backing memory");
     Wg16::mem(&mut fixture.machine).write(Wg16::ptr_offset(record_ptr, 0x1e), &[1]).expect("mark loaded");
+    Wg16::mem(&mut fixture.machine).write(Wg16::ptr_offset(record_ptr, 0x613), &42u32.to_le_bytes()).expect("seed copper");
     let module = wccmmud_test_module(&mut fixture, record_ptr);
     let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
     let chan = fixture.console();
@@ -1658,7 +1646,7 @@ fn wccmmud_lib_player_returns_a_working_handle_on_a_loaded_slot() {
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(String::from_utf8_lossy(&out), "ok:1\r\n");
+    assert_eq!(String::from_utf8_lossy(&out), "ok:42\r\n");
     assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
 }
 
@@ -1677,37 +1665,36 @@ fn wccmmud_lib_dir_with(test_name: &str, cmd_lua: &str) -> std::path::PathBuf {
     tempdir_with(test_name, &[("lib/wccmmud.lua", include_str!("../../../scripts/lib/wccmmud.lua")), ("cmd.lua", cmd_lua)])
 }
 
-/// Reads all six experience words back through a fresh `mud.player(c)`
-/// handle and prints them CSV, after a `mud.set_experience(c, n)` call --
-/// exactly [`SetExperienceCaller`]'s old Rust shape
-/// (`crates/mbbs/tests/extension_seam.rs`, now deleted along with
-/// `CommandCtx::set_experience` itself), reimplemented in Lua so the SAME
-/// two input/expected-word pairs port over unchanged.
+/// Reads a `u32` back out of real fixture memory at `record_ptr + off` --
+/// the record-object migration's replacement for printing fields through
+/// Lua and parsing the printed string: the record object itself only
+/// exposes `copper`/`experience`/`save`, so proving what actually landed in
+/// the three raw experience fields (`0x3c`, `0x46f`, `0x46b`) now reads the
+/// bytes directly, the same way the seeding calls beside it write them.
+fn u32_at(fixture: &mut Fixture<Wg16>, record_ptr: FarPtr, off: u16) -> u32 {
+    let bytes = Wg16::mem(&mut fixture.machine).resolve(Wg16::ptr_offset(record_ptr, off), 4).expect("read");
+    u32::from_le_bytes(bytes.try_into().expect("4 bytes"))
+}
+
+/// Sets the caller's experience through the record object's `experience`
+/// field and saves -- the record-object replacement for the old six-word
+/// CSV probe (which read `p:u16` directly; the record object exposes no
+/// such method any more).
 const SETEXP_TEST_CMD: &str = r#"local mud = wccmmud
 mmud.command("setexptest", function(c)
-    local n = tonumber(c.args)
-    local ok, reason = mud.set_experience(c, n)
-    if not ok then
-        c:print("fail:" .. tostring(reason) .. "\r\n")
-        return mmud.HANDLED
-    end
     local p = mud.player(c)
-    c:print(table.concat({
-        p:u16(0x3c), p:u16(0x3e),
-        p:u16(0x46f), p:u16(0x471),
-        p:u16(0x46b), p:u16(0x46d),
-    }, ",") .. "\r\n")
+    p.experience = tonumber(c.args)
+    p:save()
+    c:print("ok\r\n")
     return mmud.HANDLED
 end)"#;
 
-/// Experience is stored THREE times in the character record
-/// (`0x3c`/`0x3e` the raw total, `0x46f`/`0x471` the total modulo one
-/// billion, `0x46b`/`0x46d` the billions count -- see
-/// `scripts/lib/wccmmud.lua`'s own `M.set_experience` doc comment). This is
-/// `setting_experience_writes_both_copies`'s replacement, ported to drive
-/// through the real Lua lib instead of the deleted `CommandCtx::set_experience`
-/// -- same input (`0x1234_5678`), same expected six words, against a genuine
-/// `_GET_PLAYER`/`_SAVE_PLAYER` pair and real, resolvable backing memory.
+/// Experience is stored THREE times in the character record (`0x3c` the raw
+/// total, `0x46f` the total modulo one billion, `0x46b` the billions count
+/// -- see `scripts/lib/wccmmud.lua`'s own record-object doc comment). Same
+/// input (`0x1234_5678`) the pre-migration test used; the expectation is now
+/// read directly from fixture memory rather than parsed out of printed
+/// words.
 #[test]
 fn wccmmud_lib_set_experience_writes_all_three_fields_for_a_sub_billion_total() {
     let dir = wccmmud_lib_dir_with("wccmmud_lib_set_experience_writes_all_three_fields_for_a_sub_billion_total", SETEXP_TEST_CMD);
@@ -1722,21 +1709,20 @@ fn wccmmud_lib_set_experience_writes_all_three_fields_for_a_sub_billion_total() 
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "ok\r\n");
+    assert_eq!(u32_at(&mut fixture, record_ptr, 0x3c), 0x1234_5678, "exp_raw must hold the raw total");
     assert_eq!(
-        String::from_utf8_lossy(&out),
-        "22136,4660,22136,4660,0,0\r\n", // 0x5678,0x1234,0x5678,0x1234,0,0
-        "both the 0x3c/0x3e copy and the 0x46f/0x471 copy must read back the new value, and \
-         the billions count (under one billion) must read back zero"
+        u32_at(&mut fixture, record_ptr, 0x46f),
+        0x1234_5678,
+        "exp_mod must hold the total modulo one billion -- under a billion, that is the total itself"
     );
+    assert_eq!(u32_at(&mut fixture, record_ptr, 0x46b), 0, "exp_bil must read back zero under a billion");
     assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
 }
 
-/// `setting_experience_past_a_billion_writes_the_reduced_remainder_and_billions_count`'s
-/// replacement -- same distinctive `exp = 3_141_592_653` and the same
-/// expected six words the deleted Rust test asserted, now through
-/// `M.set_experience`. Past one billion, `0x46f`/`0x471` must hold the
-/// REMAINDER, not the raw total, and `0x46b`/`0x46d` must hold the billions
-/// count.
+/// Same distinctive `exp = 3_141_592_653` the pre-migration test used. Past
+/// one billion, `0x46f` must hold the REMAINDER, not the raw total, and
+/// `0x46b` must hold the billions count.
 #[test]
 fn wccmmud_lib_set_experience_writes_the_reduced_remainder_and_billions_count_past_a_billion() {
     let dir = wccmmud_lib_dir_with(
@@ -1754,44 +1740,37 @@ fn wccmmud_lib_set_experience_writes_the_reduced_remainder_and_billions_count_pa
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(
-        String::from_utf8_lossy(&out),
-        "58957,47936,34893,2160,3,0\r\n", // 0xe64d,0xbb40,0x884d,0x0870,3,0
-        "0x3c/0x3e must hold the raw total, 0x46f/0x471 must hold the total modulo one \
-         billion, and 0x46b/0x46d must hold the billions count"
-    );
+    assert_eq!(String::from_utf8_lossy(&out), "ok\r\n");
+    assert_eq!(u32_at(&mut fixture, record_ptr, 0x3c), 3_141_592_653, "exp_raw must hold the raw total");
+    assert_eq!(u32_at(&mut fixture, record_ptr, 0x46f), 141_592_653, "exp_mod must hold the total modulo one billion");
+    assert_eq!(u32_at(&mut fixture, record_ptr, 0x46b), 3, "exp_bil must hold the billions count");
     assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
 }
 
-/// Seeds `0x613`/`0x615` (the copper accumulator) with a low word of
-/// `0xFFFF`, grants `1` more copper, and reads both words back through a
-/// fresh `mud.player(c)` handle -- proving `M.grant_copper`'s add-with-carry
-/// arithmetic actually propagates a 16-bit overflow into the high word, not
-/// merely that the low word wraps. `0xFFFF + 1` forces the carry;
-/// `coin_hi` starting at `2` (not `0`) proves the carry is ADDED to the
-/// existing high word, not just set to `1`.
+/// Seeds the copper field (`0x613`) with `0x0000_ffff`, grants `1` more
+/// copper through the record object's own `copper` field, and reads it back
+/// -- proving the new single 32-bit add actually carries across the old
+/// 16-bit word boundary (`0x613`/`0x615`), not merely that a low word wraps.
+/// `_CLEANUP_CURRENCY` is left as [`wccmmud_test_module`]'s bare `retf` stub
+/// so it does not perturb the field.
 #[test]
 fn wccmmud_lib_grant_copper_propagates_a_carry_into_the_high_word() {
     let dir = wccmmud_lib_dir_with(
         "wccmmud_lib_grant_copper_propagates_a_carry_into_the_high_word",
         r#"local mud = wccmmud
         mmud.command("granttest", function(c)
-            local n = tonumber(c.args)
-            local ok, reason = mud.grant_copper(c, n)
-            if not ok then
-                c:print("fail:" .. tostring(reason) .. "\r\n")
-                return mmud.HANDLED
-            end
             local p = mud.player(c)
-            c:print(tostring(p:u16(0x613)) .. "," .. tostring(p:u16(0x615)) .. "\r\n")
+            p.copper = (p.copper + tonumber(c.args)) & 0xffffffff
+            mud.cleanup_currency(c.chan)
+            p:save()
+            c:print("ok\r\n")
             return mmud.HANDLED
         end)"#,
     );
     let mut fixture = Fixture::new();
     let record_ptr = Wg16::mem(&mut fixture.machine).alloc_region(2000).expect("alloc real backing memory");
     Wg16::mem(&mut fixture.machine).write(Wg16::ptr_offset(record_ptr, 0x1e), &[1]).expect("mark loaded");
-    Wg16::mem(&mut fixture.machine).write(Wg16::ptr_offset(record_ptr, 0x613), &0xffffu16.to_le_bytes()).expect("seed coin_lo");
-    Wg16::mem(&mut fixture.machine).write(Wg16::ptr_offset(record_ptr, 0x615), &2u16.to_le_bytes()).expect("seed coin_hi");
+    Wg16::mem(&mut fixture.machine).write(Wg16::ptr_offset(record_ptr, 0x613), &0x0000_ffffu32.to_le_bytes()).expect("seed copper");
     let module = wccmmud_test_module(&mut fixture, record_ptr);
     let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
     let chan = fixture.console();
@@ -1800,50 +1779,74 @@ fn wccmmud_lib_grant_copper_propagates_a_carry_into_the_high_word() {
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
+    assert_eq!(String::from_utf8_lossy(&out), "ok\r\n");
     assert_eq!(
-        String::from_utf8_lossy(&out),
-        "0,3\r\n",
-        "0xffff + 1 must wrap the low word to 0 and carry 1 into the high word (2 -> 3)"
+        u32_at(&mut fixture, record_ptr, 0x613),
+        0x0001_0000,
+        "0x0000ffff + 1 must carry across the 16-bit word boundary as a plain 32-bit add"
     );
     assert!(ext.notes().is_empty(), "got: {:?}", ext.notes());
 }
 
-/// `M.deduct_wealth`'s success branch, driven through the real shipped
-/// `cash.lua`: `_ADDON_ADJUST_USER_WEALTH` returning a nonzero `char` (`AX =
-/// 1`) is "done." -- proving `cash -5` (a negative amount) actually reaches
-/// the deduct path and reports success on it.
+/// `mud.addon_adjust_user_wealth`'s success branch, now read as the bare
+/// `bool` Task 1 added: `_ADDON_ADJUST_USER_WEALTH` returning a nonzero
+/// value (`AX = 1`) reads `true`.
 #[test]
 fn wccmmud_lib_deduct_wealth_reports_success_when_the_export_returns_nonzero() {
     let mut fixture = Fixture::new();
     let success = [0xb8, 0x01, 0x00, 0xcb]; // mov ax, 1 ; retf
     let module = wccmmud_module(&mut fixture, &[("_ADDON_ADJUST_USER_WEALTH", &success)]);
-    let mut ext = LuaExtension::load_with_modules::<Wg16>(&shipped_scripts(), &[("wccmmud", &module)]).expect("loads and binds");
+    let dir = wccmmud_lib_dir_with(
+        "wccmmud_lib_deduct_wealth_reports_success_when_the_export_returns_nonzero",
+        r#"local mud = wccmmud
+        mmud.command("deducttest", function(c)
+            if mud.addon_adjust_user_wealth(c.chan, tonumber(c.args)) then
+                c:print("done\r\n")
+            else
+                c:print("insufficient\r\n")
+            end
+            return mmud.HANDLED
+        end)"#,
+    );
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "cash -5", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "deducttest 5", &module);
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(String::from_utf8_lossy(&out), "done.\r\n");
+    assert_eq!(String::from_utf8_lossy(&out), "done\r\n");
     assert!(ext.notes().is_empty() && fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
 }
 
-/// `M.deduct_wealth`'s refusal branch: `_ADDON_ADJUST_USER_WEALTH` returning
-/// zero -- unaffordable, or no character loaded, the export answers the
-/// same either way -- is "insufficient funds.", not a thrown error.
+/// The refusal branch: `_ADDON_ADJUST_USER_WEALTH` returning zero (`AX = 0`)
+/// -- unaffordable, or no character loaded, the export answers the same
+/// either way -- reads `false`.
 #[test]
 fn wccmmud_lib_deduct_wealth_reports_insufficient_funds_when_the_export_returns_zero() {
     let mut fixture = Fixture::new();
     let refuse = [0xb8, 0x00, 0x00, 0xcb]; // mov ax, 0 ; retf
     let module = wccmmud_module(&mut fixture, &[("_ADDON_ADJUST_USER_WEALTH", &refuse)]);
-    let mut ext = LuaExtension::load_with_modules::<Wg16>(&shipped_scripts(), &[("wccmmud", &module)]).expect("loads and binds");
+    let dir = wccmmud_lib_dir_with(
+        "wccmmud_lib_deduct_wealth_reports_insufficient_funds_when_the_export_returns_zero",
+        r#"local mud = wccmmud
+        mmud.command("deducttest", function(c)
+            if mud.addon_adjust_user_wealth(c.chan, tonumber(c.args)) then
+                c:print("done\r\n")
+            else
+                c:print("insufficient\r\n")
+            end
+            return mmud.HANDLED
+        end)"#,
+    );
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "cash -5", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "deducttest 5", &module);
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(String::from_utf8_lossy(&out), "insufficient funds.\r\n");
+    assert_eq!(String::from_utf8_lossy(&out), "insufficient\r\n");
     assert!(ext.notes().is_empty() && fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
 }
 
@@ -1872,11 +1875,24 @@ fn get_item_from_name_ambiguous_code() -> Vec<u8> {
     ]
 }
 
+/// The `summontest` probe every `wccmmud_lib_summon_*` test below shares --
+/// drives `mud.find_item`/`mud.add_item` directly (the lib's own surface),
+/// rather than through the shipped `summon.lua`'s player-facing wording.
+const SUMMON_TEST_CMD: &str = r#"local mud = wccmmud
+mmud.command("summontest", function(c)
+    local item, count = mud.find_item(c, c.args)
+    if not item then
+        if count ~= 0 then c:print("ambiguous\r\n") else c:print("nosuch\r\n") end
+        return mmud.HANDLED
+    end
+    if mud.add_item(c.chan, item) then c:print("ok\r\n") else c:print("tooheavy\r\n") end
+    return mmud.HANDLED
+end)"#;
+
 /// The disambiguation this whole helper exists to prove: a null
 /// `_GET_ITEM_FROM_NAME` return with a NONZERO OUT count means "several
 /// items matched, and the module already told the player so through its own
-/// output" -- `M.summon` must say NOTHING further (`summon.lua`'s own
-/// `ambiguous` branch is silent), and must not disable the handler.
+/// output" -- `mud.find_item` hands that back as `(nil, nonzero)`.
 ///
 /// This is the OUT-ptr-writing stub the task brief itself flagged as the
 /// likeliest blocker; [`get_item_from_name_ambiguous_code`]'s own doc
@@ -1890,14 +1906,15 @@ fn wccmmud_lib_summon_is_silent_and_enabled_when_the_module_already_disambiguate
     let mut fixture = Fixture::new();
     let code = get_item_from_name_ambiguous_code();
     let module = wccmmud_module(&mut fixture, &[("_GET_ITEM_FROM_NAME", &code)]);
-    let mut ext = LuaExtension::load_with_modules::<Wg16>(&shipped_scripts(), &[("wccmmud", &module)]).expect("loads and binds");
+    let dir = wccmmud_lib_dir_with("wccmmud_lib_summon_is_silent_and_enabled_when_the_module_already_disambiguated", SUMMON_TEST_CMD);
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "summon sword", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "summontest sword", &module);
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(String::from_utf8_lossy(&out), "", "the module already prompted -- summon.lua must print nothing more");
+    assert_eq!(String::from_utf8_lossy(&out), "ambiguous\r\n");
     assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
 }
 
@@ -1910,20 +1927,21 @@ fn wccmmud_lib_summon_reports_no_such_item_when_the_out_count_stays_zero() {
     let mut fixture = Fixture::new();
     let null_code = far_ptr_return_code(FarPtr { offset: 0, selector: 0 });
     let module = wccmmud_module(&mut fixture, &[("_GET_ITEM_FROM_NAME", &null_code)]);
-    let mut ext = LuaExtension::load_with_modules::<Wg16>(&shipped_scripts(), &[("wccmmud", &module)]).expect("loads and binds");
+    let dir = wccmmud_lib_dir_with("wccmmud_lib_summon_reports_no_such_item_when_the_out_count_stays_zero", SUMMON_TEST_CMD);
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "summon sword", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "summontest sword", &module);
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(String::from_utf8_lossy(&out), "no such item.\r\n");
+    assert_eq!(String::from_utf8_lossy(&out), "nosuch\r\n");
     assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
 }
 
 /// The third branch: `_GET_ITEM_FROM_NAME` finds a real item (a non-null
-/// return), but `_ADD_ITEM_TO_INVENTORY` refuses it (`char` return `0`) --
-/// too heavy, or no free inventory slot. `item_ptr` is real, resolvable
+/// return), but `_ADD_ITEM_TO_INVENTORY` refuses it (`bool` return `false`)
+/// -- too heavy, or no free inventory slot. `item_ptr` is real, resolvable
 /// backing memory (not a fabricated address), matching the same
 /// "never a bare literal" discipline every other `ptr`-returning test in
 /// this file uses.
@@ -1932,15 +1950,16 @@ fn wccmmud_lib_summon_reports_too_heavy_when_add_item_to_inventory_refuses() {
     let mut fixture = Fixture::new();
     let item_ptr = Wg16::mem(&mut fixture.machine).alloc_region(4).expect("alloc a real item pointer");
     let found_code = far_ptr_return_code(item_ptr);
-    let refuse_code = [0xb8, 0x00, 0x00, 0xcb]; // mov ax, 0 ; retf -- char false
+    let refuse_code = [0xb8, 0x00, 0x00, 0xcb]; // mov ax, 0 ; retf -- bool false
     let module = wccmmud_module(&mut fixture, &[("_GET_ITEM_FROM_NAME", &found_code), ("_ADD_ITEM_TO_INVENTORY", &refuse_code)]);
-    let mut ext = LuaExtension::load_with_modules::<Wg16>(&shipped_scripts(), &[("wccmmud", &module)]).expect("loads and binds");
+    let dir = wccmmud_lib_dir_with("wccmmud_lib_summon_reports_too_heavy_when_add_item_to_inventory_refuses", SUMMON_TEST_CMD);
+    let mut ext = LuaExtension::load_with_modules::<Wg16>(&dir, &[("wccmmud", &module)]).expect("loads and binds");
     let chan = fixture.console();
 
-    let verdict = fixture.run_command(&mut ext, chan, "summon sword", &module);
+    let verdict = fixture.run_command(&mut ext, chan, "summontest sword", &module);
 
     assert_eq!(verdict, Verdict::Handled);
     let out = fixture.host.gsbl_mut().drain_output(chan);
-    assert_eq!(String::from_utf8_lossy(&out), "too heavy, or no room in your inventory.\r\n");
+    assert_eq!(String::from_utf8_lossy(&out), "tooheavy\r\n");
     assert!(fixture.host.notes().is_empty(), "got: {:?}", fixture.host.notes());
 }
