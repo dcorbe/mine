@@ -775,6 +775,25 @@ fn report_notes<A: Abi>(host: &mut Host<A>) {
     }
 }
 
+/// The extra clause an init stop earns when the library it could not serve
+/// is a module the operator listed *later* on the command line.
+///
+/// `--module` order is load order (see [`Boot::modules`]): an import binds
+/// against what is already loaded and against nothing else, so
+/// `--module wccmmpls.dll --module wccmmud.dll` stops on `WCCMMUD.dll`'s
+/// own symbols with nothing in the message to say the file is right there,
+/// one argument to the right. Matched on the file stem, case-insensitively:
+/// a PE import directory spells the library `WCCMMUD.dll` and the file on
+/// disk is `wccmmud.dll`.
+fn later_module_hint(library: &str, remaining: &[PathBuf]) -> Option<String> {
+    let want = Path::new(library).file_stem()?.to_str()?;
+    remaining
+        .iter()
+        .filter_map(|p| p.file_stem()?.to_str())
+        .any(|stem| stem.eq_ignore_ascii_case(want))
+        .then(|| format!(" -- {library} is given later on the command line; --module order is load order"))
+}
+
 /// Build a fresh machine, boot every module in `boot.modules` on it in the
 /// order given, and drive the steady state until the module stops or every
 /// connection is gone.
@@ -797,25 +816,6 @@ fn report_notes<A: Abi>(host: &mut Host<A>) {
 /// crate does not understand would hide it, not fix it.
 ///
 /// [`LoadError::Globals`]: mbbs::LoadError::Globals
-/// The extra clause an init stop earns when the library it could not serve
-/// is a module the operator listed *later* on the command line.
-///
-/// `--module` order is load order (see [`Boot::modules`]): an import binds
-/// against what is already loaded and against nothing else, so
-/// `--module wccmmpls.dll --module wccmmud.dll` stops on `WCCMMUD.dll`'s
-/// own symbols with nothing in the message to say the file is right there,
-/// one argument to the right. Matched on the file stem, case-insensitively:
-/// a PE import directory spells the library `WCCMMUD.dll` and the file on
-/// disk is `wccmmud.dll`.
-fn later_module_hint(library: &str, remaining: &[PathBuf]) -> Option<String> {
-    let want = Path::new(library).file_stem()?.to_str()?;
-    remaining
-        .iter()
-        .filter_map(|p| p.file_stem()?.to_str())
-        .any(|stem| stem.eq_ignore_ascii_case(want))
-        .then(|| format!(" -- {library} is given later on the command line; --module order is load order"))
-}
-
 fn life<A: Abi>(
     boot: &Boot<A>,
     rx: &std::sync::mpsc::Receiver<In>,
