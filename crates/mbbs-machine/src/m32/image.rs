@@ -320,6 +320,13 @@ impl Image {
     /// After [`Image::bind_imports`], overwrite every IAT slot it gave a
     /// thunk index with a real address instead: `thunk_addr(index)`.
     ///
+    /// `index` is **local** to this module's own thunk slice -- `0` for
+    /// `thunks[0]`, and so on -- the same numbering `bind_imports` handed
+    /// out. On a machine shared by more than one module (`Machine::
+    /// reserve_thunks`), the caller's `thunk_addr` closure is what adds the
+    /// module's own base before resolving a machine-wide address; this
+    /// method never sees or needs that base itself.
+    ///
     /// `thunks` must be exactly what the matching `bind_imports` call
     /// returned. This does **not** call a resolver again -- a resolver may
     /// have side effects (the doc comment on [`Image::bind_imports`] already

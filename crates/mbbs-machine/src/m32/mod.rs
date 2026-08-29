@@ -371,11 +371,25 @@ pub struct Module {
     init: Option<u32>,
     imports: Vec<crate::module::ImportSite>,
     exports: std::sync::Arc<Exports>,
+    /// First machine-wide thunk slot this module's imports occupy -- see
+    /// [`Machine::reserve_thunks`]. `imports[0]` sits at `thunk_base`,
+    /// `imports[1]` at `thunk_base + 1`, and so on.
+    thunk_base: u16,
+    /// The PE export directory's own name (`wccmmud.DLL`), or `None` for an
+    /// image with no export directory.
+    name: Option<String>,
 }
 
 impl Module {
-    pub fn new(entry: u32, init: Option<u32>, imports: Vec<crate::module::ImportSite>, exports: Exports) -> Self {
-        Self { entry, init, imports, exports: std::sync::Arc::new(exports) }
+    pub fn new(
+        entry: u32,
+        init: Option<u32>,
+        imports: Vec<crate::module::ImportSite>,
+        exports: Exports,
+        thunk_base: u16,
+        name: Option<String>,
+    ) -> Self {
+        Self { entry, init, imports, exports: std::sync::Arc::new(exports), thunk_base, name }
     }
 
     /// The linear address of the module's own named export -- see
@@ -438,15 +452,33 @@ impl Module {
         self.init
     }
 
-    /// What thunk `index` stands for, as [`Exit::Call`] reports it. Mirrors
-    /// `crate::m16::ne::Module::import`.
+    /// What machine-wide thunk `index` stands for, as [`Exit::Call`] reports
+    /// it, or `None` when `index` is outside this module's own slice
+    /// (`[thunk_base, thunk_base + imports.len())` -- see
+    /// [`Module::thunk_base`]). Two modules sharing one [`Machine`] answer
+    /// disjoint index ranges; a stray index from the wrong module's slice
+    /// must not silently resolve here. Mirrors `crate::m16::ne::Module::import`.
     pub fn import(&self, index: u16) -> Option<&crate::module::ImportSite> {
-        self.imports.get(usize::from(index))
+        let local = index.checked_sub(self.thunk_base)?;
+        self.imports.get(usize::from(local))
     }
 
-    /// Every import the module has, in thunk-index order.
+    /// Every import the module has, in thunk-index order (local, not
+    /// machine-wide -- add [`Module::thunk_base`] to match [`Exit::Call`]).
     pub fn imports(&self) -> &[crate::module::ImportSite] {
         &self.imports
+    }
+
+    /// The first machine-wide thunk slot this module's imports occupy --
+    /// what [`Machine::reserve_thunks`] returned when this module was loaded.
+    pub fn thunk_base(&self) -> u16 {
+        self.thunk_base
+    }
+
+    /// The PE export directory's own name (`wccmmud.DLL`), or `None` for an
+    /// image with no export directory.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }
 
@@ -460,6 +492,10 @@ impl Module {
 pub struct Machine {
     /// The thunk table and the trampoline. The host's, and no module's.
     bridge: Mapping,
+
+    /// The next unallocated thunk slot -- machine-wide, never reused across
+    /// modules. See [`Machine::reserve_thunks`].
+    next_thunk: u16,
 
     /// The module's stack and Win32 TIB. `FS` is loaded from this on every
     /// entry; see `tib.rs`.
@@ -500,11 +536,12 @@ pub struct Machine {
     /// exists at all and why it lives here rather than in [`asm::Ctx`].
     st0_scratch_off: usize,
 
-    /// The one thunk slot currently wired to capture `ST0`, if any -- see
-    /// [`Machine::arm_st0_capture`]. `None` until armed; [`Machine::take_st0`]
-    /// panics against that, rather than silently handing back whatever
-    /// garbage happens to sit in the scratch qword.
-    st0_capture_slot: Option<u16>,
+    /// The thunk slots currently wired to capture `ST0`, one per module
+    /// that has called [`Machine::arm_st0_capture`]. Empty until at least
+    /// one is armed; [`Machine::take_st0`] panics against that, rather than
+    /// silently handing back whatever garbage happens to sit in the scratch
+    /// qword.
+    st0_capture_slots: Vec<u16>,
 
     /// Where the *outbound* `ST0` scratch qword sits within [`Machine::bridge`]
     /// -- the mirror of [`Machine::st0_scratch_off`], for a value the host is
@@ -514,11 +551,26 @@ pub struct Machine {
 
     /// Where the return-path `fld`/`jmp` stub sits within [`Machine::bridge`].
     /// Rewritten fresh on every crossing that carries a [`Ret::F64`] -- unlike
-    /// [`Machine::arm_st0_capture`]'s thunk, which is armed once per import
-    /// slot, this stub's destination changes on every resume, so there is
-    /// nothing to arm in advance. See [`Machine::run`].
+    /// [`Machine::arm_st0_capture`]'s thunk, which is armed once per module
+    /// that imports `__ftol`, this stub's destination changes on every
+    /// resume, so there is nothing to arm in advance. See [`Machine::run`].
     st0_return_stub_off: usize,
 }
+
+/// A [`Machine::reserve_thunks`] that would run past [`MAX_THUNKS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThunkExhausted {
+    pub wanted: u16,
+    pub free: u16,
+}
+
+impl std::fmt::Display for ThunkExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} import thunks wanted but only {} of {MAX_THUNKS} are free", self.wanted, self.free)
+    }
+}
+
+impl std::error::Error for ThunkExhausted {}
 
 impl Machine {
     /// The module's own stack, as `(limit, base)` -- low end and high end.
@@ -532,6 +584,28 @@ impl Machine {
     /// mappings.
     pub fn stack_range(&self) -> (u32, u32) {
         (self.tib.stack_limit(), self.tib.stack_base())
+    }
+
+    /// The next unallocated thunk slot -- where the next load's slice starts.
+    pub fn next_thunk(&self) -> u16 {
+        self.next_thunk
+    }
+
+    /// Reserve `n` consecutive thunk slots for one module and return the
+    /// first. Machine-wide, never reused: two modules must not share a
+    /// physical slot, because [`Exit::Call`] reports only the bare index.
+    ///
+    /// # Errors
+    ///
+    /// If fewer than `n` slots remain below [`MAX_THUNKS`]; nothing moves.
+    pub fn reserve_thunks(&mut self, n: u16) -> Result<u16, ThunkExhausted> {
+        let free = MAX_THUNKS - self.next_thunk;
+        if n > free {
+            return Err(ThunkExhausted { wanted: n, free });
+        }
+        let base = self.next_thunk;
+        self.next_thunk += n;
+        Ok(base)
     }
 
     /// Build the thunk table and trampoline, a module stack and TIB, and arm
@@ -609,13 +683,14 @@ impl Machine {
 
         Ok(Self {
             bridge,
+            next_thunk: 0,
             tib,
             ctx: Watched::new()?,
             frame_sp: None,
             budget: Some(DEFAULT_BUDGET),
             poisoned: None,
             st0_scratch_off,
-            st0_capture_slot: None,
+            st0_capture_slots: Vec::new(),
             st0_return_scratch_off,
             st0_return_stub_off,
         })
@@ -1135,7 +1210,7 @@ impl Machine {
 
         let off = THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE;
         self.bridge.as_mut_slice()[off..off + thunk.len()].copy_from_slice(&thunk);
-        self.st0_capture_slot = Some(slot);
+        self.st0_capture_slots.push(slot);
     }
 
     /// The `f64` [`Machine::arm_st0_capture`]'s thunk most recently popped
@@ -1159,7 +1234,7 @@ impl Machine {
     /// answering.
     pub fn take_st0(&self) -> f64 {
         assert!(
-            self.st0_capture_slot.is_some(),
+            !self.st0_capture_slots.is_empty(),
             "take_st0 called before arm_st0_capture bound a thunk slot to capture ST0"
         );
         let off = self.st0_scratch_off;
@@ -1789,6 +1864,50 @@ mod st0_tests {
         let _ = machine.take_st0();
     }
 
+    /// Two modules on one machine can each import `__ftol` into a different
+    /// slot -- `st0_capture_slots` is a `Vec`, not one `Option`, and
+    /// `take_st0` answers after *either* armed slot delivers a call, not
+    /// only the first one armed.
+    #[test]
+    fn arm_st0_capture_answers_after_either_of_two_armed_slots() {
+        const SLOT_A: u16 = 0;
+        const SLOT_B: u16 = 7;
+        const VALUE_A: f64 = 111.5;
+        const VALUE_B: f64 = 222.5;
+
+        let mut machine = Machine::new().expect("a fresh machine");
+        machine.arm_st0_capture(SLOT_A);
+        machine.arm_st0_capture(SLOT_B);
+        assert_eq!(machine.st0_capture_slots, vec![SLOT_A, SLOT_B]);
+
+        for (slot, value) in [(SLOT_A, VALUE_A), (SLOT_B, VALUE_B)] {
+            let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+            let base = code_mapping.base() as usize as u32;
+
+            const CONST_OFF: usize = 512;
+            let const_addr = base + CONST_OFF as u32;
+            code_mapping.as_mut_slice()[CONST_OFF..CONST_OFF + 8].copy_from_slice(&value.to_le_bytes());
+
+            // fld qword ptr [const_addr] -- see the single-slot test above
+            // for the encoding.
+            let mut code = vec![0xdd_u8, 0x05];
+            code.extend_from_slice(&const_addr.to_le_bytes());
+
+            let target = machine.thunk_addr(slot);
+            let next_ip = base + code.len() as u32 + 5;
+            code.push(0xe8);
+            code.extend_from_slice(&target.wrapping_sub(next_ip).to_le_bytes());
+
+            code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+            let exit = machine.call(base, &[]).expect("the module traps into the armed thunk");
+            assert_eq!(exit, Exit::Call { index: slot });
+            assert_eq!(machine.take_st0(), value, "slot {slot} did not deliver its own ST0 value");
+
+            drop(code_mapping);
+        }
+    }
+
     /// The return-path mirror of
     /// [`arm_st0_capture_delivers_the_module_s_fld_across_the_crossing`]: a
     /// module calls out, the host answers with [`Ret::F64`], and the module
@@ -2322,5 +2441,54 @@ mod register_tests {
         );
 
         drop(mapping);
+    }
+}
+
+#[cfg(test)]
+mod thunk_tests {
+    use super::*;
+
+    /// Two loads in a row must not be handed the same physical slot --
+    /// `Exit::Call` reports only the bare index, so a collision would be
+    /// indistinguishable from the wrong module answering.
+    #[test]
+    fn thunk_slices_are_disjoint_and_machine_wide() {
+        let mut m = Machine::new().expect("machine");
+        assert_eq!(m.next_thunk(), 0);
+        assert_eq!(m.reserve_thunks(3).expect("3 fit"), 0);
+        assert_eq!(m.reserve_thunks(5).expect("5 more fit"), 3);
+        assert_eq!(m.next_thunk(), 8);
+        assert_eq!(m.reserve_thunks(0).expect("zero is fine"), 8);
+    }
+
+    /// [`MAX_THUNKS`] is a hard ceiling, not a soft one -- a load that would
+    /// overrun it must be a diagnosable error, not a panic or a silent
+    /// wraparound.
+    #[test]
+    fn reserving_past_max_thunks_is_an_error_not_a_panic() {
+        let mut m = Machine::new().expect("machine");
+        m.reserve_thunks(MAX_THUNKS - 2).expect("almost all");
+        let err = m.reserve_thunks(3).expect_err("3 do not fit in 2");
+        assert_eq!((err.wanted, err.free), (3, 2));
+        assert_eq!(m.next_thunk(), MAX_THUNKS - 2, "a refused reservation moves nothing");
+    }
+
+    /// A module's `import` must answer only inside its own slice -- a
+    /// machine-wide index from another module's slice, or outside every
+    /// module's slice, is `None`, not a wrong-module answer.
+    #[test]
+    fn a_module_answers_only_its_own_thunk_slice() {
+        let site = |name: &str| crate::module::ImportSite {
+            module: "X.DLL".into(),
+            symbol: crate::module::Symbol::Name(name.into()),
+            resolved: false,
+        };
+        let module = Module::new(0, None, vec![site("a"), site("b")], Exports::default(), 10, Some("X.DLL".into()));
+        assert!(module.import(9).is_none());
+        assert_eq!(module.import(10).map(|s| &s.symbol), Some(&crate::module::Symbol::Name("a".into())));
+        assert_eq!(module.import(11).map(|s| &s.symbol), Some(&crate::module::Symbol::Name("b".into())));
+        assert!(module.import(12).is_none());
+        assert_eq!(module.thunk_base(), 10);
+        assert_eq!(module.name(), Some("X.DLL"));
     }
 }

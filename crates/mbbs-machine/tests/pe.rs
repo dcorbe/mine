@@ -1522,7 +1522,7 @@ fn rebased_exports_answer_a_name_with_the_images_linear_address_not_an_rva() {
 
     // `Module` exposes the same table unchanged -- what `Abi::export_address`
     // reads from.
-    let module = Module::new(base + 0x1000, None, Vec::new(), exports);
+    let module = Module::new(base + 0x1000, None, Vec::new(), exports, 0, None);
     assert_eq!(module.export_by_name("Beta"), Some(base + 0x2000));
     assert_eq!(module.export_by_name("Alpha"), None);
 }
@@ -1542,7 +1542,7 @@ fn rebased_exports_answer_a_public_ordinal_including_the_nameless_slot() {
     assert_eq!(exports.by_ordinal(4), None, "below Base -- refused, not wrapped");
     assert_eq!(exports.by_ordinal(9), None, "past NumberOfFunctions(4)");
 
-    let module = Module::new(base + 0x1000, None, Vec::new(), exports);
+    let module = Module::new(base + 0x1000, None, Vec::new(), exports, 0, None);
     assert_eq!(module.export_by_ordinal(6), Some(base + 0x2010));
     assert_eq!(module.export_by_ordinal(8), None);
 }

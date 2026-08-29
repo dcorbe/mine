@@ -513,7 +513,10 @@ impl Abi for Wg32 {
         // describes the old `replace_image` behaviour).
         cpu.mem.push_image(image);
 
-        Ok(mbbs_machine::m32::Module::new(entry, init, thunks, exports))
+        // `0` is provisional: this crate still numbers every load's thunks
+        // from zero (Task 3 of `docs/plans/2026-08-29-wg32-n-module-boot`
+        // replaces it with `Machine::reserve_thunks`'s answer).
+        Ok(mbbs_machine::m32::Module::new(entry, init, thunks, exports, 0, pe.export_name.clone()))
     }
 
     /// Direct delegation -- `mbbs_machine::m32::Module::import` (this task).

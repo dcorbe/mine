@@ -572,7 +572,7 @@ mod tests {
             export_base: Some(1),
             export_name: None,
         };
-        let module = Module::new(0, None, Vec::new(), Exports::rebased(&pe, 0x7000_0000));
+        let module = Module::new(0, None, Vec::new(), Exports::rebased(&pe, 0x7000_0000), 0, None);
 
         assert_eq!(
             probe::<Wg32>(&module, "get_player"),
