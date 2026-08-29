@@ -3183,6 +3183,12 @@ impl<A: Abi> Host<A> {
     /// import of that library routed through the forwarder rather than
     /// straight to the host, opts in here.
     ///
+    /// **`prefer` matches an import table's spelling case-insensitively**,
+    /// the same fold `registry_key` applies to the registry this flip then
+    /// looks in. A caller naming `WCCMMUD.DLL` must reach a PE that spells
+    /// its import `wccmmud.dll`; a case-sensitive `prefer` beside a
+    /// case-insensitive lookup would silently decline to flip.
+    ///
     /// # Errors
     ///
     /// Same as [`Host::load`].
@@ -5851,7 +5857,7 @@ impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
         // name and actually exports the symbol -- otherwise this falls
         // through to the ordinary host-tables-first order below exactly as
         // if `prefer` had never named it.
-        if self.prefer.contains(&module)
+        if self.prefer.iter().any(|p| p.eq_ignore_ascii_case(module))
             && let Some(loaded) = self.loaded.get(&registry_key(module))
             && let Some(ptr) = A::export_address(loaded, symbol)
         {

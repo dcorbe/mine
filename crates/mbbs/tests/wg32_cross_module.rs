@@ -264,9 +264,15 @@ fn an_import_from_a_loaded_pe_binds_to_its_export_not_a_thunk() {
     let iat = Flat32Ptr(cpu.mem.images()[1].base() + 0x1068);
     let bound = u32::from_le_bytes(iat.resolve(&cpu.mem, 4).expect("iat").try_into().unwrap());
     assert_eq!(bound, answer, "bound to the exporter's export");
+    // No thunk site at all: `Image::bind_imports` records an `ImportSite`
+    // only for the answers that need a thunk (`Routine`, or none at all).
+    // A cross-module `Import::Data` goes straight into the IAT and records
+    // nothing, so an empty table is the discriminating assertion here --
+    // `.iter().all(..)` over it would be trivially true in every world,
+    // including the one where nothing bound.
     assert!(
-        importer_mod.imports().iter().all(|s| s.resolved || s.module != "expo.dll"),
-        "a cross-module import is not an unresolved thunk: {:?}",
+        importer_mod.imports().is_empty(),
+        "a cross-module import must not get a thunk site: {:?}",
         importer_mod.imports()
     );
 
@@ -327,4 +333,37 @@ fn a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner() {
     // `a_only`, not `_a_only` -- `Host::symbol_name` strips the leading
     // underscore; see the sibling test above.
     assert!(symbol.contains("a_only"), "named A's import, not B's: {symbol}");
+}
+
+/// `Host::load_with_precedence`'s `prefer` list names libraries whose
+/// already-loaded module wins over this host's own shim tables. It has to
+/// match an import table's own spelling case-insensitively, the same fold
+/// the registry lookup right beside it applies -- a case-sensitive `prefer`
+/// beside a case-insensitive lookup silently declines to flip.
+///
+/// `WGSERVER.EXE!_l2as` is deliberately a library *and* symbol this host's
+/// tables really do serve (`wg32_round_trip.rs` runs it as a shim), so the
+/// only thing that can put the loaded module ahead of them is the flip.
+#[test]
+fn prefer_matches_the_import_tables_spelling_case_insensitively() {
+    let mut cpu = machine();
+    let exp = exporter("WGSERVER.EXE", "_l2as");
+    let (exporter_mod, mut host) = load_module_and_host(&mut cpu, &exp);
+    let l2as = exporter_mod.export_by_name("_l2as").expect("exported");
+
+    // Mixed case on purpose: `prefer` says `WGSERVER.EXE`, the PE spells
+    // its own import `wgserver.exe`.
+    let imp = module_with_import(&[0xC3], "wgserver.exe", "_l2as");
+    let importer_mod = host
+        .load_with_precedence(&mut cpu, &imp, &["WGSERVER.EXE"])
+        .expect("the importer loads");
+
+    let iat = Flat32Ptr(cpu.mem.images()[1].base() + 0x1068);
+    let bound = u32::from_le_bytes(iat.resolve(&cpu.mem, 4).expect("iat").try_into().unwrap());
+    assert_eq!(bound, l2as, "prefer must route l2as to the loaded module, not to a host thunk");
+    assert!(
+        importer_mod.imports().is_empty(),
+        "a preferred import must not get a thunk site: {:?}",
+        importer_mod.imports()
+    );
 }
