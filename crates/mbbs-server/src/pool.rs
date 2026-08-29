@@ -10,7 +10,7 @@
 //! **One `Pool` per machine, never shared.** `crates/mbbs-server/src/host.rs`'s
 //! `life` builds a fresh `Pool` every life, on the one thread that owns that
 //! life's `A::Cpu` -- see `crates/mbbs-server/src/conn.rs`'s module doc,
-//! "One `serve` call is one machine". There is one machine per
+//! "One `serve_on` call serves one machine". There is one machine per
 //! `mbbs-server` process, so a `Chan`'s value is the connection's identity
 //! for the whole process, not just within one `Pool`.
 

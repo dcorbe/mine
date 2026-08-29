@@ -856,7 +856,12 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.expect("connect");
         // The user ID and a second line in ONE write, so both land in the
         // same TCP segment and the same `read()` inside `read_user_id` --
-        // exactly the pipelining `leftover` exists to carry forward.
+        // exactly the pipelining `leftover` exists to carry forward. This is
+        // the whole test: it only discriminates `handle`'s `leftover`
+        // forwarding from `pump`'s own read loop if both lines arrive in
+        // that one `read()`. A write split across two `read()`s would let
+        // `pump` deliver the second line on its own, and the test would
+        // still pass without proving `leftover` forwarding at all.
         client
             .write_all(b"tester\rHELLO\r")
             .await

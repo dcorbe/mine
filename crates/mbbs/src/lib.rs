@@ -5025,8 +5025,10 @@ impl<A: Abi> Host<A> {
     ///
     /// Returns `None` if the module supplies no `lonrou` -- the real host
     /// never called one either, so there is no [`Outcome`] to report for a
-    /// call that never happened. The entry line is queued either way; only a
-    /// `lonrou` that *stopped* the machine skips it.
+    /// call that never happened -- unless `enter_module` then fails, in
+    /// which case `Some(Outcome::Stopped(..))` is returned even with a null
+    /// `lonrou`. The entry line is queued either way; only a `lonrou` that
+    /// *stopped* the machine skips it.
     ///
     /// R21: a `ShimError` out of `connect_state` or the `lonrou` lookup
     /// poisons the machine and comes back as `Outcome::Stopped`, the same
@@ -5149,12 +5151,14 @@ impl<A: Abi> Host<A> {
 
     /// `entmdl` (`MENUING.C:655-687`): what the real host does the moment a
     /// user picks a module from its menu. `state` already names the first
-    /// module (`connect_state`). Then, in `entmdl`'s order: `substt = 0`,
-    /// `flags |= X2MAIN`, the synthesised input line, the volatile data area
-    /// zeroed, `clrprf`, and `sttrou` -- which happens on the driver's next
-    /// poll, because the line is queued the way a terminal's would be
-    /// ([`gsbl::Gsbl::queue_line`]) rather than dispatched from here. One
-    /// `sttrou` path, not two.
+    /// module (`connect_state`). This runs `substt = 0`, `flags |= X2MAIN`,
+    /// the volatile data area zeroed, `clrprf`, then the synthesised input
+    /// line -- last here rather than `entmdl`'s order, since the line only
+    /// touches GSBL while the other steps touch guest memory; the two
+    /// halves don't interact, so the order between them is free. `sttrou`
+    /// itself happens on the driver's next poll, because the line is queued
+    /// the way a terminal's would be ([`gsbl::Gsbl::queue_line`]) rather
+    /// than dispatched from here. One `sttrou` path, not two.
     ///
     /// The line is `"%c%s %-.*s"` of the select character (`Z` when there is
     /// none), the menu page's command string (none here) and the rest of the

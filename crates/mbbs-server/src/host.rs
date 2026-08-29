@@ -201,12 +201,12 @@ pub struct Boot<A: Abi> {
     /// This is a pre-existing fact about cross-module calls (true since
     /// `071c5a0`, not introduced by N-module boot) that N-module-per-machine
     /// boot is simply the first feature to actually exercise -- a single
-    /// module never crosses into another's code at all, and `--module32`
-    /// boots its own separate `Machine`/thunk table on its own separate
-    /// process entirely (one machine per `mbbs-server` process; two boards
-    /// are two processes, not two machines sharing this one). Not something
-    /// this stage claims to fix; recorded here, with the real run that found
-    /// it, rather than assumed away.
+    /// module never crosses into another's code at all, and a second board
+    /// is a second process, with its own `Machine` and its own thunk table
+    /// (one machine per `mbbs-server` process; two boards are two
+    /// processes, not two machines sharing this one). Not something this
+    /// stage claims to fix; recorded here, with the real run that found it,
+    /// rather than assumed away.
     pub modules: Vec<PathBuf>,
     /// The fixed channel count. Sizes every per-channel table at `Host::new`.
     pub terms: Terms,

@@ -521,6 +521,8 @@ async fn shut_down(tx: &std::sync::mpsc::Sender<In>, grace: Duration) {
             "mbbs-server: the module did not finish shutting down within {grace:?} -- \
              exiting anyway; it may leave a recovery marker behind"
         );
+    } else {
+        eprintln!("mbbs-server: shut down");
     }
 }
 
