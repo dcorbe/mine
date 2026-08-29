@@ -107,6 +107,13 @@ struct Cli {
     #[arg(long)]
     listen_raw: Vec<String>,
 
+    /// Path of a Unix-domain socket for BBS door sessions (`mbbs-door`
+    /// connects here on a caller's behalf). No default: a board with two
+    /// games has two servers and two sockets, and a shared default would
+    /// let one steal the other's.
+    #[arg(long)]
+    listen_door: Option<PathBuf>,
+
     /// Fixed channel count, must be at least 1
     #[arg(long, default_value_t = DEFAULT_TERMS, value_parser = parse_terms)]
     terms: u16,
@@ -444,6 +451,7 @@ async fn main() -> ExitCode {
         }),
     };
     let shutdown = tx.clone();
+    let door_tx = tx.clone();
 
     let addrs = match conn::serve_on(tx, keys, &listeners).await {
         Ok(addrs) => addrs,
@@ -457,12 +465,23 @@ async fn main() -> ExitCode {
         println!("mbbs-server: listening on {addr}");
     }
 
+    if let Some(path) = &cli.listen_door {
+        if let Err(e) = mbbs_server::door::serve(path.clone(), door_tx).await {
+            eprintln!("mbbs-server: failed to bind the door socket {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+        println!("mbbs-server: door socket at {}", path.display());
+    }
+
     // The accept loop and the host thread are already spawned; this task's
     // only remaining job is to keep the process alive for it, and to shut it
     // down in an orderly way when told to.
     let signal = wait_for_signal().await;
     eprintln!("mbbs-server: {signal} -- shutting the module down");
     shut_down(&shutdown, SHUTDOWN_GRACE).await;
+    if let Some(path) = &cli.listen_door {
+        let _ = std::fs::remove_file(path);
+    }
     ExitCode::SUCCESS
 }
 
@@ -587,6 +606,14 @@ mod tests {
             &[0xDB],
             "--listen-raw is the period stack: the byte reaches the client as CP437"
         );
+    }
+
+    #[test]
+    fn listen_door_is_optional_and_takes_a_path() {
+        let cli = Cli::try_parse_from(["mbbs-server", "--listen-door", "/run/user/1000/mbbs-mmud.sock"])
+            .expect("parses");
+        assert_eq!(cli.listen_door.as_deref(), Some(std::path::Path::new("/run/user/1000/mbbs-mmud.sock")));
+        assert!(Cli::try_parse_from(["mbbs-server"]).expect("parses").listen_door.is_none());
     }
 
     /// `--root` alone parses cleanly and everything else takes its documented
