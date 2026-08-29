@@ -142,9 +142,15 @@ impl Terminal {
     /// Retries on `EINTR`: a blocking read here shares its thread with the
     /// guest's watchdog signal, and treating an interrupted read as end of
     /// input closes the session under the user the first time anything else
-    /// in the process raises a signal.
+    /// in the process raises a signal. The one interruption that *is* the
+    /// end is a stop asked for through [`crate::driver::stop`] -- checked
+    /// before every read too, so a stop that landed while the guest was
+    /// running is honoured at its next key rather than blocking on one more.
     fn byte(&self) -> Option<u8> {
         loop {
+            if crate::driver::stop::requested() {
+                return None;
+            }
             let mut b = 0u8;
             // SAFETY: a one-byte read into a local from our own stdin.
             let n = unsafe { libc::read(libc::STDIN_FILENO, std::ptr::from_mut(&mut b).cast(), 1) };
@@ -289,6 +295,8 @@ impl Driver for Terminal {
     fn ending(&self) -> String {
         if self.quit {
             "you pressed Ctrl-] to take control back".to_string()
+        } else if crate::driver::stop::requested() {
+            "stopped by a signal".to_string()
         } else {
             "terminal input ended".to_string()
         }

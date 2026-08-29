@@ -67,6 +67,31 @@ impl Key {
     }
 }
 
+/// A stop asked for from outside the guest -- a signal, typically.
+///
+/// A blocking driver ([`crate::terminal::Terminal`]) shares its thread with
+/// the guest, so a run parked in its `read` cannot be reached by anything
+/// that only acts at guest crossings. The signal handler records the request
+/// here, the read returns on the `EINTR` that same signal caused, and the
+/// driver answers "no key" -- which is how every loop already ends a run
+/// whose driver has nothing left to say. Process-wide and one-way on
+/// purpose: a stop is a stop, and a handler can do nothing but set a flag.
+pub mod stop {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    /// Ask the run to stop. Async-signal-safe: one relaxed store.
+    pub fn request() {
+        REQUESTED.store(true, Ordering::Relaxed);
+    }
+
+    /// Has a stop been asked for?
+    pub fn requested() -> bool {
+        REQUESTED.load(Ordering::Relaxed)
+    }
+}
+
 /// Asked for the next keystroke whenever the guest goes idle.
 pub trait Driver {
     /// Return the next key, or `None` to stop the program.

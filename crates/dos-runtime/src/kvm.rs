@@ -295,7 +295,9 @@ pub enum Stop {
     Debug,
     /// The guest halted.
     Halted,
-    /// The watchdog cut in: the guest is running but not asking for anything.
+    /// A signal cut `KVM_RUN` short: the spin timer decided the guest was
+    /// running but not asking for anything, or the operator asked for the
+    /// stop. Which one is the caller's to say -- see `runexe`'s report.
     Interrupted,
     /// Something this proof of concept does not model.
     Unexpected(u32),
@@ -308,10 +310,24 @@ pub enum Stop {
 pub struct Helpers {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// Nanoseconds after `base` at which the guest last exited to the host --
+    /// what [`Self::feed`] records and the spin timer measures against.
+    fed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    base: std::time::Instant,
     /// Ticks actually delivered. A program that times itself against the BIOS
     /// clock is only as accurate as this is, so it is worth being able to say
     /// what rate the guest really saw rather than what was intended.
     pub ticks: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Helpers {
+    /// Record that the guest just exited to the host -- a trap, port I/O,
+    /// anything -- which is the only progress the spin timer recognises.
+    /// Call it on every exit; a guest that keeps exiting is never a spin.
+    pub fn feed(&self) {
+        let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.fed.store(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Drop for Helpers {
@@ -847,11 +863,26 @@ impl VmGuest {
     /// bumps the tick count at `0040:006C` while the guest is running natively
     /// on another core. No trap, no exit, no coordination. A Turbo Pascal
     /// runtime calibrating its delay loop spins forever without it.
-    pub fn helpers(&mut self, watchdog_ms: u64) -> Helpers {
+    ///
+    /// # The spin timer, and when there is none
+    ///
+    /// `spin_timeout` is how long the guest may run **without exiting to
+    /// the host** before it is presumed spinning and interrupted --
+    /// [`Helpers::feed`] restarts the count on every exit, so a program that
+    /// is working, however slowly, is never cut off. `None` means no timer
+    /// at all: a run with a person on the other end has the person, and a
+    /// time limit there can only ever stop correct work (the fixed deadline
+    /// this replaced was 24 hours when attended -- a bug that fires once a
+    /// day). The clock thread and the `SIGUSR1` nudge handler are set up
+    /// either way; the nudge is also how an outside stop signal reaches a
+    /// thread blocked in `KVM_RUN`.
+    pub fn helpers(&mut self, spin_timeout: Option<std::time::Duration>) -> Helpers {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         let stop = Arc::new(AtomicBool::new(false));
+        let base = std::time::Instant::now();
+        let fed = Arc::new(AtomicU64::new(0));
         let mem = self.mem as usize;
         let run = self.run as usize;
 
@@ -898,10 +929,12 @@ impl VmGuest {
         let _ = run;
 
         let dog_stop = Arc::clone(&stop);
-        let dog = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(watchdog_ms);
+        let dog_fed = Arc::clone(&fed);
+        let dog = spin_timeout.map(|timeout| {
+            std::thread::spawn(move || {
             while !dog_stop.load(Ordering::Relaxed) {
-                if std::time::Instant::now() >= deadline {
+                let last = std::time::Duration::from_nanos(dog_fed.load(Ordering::Relaxed));
+                if base.elapsed().saturating_sub(last) >= timeout {
                     // Keep signalling rather than firing once. A single signal
                     // that arrives while the main thread is in userspace -- not
                     // blocked in KVM_RUN -- is swallowed by the no-op handler
@@ -915,11 +948,16 @@ impl VmGuest {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            })
         });
 
+        let mut threads = vec![clock];
+        threads.extend(dog);
         Helpers {
             stop,
-            threads: vec![clock, dog],
+            threads,
+            fed,
+            base,
             ticks: counter,
         }
     }
@@ -1046,6 +1084,60 @@ impl Drop for VmGuest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest that never exits (`jmp $`) at `0x2000:0x0100`, entered.
+    fn spinning_guest() -> VmGuest {
+        let mut vm = VmGuest::new(1 << 20).expect("open /dev/kvm and map guest memory");
+        vm.load(0x2000 * 16 + 0x100, &[0xeb, 0xfe]).expect("load jmp $");
+        vm.start(0x2000, 0x0100, 0x2000, 0xfffe).expect("enter real mode");
+        vm
+    }
+
+    /// The spin timer counts from the last [`Helpers::feed`], not from when
+    /// the helpers started: a guest fed every 50 ms for 600 ms is not cut
+    /// off until 200 ms after the feeding stops.
+    #[test]
+    fn the_spin_timer_counts_from_the_last_feed() {
+        let mut vm = spinning_guest();
+        let helpers = vm.helpers(Some(std::time::Duration::from_millis(200)));
+        let started = std::time::Instant::now();
+        let stop = std::thread::scope(|s| {
+            s.spawn(|| {
+                for _ in 0..12 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    helpers.feed();
+                }
+            });
+            vm.run().expect("KVM run")
+        });
+        assert_eq!(stop, Stop::Interrupted);
+        let took = started.elapsed();
+        assert!(took >= std::time::Duration::from_millis(750), "cut off while still fed: {took:?}");
+        drop(helpers);
+    }
+
+    /// Without a spin timeout there is no dog at all; only a signal from
+    /// outside -- the nudge the helpers install a handler for -- stops the
+    /// same guest.
+    #[test]
+    fn no_spin_timeout_means_no_dog() {
+        let mut vm = spinning_guest();
+        let helpers = vm.helpers(None);
+        assert_eq!(helpers.threads.len(), 1, "the clock, and nothing else");
+        // SAFETY: plain queries about the calling thread.
+        let (pid, tid) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid) as libc::pid_t) };
+        let stop = std::thread::scope(|s| {
+            s.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                // SAFETY: signalling a thread of our own process, with the
+                // no-op SIGUSR1 handler `helpers` installed.
+                unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGUSR1) };
+            });
+            vm.run().expect("KVM run")
+        });
+        assert_eq!(stop, Stop::Interrupted);
+        drop(helpers);
+    }
 
     /// A stub segment matching `runexe.rs`'s `STUB_SEG` -- any unused
     /// paragraph works, this just keeps the test's memory picture familiar.

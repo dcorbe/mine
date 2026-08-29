@@ -63,6 +63,7 @@ mod mem;
 mod pe;
 mod tib;
 mod watchdog;
+pub use watchdog::Interrupter;
 
 use std::io;
 use std::time::Duration;
@@ -485,9 +486,10 @@ pub struct Machine {
     /// already names this address directly.
     frame_sp: Option<u32>,
 
-    /// How much CPU time one entry point may have. Mirrors
-    /// `crate::m16::Machine::budget`.
-    budget: Duration,
+    /// How much CPU time one entry point may have, or `None` for a machine
+    /// told not to watch -- see [`Machine::unwatch`]. Mirrors
+    /// `crate::m16::Machine::budget` when `Some`.
+    budget: Option<Duration>,
 
     /// Set once this machine has faulted or overrun, and never cleared. A
     /// poisoned machine refuses to be entered again.
@@ -610,7 +612,7 @@ impl Machine {
             tib,
             ctx: Watched::new()?,
             frame_sp: None,
-            budget: DEFAULT_BUDGET,
+            budget: Some(DEFAULT_BUDGET),
             poisoned: None,
             st0_scratch_off,
             st0_capture_slot: None,
@@ -619,8 +621,9 @@ impl Machine {
         })
     }
 
-    /// How much CPU time one entry point may have. See [`Machine::set_budget`].
-    pub fn budget(&self) -> Duration {
+    /// How much CPU time one entry point may have, or `None` after
+    /// [`Machine::unwatch`]. See [`Machine::set_budget`].
+    pub fn budget(&self) -> Option<Duration> {
         self.budget
     }
 
@@ -631,10 +634,31 @@ impl Machine {
     ///
     /// If `budget` is zero, which would mean "no time at all" but is how
     /// `timer_settime` spells "no limit". Nothing good comes of guessing which
-    /// was meant.
+    /// was meant; "no limit" is spelt [`Machine::unwatch`].
     pub fn set_budget(&mut self, budget: Duration) {
         assert!(!budget.is_zero(), "a zero watchdog budget is not a budget");
-        self.budget = budget;
+        self.budget = Some(budget);
+    }
+
+    /// Run entry points with no budget at all: nothing arms the timer, so a
+    /// module only ever stops because it returned, faulted, or an
+    /// [`Interrupter`] fired.
+    ///
+    /// For a *program* someone is watching, not for a BBS module. A module's
+    /// entry point must return -- a spinning `sttrou` freezes every player on
+    /// the board -- so the host keeps the budget. A standalone program under
+    /// an operator has the operator: a time limit there can only ever cut
+    /// off correct work (a 120-second cap did, 2026-08-29, ten minutes into
+    /// a database recovery), and "still running" is not the machine's to
+    /// judge. [`Self::interrupter`] is how the operator stops it.
+    pub fn unwatch(&mut self) {
+        self.budget = None;
+    }
+
+    /// A handle that stops this machine's module on demand, from any thread
+    /// or a signal handler -- see [`Interrupter`].
+    pub fn interrupter(&self) -> Interrupter {
+        self.ctx.interrupter()
     }
 
     /// Why this machine will not run again, if it will not.
@@ -700,7 +724,10 @@ impl Machine {
     ///
     /// If the watchdog timer cannot be armed.
     pub fn rearm_watchdog(&mut self) -> io::Result<()> {
-        self.ctx.arm(self.budget)
+        match self.budget {
+            Some(budget) => self.ctx.arm(budget),
+            None => Ok(()),
+        }
     }
 
     pub fn poison(&mut self, reason: Poison) -> io::Result<()> {
@@ -879,8 +906,10 @@ impl Machine {
                 "refusing to enter a poisoned module: {poison}"
             )));
         }
-        if !self.ctx.armed()? {
-            self.ctx.arm(self.budget)?;
+        if let Some(budget) = self.budget
+            && !self.ctx.armed()?
+        {
+            self.ctx.arm(budget)?;
         }
         self.enter()
     }
@@ -1250,7 +1279,9 @@ impl Machine {
         // servicing imports in between. Mirrors
         // `crate::m16::Machine::call`'s own arm exactly; see that method's
         // doc comment for why arming per crossing instead would be wrong.
-        self.ctx.arm(self.budget)?;
+        if let Some(budget) = self.budget {
+            self.ctx.arm(budget)?;
+        }
         self.run(entry, sp, Ret::Void)
     }
 
@@ -2214,6 +2245,54 @@ mod register_tests {
             }
             drop(mapping);
         }
+    }
+
+    /// [`Machine::unwatch`]: no budget means no timer, and a module that
+    /// takes longer than any budget would have allowed still returns.
+    #[test]
+    fn an_unwatched_machine_never_times_out() {
+        let mut machine = Machine::new().expect("a fresh machine");
+        machine.set_budget(Duration::from_millis(100));
+        machine.unwatch();
+        assert_eq!(machine.budget(), None);
+        let (mut mapping, base) = mapped(&[]);
+        let thunk = machine.thunk_addr(SLOT);
+
+        // call thunk; ret
+        let mut code = call_rel32(thunk, base + 5);
+        code.push(0xc3);
+        mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let exit = machine.call(base, &[]).expect("the module traps");
+        assert_eq!(exit, Exit::Call { index: SLOT });
+        assert!(!machine.watchdog_armed().expect("gettime"), "nothing armed the timer");
+        let until = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        let exit = machine.resume(Ret::Void).expect("the module resumes");
+        assert!(matches!(exit, Exit::Returned { .. }), "{exit:?}");
+        drop(mapping);
+    }
+
+    /// [`Interrupter::fire`] from another thread stops a module that is
+    /// spinning in 32-bit code with no crossing in sight -- on an unwatched
+    /// machine, so nothing else could have. The exit names the spin.
+    #[test]
+    fn an_interrupter_stops_a_spinning_module_from_another_thread() {
+        let mut machine = Machine::new().expect("a fresh machine");
+        machine.unwatch();
+        let (mut mapping, base) = mapped(&[0xeb, 0xfe]); // jmp $
+        let interrupter = machine.interrupter();
+
+        let fired = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            interrupter.fire()
+        });
+        let exit = machine.call(base, &[]).expect("the module stops");
+        assert!(fired.join().expect("the firing thread"), "the timer took the request");
+        assert_eq!(exit, Exit::Timeout { eip: base }, "stopped in the spin itself");
+        drop(mapping);
     }
 
     #[test]

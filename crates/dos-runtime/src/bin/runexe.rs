@@ -30,6 +30,8 @@ use dos_runtime::bios::{Bios, Keyboard, Video, int16, int16_implemented, missing
 use dos_runtime::dos::is_implemented;
 use dos_runtime::guest::{Guest, Ptr};
 use dos_runtime::kvm::{Stop, VmGuest};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 use dos_runtime::driver::{Driver, Script};
 use dos_runtime::terminal::{RawStdin, Terminal};
 use dos_runtime::uart::{COM1_BASE, IRQ4_VECTOR, Pic, Uart};
@@ -483,6 +485,81 @@ pub enum Format {
 /// not enough to reach a real stopping point.
 const PE_CALL_BUDGET: usize = 20_000_000;
 
+/// How long an **unattended** guest may run without crossing into the host
+/// -- no DOS/BIOS trap, no import call -- before it is presumed spinning and
+/// stopped. Attended runs have no timer at all: the person is the watchdog
+/// (see [`install_stop_signals`]).
+///
+/// This bounds a gap, never a run: the real-mode loop feeds the KVM spin
+/// timer on every guest exit and the Win32 loop re-arms the machine's budget
+/// on every import, so a program that is working, however slowly, is never
+/// cut off. The number is still a judgement -- `-recover` was measured
+/// walking `WCCKNMS2.DAT` (895 KB) for five seconds with no crossing at all,
+/// so it has to be well clear of that -- but a wrong judgement here only
+/// costs an unattended probe a slower report, not a real run its work.
+const SPIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The Win32 machine's stop handle, once a PE32 image is loaded.
+static INTERRUPTER: OnceLock<mbbs_machine::m32::Interrupter> = OnceLock::new();
+
+/// The thread blocked in `KVM_RUN`, once the real-mode helpers exist and
+/// their no-op `SIGUSR1` handler is in place -- zero until then, and a
+/// signal that lands before that is not forwarded.
+static MAIN_TID: AtomicI32 = AtomicI32::new(0);
+
+/// `SIGINT`/`SIGTERM`: stop the guest wherever it is and let the run report.
+///
+/// Both guests run natively -- 32-bit code on this thread, real-mode code on
+/// a vCPU -- so a guest spinning with no crossing cannot be reached by the
+/// drivers, which are only consulted at crossings. This is the one way in:
+/// the Win32 machine's [`mbbs_machine::m32::Interrupter`] makes its budget
+/// expire now, and a `SIGUSR1` at the `KVM_RUN` thread gives `EINTR` (the
+/// same nudge the spin timer uses; a process-directed signal may land on a
+/// helper thread, so it is forwarded rather than relied on). A signal that
+/// arrives while the host is servicing a crossing is caught at the next
+/// resume, or at the top of the real-mode loop.
+///
+/// The interactive terminal is raw with `ISIG` off, so from *that* keyboard
+/// Ctrl-C is a keystroke for the guest and Ctrl-] the driver's own stop,
+/// honoured at crossings; a spinning attended guest is stopped with
+/// `kill -INT` from elsewhere, and still gets its report and its terminal
+/// back.
+extern "C" fn on_stop_signal(_: libc::c_int) {
+    // Recorded where the blocking terminal driver can see it, so a run
+    // parked in a `read` ends too -- see `dos_runtime::driver::stop`.
+    dos_runtime::driver::stop::request();
+    if let Some(interrupter) = INTERRUPTER.get() {
+        interrupter.fire();
+    }
+    let tid = MAIN_TID.load(Ordering::Relaxed);
+    if tid != 0 {
+        // SAFETY: signalling a thread of our own process; `tgkill` and
+        // `getpid` are async-signal-safe.
+        unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, libc::SIGUSR1) };
+    }
+}
+
+fn install_stop_signals() {
+    for signo in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: installing a handler with no SA_RESTART, so a blocked
+        // `ioctl(KVM_RUN)` reports EINTR instead of being resumed.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_stop_signal as *const () as usize;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(signo, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// The operator (or the harness) asked for the stop, so a
+/// `Stop::Interrupted`/`Outcome::Timeout` that follows is theirs, not the
+/// spin timer's.
+fn interrupted() -> bool {
+    dos_runtime::driver::stop::requested()
+}
+
 /// Which runtime `file` belongs to.
 ///
 /// Reads the two bytes at `e_lfanew` rather than trusting the offset itself.
@@ -528,19 +605,16 @@ fn run_pe32(
     interactive: bool,
 ) -> io::Result<()> {
     let mut loaded = win32::load::load(data)?;
-    // The watchdog budget here is CPU *between two import calls*, not for
-    // the run: `win32::process::run` re-arms it at every import it answers
-    // (`Machine::rearm_watchdog`). It used to be the machine's whole-entry
-    // budget, and 120 s of it cut off a database recovery that was still
-    // advancing ("/ Updating Rooms  M 2 R 361", 2026-08-29) -- a program's
-    // one entry point is its entire life, so a total cap can only ever
-    // stop correct work. The gap it bounds is real, though: `-recover`
-    // walked `WCCKNMS2.DAT` (895 KB of monster records) for five seconds
-    // with no `BTRCALL`/CRT call at all, so the machine's five-second
-    // default (`mbbs_machine::m32::DEFAULT_BUDGET`, sized for a module's
-    // entry point) is too tight for one pass of a batch utility, and 120 s
-    // of pure compute with no I/O is the shape of a spin.
-    loaded.machine.set_budget(std::time::Duration::from_secs(120));
+    // A person watching gets no timer; an unattended run gets the spin
+    // detector, which `win32::process::run` re-arms at every import it
+    // answers (`Machine::rearm_watchdog`) -- see `SPIN_TIMEOUT`. Either way
+    // a stop signal reaches the machine through `INTERRUPTER`.
+    if interactive {
+        loaded.machine.unwatch();
+    } else {
+        loaded.machine.set_budget(SPIN_TIMEOUT);
+    }
+    let _ = INTERRUPTER.set(loaded.machine.interrupter());
     println!(
         "{path}: PE32 image, {} imports, entry {:#010x}",
         loaded.imports.len(),
@@ -606,7 +680,18 @@ fn run_pe32(
     let ending = process.keys.as_ref().map(|d| d.ending());
     process.keys = None;
 
-    println!("--- {outcome:?} ---");
+    match outcome {
+        win32::process::Outcome::Timeout { eip } if interrupted() => {
+            println!("--- interrupted by a signal at {eip:#010x} ---");
+        }
+        win32::process::Outcome::Timeout { eip } => {
+            println!(
+                "--- spin: no import call for {}s, at {eip:#010x} ---",
+                SPIN_TIMEOUT.as_secs()
+            );
+        }
+        ref other => println!("--- {other:?} ---"),
+    }
     show_console(&process);
     report_diagnostics(&process);
     if let Some(ending) = ending {
@@ -730,6 +815,7 @@ fn main() -> io::Result<()> {
     let strict = cli.strict;
     let max_calls = cli.max_calls;
     let interactive = cli.interactive;
+    install_stop_signals();
     let door = cli.door;
     let baud: Option<u32> = cli.baud;
     let dropfile = cli.dropfile;
@@ -742,10 +828,11 @@ fn main() -> io::Result<()> {
     let bturno = cli.bturno;
     let tsr = cli.tsr;
 
-    // Somebody is on the other end. Every guard in here exists to rescue an
-    // *unattended* probe from a guest that will not stop, and every one has now
-    // fired on a real session at least once -- the call cap, and the watchdog
-    // twice. One name for the condition, used everywhere, is the fix.
+    // Somebody is on the other end. The call cap and the spin timer exist to
+    // rescue an *unattended* probe from a guest that will not stop, and both
+    // have fired on a real session -- so neither applies when attended; the
+    // person is the watchdog (`install_stop_signals`). One name for the
+    // condition, used everywhere, is the fix.
     let attended = interactive || door;
 
     // The BBS already knows the line rate, so ask it rather than making the
@@ -921,9 +1008,12 @@ fn main() -> io::Result<()> {
         vm.debug(Some(addr), false)?;
         println!("watching {addr:#07x} for a data access");
     }
-    // A human takes as long as they take, so the watchdog that rescues an
-    // unattended probe from a spinning guest must not fire on them.
-    let helpers = vm.helpers(if attended { 24 * 60 * 60 * 1000 } else { 10_000 });
+    // A human takes as long as they take: no spin timer when attended. See
+    // `SPIN_TIMEOUT` for what the unattended one measures.
+    let helpers = vm.helpers((!attended).then_some(SPIN_TIMEOUT));
+    // SAFETY: a plain query about the calling thread -- the one `KVM_RUN`
+    // will block in, which is where a stop signal has to land.
+    MAIN_TID.store(unsafe { libc::syscall(libc::SYS_gettid) as i32 }, Ordering::Relaxed);
 
     // The sandbox. Everything the guest opens resolves beneath this one
     // descriptor, enforced by openat2(RESOLVE_BENEATH), not by path munging.
@@ -1124,8 +1214,14 @@ fn main() -> io::Result<()> {
             }
         }
 
+        if interrupted() {
+            let (cs, ip) = vm.cs_ip();
+            break format!("interrupted by a signal at {cs:#06x}:{ip:#06x}");
+        }
         let ran = std::time::Instant::now();
         let stop = vm.run()?;
+        // Every exit is progress as far as the spin timer is concerned.
+        helpers.feed();
         let took = ran.elapsed();
         in_guest += took;
         since_settle.0 += 1;
@@ -1511,9 +1607,16 @@ fn main() -> io::Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Stop::Halted => break "halted".to_string(),
+            Stop::Interrupted if interrupted() => {
+                let (cs, ip) = vm.cs_ip();
+                break format!("interrupted by a signal at {cs:#06x}:{ip:#06x}");
+            }
             Stop::Interrupted => {
                 let (cs, ip) = vm.cs_ip();
-                break format!("watchdog: still running at {cs:#06x}:{ip:#06x}, no DOS call");
+                break format!(
+                    "spin: no exit from the guest for {}s, at {cs:#06x}:{ip:#06x}",
+                    SPIN_TIMEOUT.as_secs()
+                );
             }
             Stop::Unexpected(reason) => break format!("unexpected KVM exit {reason}"),
         }

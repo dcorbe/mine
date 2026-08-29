@@ -181,6 +181,11 @@ impl Watched {
         &raw mut *self.ctx
     }
 
+    /// A handle that fires this timer on demand -- see [`Interrupter`].
+    pub(crate) fn interrupter(&self) -> Interrupter {
+        Interrupter { timer: self.timer }
+    }
+
     fn set(&self, value: Duration, interval: Duration) -> io::Result<()> {
         let spec = libc::itimerspec {
             it_interval: to_timespec(interval),
@@ -192,6 +197,48 @@ impl Watched {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+}
+
+/// Stop the module a [`Watched`] timer watches, from anywhere: another
+/// thread, or a signal handler.
+///
+/// [`fire`](Self::fire) makes the watchdog timer expire *now*, so the
+/// module stops exactly the way an exhausted budget stops it -- interrupted
+/// mid-instruction if it is running, refused at its next resume if the host
+/// is servicing an import -- and reports where it was. It is what lets a
+/// human, or a `SIGINT`, be the watchdog for a program the machine has been
+/// told not to watch (`Machine::unwatch`): the timer still exists, it is
+/// simply never armed until someone asks for the stop.
+///
+/// Async-signal-safe: one `timer_settime`, which POSIX lists as such. After
+/// the machine is gone the timer id is dead and the call fails harmlessly
+/// (`fire` answers `false`); the kernel never reuses a `timer_t` across a
+/// delete within one process in a way this could confuse, because the
+/// machine's `Drop` deletes it and nothing recreates timers on this thread
+/// afterwards without going through `Machine::new`.
+#[derive(Clone, Copy, Debug)]
+pub struct Interrupter {
+    timer: libc::timer_t,
+}
+
+// SAFETY: the handle is a kernel timer id, not a pointer into anything this
+// crate owns; `timer_settime` on it is thread-safe and async-signal-safe.
+unsafe impl Send for Interrupter {}
+// SAFETY: as for `Send` -- no shared state beyond the id.
+unsafe impl Sync for Interrupter {}
+
+impl Interrupter {
+    /// Make the watched module's budget expire now. `true` if the timer
+    /// took the request; `false` once its machine is gone.
+    pub fn fire(&self) -> bool {
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: libc::timespec { tv_sec: 0, tv_nsec: 1 },
+        };
+        // SAFETY: `spec` outlives a call that copies it; a dead timer id
+        // makes the call fail, which is the `false` below, not UB.
+        unsafe { libc::timer_settime(self.timer, 0, &raw const spec, ptr::null_mut()) == 0 }
     }
 }
 
