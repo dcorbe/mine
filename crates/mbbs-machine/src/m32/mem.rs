@@ -1,6 +1,6 @@
-//! What a [`Flat32Ptr`] resolves against: a module's loaded [`Image`], plus a
-//! second [`Mapping`] the host allocates fresh module-addressable memory out
-//! of.
+//! What a [`Flat32Ptr`] resolves against: every loaded module's [`Image`],
+//! plus a second [`Mapping`] the host allocates fresh module-addressable
+//! memory out of.
 //!
 //! **Why not fold this into `Image`.** `Image` is a fixed-size mapping made
 //! once at load -- see its own module doc comment ("Section protections are
@@ -17,10 +17,14 @@
 //! whatever `Image` a caller happens to be executing against (`Machine`
 //! does not own an `Image` at all -- see `mod.rs`'s `Machine::call` doc
 //! comment). `Memory` is that same shape applied to the *other* side of the
-//! crate: one struct owning the module's `Image` and a second `Mapping` for
-//! host-allocated regions, so a pointer into either resolves the same way.
+//! crate: one struct owning every loaded module's `Image` and a second
+//! `Mapping` for host-allocated regions, so a pointer into any of them
+//! resolves the same way.
 pub struct Memory {
-    image: crate::m32::Image,
+    /// Every loaded module's image, in load order. The first is the
+    /// channel-owning module's. Images never overlap: each is its own
+    /// mapping, so a linear scan's first hit is the only hit.
+    images: Vec<crate::m32::Image>,
     arena: crate::m32::Mapping,
     /// Bytes of `arena` already handed out. A bump allocator, not a real
     /// free list -- see [`Memory::alloc`] for why nothing here needs to
@@ -34,16 +38,15 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// Take ownership of a loaded `image`, and reserve `arena_len` bytes of
-    /// fresh mapping the host can hand the module regions out of.
+    /// An arena and no images -- [`Memory::push_image`] adds each module's.
     ///
     /// # Errors
     ///
     /// If the arena mapping cannot be made -- [`Mapping::new`]'s errors, most
     /// likely `ENOMEM`.
-    pub fn new(image: crate::m32::Image, arena_len: usize) -> std::io::Result<Self> {
+    pub fn new(arena_len: usize) -> std::io::Result<Self> {
         Ok(Self {
-            image,
+            images: Vec::new(),
             arena: crate::m32::Mapping::new(arena_len)?,
             arena_used: 0,
             stack: None,
@@ -51,34 +54,33 @@ impl Memory {
         })
     }
 
-    /// The module's own loaded image.
-    pub fn image(&self) -> &crate::m32::Image {
-        &self.image
-    }
-
-    /// The module's own loaded image, mutably -- for relocation and import
-    /// binding, which happen before any pointer into it is handed to a shim.
-    pub fn image_mut(&mut self) -> &mut crate::m32::Image {
-        &mut self.image
-    }
-
-    /// Swap in a freshly loaded `image`, in place -- `self.arena` and
-    /// `self.arena_used` are untouched.
+    /// One image and an arena -- the single-module shape `dos-runtime` and
+    /// most tests want.
     ///
-    /// This is the operation a host reloading a module needs:
-    /// [`Memory::alloc`] pointers the host is already holding resolve
-    /// against `arena`, never `image`, so replacing only the field that
-    /// changes on a reload is what keeps them valid. Assigning a whole new
-    /// `Memory` in their place (`*self = Memory::new(image, ..)`) would
-    /// drop the old `arena` `Mapping` -- and `Mapping::drop` really does
-    /// `munmap` it (`crate::m32::map`) -- so every pointer `alloc` had
-    /// already handed out would resolve against memory the kernel has
-    /// since taken back. The old `image`'s `Mapping` is still dropped here,
-    /// by the ordinary assignment below; that is correct and intended --
-    /// the previous image is not addressable once a new one has taken its
-    /// place -- it is only the arena this method is careful to leave alone.
-    pub fn replace_image(&mut self, image: crate::m32::Image) {
-        self.image = image;
+    /// # Errors
+    ///
+    /// Same as [`Memory::new`].
+    pub fn with_image(image: crate::m32::Image, arena_len: usize) -> std::io::Result<Self> {
+        let mut mem = Self::new(arena_len)?;
+        mem.push_image(image);
+        Ok(mem)
+    }
+
+    /// Append a loaded image; returns its index in load order.
+    pub fn push_image(&mut self, image: crate::m32::Image) -> usize {
+        self.images.push(image);
+        self.images.len() - 1
+    }
+
+    /// The first image loaded -- the channel-owning module's -- or `None`
+    /// before any module has loaded.
+    pub fn image(&self) -> Option<&crate::m32::Image> {
+        self.images.first()
+    }
+
+    /// Every loaded image, in load order.
+    pub fn images(&self) -> &[crate::m32::Image] {
+        &self.images
     }
 
     /// Take ownership of the module's stack mapping.
@@ -181,14 +183,15 @@ impl Memory {
     }
 
     /// `len` bytes at linear address `addr`, wherever they actually live --
-    /// the image or the arena. `None` if `addr..addr+len` is not entirely
-    /// inside either.
+    /// an image or the arena. `None` if `addr..addr+len` is not entirely
+    /// inside any of them.
     pub(crate) fn read_at(&self, addr: u32, len: usize) -> Option<&[u8]> {
-        let in_image = addr
-            .checked_sub(self.image.base())
-            .and_then(|off| self.image.read_at(off, len).ok());
-        if let Some(bytes) = in_image {
-            return Some(bytes);
+        for image in &self.images {
+            if let Some(off) = addr.checked_sub(image.base())
+                && let Ok(bytes) = image.read_at(off, len)
+            {
+                return Some(bytes);
+            }
         }
         if let Some(off) = addr.checked_sub(self.arena_base())
             && let Ok(off) = usize::try_from(off)
@@ -205,14 +208,15 @@ impl Memory {
     }
 
     /// Write `bytes` at linear address `addr`. `None` (nothing written) if
-    /// `addr..addr+bytes.len()` is not entirely inside the image or the
+    /// `addr..addr+bytes.len()` is not entirely inside any image or the
     /// arena.
     pub(crate) fn write_at(&mut self, addr: u32, bytes: &[u8]) -> Option<()> {
-        let wrote_image = addr
-            .checked_sub(self.image.base())
-            .is_some_and(|off| self.image.write_at(off, bytes).is_ok());
-        if wrote_image {
-            return Some(());
+        for image in &mut self.images {
+            if let Some(off) = addr.checked_sub(image.base())
+                && image.write_at(off, bytes).is_ok()
+            {
+                return Some(());
+            }
         }
         let arena_base = self.arena_base();
         if let Some(off) = addr.checked_sub(arena_base)
@@ -233,16 +237,18 @@ impl Memory {
     }
 
     /// Every byte from linear address `addr` to the end of whichever mapping
-    /// -- image or arena -- contains it, for a NUL scan. `None` if `addr`
-    /// names neither mapping, or sits exactly at the end of one (zero bytes
-    /// available, the same "nothing to scan" refusal `Flat32Ptr::read_cstr`
-    /// already drew against a bare `Image`).
+    /// -- an image or the arena -- contains it, for a NUL scan. `None` if
+    /// `addr` names no mapping, or sits exactly at the end of one (zero
+    /// bytes available, the same "nothing to scan" refusal
+    /// `Flat32Ptr::read_cstr` already drew against a bare `Image`).
     pub(crate) fn tail_from(&self, addr: u32) -> Option<&[u8]> {
-        if let Some(off) = addr.checked_sub(self.image.base()) {
-            let off = off as usize;
-            let full = self.image.as_slice();
-            if let Some(n) = full.len().checked_sub(off).filter(|n| *n > 0) {
-                return Some(&full[off..off + n]);
+        for image in &self.images {
+            if let Some(off) = addr.checked_sub(image.base()) {
+                let off = off as usize;
+                let full = image.as_slice();
+                if let Some(n) = full.len().checked_sub(off).filter(|n| *n > 0) {
+                    return Some(&full[off..off + n]);
+                }
             }
         }
         if let Some(off) = addr.checked_sub(self.arena_base())
@@ -280,7 +286,7 @@ mod tests {
     /// is exactly where a local buffer in an early frame sits.
     #[test]
     fn an_address_in_the_adopted_stack_resolves_reads_and_writes() {
-        let mut mem = Memory::new(load(), 0x1000).expect("arena");
+        let mut mem = Memory::with_image(load(), 0x1000).expect("arena");
 
         // Nothing is adopted yet, so a stack address is unresolvable -- the
         // state this test exists to prove we left behind.
@@ -309,7 +315,7 @@ mod tests {
         // The other two mappings still answer, and the stack has not
         // shadowed them: a bug that resolved everything into the stack would
         // pass every assertion above.
-        assert!(mem.read_at(mem.image.base(), 4).is_some(), "the image still resolves");
+        assert!(mem.read_at(mem.image().expect("image").base(), 4).is_some(), "the image still resolves");
         let (arena_base, _) = mem.arena_range();
         assert!(mem.read_at(arena_base, 4).is_some(), "the arena still resolves");
 
@@ -364,11 +370,11 @@ mod tests {
     /// catches that.
     #[test]
     fn an_allocated_region_resolves_through_the_arena_and_starts_zeroed() {
-        let mut mem = Memory::new(load(), 0x1000).expect("arena");
+        let mut mem = Memory::with_image(load(), 0x1000).expect("arena");
         let ptr = mem.alloc(16).expect("16 bytes fit");
 
         assert!(
-            ptr.0.wrapping_sub(mem.image().base()) >= SIZE_OF_IMAGE,
+            ptr.0.wrapping_sub(mem.image().expect("image").base()) >= SIZE_OF_IMAGE,
             "an arena pointer must not land inside the image"
         );
         assert_eq!(
@@ -382,7 +388,7 @@ mod tests {
     /// `arena_used` rather than always answering the arena's base.
     #[test]
     fn two_allocations_do_not_overlap() {
-        let mut mem = Memory::new(load(), 0x1000).expect("arena");
+        let mut mem = Memory::with_image(load(), 0x1000).expect("arena");
         let a = mem.alloc(10).expect("fits");
         let b = mem.alloc(10).expect("fits");
         assert_eq!(b.0, a.0 + 10, "the second allocation must start after the first");
@@ -392,7 +398,7 @@ mod tests {
     /// truncated or wrapped into an out-of-bounds pointer.
     #[test]
     fn an_allocation_past_the_arenas_capacity_is_refused() {
-        let mut mem = Memory::new(load(), 16).expect("arena");
+        let mut mem = Memory::with_image(load(), 16).expect("arena");
         assert!(mem.alloc(17).is_err());
     }
 
@@ -402,10 +408,10 @@ mod tests {
     /// ever checked one of the two.
     #[test]
     fn read_and_write_reach_both_the_image_and_the_arena() {
-        let mut mem = Memory::new(load(), 0x1000).expect("arena");
+        let mut mem = Memory::with_image(load(), 0x1000).expect("arena");
 
         // Image: rva 0x1010, inside the mapped CODE section.
-        let image_addr = mem.image().base() + 0x1010;
+        let image_addr = mem.image().expect("image").base() + 0x1010;
         mem.write_at(image_addr, &[1, 2, 3, 4])
             .expect("address is inside the mapped image");
         assert_eq!(mem.read_at(image_addr, 4).unwrap(), &[1, 2, 3, 4]);
@@ -422,44 +428,57 @@ mod tests {
     /// mapping happened to be checked first.
     #[test]
     fn an_address_in_neither_mapping_is_refused() {
-        let mut mem = Memory::new(load(), 0x1000).expect("arena");
+        let mut mem = Memory::with_image(load(), 0x1000).expect("arena");
         // Comfortably past both the image (0x2000 bytes) and the arena
         // (0x1000 bytes), and not `0` (which some future accidental
         // "unchecked" base could make look valid by coincidence).
-        let nowhere = mem.image().base().max(mem.arena_base()) + 0x10_0000;
+        let nowhere = mem.image().expect("image").base().max(mem.arena_base()) + 0x10_0000;
         assert!(mem.read_at(nowhere, 1).is_none());
         assert!(mem.write_at(nowhere, &[0]).is_none());
     }
 
-    /// `replace_image` must leave the arena -- and a pointer already
-    /// allocated out of it -- exactly as they were. This is the property
-    /// `crates/mbbs/src/abi/wg32.rs`'s `Wg32::load` now depends on: without
-    /// it, reloading a module would drop the old arena `Mapping` and every
-    /// host-owned buffer's pointer would resolve against memory the kernel
-    /// has already taken back.
     #[test]
-    fn replace_image_leaves_the_arena_and_its_pointers_untouched() {
-        let mut mem = Memory::new(load(), 0x1000).expect("arena");
-        let ptr = mem.alloc(4).expect("fits");
-        mem.write_at(ptr.0, &[9, 8, 7, 6]).expect("just allocated");
+    fn a_fresh_memory_has_no_image() {
+        let mem = Memory::new(0x1000).expect("arena");
+        assert!(mem.image().is_none());
+        assert!(mem.images().is_empty());
+    }
 
-        let second = load();
-        let second_base = second.base();
-        mem.replace_image(second);
+    #[test]
+    fn the_first_pushed_image_is_the_image() {
+        let mut mem = Memory::new(0x1000).expect("arena");
+        let file = minimal_with_one_section();
+        let pe = PeImage::parse(&file).expect("parses");
+        let image = crate::m32::Image::load(&file, &pe).expect("loads");
+        let base = image.base();
+        assert_eq!(mem.push_image(image), 0);
+        assert_eq!(mem.image().expect("one image").base(), base);
+        assert_eq!(mem.images().len(), 1);
+    }
 
-        assert_eq!(mem.image().base(), second_base, "the image really did change");
-        assert_eq!(
-            mem.read_at(ptr.0, 4).expect("the arena pointer must still resolve"),
-            &[9, 8, 7, 6],
-            "replacing the image must not disturb bytes already in the arena"
-        );
+    #[test]
+    fn two_images_resolve_independently() {
+        use crate::m32::Flat32Ptr;
+        use crate::ptr::ModulePtr;
 
-        // The arena is still open for business at the address the first
-        // allocation ended -- `arena_used` was not reset, so a second
-        // `alloc` continues exactly where the first left off rather than
-        // starting over (which would happen for free if `replace_image`
-        // secretly rebuilt the whole `Memory`).
-        let second_ptr = mem.alloc(4).expect("the arena is still there to allocate from");
-        assert_eq!(second_ptr.0, ptr.0 + 4, "arena_used must not have reset");
+        let mut mem = Memory::new(0x1000).expect("arena");
+        let file = minimal_with_one_section();
+        let pe = PeImage::parse(&file).expect("parses");
+        let a = crate::m32::Image::load(&file, &pe).expect("loads a");
+        let b = crate::m32::Image::load(&file, &pe).expect("loads b");
+        let (a_base, b_base) = (a.base(), b.base());
+        assert_ne!(a_base, b_base, "two mappings never share a base");
+        mem.push_image(a);
+        assert_eq!(mem.push_image(b), 1);
+
+        // A write into the second image lands there and nowhere else.
+        Flat32Ptr(b_base + 0x1010).write(&mut mem, &[0xAB, 0xCD]).expect("in image b");
+        assert_eq!(Flat32Ptr(b_base + 0x1010).resolve(&mem, 2).expect("read b"), &[0xAB, 0xCD]);
+        assert_eq!(Flat32Ptr(a_base + 0x1010).resolve(&mem, 2).expect("read a"), &[0, 0]);
+
+        // Past the end of either image, in neither, arena nor stack: refused.
+        let nowhere = a_base.max(b_base).max(mem.arena_range().0) + 0x10_0000;
+        assert!(Flat32Ptr(nowhere).resolve(&mem, 1).is_err());
+        assert!(Flat32Ptr(nowhere).write(&mut mem, &[1]).is_err());
     }
 }

@@ -287,7 +287,7 @@ impl Abi for Wg32 {
     /// into it" are the same address. See [`Abi::data_ptr`]'s own doc
     /// comment.
     fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr {
-        mbbs_machine::m32::Flat32Ptr(cpu.mem.image().base())
+        mbbs_machine::m32::Flat32Ptr(cpu.mem.image().map_or(0, mbbs_machine::m32::Image::base))
     }
 
     type Poison = mbbs_machine::m32::Poison;
@@ -503,11 +503,15 @@ impl Abi for Wg32 {
         // [`Abi::export_address`] answers from once the `PeImage` is gone.
         let exports = mbbs_machine::m32::Exports::rebased(&pe, image.base());
 
-        // Every step above succeeded -- commit. `replace_image` swaps in
-        // `image` without touching `cpu.mem`'s arena -- see this method's
-        // own doc comment ("Only the image is replaced -- the arena is
-        // not.").
-        cpu.mem.replace_image(image);
+        // Every step above succeeded -- commit. `push_image` appends `image`
+        // without touching `cpu.mem`'s arena. Provisional: `Memory` no
+        // longer has a "replace the one image" operation (Task 1 of
+        // `docs/plans/2026-08-29-wg32-n-module-boot`), and this call has not
+        // yet been updated for what that means when `cpu.mem` already holds
+        // an image -- Task 3 owns fixing `Wg32::load` for real N-module
+        // semantics (see this method's own doc comment, which still
+        // describes the old `replace_image` behaviour).
+        cpu.mem.push_image(image);
 
         Ok(mbbs_machine::m32::Module::new(entry, init, thunks, exports))
     }

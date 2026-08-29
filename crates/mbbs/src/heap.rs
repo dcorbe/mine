@@ -465,7 +465,7 @@ mod tests {
         let file = wg32_minimal_with_one_section();
         let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
         let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
-        mbbs_machine::m32::Memory::new(image, arena_len).expect("arena mapping")
+        mbbs_machine::m32::Memory::with_image(image, arena_len).expect("arena mapping")
     }
 
     /// The scenario this task exists for: MajorMUD-NT's module init calls

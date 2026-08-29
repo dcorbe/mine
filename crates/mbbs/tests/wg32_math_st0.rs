@@ -81,7 +81,7 @@ fn cpu_and_host() -> (Wg32Cpu, Host<Wg32>) {
     let file = minimal_with_one_section();
     let pe = PeImage::parse(&file).expect("fixture parses");
     let image = Image::load(&file, &pe).expect("fixture loads");
-    let mem = Memory::new(image, 0x0002_0000).expect("arena mapping");
+    let mem = Memory::with_image(image, 0x0002_0000).expect("arena mapping");
     let machine = Machine::new().expect("thunk table, TIB, fault recovery");
     let mut cpu = Wg32Cpu::new(machine, mem);
     let host = Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), Terms::new(1))

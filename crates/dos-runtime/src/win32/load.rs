@@ -123,7 +123,7 @@ pub fn load(file: &[u8]) -> io::Result<Loaded> {
         })
         .collect();
 
-    let mut mem = Memory::new(image, ARENA_LEN)?;
+    let mut mem = Memory::with_image(image, ARENA_LEN)?;
     // After this the machine has no stack of its own, which is why every
     // crossing below uses the `_on` forms. `Machine::call` panics rather than
     // silently making a second stack, so the two cannot be mixed by accident.

@@ -92,7 +92,7 @@ fn cpu() -> Wg32Cpu {
     let file = minimal_with_one_section();
     let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
     let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
-    let mem = mbbs_machine::m32::Memory::new(image, 0x1000).expect("arena mapping");
+    let mem = mbbs_machine::m32::Memory::with_image(image, 0x1000).expect("arena mapping");
     let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
     Wg32Cpu::new(machine, mem)
 }
@@ -156,10 +156,10 @@ fn call_reads_a_ptr_int_int_frame_at_32_bit_offsets_not_16_bit_ones() {
 #[test]
 fn call_mem_reborrows_the_same_memory_the_cpu_owns() {
     let mut cpu = cpu();
-    let want = cpu.mem.image().base();
+    let want = cpu.mem.image().expect("image").base();
 
     let mut call = Call::<Wg32>::new(&mut cpu, &[]);
-    assert_eq!(call.mem().image().base(), want);
+    assert_eq!(call.mem().image().expect("image").base(), want);
 }
 
 /// `Abi::data_ptr` names the module's own image base -- the same answer an
@@ -168,7 +168,7 @@ fn call_mem_reborrows_the_same_memory_the_cpu_owns() {
 #[test]
 fn data_ptr_is_the_images_own_base() {
     let cpu = cpu();
-    assert_eq!(Wg32::data_ptr(&cpu), mbbs_machine::m32::Flat32Ptr(cpu.mem.image().base()));
+    assert_eq!(Wg32::data_ptr(&cpu), mbbs_machine::m32::Flat32Ptr(cpu.mem.image().expect("image").base()));
 }
 
 /// `ModuleMem::alloc_region` reaches `mbbs_machine::m32::Memory`'s real allocator -- not
@@ -183,7 +183,7 @@ fn alloc_region_reaches_the_real_arena() {
     let mut cpu = cpu();
     let ptr = ModuleMem::alloc_region(&mut cpu.mem, 8).expect("8 bytes fit");
     assert!(
-        ptr.0.wrapping_sub(cpu.mem.image().base()) >= SIZE_OF_IMAGE,
+        ptr.0.wrapping_sub(cpu.mem.image().expect("image").base()) >= SIZE_OF_IMAGE,
         "an allocated region must not land inside the image"
     );
 }
@@ -434,7 +434,7 @@ fn alcmem_and_alczer_still_pack_ordinary_wg32_sizes() {
     let file = minimal_with_one_section();
     let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
     let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
-    let mem = mbbs_machine::m32::Memory::new(image, 256 * 1024).expect("arena mapping");
+    let mem = mbbs_machine::m32::Memory::with_image(image, 256 * 1024).expect("arena mapping");
     let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
     let mut cpu = Wg32Cpu::new(machine, mem);
 
@@ -499,7 +499,7 @@ fn alcblok32_answers_majormud_nts_own_call_and_frees_cleanly() {
     let file = minimal_with_one_section();
     let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
     let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
-    let mem = mbbs_machine::m32::Memory::new(image, 4 * 1024 * 1024).expect("arena mapping");
+    let mem = mbbs_machine::m32::Memory::with_image(image, 4 * 1024 * 1024).expect("arena mapping");
     let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
     let mut cpu = Wg32Cpu::new(machine, mem);
 
@@ -573,7 +573,7 @@ fn alcblok32_reads_a_ushort_qty_and_ignores_the_callers_stale_high_half() {
     let file = minimal_with_one_section();
     let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
     let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
-    let mem = mbbs_machine::m32::Memory::new(image, 4 * 1024 * 1024).expect("arena mapping");
+    let mem = mbbs_machine::m32::Memory::with_image(image, 4 * 1024 * 1024).expect("arena mapping");
     let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
     let mut cpu = Wg32Cpu::new(machine, mem);
 
@@ -645,7 +645,7 @@ fn ptrblok32_reads_a_ushort_idx_and_ignores_the_callers_stale_high_half() {
     let file = minimal_with_one_section();
     let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
     let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
-    let mem = mbbs_machine::m32::Memory::new(image, 4 * 1024 * 1024).expect("arena mapping");
+    let mem = mbbs_machine::m32::Memory::with_image(image, 4 * 1024 * 1024).expect("arena mapping");
     let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
     let mut cpu = Wg32Cpu::new(machine, mem);
 
@@ -775,7 +775,7 @@ mod boot_bug {
         let module = Wg32::load(&mut cpu, &file, &no_host)
             .expect("LunatiX's own imports all bind -- unresolved ones just get a thunk");
 
-        let base = cpu.mem.image().base();
+        let base = cpu.mem.images().last().expect("just loaded").base();
         let got = <Wg32 as Abi>::init_entry(&module).expect("LunatiX exports ordinal 1");
 
         assert_eq!(
@@ -956,7 +956,7 @@ mod exports {
         let file = exporting(&[("_alpha", 0x1300), ("_beta", 0x1310)]);
         let mut cpu = cpu();
         let module = Wg32::load(&mut cpu, &file, &no_host).expect("a PE with no imports loads");
-        let base = cpu.mem.image().base();
+        let base = cpu.mem.images().last().expect("just loaded").base();
 
         assert_eq!(
             <Wg32 as Abi>::export_address(&module, &name("_alpha")),
@@ -976,7 +976,7 @@ mod exports {
         let file = exporting(&[("_alpha", 0x1300), ("_beta", 0x1310)]);
         let mut cpu = cpu();
         let module = Wg32::load(&mut cpu, &file, &no_host).expect("a PE with no imports loads");
-        let base = cpu.mem.image().base();
+        let base = cpu.mem.images().last().expect("just loaded").base();
         let ordinal = mbbs_machine::module::Symbol::Ordinal;
 
         assert_eq!(
@@ -1004,7 +1004,7 @@ mod exports {
         let mut cpu = cpu();
         let module = Wg32::load(&mut cpu, &file, &no_host)
             .expect("MajorMUD NT's imports all bind -- unresolved ones just get a thunk");
-        let base = cpu.mem.image().base();
+        let base = cpu.mem.images().last().expect("just loaded").base();
         let at = |rva: u32| Some(mbbs_machine::m32::Flat32Ptr(base + rva));
 
         assert_eq!(<Wg32 as Abi>::export_address(&module, &name("_get_item_from_name")), at(0x1ad5c));

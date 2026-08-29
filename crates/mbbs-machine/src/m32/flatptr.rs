@@ -8,7 +8,7 @@
 //! mapping's own base, not by being one directly. Which mapping contains it
 //! is [`Memory`]'s question to answer (`Memory::read_at`/`write_at`/
 //! `tail_from`), not this module's -- see that type's own doc comment for
-//! why the image and the arena are two separate `Mapping`s rather than one.
+//! why each image and the arena are separate `Mapping`s rather than one.
 //!
 //! **Constructible only from a linear address, never from another
 //! pointer type's bits.** `FarPtr` is also 32 bits total
@@ -159,7 +159,7 @@ mod tests {
     /// against -- `TEST_ARENA_LEN` bytes of arena that none of these tests
     /// exercise (they are all about the image half).
     fn mem(file: &[u8]) -> Memory {
-        Memory::new(load(file), TEST_ARENA_LEN).expect("arena mapping")
+        Memory::with_image(load(file), TEST_ARENA_LEN).expect("arena mapping")
     }
 
     #[test]
@@ -171,7 +171,7 @@ mod tests {
         let image = mem(&file);
 
         // `Mapping::new` (map.rs) never asks mmap for a fixed address --
-        // `MAP_32BIT`, no `MAP_FIXED` -- so `image.image().base()` is a real,
+        // `MAP_32BIT`, no `MAP_FIXED` -- so `image.image().expect("image").base()` is a real,
         // kernel-chosen address. It is never 0 (Linux refuses to hand back
         // the zero page), and it dwarfs this fixture's rva scale (a few
         // KiB). That is exactly the property `Image::relocate`'s own
@@ -184,7 +184,7 @@ mod tests {
         // implementation that actually computes `self.0 - base` can pass
         // this.
         let rva = 0x1010u32;
-        let base = image.image().base();
+        let base = image.image().expect("image").base();
         assert_ne!(base, 0, "a real mmap base is never the null address");
         assert!(
             base > SIZE_OF_IMAGE,
@@ -201,7 +201,7 @@ mod tests {
         let file = minimal_with_one_section();
         let image = mem(&file);
 
-        let ptr = Flat32Ptr(image.image().base() + SIZE_OF_IMAGE);
+        let ptr = Flat32Ptr(image.image().expect("image").base() + SIZE_OF_IMAGE);
         let err = ptr.resolve(&image, 1).unwrap_err();
         assert_eq!(err, Flat32PtrError::OutOfBounds { addr: ptr.0, len: 1 });
     }
@@ -214,7 +214,7 @@ mod tests {
         file[RAW_OFFSET + 0x26] = b'X';
         let image = mem(&file);
 
-        let ptr = Flat32Ptr(image.image().base() + 0x1020);
+        let ptr = Flat32Ptr(image.image().expect("image").base() + 0x1020);
         assert_eq!(ptr.read_cstr(&image).unwrap(), b"hello");
     }
 
@@ -230,12 +230,10 @@ mod tests {
         // `read_cstr`'s "ran off the end" path is exercised at all.
         let rva = 0x1000u32;
         let tail_len = (SIZE_OF_IMAGE - rva) as usize;
-        image
-            .image_mut()
-            .write_at(rva, &vec![0xAAu8; tail_len])
-            .unwrap();
+        let base = image.image().expect("image").base();
+        image.write_at(base + rva, &vec![0xAAu8; tail_len]).expect("in bounds");
 
-        let ptr = Flat32Ptr(image.image().base() + rva);
+        let ptr = Flat32Ptr(base + rva);
         let err = ptr.read_cstr(&image).unwrap_err();
         assert_eq!(err, Flat32PtrError::Unterminated { addr: ptr.0 });
     }
@@ -248,7 +246,7 @@ mod tests {
         let file = minimal_with_one_section();
         let image = mem(&file);
 
-        let ptr = Flat32Ptr(image.image().base() + SIZE_OF_IMAGE);
+        let ptr = Flat32Ptr(image.image().expect("image").base() + SIZE_OF_IMAGE);
         let err = ptr.read_cstr(&image).unwrap_err();
         assert_eq!(err, Flat32PtrError::OutOfBounds { addr: ptr.0, len: 1 });
     }
@@ -266,9 +264,10 @@ mod tests {
         let mut image = mem(&file);
 
         let rva = SIZE_OF_IMAGE - 1;
-        image.image_mut().write_at(rva, &[0xAA]).unwrap();
+        let base = image.image().expect("image").base();
+        image.write_at(base + rva, &[0xAA]).expect("in bounds");
 
-        let ptr = Flat32Ptr(image.image().base() + rva);
+        let ptr = Flat32Ptr(base + rva);
         let err = ptr.read_cstr(&image).unwrap_err();
         assert_eq!(err, Flat32PtrError::Unterminated { addr: ptr.0 });
     }
@@ -278,7 +277,7 @@ mod tests {
         let file = minimal_with_one_section();
         let mut image = mem(&file);
 
-        let ptr = Flat32Ptr(image.image().base() + 0x1030);
+        let ptr = Flat32Ptr(image.image().expect("image").base() + 0x1030);
         ptr.write(&mut image, &[1, 2, 3, 4]).unwrap();
         assert_eq!(ptr.resolve(&image, 4).unwrap(), &[1, 2, 3, 4]);
     }
@@ -294,7 +293,7 @@ mod tests {
         let file = minimal_with_one_section();
         let mut image = mem(&file);
 
-        let ptr = Flat32Ptr(image.image().base() + SIZE_OF_IMAGE);
+        let ptr = Flat32Ptr(image.image().expect("image").base() + SIZE_OF_IMAGE);
         let err = ptr.write(&mut image, &[0]).unwrap_err();
         assert_eq!(err, Flat32PtrError::OutOfBounds { addr: ptr.0, len: 1 });
     }

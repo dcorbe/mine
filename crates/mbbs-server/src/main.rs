@@ -304,35 +304,32 @@ fn format_name(format: Format) -> &'static str {
     }
 }
 
-/// Build [`Boot::build`]'s closure for a `Wg32` machine: read `module_path`'s
-/// bytes, parse them as a PE, and build a placeholder [`Wg32Cpu`] -- a
-/// [`mbbs_machine::m32::Machine`] plus a [`mbbs_machine::m32::Memory`]
-/// wrapping this same file's own [`mbbs_machine::m32::Image`], exactly the
-/// shape `crates/mbbs/tests/wg32_round_trip.rs`'s `machine_and_placeholder`
-/// builds from a synthetic fixture -- this one is real. `host::life` (in
-/// `mbbs-server/src/host.rs`) reads `boot.modules[0]` (the same path, and
-/// today the *only* path -- see `plan` on why this binary refuses more than
-/// one) again immediately after this runs and calls
-/// `host.load`, whose `Wg32::load`
-/// replaces this placeholder image wholesale via
-/// [`mbbs_machine::m32::Memory::replace_image`] while leaving the arena this
-/// closure reserved untouched -- see that method's own doc comment, and
-/// `wg32_round_trip.rs`'s module doc, "The load-order hazard this file first
-/// exposed, now fixed". Building the placeholder from the module's own
-/// bytes, rather than a throwaway skeleton, means a file that cannot even be
-/// read or parsed as a PE fails here, on `Boot::build`, with the same error
-/// `host.load` would otherwise report one line later.
+/// Build [`Boot::build`]'s closure for a `Wg32` machine: an empty
+/// [`Wg32Cpu`] -- a [`mbbs_machine::m32::Machine`] plus an empty
+/// [`mbbs_machine::m32::Memory`], no image yet. `host::life` (in
+/// `mbbs-server/src/host.rs`) reads `boot.modules[0]` (and today the *only*
+/// path -- see `plan` on why this binary refuses more than one) immediately
+/// after this runs and calls `host.load`, whose `Wg32::load` pushes the real
+/// image onto this same `cpu.mem`, leaving the arena this closure reserved
+/// untouched.
+///
+/// Provisional, pending Task 3 of
+/// `docs/plans/2026-08-29-wg32-n-module-boot`: `Memory::new` no longer
+/// requires an image up front (Task 1), so the placeholder this closure used
+/// to build from `module_path`'s own bytes -- solely to fail fast on a file
+/// that cannot even be read or parsed as a PE -- is gone along with it.
+/// `std::fs::read` below still catches an unreadable file here; a file that
+/// reads but does not parse as PE32 now surfaces one step later, from
+/// `host.load` itself.
 ///
 /// `Fn`, not `FnOnce`: [`host::run`]'s restart loop calls [`Boot::build`]
 /// once per life (see its own doc comment, "Surviving a module stop"), so
-/// this closure re-reads and re-parses the file every restart rather than
-/// only once at process start.
+/// this closure re-reads the file every restart rather than only once at
+/// process start.
 fn build_wg32_cpu(module_path: PathBuf) -> impl Fn() -> io::Result<Wg32Cpu> + Send {
     move || {
-        let file = std::fs::read(&module_path)?;
-        let pe = mbbs_machine::m32::PeImage::parse(&file).map_err(io::Error::other)?;
-        let image = mbbs_machine::m32::Image::load(&file, &pe)?;
-        let mem = mbbs_machine::m32::Memory::new(image, DEFAULT_WG32_ARENA_BYTES)?;
+        std::fs::read(&module_path)?;
+        let mem = mbbs_machine::m32::Memory::new(DEFAULT_WG32_ARENA_BYTES)?;
         let machine = mbbs_machine::m32::Machine::new()?;
         Ok(Wg32Cpu::new(machine, mem))
     }

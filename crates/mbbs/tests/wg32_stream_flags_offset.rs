@@ -84,7 +84,7 @@ fn cpu() -> Wg32Cpu {
     let file = minimal_with_one_section();
     let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
     let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
-    let mem = mbbs_machine::m32::Memory::new(image, 128 * 1024).expect("arena mapping");
+    let mem = mbbs_machine::m32::Memory::with_image(image, 128 * 1024).expect("arena mapping");
     let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
     Wg32Cpu::new(machine, mem)
 }

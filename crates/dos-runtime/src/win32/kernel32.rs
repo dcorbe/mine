@@ -88,7 +88,13 @@ pub fn dispatch(
     // past the stack, and the first frame of all sits near the top of it.
     match symbol {
         // GetModuleHandleA(LPCSTR)
-        "GetModuleHandleA" => Some(Answer::stdcall(get_module_handle_a(mem.image().base()), 1)),
+        "GetModuleHandleA" => {
+            let base = mem
+                .image()
+                .expect("a PE program always has its image loaded before any import is answered")
+                .base();
+            Some(Answer::stdcall(get_module_handle_a(base), 1))
+        }
         // OpenEventA(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCSTR lpName)
         "OpenEventA" => {
             let name_ptr = machine.arg_u32(mem.stack(), 2);
@@ -818,7 +824,9 @@ fn virtual_query(mem: &mut Memory, address: u32, out: u32, len: u32) -> u32 {
 /// and the program dutifully printed that. A real `VirtualQuery` reads the
 /// kernel's list of mappings; so does this.
 fn mappings(mem: &Memory) -> Vec<(u32, u32)> {
-    let image = mem.image();
+    let image = mem
+        .image()
+        .expect("a PE program always has its image loaded before any import is answered");
     let image_len = u32::try_from(image.as_slice().len()).unwrap_or(0);
     let (arena, arena_len) = mem.arena_range();
     let (stack, stack_len) = mem.stack_range();
@@ -1437,7 +1445,11 @@ mod tests {
     fn get_module_handle_a_pops_its_own_argument_and_answers_the_base() {
         let mut l = loaded();
         let mut p = Process::new("X.EXE", &[]);
-        let base = l.mem.image().base();
+        let base = l
+            .mem
+            .image()
+            .expect("a PE program always has its image loaded before any import is answered")
+            .base();
         let a = dispatch(&mut p, &mut l.machine, &mut l.mem, "GetModuleHandleA")
             .expect("implemented");
         assert_eq!(a.value, base, "a module handle is the image base");
@@ -1501,7 +1513,11 @@ mod memory_tests {
     #[test]
     fn every_region_is_page_aligned_and_never_zero() {
         let l = loaded();
-        let base = l.mem.image().base();
+        let base = l
+            .mem
+            .image()
+            .expect("a PE program always has its image loaded before any import is answered")
+            .base();
         for addr in [
             0,
             0x1000,
@@ -1536,7 +1552,11 @@ mod memory_tests {
     #[test]
     fn the_image_is_found_rather_than_stepped_over() {
         let l = loaded();
-        let base = l.mem.image().base();
+        let base = l
+            .mem
+            .image()
+            .expect("a PE program always has its image loaded before any import is answered")
+            .base();
 
         let inside = describe_region(&l.mem, base);
         assert_eq!(field(&inside, 16), 0x1000, "MEM_COMMIT inside the image");

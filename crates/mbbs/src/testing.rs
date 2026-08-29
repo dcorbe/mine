@@ -393,17 +393,20 @@ impl Fixture<Wg32> {
     /// Builds a real `mbbs_machine::m32::Machine` (thunk table, TIB, fault
     /// recovery armed) over an inert placeholder image -- [`wg32_skeleton`]
     /// -- the same construction `crates/mbbs/tests/wg32_abi.rs`'s own `cpu()`
-    /// and `crates/mbbs/tests/wg32_round_trip.rs`'s `machine_and_placeholder`
-    /// use. No module is ever loaded through it: every
+    /// uses. No module is ever loaded through it: every
     /// [`Fixture::invoke_wg32`](Fixture::invoke_wg32) call here reaches a
     /// shim directly, through a hand-built [`Call`], never through
     /// `Host::run`'s dispatch -- so the placeholder image is never entered
-    /// and never needs to be anything but parseable.
+    /// and never needs to be anything but parseable. Unlike
+    /// `crates/mbbs/tests/wg32_round_trip.rs`'s `machine_and_placeholder`
+    /// (which does load a module through it, so the placeholder there is
+    /// gone -- `Memory::new` needs no image at all), a placeholder is still
+    /// the right shape here.
     pub fn rooted_wg32(root: PathBuf) -> Self {
         let file = wg32_skeleton();
         let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture PE parses");
         let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture PE loads");
-        let mem = mbbs_machine::m32::Memory::new(image, WG32_ARENA).expect("arena mapping");
+        let mem = mbbs_machine::m32::Memory::with_image(image, WG32_ARENA).expect("arena mapping");
         let machine = mbbs_machine::m32::Machine::new().expect("32-bit machine");
         let mut cpu = Wg32Cpu::new(machine, mem);
         let mut host =

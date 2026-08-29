@@ -36,7 +36,7 @@
 
 use mbbs::abi::{Wg32, Wg32Cpu};
 use mbbs::{Host, Kick, Outcome, Terms};
-use mbbs_machine::m32::{Flat32Ptr, Image, Machine, Memory, PeImage, Poison};
+use mbbs_machine::m32::{Flat32Ptr, Machine, Memory, Poison};
 
 /// Byte-for-byte `wg32_round_trip.rs`'s own `SIZE_OF_IMAGE`/`put_u32`/
 /// `put_bytes`/`skeleton`/`module_with_import` -- duplicated per this crate
@@ -151,10 +151,7 @@ fn calls_rtkick(thunk: u32, delay: u32, dstrou: u32) -> Vec<u8> {
 }
 
 fn machine_and_placeholder() -> Wg32Cpu {
-    let file = skeleton();
-    let pe = PeImage::parse(&file).expect("fixture parses");
-    let image = Image::load(&file, &pe).expect("fixture loads");
-    let mem = Memory::new(image, 0x0002_0000).expect("arena mapping");
+    let mem = Memory::new(0x0002_0000).expect("arena mapping");
     let machine = Machine::new().expect("thunk table, TIB, fault recovery");
     Wg32Cpu::new(machine, mem)
 }

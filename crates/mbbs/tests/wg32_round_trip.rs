@@ -114,21 +114,24 @@
 //! discarding it the instant `load` returned, and building a *second*
 //! `Host<Wg32>` against the now-final, now-stable `cpu.mem`.
 //!
-//! **The fix has since landed.** `Wg32::load` now calls
-//! [`mbbs_machine::m32::Memory::replace_image`], which swaps in the freshly
-//! loaded `Image` while leaving `cpu.mem`'s arena -- and every pointer
-//! already carved out of it -- untouched (see that method's own doc
-//! comment, and `Abi::load`'s own doc comment in `crates/mbbs/src/abi.rs`,
-//! which now states the invariant this closes generally: loading a module
-//! must never invalidate a pointer `ModuleMem::alloc_region` already
-//! returned). [`load_module_and_host`] below builds exactly one
+//! **The fix has since landed.** `Wg32::load` pushes the freshly loaded
+//! `Image` onto `cpu.mem` (`mbbs_machine::m32::Memory::push_image`) while
+//! leaving `cpu.mem`'s arena -- and every pointer already carved out of it
+//! -- untouched (see `Abi::load`'s own doc comment in
+//! `crates/mbbs/src/abi.rs`, which states the invariant this closes
+//! generally: loading a module must never invalidate a pointer
+//! `ModuleMem::alloc_region` already returned). [`machine_and_placeholder`]
+//! below now builds `cpu.mem` with no image at all -- `Memory::new` no
+//! longer requires one -- so the module `push_image` appends is the first
+//! and only one, exactly the shape `Memory::image()` (still "the first
+//! image loaded") expects. [`load_module_and_host`] builds exactly one
 //! `Host<Wg32>`, the same order `host.rs` always used for `Wg16` and the
 //! order that used to be unsafe here -- the workaround is gone because the
 //! gap it worked around is closed, not merely papered over again.
 
 use mbbs::abi::{Arg, ModuleMem, Wg32, Wg32Cpu};
 use mbbs::{Host, Outcome, Terms};
-use mbbs_machine::m32::{Flat32Ptr, Image, Machine, Memory, PeImage};
+use mbbs_machine::m32::{Flat32Ptr, Machine, Memory};
 use mbbs_machine::ptr::ModulePtr;
 
 /// `size_of_image`, generous enough that a one-section image with a whole
@@ -272,19 +275,15 @@ fn calls_unimplemented(thunk: u32) -> Vec<u8> {
     code
 }
 
-/// A `Machine`, and a `Wg32Cpu` bundling it with a small placeholder
-/// `Memory` -- large enough only to exist, since [`load_module_and_host`]
-/// replaces it wholesale. Built first, on its own, so
-/// [`Machine::thunk_addr`] is known (stable from `Machine::new` onward,
-/// independent of `cpu.mem` -- the thunk table lives in `Machine`'s own
-/// `bridge` mapping, never in `Memory`) before any module file is even
-/// assembled -- every `calls_*` helper above needs the target thunk address
-/// baked into the module's own code before that code exists.
+/// A `Machine`, and a `Wg32Cpu` bundling it with an empty `Memory` --
+/// [`load_module_and_host`] pushes the real image onto it via `host.load`.
+/// Built first, on its own, so [`Machine::thunk_addr`] is known (stable from
+/// `Machine::new` onward, independent of `cpu.mem` -- the thunk table lives
+/// in `Machine`'s own `bridge` mapping, never in `Memory`) before any module
+/// file is even assembled -- every `calls_*` helper above needs the target
+/// thunk address baked into the module's own code before that code exists.
 fn machine_and_placeholder() -> Wg32Cpu {
-    let file = skeleton();
-    let pe = PeImage::parse(&file).expect("fixture parses");
-    let image = Image::load(&file, &pe).expect("fixture loads");
-    let mem = Memory::new(image, 0x0002_0000).expect("arena mapping");
+    let mem = Memory::new(0x0002_0000).expect("arena mapping");
     let machine = Machine::new().expect("thunk table, TIB, fault recovery");
     Wg32Cpu::new(machine, mem)
 }

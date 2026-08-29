@@ -22,7 +22,7 @@
 
 use mbbs::abi::{Wg32, Wg32Cpu};
 use mbbs::{Host, Outcome, Terms};
-use mbbs_machine::m32::{Flat32Ptr, Image, Machine, Memory, PeImage, Poison};
+use mbbs_machine::m32::{Flat32Ptr, Machine, Memory, Poison};
 
 const SIZE_OF_IMAGE: u32 = 0x0000_2000;
 
@@ -71,24 +71,14 @@ fn module_with_code(code: &[u8]) -> Vec<u8> {
 }
 
 /// A `Wg32Cpu` ready to load: a real `Machine` (thunk table, TIB, fault
-/// recovery armed), and a placeholder `Memory` large enough for
-/// `Host::new`'s own buffers -- see `wg32_round_trip.rs`'s module doc
-/// comment, "The load-order hazard", for why a `Host<Wg32>` built before
-/// `load` must normally be discarded and rebuilt afterward. Irrelevant to
-/// *this* test: a `hlt` module faults on its very first instruction, before
-/// it ever calls a shim, so no host-owned buffer is ever touched -- one
-/// ordinary `Host::new` before `load` is enough here.
+/// recovery armed), and an empty `Memory` -- see `wg32_round_trip.rs`'s
+/// module doc comment, "The load-order hazard", for why a `Host<Wg32>`
+/// built before `load` must normally be discarded and rebuilt afterward.
+/// Irrelevant to *this* test: a `hlt` module faults on its very first
+/// instruction, before it ever calls a shim, so no host-owned buffer is ever
+/// touched -- one ordinary `Host::new` before `load` is enough here.
 fn cpu_module_and_host(code: &[u8]) -> (Wg32Cpu, mbbs_machine::m32::Module, Host<Wg32>) {
-    let placeholder_file = {
-        // The same minimal, import-free skeleton `module_with_code` builds,
-        // just not yet holding the real (faulting) code -- only used to
-        // stand up a `Memory` big enough for `Host::new`'s own allocations
-        // before the real module is loaded over it.
-        module_with_code(&[0xc3]) // ret -- never entered
-    };
-    let pe = PeImage::parse(&placeholder_file).expect("fixture parses");
-    let image = Image::load(&placeholder_file, &pe).expect("fixture loads");
-    let mem = Memory::new(image, 0x0002_0000).expect("arena mapping");
+    let mem = Memory::new(0x0002_0000).expect("arena mapping");
     let machine = Machine::new().expect("thunk table, TIB, fault recovery");
     let mut cpu = Wg32Cpu::new(machine, mem);
 
