@@ -10,53 +10,13 @@
 //! **One `Pool` per machine, never shared.** `crates/mbbs-server/src/host.rs`'s
 //! `life` builds a fresh `Pool` every life, on the one thread that owns that
 //! life's `A::Cpu` -- see `crates/mbbs-server/src/conn.rs`'s module doc,
-//! "One `serve` call is one machine". A `Chan`'s value alone is therefore
-//! only meaningful *within* the machine that handed it out: two machines
-//! both number their channels from zero, and this module has no way to tell
-//! one machine's channel zero from another's just by looking at a `Chan` --
-//! that is a fact about whichever `Pool` a caller is holding, not something
-//! a `Chan` carries.
-//!
-//! **[`MachineId`] and [`Routed`] are that fact, made a value.** Task 20 of
-//! `docs/plans/2026-08-12-abi-border-implementation.md` built the pairing
-//! the paragraph above only used to describe: whoever builds a
-//! `crate::conn::Machine` assigns one `MachineId` per machine
-//! (`crate::host::Boot::machine`), and [`Pool::take`] hands back a `Routed`
-//! -- the id plus the `Chan` -- rather than a bare `Chan`. That is the
-//! actual process-wide key wherever a connection gets mapped to a host:
-//! `crate::msg::In::Connect`'s reply and `In::Input`/`In::Disconnect`'s
-//! `chan` field all carry `Routed`, and `crate::conn`'s per-connection state
-//! holds one for the connection's whole life. Task 22 (same plan) built the
-//! registry and the connect-time selector this comment used to say did not
-//! exist yet -- `main.rs` may now call `conn::spawn_machine` more than once
-//! and hand every result to one `conn::serve_on` call, so a running process
-//! can genuinely mint `Routed` values with different `MachineId`s; see
-//! `crate::conn`'s own module doc, "The connect-time selector".
+//! "One `serve` call is one machine". There is one machine per
+//! `mbbs-server` process, so a `Chan`'s value is the connection's identity
+//! for the whole process, not just within one `Pool`.
 
 use std::collections::VecDeque;
 
 use mbbs::{Chan, Terms};
-
-/// Which machine's `serve` call a [`Chan`] belongs to, process-wide.
-///
-/// Assigned once by whoever calls `crate::conn::serve` -- `main.rs` today,
-/// always the same id, since only one machine boots -- never invented by a
-/// `Pool` itself. See the module doc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MachineId(pub u16);
-
-/// A connection's identity, process-wide: which machine's [`Pool`] handed
-/// `chan` out, plus the `chan` itself.
-///
-/// A bare [`Chan`] is only unique *within* the `Pool` that issued it (see the
-/// module doc) -- this is the actual key everywhere a connection is mapped
-/// to a host: [`Pool::take`]'s answer, `crate::msg::In::Connect`'s reply, and
-/// `In::Input`/`In::Disconnect`'s `chan` field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Routed {
-    pub machine: MachineId,
-    pub chan: Chan,
-}
 
 /// The free channels, **oldest free first**.
 ///
@@ -80,9 +40,6 @@ pub struct Routed {
 /// test to think of them. It also means the first connection gets channel
 /// zero, which is what every fixture and doc in `crates/mbbs` assumes.
 pub struct Pool {
-    /// The id every [`Chan`] this pool hands out gets tagged with -- see
-    /// [`Routed`] and the module doc.
-    machine: MachineId,
     free: VecDeque<Chan>,
     /// Whether channel `i` (by [`Chan::index`]) is currently out with a
     /// connection. The only thing [`Pool::give_back`] consults to decide
@@ -91,37 +48,20 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// Every channel of `terms`, all free, lowest first, all belonging to
-    /// `machine`.
+    /// Every channel of `terms`, all free, lowest first.
     #[must_use]
-    pub fn new(machine: MachineId, terms: Terms) -> Self {
+    pub fn new(terms: Terms) -> Self {
         Self {
-            machine,
             free: terms.all().collect(),
             taken: vec![false; terms.count().into()],
         }
     }
 
-    /// A free channel, tagged with this pool's [`MachineId`], or `None` if
-    /// every line is busy.
-    pub fn take(&mut self) -> Option<Routed> {
+    /// A free channel, or `None` if every line is busy.
+    pub fn take(&mut self) -> Option<Chan> {
         let chan = self.free.pop_front()?;
         self.taken[chan.index()] = true;
-        Some(Routed { machine: self.machine, chan })
-    }
-
-    /// Pair a [`Chan`] this pool already knows is its own with this pool's
-    /// [`MachineId`].
-    ///
-    /// For a caller inside this crate that only ever has a bare `Chan` in
-    /// hand because it is walking *this* pool's own channels (`host.rs`'s
-    /// `flush`, sweeping `Terms::all()`) rather than answering an
-    /// externally-sourced [`Routed`] message -- unlike [`Pool::give_back`],
-    /// which is the guarded entry point for a `Routed` a caller received
-    /// from somewhere else and must not simply trust.
-    #[must_use]
-    pub fn key(&self, chan: Chan) -> Routed {
-        Routed { machine: self.machine, chan }
+        Some(chan)
     }
 
     /// Return a channel a connection is done with, behind everything already
@@ -158,41 +98,26 @@ impl Pool {
     /// today, which is fine -- the guarantee holds either way -- but the
     /// signature says honestly that calling `give_back` no longer promises
     /// unconditionally to grow `free` by one.
-    ///
-    /// **Also a no-op for the wrong [`MachineId`].** `routed.machine !=
-    /// self.machine` means this `Routed` was never this pool's to free in
-    /// the first place -- a caller can only construct one from
-    /// `Pool::take`/`Pool::key`, so the only way to reach this arm is a
-    /// message misrouted to the wrong machine's `apply`, and today nothing
-    /// in this crate can do that (`main.rs` calls `conn::serve` once). This
-    /// guard is what makes that true by construction, the same way the
-    /// index guard above makes a double free structurally unreachable
-    /// through this method rather than merely unlikely in practice -- see
-    /// the module doc for why a `Chan`'s value alone cannot tell two
-    /// machines' channel zeros apart.
-    pub fn give_back(&mut self, routed: Routed) -> bool {
-        if routed.machine != self.machine {
-            return false;
-        }
-        let idx = routed.chan.index();
+    pub fn give_back(&mut self, chan: Chan) -> bool {
+        let idx = chan.index();
         if !self.taken[idx] {
             return false;
         }
         self.taken[idx] = false;
-        self.free.push_back(routed.chan);
+        self.free.push_back(chan);
         true
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MachineId, Pool};
+    use super::Pool;
     use mbbs::Terms;
 
     #[test]
     fn a_pool_hands_out_every_channel_once_and_then_refuses() {
         let terms = Terms::new(2);
-        let mut pool = Pool::new(MachineId(0), terms);
+        let mut pool = Pool::new(terms);
         let a = pool.take().expect("first");
         let b = pool.take().expect("second");
         assert_ne!(a, b, "two connections must not share a channel");
@@ -211,11 +136,11 @@ mod tests {
     #[test]
     fn channels_are_reused_oldest_first_and_the_first_caller_gets_zero() {
         let terms = Terms::new(3);
-        let mut pool = Pool::new(MachineId(0), terms);
+        let mut pool = Pool::new(terms);
 
         let first = pool.take().expect("a free channel");
         assert_eq!(
-            first.chan,
+            first,
             terms.chan(0).expect("channel 0"),
             "the first caller gets channel zero, as every fixture in mbbs assumes"
         );
@@ -254,8 +179,8 @@ mod tests {
     #[test]
     fn give_back_on_a_channel_that_was_never_taken_is_a_no_op() {
         let terms = Terms::new(2);
-        let mut pool = Pool::new(MachineId(0), terms);
-        let stray = pool.key(terms.chan(0).expect("channel 0"));
+        let mut pool = Pool::new(terms);
+        let stray = terms.chan(0).expect("channel 0");
 
         assert!(
             !pool.give_back(stray),
@@ -281,7 +206,7 @@ mod tests {
     #[test]
     fn give_back_twice_after_one_take_frees_it_only_once() {
         let terms = Terms::new(1);
-        let mut pool = Pool::new(MachineId(0), terms);
+        let mut pool = Pool::new(terms);
         let a = pool.take().expect("the only channel");
 
         assert!(pool.give_back(a), "the first give_back genuinely frees it");
@@ -297,76 +222,6 @@ mod tests {
             "the duplicate give_back must not have doubled the free list -- \
              this is the exact mechanism by which two clients would end up \
              sharing one channel"
-        );
-    }
-
-    /// Task 20's whole point: two machines' `Pool`s both number their
-    /// channels from zero, and the `Chan` values `take` hands back are
-    /// therefore equal -- but the `Routed` values are not, because they
-    /// carry different `MachineId`s. A `HashSet<Routed>` holding one key
-    /// from each pool has two entries, not one; a `HashSet<mbbs::Chan>`
-    /// built by stripping `.machine` off the same two values would have
-    /// only one -- that collision is exactly the bug a bare `Chan` cannot
-    /// see, see the module doc.
-    #[test]
-    fn two_machines_sharing_a_chan_value_are_routed_distinctly() {
-        use std::collections::HashSet;
-
-        let mut pool_a = Pool::new(MachineId(0), Terms::new(1));
-        let mut pool_b = Pool::new(MachineId(1), Terms::new(1));
-
-        let routed_a = pool_a.take().expect("pool a's only channel");
-        let routed_b = pool_b.take().expect("pool b's only channel");
-
-        assert_eq!(
-            routed_a.chan, routed_b.chan,
-            "both pools number their channels from zero -- the bare Chan really \
-             does collide"
-        );
-        assert_ne!(
-            routed_a, routed_b,
-            "but the Routed keys must not -- they carry different MachineIds"
-        );
-
-        let mut seen = HashSet::new();
-        seen.insert(routed_a);
-        seen.insert(routed_b);
-        assert_eq!(
-            seen.len(),
-            2,
-            "two connections on two different machines' channel zero must occupy \
-             two distinct slots in anything keyed on Routed, not collapse into one"
-        );
-    }
-
-    /// A `Routed` naming the right `Chan` but the wrong `MachineId` must not
-    /// free anything -- the same "no-op, not a crash" contract
-    /// `give_back_on_a_channel_that_was_never_taken_is_a_no_op` pins for an
-    /// untaken channel, but for the other way a `Routed` can be wrong: it
-    /// names a channel that really is taken, just not by this pool.
-    #[test]
-    fn give_back_for_the_wrong_machine_is_a_no_op() {
-        let mut pool_a = Pool::new(MachineId(0), Terms::new(1));
-        let mut pool_b = Pool::new(MachineId(1), Terms::new(1));
-
-        let routed_a = pool_a.take().expect("pool a's only channel");
-        let _routed_b = pool_b.take().expect("pool b's only channel");
-
-        assert!(
-            !pool_b.give_back(routed_a),
-            "pool b must refuse a Routed stamped with pool a's MachineId, even \
-             though the Chan inside it (channel 0) is one pool b also handed out"
-        );
-        assert!(
-            pool_b.take().is_none(),
-            "pool b's channel 0 must still be out -- the wrong-machine give_back \
-             must not have freed it"
-        );
-
-        assert!(
-            pool_a.give_back(routed_a),
-            "pool a must still accept the very same Routed value back -- it is \
-             genuinely pool a's"
         );
     }
 }

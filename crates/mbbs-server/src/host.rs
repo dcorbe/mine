@@ -65,7 +65,7 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 use crate::msg::{In, Out};
-use crate::pool::{MachineId, Pool};
+use crate::pool::Pool;
 
 /// The type [`Boot::extension`] carries -- named so the field itself does
 /// not have to spell out four levels of nesting, and public so a caller
@@ -86,12 +86,6 @@ pub type ExtensionBuilder<A> = Box<dyn Fn(&[(String, <A as Abi>::Module)]) -> io
 /// here and cannot be: it is `!Send`, and the thread builds its own -- see
 /// [`Boot::build`].
 pub struct Boot<A: Abi> {
-    /// This machine's process-wide id -- see `crate::pool`'s module doc.
-    /// Assigned by whoever builds this `Boot` (`main.rs` today, always the
-    /// same id, since only one machine boots); [`life`] hands it straight to
-    /// [`Pool::new`], so every `Chan` this machine's `Pool` takes comes back
-    /// tagged with it.
-    pub machine: MachineId,
     /// Build a fresh `A::Cpu`, called on the host thread itself, once per
     /// life (see the module doc's "Surviving a module stop").
     ///
@@ -207,12 +201,12 @@ pub struct Boot<A: Abi> {
     /// This is a pre-existing fact about cross-module calls (true since
     /// `071c5a0`, not introduced by N-module boot) that N-module-per-machine
     /// boot is simply the first feature to actually exercise -- a single
-    /// module never crosses into another's code at all, and neither does two
-    /// modules on two *separate* machines (this repository's only other
-    /// multi-module configuration, `--module32`'s own `Wg32` machine, has its
-    /// own separate `Machine`/thunk table entirely). Not something this stage
-    /// claims to fix; recorded here, with the real run that found it, rather
-    /// than assumed away.
+    /// module never crosses into another's code at all, and `--module32`
+    /// boots its own separate `Machine`/thunk table on its own separate
+    /// process entirely (one machine per `mbbs-server` process; two boards
+    /// are two processes, not two machines sharing this one). Not something
+    /// this stage claims to fix; recorded here, with the real run that found
+    /// it, rather than assumed away.
     pub modules: Vec<PathBuf>,
     /// The fixed channel count. Sizes every per-channel table at `Host::new`.
     pub terms: Terms,
@@ -227,8 +221,9 @@ pub struct Boot<A: Abi> {
     /// modules key their own licensing on it, and a module that finds it
     /// blank cannot tell a board apart from any other.
     ///
-    /// Set per machine rather than per process because two machines on one
-    /// server are two boards; nothing says they share a serial.
+    /// One machine per `mbbs-server` process, so this is really set per
+    /// board: two boards are two processes, each with its own `Boot` and its
+    /// own serial.
     pub bturno: Option<String>,
     /// Poll firings granted per elapsed second. Set once, at boot, via
     /// [`mbbs::Host::set_polls_per_second`] -- the clock inside
@@ -555,7 +550,6 @@ fn census_interval() -> Option<Duration> {
 /// two conditions, not one shared early return.
 fn report_census<A: Abi>(
     host: &mut mbbs::Host<A>,
-    who: MachineId,
     due: &mut Instant,
     every: Option<Duration>,
     turns: &mut u64,
@@ -571,15 +565,10 @@ fn report_census<A: Abi>(
     *worst_turn = Duration::ZERO;
     let census = host.take_census();
     let secs = every.as_secs_f64();
-    // Named, because a board runs one of these per machine on its own thread
-    // and both write to the same stderr. Two modules' censuses interleaved
-    // under one label read as one module changing behaviour every ten
-    // seconds, which is a conclusion the numbers do not support.
     if census.polls > 0 {
         eprintln!(
-            "mbbs-server: census[m{who}]: {polls} polls ({rate:.0}/s), {barren} barren \
+            "mbbs-server: census: {polls} polls ({rate:.0}/s), {barren} barren \
              ({barren_pct:.1}%), {calls:.1} host calls each, worst {worst}",
-            who = who.0,
             polls = census.polls,
             rate = census.polls as f64 / secs,
             barren = census.barren,
@@ -590,9 +579,8 @@ fn report_census<A: Abi>(
     }
     if loops > 0 {
         eprintln!(
-            "mbbs-server: census[m{who}]: {loops} driver turns, \
+            "mbbs-server: census: {loops} driver turns, \
              worst cycle {longest:.0?} -- that is the ceiling on input latency",
-            who = who.0,
         );
     }
 }
@@ -615,7 +603,6 @@ fn shut_down<A: Abi>(
     host: &mut mbbs::Host<A>,
     machine: &mut A::Cpu,
     module: &A::Module,
-    who: MachineId,
     conns: &mut [Option<Sender<Out>>],
     terms: Terms,
 ) {
@@ -624,7 +611,7 @@ fn shut_down<A: Abi>(
             continue;
         }
         if let Err(e) = host.hangup(machine, module, chan) {
-            eprintln!("mbbs-server: shutdown[m{}]: hanging up channel {chan}: {e}", who.0);
+            eprintln!("mbbs-server: shutdown: hanging up channel {chan}: {e}");
         }
         if let Some(conn) = conns[chan.index()].as_ref() {
             let _ = conn.try_send(Out::Close);
@@ -635,16 +622,14 @@ fn shut_down<A: Abi>(
     let mut dispatched = 0;
     match host.finalize(machine, module, &mut dispatched) {
         Ok(None) => {
-            eprintln!("mbbs-server: shutdown[m{}]: {dispatched} module(s) finalised", who.0);
+            eprintln!("mbbs-server: shutdown: {dispatched} module(s) finalised");
         }
         Ok(Some(poison)) => eprintln!(
-            "mbbs-server: shutdown[m{}]: a module stopped during its own finrou after \
-             {dispatched} finalised: {poison:?}",
-            who.0
+            "mbbs-server: shutdown: a module stopped during its own finrou after \
+             {dispatched} finalised: {poison:?}"
         ),
         Err(e) => eprintln!(
-            "mbbs-server: shutdown[m{}]: finrou sweep failed after {dispatched}: {e}",
-            who.0
+            "mbbs-server: shutdown: finrou sweep failed after {dispatched}: {e}"
         ),
     }
 
@@ -653,8 +638,8 @@ fn shut_down<A: Abi>(
     // whatever a module leaves dirty rather than assuming every module
     // closed everything itself.
     match host.close_btrieve() {
-        Ok(n) => eprintln!("mbbs-server: shutdown[m{}]: {n} btrieve block(s) closed", who.0),
-        Err(e) => eprintln!("mbbs-server: shutdown[m{}]: closing btrieve blocks failed: {e}", who.0),
+        Ok(n) => eprintln!("mbbs-server: shutdown: {n} btrieve block(s) closed"),
+        Err(e) => eprintln!("mbbs-server: shutdown: closing btrieve blocks failed: {e}"),
     }
 
     report_notes(host);
@@ -1027,15 +1012,12 @@ fn life<A: Abi>(
     // operator tuning the grant is exactly the operator already reading it.
     if census_every.is_some() {
         for (msgnum, value) in host.numeric_options() {
-            eprintln!(
-                "mbbs-server: numopt[m{who}]: option {msgnum} = {value}",
-                who = boot.machine.0
-            );
+            eprintln!("mbbs-server: numopt: option {msgnum} = {value}");
         }
     }
 
     let terms = boot.terms;
-    let mut pool = Pool::new(boot.machine, terms);
+    let mut pool = Pool::new(terms);
     let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
     let mut wait = Wait::Now;
     let mut census_due = Instant::now();
@@ -1095,7 +1077,7 @@ fn life<A: Abi>(
             apply(&mut host, &mut machine, &module, &mut pool, &mut conns, msg)?;
         }
         if let Some(done) = batch.stopping {
-            shut_down(&mut host, &mut machine, &module, boot.machine, &mut conns, terms);
+            shut_down(&mut host, &mut machine, &module, &mut conns, terms);
             // Sent after the sweep, not before: the whole point of the
             // channel is that the waiter learns when `finrou` has finished,
             // which for MajorMUD is when its buffers are on disk and
@@ -1177,8 +1159,7 @@ fn life<A: Abi>(
         {
             if spent >= Duration::from_millis(floor) {
                 eprintln!(
-                    "mbbs-server: turn[m{who}]: {spent:?}, {iters} passes, {disp} dispatches, ended {ended:?}",
-                    who = boot.machine.0,
+                    "mbbs-server: turn: {spent:?}, {iters} passes, {disp} dispatches, ended {ended:?}",
                     iters = cycles.iterations,
                     disp = cycles.dispatched,
                     ended = std::mem::discriminant(&cycles.ended),
@@ -1194,7 +1175,7 @@ fn life<A: Abi>(
         if let Some(meter) = &boot.calls_total {
             meter.store(host.calls(), Ordering::Relaxed);
         }
-        report_census(&mut host, boot.machine, &mut census_due, census_every, &mut turns, &mut worst_turn);
+        report_census(&mut host, &mut census_due, census_every, &mut turns, &mut worst_turn);
 
         // 4. Everything the channels queued goes out.
         flush(&mut host, &mut machine, &module, &mut pool, &mut conns, terms)?;
@@ -1321,20 +1302,20 @@ fn apply<A: Abi>(
 ) -> io::Result<()> {
     match msg {
         In::Connect { who, out, reply } => {
-            let Some(routed) = pool.take() else {
+            let Some(chan) = pool.take() else {
                 // All lines busy. Whoever is waiting on `reply` is the only
                 // audience -- if they are already gone (the connection task
                 // died before we got here) there is nobody left to tell.
                 let _ = reply.send(None);
                 return Ok(());
             };
-            host.connect(machine, module, routed.chan, &who)?;
-            conns[routed.chan.index()] = Some(out);
-            let _ = reply.send(Some(routed));
+            host.connect(machine, module, chan, &who)?;
+            conns[chan.index()] = Some(out);
+            let _ = reply.send(Some(chan));
             Ok(())
         }
-        In::Input { chan: routed, bytes } => {
-            if conns[routed.chan.index()].is_none() {
+        In::Input { chan, bytes } => {
+            if conns[chan.index()].is_none() {
                 // Nobody is connected on this channel in this life. Either
                 // this is a duplicate arriving after `flush` already hung
                 // this same connection up (Path 1: the sender closed and a
@@ -1349,11 +1330,11 @@ fn apply<A: Abi>(
                 // in someone else's session -- so they are dropped instead.
                 return Ok(());
             }
-            host.gsbl_mut().push_input(routed.chan, &bytes);
+            host.gsbl_mut().push_input(chan, &bytes);
             Ok(())
         }
-        In::Disconnect { chan: routed } => {
-            if conns[routed.chan.index()].is_none() {
+        In::Disconnect { chan } => {
+            if conns[chan.index()].is_none() {
                 // Already disconnected in this life -- see the matching
                 // comment on `In::Input` above for the two ways this
                 // arrives. Running `Host::hangup` here would run the
@@ -1365,9 +1346,9 @@ fn apply<A: Abi>(
                 // what keeps it from running in the first place.
                 return Ok(());
             }
-            host.hangup(machine, module, routed.chan)?;
-            pool.give_back(routed);
-            conns[routed.chan.index()] = None;
+            host.hangup(machine, module, chan)?;
+            pool.give_back(chan);
+            conns[chan.index()] = None;
             Ok(())
         }
         // Nothing to apply -- see `In::Alarm`'s own doc. It exists purely to
@@ -1518,12 +1499,7 @@ fn drop_channel<A: Abi>(
     chan: Chan,
 ) -> io::Result<()> {
     host.hangup(machine, module, chan)?;
-    // `chan` here is a bare `Chan` from `terms.all()`, not a `Routed` that
-    // arrived on the wire -- `Pool::key` is the caller-trusts-itself pairing
-    // for exactly that case (this pool's own sweep of its own channels), as
-    // opposed to `Pool::give_back`'s guarded acceptance of a `Routed` handed
-    // in from outside. See `pool.rs`'s doc on both.
-    pool.give_back(pool.key(chan));
+    pool.give_back(chan);
     conns[chan.index()] = None;
     eprintln!("mbbs-server: channel {chan} dropped (could not send output), hung up");
     Ok(())
@@ -1556,7 +1532,7 @@ mod tests {
     use tokio::sync::mpsc::Sender;
     use tokio::sync::oneshot;
 
-    use crate::pool::{MachineId, Pool};
+    use crate::pool::Pool;
 
     use super::{Woke, collapse, drain_turn, offer, wait_with_peek, wake};
     use crate::msg::{In, Out};
@@ -1714,8 +1690,8 @@ mod tests {
     #[test]
     fn drain_turn_applies_a_peeked_message_even_when_the_wake_was_gone() {
         let terms = Terms::new(1);
-        let mut pool = Pool::new(MachineId(0), terms);
-        let routed = pool.take().expect("the only channel");
+        let mut pool = Pool::new(terms);
+        let taken = pool.take().expect("the only channel");
 
         // `rx` empty and disconnected -- exactly what `wake` sees once the
         // interrupt closure has already taken the one message anyone was
@@ -1727,14 +1703,14 @@ mod tests {
             "the channel must report Gone, not spin"
         );
 
-        let peeked = Some(In::Input { chan: routed, bytes: b"hi".to_vec() });
+        let peeked = Some(In::Input { chan: taken, bytes: b"hi".to_vec() });
         let batch = drain_turn(peeked, None, &rx, true);
 
         assert_eq!(batch.apply.len(), 1, "the peeked message must survive draining");
         let In::Input { chan, bytes } = &batch.apply[0] else {
             panic!("expected the peeked In::Input to survive draining");
         };
-        assert_eq!(*chan, routed);
+        assert_eq!(*chan, taken);
         assert_eq!(bytes, b"hi");
         assert!(batch.stopping.is_none());
         assert!(
@@ -1771,12 +1747,12 @@ mod tests {
     #[tokio::test]
     async fn a_connect_against_an_empty_pool_replies_none() {
         let terms = Terms::new(1);
-        let mut pool = Pool::new(MachineId(0), terms);
+        let mut pool = Pool::new(terms);
         let taken = pool.take().expect("the only channel");
 
         // Reproduce exactly the branch `apply` takes on `pool.take() ==
         // None`, since `apply` itself needs a live `Host`.
-        let (reply_tx, reply_rx) = oneshot::channel::<Option<crate::pool::Routed>>();
+        let (reply_tx, reply_rx) = oneshot::channel::<Option<mbbs::Chan>>();
         match pool.take() {
             Some(_) => panic!("the pool had one channel and it is already out"),
             None => {
@@ -1799,7 +1775,7 @@ mod tests {
     #[test]
     fn a_disconnect_returns_its_channel_to_the_pool() {
         let terms = Terms::new(2);
-        let mut pool = Pool::new(MachineId(0), terms);
+        let mut pool = Pool::new(terms);
         let a = pool.take().expect("first");
         let _b = pool.take().expect("second");
         assert!(pool.take().is_none(), "both lines busy");
@@ -1839,8 +1815,7 @@ mod tests {
         let module = fixture.minimal_module();
         let chan = fixture.console();
 
-        let mut pool = Pool::new(MachineId(0), terms);
-        let routed = pool.key(chan);
+        let mut pool = Pool::new(terms);
         let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
 
         let result = super::apply(
@@ -1849,7 +1824,7 @@ mod tests {
             &module,
             &mut pool,
             &mut conns,
-            In::Disconnect { chan: routed },
+            In::Disconnect { chan },
         );
 
         assert!(
@@ -1860,7 +1835,7 @@ mod tests {
         );
         assert_eq!(
             pool.take(),
-            Some(routed),
+            Some(chan),
             "the channel must still be free exactly once"
         );
         assert!(
@@ -1891,8 +1866,7 @@ mod tests {
         let module = fixture.minimal_module();
         let chan = fixture.console();
 
-        let mut pool = Pool::new(MachineId(0), terms);
-        let routed = pool.key(chan);
+        let mut pool = Pool::new(terms);
         let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
 
         let result = super::apply(
@@ -1901,7 +1875,7 @@ mod tests {
             &module,
             &mut pool,
             &mut conns,
-            In::Input { chan: routed, bytes: b"EVIL\r".to_vec() },
+            In::Input { chan, bytes: b"EVIL\r".to_vec() },
         );
 
         assert!(result.is_ok(), "{result:?}");

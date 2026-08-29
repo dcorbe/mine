@@ -22,11 +22,10 @@ use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 
 use mbbs::abi::Wg16;
-use mbbs::Connection;
+use mbbs::{Chan, Connection};
 use mbbs_server::conn::{self, default_keys};
 use mbbs_server::host::Boot;
 use mbbs_server::msg::{In, Out};
-use mbbs_server::pool::{MachineId, Routed};
 
 /// How long a single read may block before a test declares a hang rather
 /// than waiting on CI forever.
@@ -614,7 +613,6 @@ fn boot(module: PathBuf, root_name: &str, terms: u16) -> Boot<Wg16> {
 /// through [`boot`], the one-module case.
 fn boot_many(modules: Vec<PathBuf>, root_name: &str, terms: u16) -> Boot<Wg16> {
     Boot {
-        machine: MachineId(0),
         build: Box::new(mbbs_machine::m16::Machine::new),
         root: mbbs::testing::scratch(root_name),
         modules,
@@ -679,7 +677,7 @@ fn real_bell(
 /// its lifetime: dropping it closes the connection's `Sender<Out>` from the
 /// other end (letting a caller reproduce `flush`'s send-failure path on
 /// purpose), keeping it alive does not.
-async fn connect_raw(tx: &std::sync::mpsc::Sender<In>, who: &str) -> (Option<Routed>, Receiver<Out>) {
+async fn connect_raw(tx: &std::sync::mpsc::Sender<In>, who: &str) -> (Option<Chan>, Receiver<Out>) {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Out>(32);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send(In::Connect {
@@ -714,7 +712,7 @@ async fn connect_two_at_once(
     tx: &std::sync::mpsc::Sender<In>,
     who_a: &str,
     who_b: &str,
-) -> ((Option<Routed>, Receiver<Out>), (Option<Routed>, Receiver<Out>)) {
+) -> ((Option<Chan>, Receiver<Out>), (Option<Chan>, Receiver<Out>)) {
     let (out_tx_a, out_rx_a) = tokio::sync::mpsc::channel::<Out>(32);
     let (reply_tx_a, reply_rx_a) = tokio::sync::oneshot::channel();
     let (out_tx_b, out_rx_b) = tokio::sync::mpsc::channel::<Out>(32);

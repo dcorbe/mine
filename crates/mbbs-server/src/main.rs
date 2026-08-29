@@ -12,7 +12,6 @@ use mbbs_machine::Format;
 use mbbs_server::conn::{self, Listener, default_keys};
 use mbbs_server::host::{Boot, ExtensionBuilder};
 use mbbs_server::msg::In;
-use mbbs_server::pool::MachineId;
 use mbbs_server::termcompat::Stack;
 
 const DEFAULT_MODULE: &str = "re/WCCMMUD.DLL";
@@ -416,7 +415,6 @@ async fn main() -> ExitCode {
     // never crosses into this `async fn`.
     let tx = match plan {
         Plan::Wg16 { modules, root } => conn::spawn_machine(Boot::<Wg16> {
-            machine: MachineId(0),
             build: Box::new(mbbs_machine::m16::Machine::new),
             root,
             modules,
@@ -431,7 +429,6 @@ async fn main() -> ExitCode {
             extension: cli.scripts.clone().map(build_lua_extension),
         }),
         Plan::Wg32 { module, root } => conn::spawn_machine(Boot::<Wg32> {
-            machine: MachineId(0),
             build: Box::new(build_wg32_cpu(module.clone())),
             root,
             modules: vec![module],

@@ -57,7 +57,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
 
-use mbbs::Connection;
+use mbbs::{Chan, Connection};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
@@ -67,7 +67,6 @@ use tokio::sync::{mpsc, oneshot};
 use crate::host::{self, Boot};
 use crate::iac::Filter;
 use crate::msg::{In, Out};
-use crate::pool::Routed;
 use crate::termcompat::Stack;
 
 const IAC: u8 = 255;
@@ -287,8 +286,8 @@ async fn handle(
     }
 
     // This connection's process-wide identity for the rest of its life.
-    let routed = match reply_rx.await {
-        Ok(Some(routed)) => routed,
+    let chan = match reply_rx.await {
+        Ok(Some(chan)) => chan,
         Ok(None) => {
             writer.write_all(b"All lines are busy.\r\n").await?;
             return Ok(());
@@ -308,12 +307,12 @@ async fn handle(
     // TCP segment carried more than one line) must not be dropped just
     // because they showed up before a channel existed to receive them.
     if !leftover.is_empty()
-        && host_tx.send(In::Input { chan: routed, bytes: leftover }).is_err()
+        && host_tx.send(In::Input { chan, bytes: leftover }).is_err()
     {
         return Ok(());
     }
 
-    pump(reader, writer, host_tx, routed, out_rx, stack).await
+    pump(reader, writer, host_tx, chan, out_rx, stack).await
 }
 
 /// The tiny line editor behind the user ID prompt.
@@ -443,7 +442,7 @@ async fn pump(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     host_tx: std_mpsc::Sender<In>,
-    routed: Routed,
+    chan: Chan,
     mut out_rx: mpsc::Receiver<Out>,
     stack: fn() -> Stack,
 ) -> io::Result<()> {
@@ -464,7 +463,7 @@ async fn pump(
                         // promptly rather than waiting for a flush that may
                         // never come (a channel with nothing queued is never
                         // visited by `host::flush` at all).
-                        let _ = host_tx.send(In::Disconnect { chan: routed });
+                        let _ = host_tx.send(In::Disconnect { chan });
                         return Ok(());
                     }
                 }
@@ -479,7 +478,7 @@ async fn pump(
             },
             result = reader.read(&mut buf) => match result {
                 Ok(0) | Err(_) => {
-                    let _ = host_tx.send(In::Disconnect { chan: routed });
+                    let _ = host_tx.send(In::Disconnect { chan });
                     return Ok(());
                 }
                 Ok(n) => {
@@ -489,7 +488,7 @@ async fn pump(
                     let bytes = filter.feed(&buf[..n]);
                     let bytes = termcompat.inbound(&bytes);
                     if !bytes.is_empty()
-                        && host_tx.send(In::Input { chan: routed, bytes }).is_err()
+                        && host_tx.send(In::Input { chan, bytes }).is_err()
                     {
                         // The host thread is gone. Nobody will ever read
                         // another `Input` or send another `Out` -- there is
@@ -525,7 +524,6 @@ mod tests {
 
         let root = mbbs::testing::scratch("mbbs-server-conn-dead-host");
         let boot: super::Boot<mbbs::abi::Wg16> = super::Boot {
-            machine: crate::pool::MachineId(0),
             build: Box::new(mbbs_machine::m16::Machine::new),
             root,
             modules: vec![PathBuf::from("/nonexistent/NOPE.DLL")],
@@ -727,9 +725,8 @@ mod tests {
         let (host_tx, _host_rx) = std_mpsc::channel::<In>();
         let (out_tx, out_rx) = mpsc::channel::<Out>(4);
         let chan = mbbs::Terms::new(1).chan(0).expect("channel zero of one");
-        let routed = crate::pool::Routed { machine: crate::pool::MachineId(0), chan };
 
-        let pump_task = tokio::spawn(pump(reader, writer, host_tx, routed, out_rx, Stack::modern));
+        let pump_task = tokio::spawn(pump(reader, writer, host_tx, chan, out_rx, Stack::modern));
 
         let cp437_bytes: Vec<u8> = vec![0xC9, 0xCD, 0xCD, 0xBB, 0x82, 0xBA];
         out_tx
@@ -789,9 +786,8 @@ mod tests {
         let (host_tx, host_rx) = std_mpsc::channel::<In>();
         let (_out_tx, out_rx) = mpsc::channel::<Out>(4);
         let chan = mbbs::Terms::new(1).chan(0).expect("channel zero of one");
-        let routed = crate::pool::Routed { machine: crate::pool::MachineId(0), chan };
 
-        let _pump_task = tokio::spawn(pump(reader, writer, host_tx, routed, out_rx, Stack::modern));
+        let _pump_task = tokio::spawn(pump(reader, writer, host_tx, chan, out_rx, Stack::modern));
 
         // U+00A0 (non-breaking space) as UTF-8, then a plain 'X'. Neither
         // byte is telnet's real IAC (255) -- the filter must let both
@@ -821,6 +817,80 @@ mod tests {
                  option byte"
             ),
             _ => panic!("expected In::Input, got a different In variant instead"),
+        }
+    }
+
+    /// `handle`'s `leftover` forwarding, pinned at the unit level.
+    ///
+    /// The real proof of this is `crates/mbbs-server/tests/two_players.rs`'s
+    /// `two_real_sockets_and_one_sees_the_other`, which drives it end to end
+    /// through a real module -- but on this checkout that test is blocked
+    /// before it ever reaches this behaviour, by a pre-existing licence-limit
+    /// fault the module reports unrelated to `leftover` at all (see that
+    /// test's own history). This is the same forwarding, isolated from the
+    /// module entirely: a fake host thread stands in, so what this proves is
+    /// exactly `handle`'s own contract -- a byte that arrives pipelined
+    /// behind the user ID's terminator, in the same `read()` `read_user_id`
+    /// makes, reaches the host thread as `In::Input { chan, .. }` tagged with
+    /// the same bare `Chan` `In::Connect`'s reply carried, not dropped just
+    /// because no `Chan` existed yet when it arrived.
+    #[tokio::test]
+    async fn handle_forwards_a_pipelined_leftover_as_input() {
+        use crate::msg::In;
+        use std::sync::mpsc as std_mpsc;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let (host_tx, host_rx) = std_mpsc::channel::<In>();
+        let terms = mbbs::Terms::new(1);
+
+        tokio::spawn(async move {
+            let (server, _peer) = listener.accept().await.expect("accept");
+            let _ = handle(server, host_tx, &[], super::Stack::modern).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        // The user ID and a second line in ONE write, so both land in the
+        // same TCP segment and the same `read()` inside `read_user_id` --
+        // exactly the pipelining `leftover` exists to carry forward.
+        client
+            .write_all(b"tester\rHELLO\r")
+            .await
+            .expect("write userid and leftover together");
+
+        let (chan, input) = tokio::task::spawn_blocking(move || {
+            let connect = host_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("In::Connect never arrived");
+            let In::Connect { reply, .. } = connect else {
+                panic!("expected In::Connect first, got a different In variant");
+            };
+            let chan = terms.chan(0).expect("channel 0");
+            let _ = reply.send(Some(chan));
+            let input = host_rx.recv_timeout(Duration::from_secs(5)).expect(
+                "In::Input for the pipelined leftover never arrived -- it was dropped",
+            );
+            (chan, input)
+        })
+        .await
+        .expect("spawn_blocking did not panic");
+
+        match input {
+            In::Input { chan: got_chan, bytes } => {
+                assert_eq!(
+                    got_chan, chan,
+                    "the leftover must be tagged with the same Chan Connect was answered with"
+                );
+                assert_eq!(
+                    bytes, b"HELLO\r",
+                    "the pipelined bytes behind the user ID's terminator must survive intact"
+                );
+            }
+            _ => panic!("expected In::Input carrying the pipelined leftover"),
         }
     }
 
@@ -878,8 +948,7 @@ mod tests {
                 if let In::Connect { out, reply, .. } = msg {
                     let chan = terms.chan(next).expect("channel in range");
                     next += 1;
-                    let routed = crate::pool::Routed { machine: crate::pool::MachineId(0), chan };
-                    let _ = reply.send(Some(routed));
+                    let _ = reply.send(Some(chan));
                     // blocking_send: this is a plain std::thread, not a
                     // tokio task, so there is no async context to violate.
                     let _ = out.blocking_send(Out::Bytes(host_chunk.clone()));
@@ -966,7 +1035,6 @@ mod tests {
 
         let root = mbbs::testing::scratch("mbbs-server-conn-multi-listen");
         let boot: super::Boot<mbbs::abi::Wg16> = super::Boot {
-            machine: crate::pool::MachineId(0),
             build: Box::new(mbbs_machine::m16::Machine::new),
             root,
             modules: vec![PathBuf::from("/nonexistent/NOPE.DLL")],
