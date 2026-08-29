@@ -31,55 +31,27 @@
 //! getting it wrong -- see `iac_filter_runs_before_inbound_transcode` in
 //! this module's tests.
 //!
-//! **One host thread per machine, however many listeners.** [`serve_on`] can
-//! bind more than one address -- a modern port and a period port, or several
-//! of either -- but every one of them feeds the *same* set of machines'
-//! senders. `A::Cpu` is `!Send` (see the crate doc): the thread that builds
-//! it is the one and only owner of its machine's channels, its loaded
-//! module, its Btrieve files, for the process's whole life. A listener that
-//! spawned its own host thread per machine would spawn a second `A::Cpu`,
-//! load the module a second time, and mint a second set of channels no other
-//! listener's connections could ever reach -- two boards quietly sharing one
-//! `--root` on disk, not one board with two doors into it. So
-//! [`spawn_machine`] is called exactly once per machine, before any listener
-//! is bound, and [`spawn_listener`] -- the per-address half -- only ever
-//! receives clones of the senders it already built.
+//! **One host thread, however many listeners.** [`serve_on`] can bind more
+//! than one address -- a modern port and a period port, or several of either
+//! -- but every one of them feeds the *same* machine's sender. `A::Cpu` is
+//! `!Send` (see the crate doc): the thread that builds it is the one and
+//! only owner of its machine's channels, its loaded module, its Btrieve
+//! files, for the process's whole life. A listener that spawned its own host
+//! thread would spawn a second `A::Cpu`, load the module a second time, and
+//! mint a second set of channels no other listener's connections could ever
+//! reach -- two boards quietly sharing one `--root` on disk, not one board
+//! with two doors into it. So [`spawn_machine`] is called exactly once, before
+//! any listener is bound, and [`spawn_listener`] -- the per-address half --
+//! only ever receives clones of the sender it already built.
 //!
-//! **One machine is one host thread, and a board can run several.**
-//! [`spawn_machine`] is generic over [`mbbs::abi::Abi`] since Task 20 of
+//! **One machine is one host thread, one process.** [`spawn_machine`] is
+//! generic over [`mbbs::abi::Abi`] since Task 20 of
 //! `docs/plans/2026-08-12-abi-border-implementation.md`, and every `Chan` a
 //! machine hands out (`Pool::take`, inside `host::life`) is numbered from
-//! zero *within that machine* -- see `crates/mbbs-server/src/pool.rs`'s own
-//! module doc for why. A board that runs more than one machine at once (a
-//! 16-bit `Wg16` board and a 32-bit `Wg32` board, say -- design doc §4a's
-//! staged acceptance) calls [`spawn_machine`] once per machine and hands
-//! every resulting [`Machine`] to one [`serve_on`] call, so a connection is
-//! identified process-wide as *(which machine's sender it holds, `Chan`)*,
-//! not `Chan` alone: two machines can both have a channel zero, and only the
-//! first half of that pair says which one a given `Chan` means.
+//! zero -- see `crates/mbbs-server/src/pool.rs`'s own module doc for why.
 //!
-//! **That pairing is [`Routed`], and it is built.**
-//! `crate::pool::MachineId` is the first half -- whoever builds a [`Machine`]
-//! assigns one per machine (`main.rs` today: `MachineId(0)` for the always-
-//! present `Wg16` board, `MachineId(1)` for an optional `Wg32` one);
-//! `Pool::take` hands back the pair, never a bare `Chan`, and every message
-//! this task exchanges with a host thread (`In::Connect`'s reply,
-//! `In::Input`/`In::Disconnect`'s `chan` field) carries the pair too -- see
-//! `crate::msg`'s module doc. A connection's identity for its whole life,
-//! from [`handle`]'s `reply_rx.await` onward, is therefore already the
-//! process-wide key, not a value that only happens to be unique because
-//! nothing multiplexes it yet.
-//!
-//! **The connect-time selector is [`select_machine`], and it is deliberately
-//! not a menu.** With exactly one [`Machine`], [`handle`] asks nothing at
-//! all -- see [`select_machine`]'s own doc for why that case must be
-//! byte-identical to a board that predates the selector entirely. With more
-//! than one, it writes a single line naming each machine by its `label` and
-//! reads a single keystroke; anything that keystroke does not resolve to a
-//! real choice re-prompts rather than guessing, because a wrong guess
-//! silently drops a player into the wrong game. This is design doc §4 point
-//! 4's named next step (`docs/plans/2026-08-12-abi-border-implementation.md`
-//! Task 22), landed.
+//! **One `serve_on` call serves one machine.** A connection goes from telnet
+//! negotiation straight to the user-ID prompt -- nothing in between.
 
 use std::io;
 use std::net::SocketAddr;
@@ -95,7 +67,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::host::{self, Boot};
 use crate::iac::Filter;
 use crate::msg::{In, Out};
-use crate::pool::{MachineId, Routed};
+use crate::pool::Routed;
 use crate::termcompat::Stack;
 
 const IAC: u8 = 255;
@@ -153,29 +125,12 @@ pub fn default_keys() -> Vec<String> {
 /// constructor every connection through it gets.
 pub type Listener<'a> = (&'a str, fn() -> Stack);
 
-/// One machine a listener can route a fresh connection to: its process-wide
-/// [`MachineId`] (see `crate::pool`'s module doc), a human-readable `label`
-/// [`select_machine`] shows a player choosing between more than one, and the
-/// sender every accepted connection uses to reach its dedicated host thread.
-///
-/// Built from [`spawn_machine`]'s return value, since the `tx` here is only
-/// meaningful paired with a host thread actually reading the other end.
-#[derive(Clone)]
-pub struct Machine {
-    pub id: MachineId,
-    pub label: String,
-    pub tx: std_mpsc::Sender<In>,
-}
-
 /// Spawn one machine's dedicated host thread and its bell, and return the
 /// sender every connection routed to it uses.
 ///
 /// This is the half of what used to be [`serve`] that has nothing to do with
 /// listening: build the channel, spawn [`alarm::spawn`]'s bell task, spawn
-/// the host thread. Callers wanting more than one machine on one board
-/// (design doc §4a's staged acceptance -- a `Wg16` board and a `Wg32` board
-/// together) call this once per machine and hand the resulting senders,
-/// wrapped in [`Machine`], to [`serve_on`].
+/// the host thread.
 ///
 /// Does not block, and does not touch the network: the host thread and the
 /// bell are both spawned and this returns immediately.
@@ -224,49 +179,41 @@ pub fn spawn_machine<A: mbbs::abi::Abi + 'static>(boot: Boot<A>) -> std_mpsc::Se
 
 /// Spawn one machine (see [`spawn_machine`]) and bind every address in
 /// `listeners` to it. A thin wrapper over [`spawn_machine`] and
-/// [`serve_on`], kept for the single-machine case that predates Task 22:
-/// existing callers, and every test that only ever boots one module, keep
-/// working unchanged. See [`select_machine`] for why this case must stay
-/// byte-identical on the wire.
+/// [`serve_on`], kept for callers that build their own `Boot` -- every
+/// integration test does.
 pub async fn serve<A: mbbs::abi::Abi + 'static>(
     boot: Boot<A>,
     keys: Vec<String>,
     listeners: &[Listener<'_>],
 ) -> io::Result<Vec<SocketAddr>> {
-    let id = boot.machine;
-    let tx = spawn_machine(boot);
-    serve_on(vec![Machine { id, label: String::new(), tx }], keys, listeners).await
+    serve_on(spawn_machine(boot), keys, listeners).await
 }
 
-/// Bind every address in `listeners`, each with the [`Stack`] constructor it
-/// was given, and route every connection among `machines` (via
-/// [`select_machine`], see [`handle`]). Returns the bound addresses in
-/// `listeners`' order -- a caller binding port 0 reads back where each one
-/// landed.
+/// Bind every listener in front of the one machine `host_tx` reaches.
+/// Returns the bound addresses in `listeners`' order -- a caller binding
+/// port 0 reads back where each one landed.
 ///
 /// Does not block: every accept loop runs in its own spawned task.
 pub async fn serve_on(
-    machines: Vec<Machine>,
+    host_tx: std_mpsc::Sender<In>,
     keys: Vec<String>,
     listeners: &[Listener<'_>],
 ) -> io::Result<Vec<SocketAddr>> {
     let mut bound = Vec::with_capacity(listeners.len());
     for &(addr, stack) in listeners {
-        bound.push(spawn_listener(addr, stack, machines.clone(), keys.clone()).await?);
+        bound.push(spawn_listener(addr, stack, host_tx.clone(), keys.clone()).await?);
     }
     Ok(bound)
 }
 
 /// Bind one address and spawn its accept loop, which hands every accepted
 /// socket to [`handle`] along with `stack` -- the [`Stack`] constructor
-/// *this* listener was given -- and `machines`, the full set [`handle`]'s
-/// [`select_machine`] chooses among. `machines` is a clone shared with every
-/// other listener [`serve_on`] binds; see the module doc for why that
-/// sharing, and not a thread of its own per listener, is the point.
+/// *this* listener was given -- and a clone of `host_tx`, the sender every
+/// connection through this listener uses to reach the one machine.
 async fn spawn_listener(
     addr: &str,
     stack: fn() -> Stack,
-    machines: Vec<Machine>,
+    host_tx: std_mpsc::Sender<In>,
     keys: Vec<String>,
 ) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
@@ -281,10 +228,10 @@ async fn spawn_listener(
                     continue;
                 }
             };
-            let machines = machines.clone();
+            let host_tx = host_tx.clone();
             let keys = keys.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(socket, machines, &keys, stack).await {
+                if let Err(e) = handle(socket, host_tx, &keys, stack).await {
                     eprintln!("mbbs-server: connection ended: {e}");
                 }
             });
@@ -294,17 +241,16 @@ async fn spawn_listener(
     Ok(local)
 }
 
-/// One connection's whole life: negotiate, choose a machine, prompt for a
-/// user ID, connect, pump bytes until either side hangs up.
+/// One connection's whole life: negotiate, prompt for a user ID, connect,
+/// pump bytes until either side hangs up.
 ///
 /// `stack` is this connection's [`Stack`] constructor -- fixed by which
 /// listener accepted the socket ([`spawn_listener`]'s parameter of the same
-/// name), never by anything the connection itself says or does. `machines`
-/// is the same list on every listener [`serve_on`] bound -- see
-/// [`select_machine`] for how a connection picks one.
+/// name), never by anything the connection itself says or does. `host_tx` is
+/// the same sender on every listener [`serve_on`] bound.
 async fn handle(
     socket: TcpStream,
-    machines: Vec<Machine>,
+    host_tx: std_mpsc::Sender<In>,
     keys: &[String],
     stack: fn() -> Stack,
 ) -> io::Result<()> {
@@ -312,14 +258,8 @@ async fn handle(
 
     // IAC WILL SGA, IAC WILL ECHO -- see the module doc for why WILL ECHO is
     // deliberate.
-    writer
-        .write_all(&[IAC, WILL, OPT_SGA, IAC, WILL, OPT_ECHO])
-        .await?;
+    writer.write_all(&[IAC, WILL, OPT_SGA, IAC, WILL, OPT_ECHO]).await?;
     writer.flush().await?;
-
-    let Some(host_tx) = select_machine(&machines, &mut reader, &mut writer).await? else {
-        return Ok(()); // gone during the machine prompt
-    };
 
     let Some((userid, leftover)) = read_user_id(&mut reader, &mut writer).await? else {
         return Ok(()); // gone during login
@@ -346,8 +286,7 @@ async fn handle(
         return Ok(());
     }
 
-    // This connection's process-wide identity for the rest of its life --
-    // see the module doc's "That pairing is `Routed`, and it is built."
+    // This connection's process-wide identity for the rest of its life.
     let routed = match reply_rx.await {
         Ok(Some(routed)) => routed,
         Ok(None) => {
@@ -375,114 +314,6 @@ async fn handle(
     }
 
     pump(reader, writer, host_tx, routed, out_rx, stack).await
-}
-
-/// Build the one-line prompt [`select_machine`] shows when there is more
-/// than one [`Machine`] to choose from, e.g. `"1) MajorMUD  2) LunatiX  ? "`.
-/// A free function so its exact wording has one place to change and one
-/// place a test can pin.
-fn machine_prompt(machines: &[Machine]) -> String {
-    let mut prompt = machines
-        .iter()
-        .enumerate()
-        .map(|(i, m)| format!("{}) {}", i + 1, m.label))
-        .collect::<Vec<_>>()
-        .join("  ");
-    prompt.push_str("  ? ");
-    prompt
-}
-
-/// Choose which [`Machine`]'s sender a fresh connection uses, before it is
-/// ever asked for a user ID.
-///
-/// **With exactly one machine, this asks nothing at all and writes nothing
-/// at all.** That is not an optimisation -- it is the whole reason this
-/// function exists as a gate in front of [`handle`]'s login flow rather than
-/// a menu screen bolted on unconditionally: a board that has only ever run
-/// one module must stay byte-identical on the wire to the board that existed
-/// before Task 22, so every test written against a single `serve` call
-/// keeps passing, and so does every real player's telnet client that has
-/// never seen this prompt. See `single_machine_writes_no_prompt_bytes_at_all`
-/// in this module's tests.
-///
-/// **With more than one, one line and one keystroke -- never a menu the
-/// player has to navigate.** [`machine_prompt`] is written once; the very
-/// next printable byte off the wire decides. A byte that is not a digit
-/// naming one of `machines`' own 1-based positions does not guess -- it
-/// re-prompts, because routing a player into the wrong game silently is
-/// worse than asking again. Telnet negotiation noise (bytes [`Filter::feed`]
-/// already stripped, plus any surviving control byte) is not a keystroke
-/// either way and is skipped without counting as an attempt.
-///
-/// Returns `Ok(None)` on EOF or a read error during the prompt -- the same
-/// "nothing left to do" outcome [`read_user_id`] reports for the very same
-/// reason, just one step earlier in a connection's life.
-async fn select_machine(
-    machines: &[Machine],
-    reader: &mut OwnedReadHalf,
-    writer: &mut OwnedWriteHalf,
-) -> io::Result<Option<std_mpsc::Sender<In>>> {
-    let [only] = machines else {
-        return select_among_machines(machines, reader, writer).await;
-    };
-    Ok(Some(only.tx.clone()))
-}
-
-/// [`select_machine`]'s prompt-and-read loop for two or more machines,
-/// split out so [`select_machine`] itself stays a one-branch gate a reader
-/// can see does nothing in the single-machine case without wading through
-/// the loop that only matters when there is a choice to make.
-async fn select_among_machines(
-    machines: &[Machine],
-    reader: &mut OwnedReadHalf,
-    writer: &mut OwnedWriteHalf,
-) -> io::Result<Option<std_mpsc::Sender<In>>> {
-    let prompt = machine_prompt(machines);
-
-    loop {
-        writer.write_all(prompt.as_bytes()).await?;
-        writer.flush().await?;
-
-        let mut filter = Filter::default();
-        let mut buf = [0u8; 512];
-
-        // `Ok(index)` is a recognised, 0-based choice; `Err(())` is a real
-        // keystroke that named nothing valid. `None` means "still waiting on
-        // one" and is never what this inner loop exits with -- it only ever
-        // breaks once `decision` is `Some`, so the match after it has
-        // nothing left to do for `None`.
-        let mut decision: Option<Result<usize, ()>> = None;
-        while decision.is_none() {
-            let n = reader.read(&mut buf).await?;
-            if n == 0 {
-                return Ok(None); // gone during the prompt
-            }
-            let bytes = filter.feed(&buf[..n]);
-            for &b in &bytes {
-                if !(0x20..=0x7e).contains(&b) {
-                    continue; // telnet/control noise, not a keystroke
-                }
-                writer.write_all(&[b]).await?; // echo the one keystroke
-                decision = Some(
-                    (b.is_ascii_digit())
-                        .then(|| (b - b'0') as usize)
-                        .filter(|&n| n >= 1 && n <= machines.len())
-                        .map(|n| n - 1)
-                        .ok_or(()),
-                );
-                break;
-            }
-            writer.flush().await?;
-        }
-
-        writer.write_all(b"\r\n").await?;
-        writer.flush().await?;
-
-        match decision.expect("the loop above only exits once a decision is made") {
-            Ok(index) => return Ok(Some(machines[index].tx.clone())),
-            Err(()) => continue, // unrecognised -- re-prompt
-        }
-    }
 }
 
 /// The tiny line editor behind the user ID prompt.
@@ -673,7 +504,7 @@ async fn pump(
 
 #[cfg(test)]
 mod tests {
-    use super::{Edit, LineEditor, Machine, default_keys, pump, select_machine};
+    use super::{Edit, IAC, LineEditor, OPT_ECHO, OPT_SGA, WILL, default_keys, handle, pump};
 
     /// A dead host thread must not leave a fresh connection hanging forever.
     ///
@@ -1059,13 +890,8 @@ mod tests {
             }
         });
 
-        let machines = vec![Machine {
-            id: crate::pool::MachineId(0),
-            label: String::new(),
-            tx: host_tx.clone(),
-        }];
         let bound = super::serve_on(
-            machines,
+            host_tx.clone(),
             default_keys(),
             &[("127.0.0.1:0", Stack::modern as fn() -> Stack), ("127.0.0.1:0", Stack::raw)],
         )
@@ -1183,254 +1009,33 @@ mod tests {
         }
     }
 
-    /// Build a throwaway [`Machine`] wrapping a fresh `std::sync::mpsc`
-    /// channel, so a test can inspect exactly what [`In::Connect`] a
-    /// selection routed to, without a real host thread.
-    fn fake_machine(
-        id: u16,
-        label: &str,
-    ) -> (Machine, std::sync::mpsc::Receiver<crate::msg::In>) {
-        let (tx, rx) = std::sync::mpsc::channel::<crate::msg::In>();
-        (Machine { id: crate::pool::MachineId(id), label: label.to_string(), tx }, rx)
-    }
-
-    /// Task 22's central guarantee: with exactly one [`Machine`], the
-    /// connect-time selector writes *nothing at all* to the wire before the
-    /// user ID prompt -- not even a suppressed prompt, not a blank line.
-    ///
-    /// This is checked byte-exactly against a real loopback socket driving
-    /// [`select_machine`] directly, so a mutation that always printed
-    /// `machine_prompt`'s line (even for one machine) or that echoed
-    /// anything at all on this path would fail here even though every other
-    /// test in this file only ever exercises the one-machine case through
-    /// `handle`, where a prompt's absence is easy to miss inside a longer
-    /// transcript.
+    /// Nothing precedes the user-ID prompt on the wire: telnet negotiation,
+    /// then `Enter your user ID: `. There is no machine to choose.
     #[tokio::test]
-    async fn single_machine_writes_no_prompt_bytes_at_all() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn the_first_prompt_is_the_user_id() {
+        use crate::termcompat::Stack;
+        use tokio::io::AsyncReadExt;
         use tokio::net::{TcpListener, TcpStream};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        let (host_tx, _host_rx) = std::sync::mpsc::channel::<crate::msg::In>();
+        tokio::spawn(async move {
+            let (server, _peer) = listener.accept().await.expect("accept");
+            let _ = handle(server, host_tx, &[], Stack::modern).await;
+        });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
-        let (server, _peer) = listener.accept().await.expect("accept");
-        let (mut reader, mut writer) = server.into_split();
-
-        let (machine, _rx) = fake_machine(0, "MajorMUD");
-        let machines = vec![machine];
-
-        let selected = select_machine(&machines, &mut reader, &mut writer)
-            .await
-            .expect("no I/O error")
-            .expect("the only machine is chosen without any read at all");
-
-        // Nothing was ever written server-side before this point returned,
-        // and nothing needs to be read from the client either -- prove it by
-        // writing a sentinel from the client and confirming the server's
-        // `writer` produced zero bytes for `select_machine` to have raced
-        // against: shut the write half down and read the client's own
-        // socket to end-of-stream immediately.
-        drop(writer);
-        drop(selected);
-        client.write_all(b"anything\r").await.expect("client write");
-        let mut received = Vec::new();
-        client.read_to_end(&mut received).await.expect("read to EOF");
-        assert!(
-            received.is_empty(),
-            "the single-machine path must write no prompt bytes at all: {received:?}"
-        );
-    }
-
-    /// Two machines: selecting `"1"` routes to the first machine's sender
-    /// and never the second's.
-    #[tokio::test]
-    async fn selecting_one_routes_to_the_first_machine() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
-        let mut client = TcpStream::connect(addr).await.expect("connect");
-        let (server, _peer) = listener.accept().await.expect("accept");
-        let (mut reader, mut writer) = server.into_split();
-
-        let (machine_a, _rx_a) = fake_machine(0, "MajorMUD");
-        let (machine_b, _rx_b) = fake_machine(1, "LunatiX");
-        let machines = vec![machine_a, machine_b];
-
-        let select_task =
-            tokio::spawn(async move { select_machine(&machines, &mut reader, &mut writer).await });
-
-        let mut prompt_buf = [0u8; 128];
-        let n = client.read(&mut prompt_buf).await.expect("read the prompt");
-        assert_eq!(
-            &prompt_buf[..n],
-            b"1) MajorMUD  2) LunatiX  ? ",
-            "the prompt must name both machines, in order, before any keystroke"
-        );
-
-        client.write_all(b"1").await.expect("select the first machine");
-
-        let chosen = select_task
-            .await
-            .expect("select_machine task did not panic")
-            .expect("no I/O error")
-            .expect("a recognised selection must return a sender");
-
-        // Send an In::Connect down the sender select_machine returned and
-        // confirm it lands on machine 0's receiver, not machine 1's.
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
-        let who = mbbs::Connection::ansi("tester");
-        chosen
-            .send(crate::msg::In::Connect { who, out: out_tx, reply: reply_tx })
-            .expect("machine 0's receiver is still alive");
-
-        let received = _rx_a.try_recv().expect("machine 0's receiver got the Connect");
-        assert!(matches!(received, crate::msg::In::Connect { .. }));
-        assert!(
-            _rx_b.try_recv().is_err(),
-            "machine 1's receiver must not have seen anything at all"
-        );
-    }
-
-    /// The mirror of the test above: selecting `"2"` routes to the second
-    /// machine's sender and never the first's.
-    ///
-    /// Together, these two tests are what a mutation swapping the routing
-    /// lookup (making selection `"2"` pick index 0, say) would fail --
-    /// exactly the mutation this task's brief calls out.
-    #[tokio::test]
-    async fn selecting_two_routes_to_the_second_machine() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
-        let mut client = TcpStream::connect(addr).await.expect("connect");
-        let (server, _peer) = listener.accept().await.expect("accept");
-        let (mut reader, mut writer) = server.into_split();
-
-        let (machine_a, _rx_a) = fake_machine(0, "MajorMUD");
-        let (machine_b, _rx_b) = fake_machine(1, "LunatiX");
-        let machines = vec![machine_a, machine_b];
-
-        let select_task =
-            tokio::spawn(async move { select_machine(&machines, &mut reader, &mut writer).await });
-
-        client.write_all(b"2").await.expect("select the second machine");
-
-        let chosen = select_task
-            .await
-            .expect("select_machine task did not panic")
-            .expect("no I/O error")
-            .expect("a recognised selection must return a sender");
-
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
-        let who = mbbs::Connection::ansi("tester");
-        chosen
-            .send(crate::msg::In::Connect { who, out: out_tx, reply: reply_tx })
-            .expect("machine 1's receiver is still alive");
-
-        let received = _rx_b.try_recv().expect("machine 1's receiver got the Connect");
-        assert!(matches!(received, crate::msg::In::Connect { .. }));
-        assert!(
-            _rx_a.try_recv().is_err(),
-            "machine 0's receiver must not have seen anything at all"
-        );
-    }
-
-    /// A selection that names nothing valid -- here, `"9"` with only two
-    /// machines on offer -- re-prompts rather than routing anywhere; only
-    /// the second, valid keystroke actually picks a machine.
-    #[tokio::test]
-    async fn an_unrecognised_selection_reprompts_instead_of_guessing() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
-        let mut client = TcpStream::connect(addr).await.expect("connect");
-        let (server, _peer) = listener.accept().await.expect("accept");
-        let (mut reader, mut writer) = server.into_split();
-
-        let (machine_a, _rx_a) = fake_machine(0, "MajorMUD");
-        let (machine_b, _rx_b) = fake_machine(1, "LunatiX");
-        let machines = vec![machine_a, machine_b];
-
-        let select_task =
-            tokio::spawn(async move { select_machine(&machines, &mut reader, &mut writer).await });
-
-        let mut buf = [0u8; 128];
-        let n = client.read(&mut buf).await.expect("read the first prompt");
-        assert_eq!(&buf[..n], b"1) MajorMUD  2) LunatiX  ? ");
-
-        // "9" names nothing -- neither machine 1 nor machine 2. The echo,
-        // the CRLF, and the re-printed prompt are three separate writer
-        // calls (see `select_among_machines`), so they can arrive as more
-        // than one TCP segment -- read until exactly as many bytes as
-        // expected have shown up rather than assuming one `read` gets all
-        // of them.
-        client.write_all(b"9").await.expect("send an out-of-range digit");
-        let want = b"9\r\n1) MajorMUD  2) LunatiX  ? ";
         let mut got = Vec::new();
-        while got.len() < want.len() {
-            let n = client.read(&mut buf).await.expect("read the echoed digit, CRLF, and re-prompt");
-            assert!(n > 0, "the connection closed before the re-prompt finished arriving");
+        let mut buf = [0u8; 256];
+        while !got.ends_with(b"Enter your user ID: ") {
+            let n = client.read(&mut buf).await.expect("read");
+            assert!(n > 0, "closed before the prompt: {got:?}");
             got.extend_from_slice(&buf[..n]);
         }
         assert_eq!(
-            got, want,
-            "an unrecognised selection must echo, terminate the line, and show \
-             the exact same prompt again -- not silently guess a machine"
+            got,
+            [IAC, WILL, OPT_SGA, IAC, WILL, OPT_ECHO].iter().copied().chain(b"Enter your user ID: ".iter().copied()).collect::<Vec<u8>>()
         );
-
-        // Now send a real selection and confirm the connection still
-        // resolves correctly -- the bad keystroke must not have wedged
-        // anything.
-        client.write_all(b"2").await.expect("select the second machine this time");
-        let chosen = select_task
-            .await
-            .expect("select_machine task did not panic")
-            .expect("no I/O error")
-            .expect("the second attempt must succeed");
-
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
-        let who = mbbs::Connection::ansi("tester");
-        chosen
-            .send(crate::msg::In::Connect { who, out: out_tx, reply: reply_tx })
-            .expect("machine 1's receiver is still alive");
-        assert!(_rx_b.try_recv().is_ok(), "the eventual valid selection must still route correctly");
-        assert!(_rx_a.try_recv().is_err());
-    }
-
-    /// A disconnect mid-prompt (EOF before any keystroke arrives) must
-    /// return `Ok(None)`, not panic and not hang -- the same contract
-    /// `read_user_id` gives `handle` one step later.
-    #[tokio::test]
-    async fn a_disconnect_during_the_prompt_is_handled_cleanly() {
-        use tokio::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
-        let client = TcpStream::connect(addr).await.expect("connect");
-        let (server, _peer) = listener.accept().await.expect("accept");
-        let (mut reader, mut writer) = server.into_split();
-
-        let (machine_a, _rx_a) = fake_machine(0, "MajorMUD");
-        let (machine_b, _rx_b) = fake_machine(1, "LunatiX");
-        let machines = vec![machine_a, machine_b];
-
-        drop(client); // disconnect before typing anything
-
-        let result = select_machine(&machines, &mut reader, &mut writer).await;
-        assert!(matches!(result, Ok(None)), "a disconnect mid-prompt must be Ok(None), not an error: {result:?}");
     }
 }
