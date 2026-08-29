@@ -800,6 +800,22 @@ impl<A: Abi> Users<A> {
         Ok(u32::from_le_bytes(wide))
     }
 
+    /// `usrptr->flags |= bits`, at the field's own width.
+    ///
+    /// The read-modify-write [`Users::flags_mem`] leaves to its callers, done
+    /// once here so `entmdl`'s `usrptr->flags|=X2MAIN` (`MENUING.C:664`) is a
+    /// call and not a third open-coded copy of the same three lines.
+    ///
+    /// # Errors
+    ///
+    /// If the read or the write runs off the segment.
+    pub fn or_flags_mem(&mut self, mem: &mut A::Mem, unum: Chan, bits: u32) -> Result<(), ShimError> {
+        let flags = self.flags_mem(mem, unum)? | bits;
+        let at = A::ptr_offset(self.slot(unum), self.user.flags.at);
+        at.write(mem, &flags.to_le_bytes()[..usize::from(self.user.flags.width)])
+            .map_err(|e| ShimError::Failed(e.to_string()))
+    }
+
     /// `user[unum].substt` -- the registered module's own substate, against
     /// memory directly rather than a whole `Machine`.
     ///
@@ -1811,6 +1827,44 @@ mod tests {
             selector: slot.selector,
         };
         assert_eq!(f.machine.resolve(at, 2).expect("in the slot"), &[1, 0]);
+    }
+
+    /// `or_flags_mem` sets its bits and leaves every other bit alone.
+    ///
+    /// Both halves of a `LONG` are exercised on purpose. `X2MAIN` alone is
+    /// `0x400`, so a writer that narrowed the field to a word would still
+    /// answer correctly for the one caller this exists for; `MONALL`
+    /// (`MAJORBBS.H`, `0x00010000L`) is in the high word and a narrowed write
+    /// loses it.
+    #[test]
+    fn or_flags_mem_sets_bits_without_disturbing_the_rest() {
+        let mut f = crate::testing::Fixture::new();
+        let console = f.console();
+
+        let slot = f.host.users().slot(console);
+        let flags = mbbs_machine::m16::FarPtr {
+            offset: slot.offset + UserLayout::of::<Wg16>().flags.at,
+            selector: slot.selector,
+        };
+        f.machine
+            .write(flags, &0x0002_0002u32.to_le_bytes())
+            .expect("in bounds");
+
+        f.host
+            .users
+            .or_flags_mem(f.machine.mem_mut(), console, 0x0001_0400)
+            .expect("write");
+
+        assert_eq!(
+            f.host.users().flags_mem(f.machine.mem(), console).expect("read"),
+            0x0003_0402,
+            "both bits are set and both that were there survive"
+        );
+        assert_eq!(
+            f.machine.resolve(flags, 4).expect("in bounds"),
+            &0x0003_0402u32.to_le_bytes(),
+            "and it landed in the module's own four bytes"
+        );
     }
 
     /// `struct usracc` at both ABIs.

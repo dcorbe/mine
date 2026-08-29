@@ -5013,7 +5013,10 @@ impl<A: Abi> Host<A> {
         Ok(())
     }
 
-    /// Put a channel into the module's state machine and let the module know.
+    /// Put a channel into the module's state machine and let the module know:
+    /// it runs `lonrou`, then enters the module (`entmdl`, `Host::enter_module`
+    /// below). A connecting player lands on the module's own first screen
+    /// without typing anything.
     ///
     /// `connect_state` writes what a real board's `loadup()` would have read
     /// out of `bbsusr.dat`; `lonrou` is the module's own logon hook, which
@@ -5022,7 +5025,8 @@ impl<A: Abi> Host<A> {
     ///
     /// Returns `None` if the module supplies no `lonrou` -- the real host
     /// never called one either, so there is no [`Outcome`] to report for a
-    /// call that never happened.
+    /// call that never happened. The entry line is queued either way; only a
+    /// `lonrou` that *stopped* the machine skips it.
     ///
     /// R21: a `ShimError` out of `connect_state` or the `lonrou` lookup
     /// poisons the machine and comes back as `Outcome::Stopped`, the same
@@ -5080,14 +5084,6 @@ impl<A: Abi> Host<A> {
             Ok(lonrou) => lonrou,
             Err(e) => return self.shim_stop(machine, "lonrou lookup", e).map(Some),
         };
-        let Some(lonrou) = lonrou else {
-            // R24: a null `lonrou` is legal -- the real host checked
-            // `if ((rouptr = module[i]->lonrou) != NULL)` before calling --
-            // and it means no call happened, not that one returned zero.
-            // `None` says that honestly; a fabricated `Returned { ax: 0,
-            // dx: 0 }` would claim a call this host never made.
-            return Ok(None);
-        };
         // `MAJORBBS.C:4000` -- `setmem(vdaptr,vdasiz,0)`, the line before
         // `cyclon` calls a module's `lonrou`. The volatile data area is the one
         // per-channel block `rstchn` does *not* clear, because `dftrst` does not
@@ -5100,16 +5096,83 @@ impl<A: Abi> Host<A> {
         // which is exactly the argument that made `btuxmt`'s channel argument
         // unfalsifiable at one channel. This branch exists because that argument
         // was wrong once already.
-        if let Some(vda) = self.users.vda(chan) {
-            let size = self.globals.word_mem(A::mem_ref(machine), "vdasiz")?;
-            if let Err(e) = vda.write(A::mem(machine), &vec![0u8; usize::from(size)]) {
-                return self
-                    .shim_stop(machine, "clearing the volatile data area", ShimError::Failed(e.to_string()))
-                    .map(Some);
+        let outcome = match lonrou {
+            // R24: a null `lonrou` is legal -- the real host checked
+            // `if ((rouptr = module[i]->lonrou) != NULL)` before calling --
+            // and it means no call happened, not that one returned zero.
+            // `None` says that honestly; a fabricated `Returned { ax: 0,
+            // dx: 0 }` would claim a call this host never made.
+            None => None,
+            Some(lonrou) => {
+                if let Err(e) = self.clear_vda(machine, chan) {
+                    return self
+                        .shim_stop(machine, "clearing the volatile data area", e)
+                        .map(Some);
+                }
+                Some(self.run(machine, module, lonrou, &[], Some(chan))?)
             }
-        }
+        };
 
-        self.run(machine, module, lonrou, &[], Some(chan)).map(Some)
+        // `lonrou` is the logon announcement; entering the module is a
+        // separate step the real host performs from its menu. A stopped
+        // module is not entered.
+        let ran = outcome
+            .as_ref()
+            .is_none_or(|o| matches!(o, Outcome::Returned { .. }));
+        if ran && let Err(e) = self.enter_module(machine, chan) {
+            return self.shim_stop(machine, "entering the module", e).map(Some);
+        }
+        Ok(outcome)
+    }
+
+    /// `setmem(vdaptr,vdasiz,0)` -- the real host's line before both
+    /// `lonrou` (`MAJORBBS.C:4000`) and `sttrou`-on-entry (`MENUING.C:684`).
+    ///
+    /// A channel with no volatile data area -- no module declared one, so
+    /// `alcvda` never ran -- has nothing to clear, which is what `vdaoff`
+    /// answering null meant on the real host too. See [`users::Users::vda`].
+    ///
+    /// # Errors
+    ///
+    /// If `vdasiz` cannot be read, or the write runs off the segment.
+    fn clear_vda(&mut self, machine: &mut A::Cpu, chan: Chan) -> Result<(), ShimError> {
+        let Some(vda) = self.users.vda(chan) else {
+            return Ok(());
+        };
+        let size = self
+            .globals
+            .word_mem(A::mem_ref(machine), "vdasiz")
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        vda.write(A::mem(machine), &vec![0u8; usize::from(size)])
+            .map_err(|e| ShimError::Failed(e.to_string()))
+    }
+
+    /// `entmdl` (`MENUING.C:655-687`): what the real host does the moment a
+    /// user picks a module from its menu. `state` already names the first
+    /// module (`connect_state`). Then, in `entmdl`'s order: `substt = 0`,
+    /// `flags |= X2MAIN`, the synthesised input line, the volatile data area
+    /// zeroed, `clrprf`, and `sttrou` -- which happens on the driver's next
+    /// poll, because the line is queued the way a terminal's would be
+    /// ([`gsbl::Gsbl::queue_line`]) rather than dispatched from here. One
+    /// `sttrou` path, not two.
+    ///
+    /// The line is `"%c%s %-.*s"` of the select character (`Z` when there is
+    /// none), the menu page's command string (none here) and the rest of the
+    /// concatenated input (none here): `"Z "`. `btuoes(usrnum,0)` is not
+    /// replayed -- `Channel::oes` starts false.
+    ///
+    /// # Errors
+    ///
+    /// If any of the writes runs off a segment.
+    fn enter_module(&mut self, machine: &mut A::Cpu, chan: Chan) -> Result<(), ShimError> {
+        /// `MAJORBBS.H:270` -- "exit-to-main-menu when sysop chat".
+        const X2MAIN: u32 = 0x0000_0400;
+        self.users.set_substt_mem(A::mem(machine), chan, 0)?;
+        self.users.or_flags_mem(A::mem(machine), chan, X2MAIN)?;
+        self.clear_vda(machine, chan)?;
+        shims::text::clrprf_mem(A::mem(machine), self)?;
+        self.gsbl_mut().queue_line(chan, b"Z ");
+        Ok(())
     }
 
     /// Lost carrier: hand the channel to the module's `huprou`, then reset it.

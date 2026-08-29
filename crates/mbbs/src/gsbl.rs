@@ -518,6 +518,21 @@ impl Gsbl {
         }
     }
 
+    /// A completed line the *host* hands the channel, not the terminal --
+    /// `entmdl`'s synthesised entry line (`MENUING.C:669`). Queues the line
+    /// and the `CRSTG` that announces it, the same pair `Channel::take`'s
+    /// terminator arm produces when a cooked channel's bytes reach a CR, so
+    /// the poll path cannot tell the two apart.
+    ///
+    /// No echo. `take` echoes the CR because a *terminal* typed it; nothing
+    /// typed this one, and `entmdl` writes `input` directly rather than
+    /// through the input pipeline at all.
+    pub fn queue_line(&mut self, chan: Chan, line: &[u8]) {
+        let c = self.channel_mut(chan);
+        c.ready.push_back(line.to_vec());
+        c.status.push_back(Gsbl::CRSTG);
+    }
+
     /// The next status for a channel, oldest first, or `None` if none is
     /// waiting.
     ///
