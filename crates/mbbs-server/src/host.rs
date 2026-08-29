@@ -155,58 +155,15 @@ pub struct Boot<A: Abi> {
     /// that shape from the *module* side -- WCCMMUD's own code, not this
     /// host, is what would call back into it).
     ///
-    /// # A caveat this driver does not paper over -- MEASURED, not merely reasoned
+    /// # Thunk ownership across modules
     ///
-    /// `Host::run`'s `module: &A::Module` argument names whose import table
-    /// an unimplemented-symbol trap resolves against (thunk indices are
-    /// assigned fresh, from zero, by each module's own `Host::load` call --
-    /// see `mbbs_machine::m16::ne::Thunks::new` -- and every module's own
-    /// thunk table lives at the *same* physical addresses in the machine's
-    /// one shared bridge segment, so the same numeric index means a
-    /// different symbol in two different modules' own tables). Whichever
-    /// `A::Module` handle a given `Host::run` call is made with is the only
-    /// table a trap during that call is ever resolved against -- for the
-    /// whole call, even if execution crosses into a *different* already-
-    /// loaded module's own code along the way (exactly the cross-module
-    /// linkage `071c5a0` added `Host::load`'s `loaded_modules` registry to
-    /// allow: a call resolved as `Import::Data` is a real far call straight
-    /// into the other module's own code, with no host involvement and no
-    /// hand-off of which `A::Module` names its thunk table).
-    ///
-    /// This is not a hypothetical. Booting `re/WCCMMUD.DLL` then
-    /// `WCCMMPLS.DLL` (MajorMUD Plus) on one `Wg16` machine -- both real
-    /// files, this driver's own per-module loop, `modules[1]`'s own handle
-    /// passed to *its own* `Host::run` call exactly as this loop is
-    /// written -- reached `WCCMMPLS.DLL: module ordinal 1 (init) stopped
-    /// before boot completed: .thunk #66 is not implemented`. The leading
-    /// `.` (an empty module name ahead of the symbol) is `Host::run`'s own
-    /// fallback for `A::import` answering `None`: Plus's own thunk table
-    /// index 66 came up empty. Plus's own `WCCMMUD.DLL` cross-module calls
-    /// (`register_mud_addon` among them) are exactly the kind of direct,
-    /// no-thunk far call described above, and `WCCMMUD.DLL` -- loaded and
-    /// initialised first in this same run, `188` distinct host symbols
-    /// measured -- has more than 66 of its own. The far likelier reading is
-    /// that Plus's init transitively called into `WCCMMUD.DLL`'s own code,
-    /// that code hit its *own* thunk 66, and this driver -- still holding
-    /// Plus's `A::Module` for the `Host::run` call it made -- resolved index
-    /// 66 against the wrong table and reported a symbol that may well
-    /// already be served. Confirming exactly which symbol thunk 66 names in
-    /// each module's own table was not done (out of scope for this driver,
-    /// and arguably `mbbs-machine`'s call to fix: thunk allocation would
-    /// need to be shared across every module loaded onto one machine, not
-    /// restarted at zero per `Host::load` call, for a trap's raw index to
-    /// mean one thing regardless of which module's code was executing when
-    /// it fired).
-    ///
-    /// This is a pre-existing fact about cross-module calls (true since
-    /// `071c5a0`, not introduced by N-module boot) that N-module-per-machine
-    /// boot is simply the first feature to actually exercise -- a single
-    /// module never crosses into another's code at all, and a second board
-    /// is a second process, with its own `Machine` and its own thunk table
-    /// (one machine per `mbbs-server` process; two boards are two
-    /// processes, not two machines sharing this one). Not something this
-    /// stage claims to fix; recorded here, with the real run that found it,
-    /// rather than assumed away.
+    /// A trap's raw thunk index used to be ambiguous with two modules on one
+    /// machine (each load numbered from zero): booting `WCCMMUD.DLL` then
+    /// `WCCMMPLS.DLL` stopped at `.thunk #66`, a slot both modules claimed.
+    /// Thunk slices are machine-wide now -- `m16` since `50944874`, `m32`
+    /// alongside it -- and `Host::import_owner` finds the true owner when
+    /// execution has crossed into another module's code. What remains is the
+    /// order contract above.
     pub modules: Vec<PathBuf>,
     /// The fixed channel count. Sizes every per-channel table at `Host::new`.
     pub terms: Terms,
@@ -896,8 +853,8 @@ fn life<A: Abi>(
     //    `loaded[0]` -- not the last, not "whichever registered" -- is what
     //    every `apply`/`flush` call below hands to `Host::connect`/
     //    `Host::hangup`/`Host::run` as "the module": see `Boot::modules`'s
-    //    doc, "A caveat this driver does not paper over", for exactly what
-    //    that does and does not promise.
+    //    doc, "Thunk ownership across modules", for exactly what that does
+    //    and does not promise.
     let mut loaded: Vec<A::Module> = Vec::with_capacity(boot.modules.len());
     for path in &boot.modules {
         let file = std::fs::read(path)
