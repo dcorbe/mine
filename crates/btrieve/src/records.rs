@@ -152,13 +152,32 @@ impl Records {
         geometry: &Geometry,
         keys: &[Key],
     ) -> Result<Self, BtvError> {
+        Self::read_via(name, path, geometry, keys, None)
+    }
+
+    /// [`Self::read`], but for a v6 block that may hold **staged, unflushed**
+    /// writes in a page cache (an open transaction or a system-transaction
+    /// bundle). With a cache attached the walk reads the file *as the cache
+    /// currently sees it* -- staged pages overlaid on disk -- so a model
+    /// rebuilt mid-transaction/mid-bundle includes writes not yet on disk,
+    /// rather than reading the pre-write file and refusing it ("the header
+    /// says N records and walking the pages found M"). `None` reads the file
+    /// off disk exactly as `read` always has; v5 ignores the cache (it has
+    /// none).
+    pub fn read_via(
+        name: &str,
+        path: &Path,
+        geometry: &Geometry,
+        keys: &[Key],
+        cache: Option<&std::rc::Rc<std::cell::RefCell<crate::cache::PageCache>>>,
+    ) -> Result<Self, BtvError> {
         crate::RECORD_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let fail = |why: String| BtvError {
             file: name.to_owned(),
             why,
         };
 
-        let records = walk(geometry, path).map_err(fail)?;
+        let records = walk(geometry, path, cache).map_err(fail)?;
 
         if records.len() as u32 != geometry.records {
             return Err(fail(format!(
@@ -647,10 +666,14 @@ impl Records {
 /// but differ in what a page's number means and where the free-standing
 /// slot content starts -- see [`walk_v6`]'s doc comment for the differences
 /// and why each is what it is.
-fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
+fn walk(
+    geometry: &Geometry,
+    path: &Path,
+    cache: Option<&std::rc::Rc<std::cell::RefCell<crate::cache::PageCache>>>,
+) -> Result<Vec<Record>, String> {
     match geometry.version {
         Version::V5 => walk_v5(geometry, path),
-        Version::V6 => walk_v6(geometry, path),
+        Version::V6 => walk_v6(geometry, path, cache),
     }
 }
 
@@ -834,7 +857,11 @@ fn walk_v5(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
 /// `dupkey30_records` test helper independently reaches the same
 /// conclusion, from the in-record `[prev][next]` duplicate chain rather
 /// than from insertion order -- see its doc comment.
-fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
+fn walk_v6(
+    geometry: &Geometry,
+    path: &Path,
+    cache: Option<&std::rc::Rc<std::cell::RefCell<crate::cache::PageCache>>>,
+) -> Result<Vec<Record>, String> {
     if usize::from(geometry.physical) < V6_SLOT_MARKER {
         return Err(format!(
             "a {}-byte physical record, too short to hold the two-byte v6 slot \
@@ -850,7 +877,28 @@ fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
     // shrink): the saving Stage B makes elsewhere is that a *write* no
     // longer pays this cost too, not that this walk can avoid it. Wrapped in
     // a `Store` only so `v6::Map::read` has one implementation, not two.
-    let file = crate::read_whole(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The image this walk runs on. With a cache attached, build it from the
+    // cache -- every physical page as the cache currently sees it, staged
+    // (unflushed) writes overlaid on disk, clean pages faulted from disk on
+    // miss -- so the walk below (and the variable-length `Chain::follow` that
+    // slices the same `file`) sees a transaction's or bundle's in-flight
+    // writes. Without a cache it is the file whole, exactly as before. The
+    // cache's `total_pages` already counts pages a staged write appended.
+    let file = match cache {
+        Some(cache) => {
+            let page = usize::from(geometry.page);
+            let mut guard = cache.borrow_mut();
+            let total = guard.total_pages();
+            let mut buf = vec![0u8; total * page];
+            for n in 0..total {
+                let physical = u32::try_from(n)
+                    .map_err(|_| format!("physical page {n} does not fit a u32"))?;
+                buf[n * page..(n + 1) * page].copy_from_slice(guard.page(physical)?);
+            }
+            buf
+        }
+        None => crate::read_whole(path).map_err(|e| format!("{}: {e}", path.display()))?,
+    };
     let size = u32::try_from(file.len())
         .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
 
@@ -2200,7 +2248,7 @@ mod tests {
         for name in SHIPPED_FILES {
             let path = dir.join(name);
             let geometry = Geometry::read(name, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let want = walk(&geometry, &path).unwrap_or_else(|e| panic!("{name} walk: {e}"));
+            let want = walk(&geometry, &path, None).unwrap_or_else(|e| panic!("{name} walk: {e}"));
             let got =
                 layout_walk(&geometry, &path).unwrap_or_else(|e| panic!("{name} layout_walk: {e}"));
             assert_eq!(want, got, "{name}: walk and layout_walk disagree");

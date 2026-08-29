@@ -1727,11 +1727,12 @@ impl<M: Mem> Block<M> {
     /// cannot be resolved (any refusal of [`v6::Map::read`]).
     pub fn records(&mut self) -> Result<&Records, BtvError> {
         if self.records.is_none() {
-            self.records = Some(Records::read(
+            self.records = Some(Records::read_via(
                 &self.name,
                 &self.path,
                 &self.geometry,
                 &self.keys,
+                self.cache.as_ref(),
             )?);
         }
         Ok(self.records.as_ref().expect("just read"))
