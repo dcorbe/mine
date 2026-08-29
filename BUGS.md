@@ -71,7 +71,34 @@ decompile.
 
 ---
 
-## 2. The host stops the machine where the runtime returned an error code
+## 2. v6 files grow without bound, and a live file already has content where table blocks belong
+
+**Found 2026-08-29 while fixing the `WCCACMS2.DAT` commit refusal; neither is fixed.**
+
+**Growth.** `Map::claim` and `Map::relocate` append a fresh physical page for
+every claim and for every relocation that finds no abandoned twin. The genuine
+engine pre-assigns each allocation-table slot a physical page (`(0, first+2+i)`
+in every fresh block of every shipped `.vir`) and reuses abandoned pages, so
+its files stay near their claimed size. Measured on the live board after one
+boot's automatic database update: `wccmp002.vir` is 13,607 pages and the
+`WCCMP002.DAT` it became is **20,744** -- 29 MB of pages nothing claims. The
+file-control-record page count (`fcr::PAGES`, `+0x26`) is not maintained on
+the v6 write path either: the live `WCCACMS2.DAT` says 3 at 1,016 pages, where
+the vendor's `wccmp002.vir` says 13,572 at 13,607.
+
+**Stranded block positions.** Before `Map::append_content`, a claim that
+landed on a table block's formula position wrote content there. The live
+`WCCMP002.DAT` has data pages at physical **14338 and 15362** (blocks 15 and
+16's positions, 4096-byte pages). The engine now reads and writes such a file
+correctly -- its table ends at block 14 -- but it can never grow a fifteenth
+block: once blocks 1-14 have no free slot, `claim` refuses with `growing a new
+block is not implemented`. Blocks 1-13 are full and block 14 has ~740 free
+slots. The remedy is a reinstall of that file from `wccmp002.vir` (the boot's
+database update regenerates it); nothing in the engine can move the pages.
+
+---
+
+## 3. The host stops the machine where the runtime returned an error code
 
 **Not one bug — a shape, and the one most likely to bite next.**
 
@@ -104,7 +131,7 @@ not own, an unimplemented import with a live caller.
 
 ---
 
-## 3. `wg32_abi` boot-stub test is flaky under the full workspace run
+## 4. `wg32_abi` boot-stub test is flaky under the full workspace run
 
 **Symptom.**
 `boot_bug::entering_the_pe_entry_stub_faults_but_the_real_init_routine_does_not`
@@ -124,7 +151,7 @@ to any commit from it.
 
 ---
 
-## 4. Btrieve record tests share scratch directories and race
+## 5. Btrieve record tests share scratch directories and race
 
 **Symptom.** An intermittent
 `written: Os { code: 2, kind: NotFound }` from `records.rs`'s `read` test
@@ -149,7 +176,7 @@ it was found while chasing something else.
 
 ---
 
-## 5. A doc comment cites the `wg20` tree
+## 6. A doc comment cites the `wg20` tree
 
 `crates/mbbs/src/lib.rs:2549` cites
 `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3368`.
@@ -161,7 +188,7 @@ number rather than assuming it transfers.
 
 ---
 
-## 6. `WCCUSERS.DAT` falls off the `setbtv` stack
+## 7. `WCCUSERS.DAT` falls off the `setbtv` stack
 
 **Not a bug in this host — recorded so it is not re-investigated.**
 
@@ -179,7 +206,7 @@ observed landing on the wrong file.
 
 ---
 
-## 7. In-process recovery has never been observed completing
+## 8. In-process recovery has never been observed completing
 
 **Open question, not a known defect.**
 
@@ -207,7 +234,7 @@ matches this module's build stamp exactly.
 
 ---
 
-## 8. Latency and idle cost in the Realm
+## 9. Latency and idle cost in the Realm
 
 **Largely closed. Kept for the numbers.**
 
