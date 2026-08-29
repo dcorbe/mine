@@ -111,8 +111,13 @@ module's `finrou` at all:
 | `clsmsg` | the block is current | stop | close it, `curmbk` goes null |
 | `clsmsg` | the block waits under the current one | stop | close it, the `saved` entry goes null in place |
 | `fclose` | the file is already closed | stop | `EOF`, and a note |
+| `rstmbk` | nothing to restore | stop | the vendor's ten-slot window: the stale slot below, or null |
 
-None of the three was the vendor's rule. `MCVAPI.H:66` declares `void
+The fourth (2026-08-29) was not teardown: a Mystic typing `spells` has
+MajorMUD pop three times for two `setmbk`s, and the refusal stopped the
+module for every player on the board. `MCVAPI.C:229` cannot fail.
+
+None of the first three was the vendor's rule. `MCVAPI.H:66` declares `void
 clsmsg(FILE *mb)` and no body survives in the recovered tree; C's `fclose`
 reports failure in its return value. All three were this host's own
 inventions, written against paths that had never run.
