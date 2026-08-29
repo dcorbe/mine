@@ -10,7 +10,19 @@
 //!
 //! See `docs/superpowers/specs/2026-08-29-sbbs-door-design.md`.
 
+use std::io;
+use std::os::unix::fs::FileTypeExt;
+use std::path::PathBuf;
+use std::sync::mpsc as std_mpsc;
+
 use mbbs::Connection;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::conn::{self, OUT_CHANNEL_BOUND};
+use crate::msg::{In, Out};
+use crate::termcompat::Stack;
 
 /// The header's first line. The `1` is the protocol version; a relay that
 /// speaks a later one is refused rather than half-understood.
@@ -171,6 +183,101 @@ pub fn connection(h: &Handshake) -> Connection {
     c.with_keys(keys(h.sysop))
 }
 
+/// Bind `path` and spawn its accept loop; returns as soon as it is bound.
+///
+/// A socket file left by a previous process is unlinked first -- nothing
+/// can be listening on it, or `bind` would fail with `AddrInUse` on a live
+/// one. Anything at `path` that is *not* a socket is refused: that is a
+/// misconfiguration, not a stale socket.
+pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>) -> io::Result<()> {
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(&path)?,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let listener = UnixListener::bind(&path)?;
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = session(stream, tx).await {
+                            eprintln!("mbbs-server: door session ended: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("mbbs-server: door accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// One door session: header, connect, pump.
+async fn session(stream: UnixStream, tx: std_mpsc::Sender<In>) -> io::Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+
+    let mut buf = Vec::with_capacity(256);
+    let (handshake, leftover) = loop {
+        match parse(&buf) {
+            Parse::Complete { handshake, consumed } => break (handshake, buf.split_off(consumed)),
+            Parse::Invalid(reason) => {
+                writer.write_all(format!("mbbs-door: {reason}\r\n").as_bytes()).await?;
+                return Ok(());
+            }
+            Parse::Incomplete => {
+                let mut chunk = [0u8; 256];
+                let n = tokio::io::AsyncReadExt::read(&mut reader, &mut chunk).await?;
+                if n == 0 {
+                    return Ok(()); // gone before the header ended
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+    };
+    eprintln!(
+        "mbbs-server: door session for {:?} (sysop={}, node={:?})",
+        handshake.user, handshake.sysop, handshake.node
+    );
+
+    let (out_tx, out_rx) = mpsc::channel::<Out>(OUT_CHANNEL_BOUND);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if tx
+        .send(In::Connect { who: connection(&handshake), out: out_tx, reply: reply_tx })
+        .is_err()
+    {
+        writer.write_all(b"Server error, try again later.\r\n").await?;
+        return Ok(());
+    }
+    let chan = match reply_rx.await {
+        Ok(Some(chan)) => chan,
+        Ok(None) => {
+            writer.write_all(b"All lines are busy.\r\n").await?;
+            return Ok(());
+        }
+        Err(_) => {
+            writer.write_all(b"Server error, try again later.\r\n").await?;
+            return Ok(());
+        }
+    };
+
+    if !leftover.is_empty() && tx.send(In::Input { chan, bytes: leftover }).is_err() {
+        return Ok(());
+    }
+
+    conn::pump(reader, writer, tx, chan, out_rx, Stack::door).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +377,158 @@ mod tests {
         let c = connection(&Handshake { sysop: true, ansi: true, ..h });
         assert!(c.ansi);
         assert!(c.keys.evaluate("SYSOP") && c.keys.evaluate("WCCSYSOP"));
+    }
+
+    use crate::msg::{In, Out};
+    use std::sync::mpsc as std_mpsc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    fn socket_path(name: &str) -> std::path::PathBuf {
+        mbbs::testing::scratch(name).canonicalize().expect("scratch dir exists").join("door.sock")
+    }
+
+    async fn read_to_end(sock: &mut UnixStream) -> Vec<u8> {
+        let mut acc = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut acc))
+            .await
+            .expect("the server closes the socket within 5s")
+            .expect("read");
+        acc
+    }
+
+    /// A host thread that died leaves nobody to answer `In::Connect`.
+    #[tokio::test]
+    async fn a_dead_host_thread_tells_the_relay_and_closes() {
+        let path = socket_path("door-dead-host");
+        let (tx, rx) = std_mpsc::channel::<In>();
+        drop(rx);
+        serve(path.clone(), tx).await.expect("bind");
+
+        let mut sock = UnixStream::connect(&path).await.expect("connect");
+        sock.write_all(b"mbbs-door 1\nuser=Dan\n\n").await.expect("write");
+        let got = read_to_end(&mut sock).await;
+        assert_eq!(got, b"Server error, try again later.\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_bad_header_is_refused_with_its_reason() {
+        let path = socket_path("door-bad-header");
+        let (tx, _rx) = std_mpsc::channel::<In>();
+        serve(path.clone(), tx).await.expect("bind");
+
+        let mut sock = UnixStream::connect(&path).await.expect("connect");
+        sock.write_all(b"HELLO\n\n").await.expect("write");
+        let got = read_to_end(&mut sock).await;
+        assert_eq!(got, b"mbbs-door: not an mbbs-door 1 header\r\n");
+    }
+
+    /// A fake host thread: answers the first `Connect` as told, then hands
+    /// the test the `Out` sender it was given and every later message.
+    fn fake_host(
+        reply_with: Option<mbbs::Chan>,
+    ) -> (std_mpsc::Sender<In>, std_mpsc::Receiver<(mbbs::Connection, tokio::sync::mpsc::Sender<Out>)>, std_mpsc::Receiver<In>) {
+        let (tx, rx) = std_mpsc::channel::<In>();
+        let (connected_tx, connected_rx) = std_mpsc::channel();
+        let (rest_tx, rest_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            for msg in rx {
+                match msg {
+                    In::Connect { who, out, reply } => {
+                        let _ = reply.send(reply_with);
+                        let _ = connected_tx.send((who, out));
+                    }
+                    other => {
+                        let _ = rest_tx.send(other);
+                    }
+                }
+            }
+        });
+        (tx, connected_rx, rest_rx)
+    }
+
+    #[tokio::test]
+    async fn a_full_board_tells_the_relay_and_closes() {
+        let path = socket_path("door-full");
+        let (tx, _connected, _rest) = fake_host(None);
+        serve(path.clone(), tx).await.expect("bind");
+
+        let mut sock = UnixStream::connect(&path).await.expect("connect");
+        sock.write_all(b"mbbs-door 1\nuser=Dan\n\n").await.expect("write");
+        assert_eq!(read_to_end(&mut sock).await, b"All lines are busy.\r\n");
+    }
+
+    /// The whole prelude, then the wire: the host sees the handshake's
+    /// `Connection`; the session's bytes flow both ways with no telnet
+    /// framing and no transcoding; bytes pipelined behind the header are
+    /// the session's first input.
+    #[tokio::test]
+    async fn a_session_connects_with_the_handshake_and_pumps_raw_cp437() {
+        let path = socket_path("door-session");
+        let chan = mbbs::Terms::new(1).chan(0).expect("channel zero");
+        let (tx, connected, rest) = fake_host(Some(chan));
+        serve(path.clone(), tx).await.expect("bind");
+
+        let mut sock = UnixStream::connect(&path).await.expect("connect");
+        sock.write_all(b"mbbs-door 1\nuser=Dan\nsysop=1\nrows=25\ncols=132\n\nlook\r")
+            .await
+            .expect("write");
+
+        let (who, out) = tokio::task::spawn_blocking(move || connected.recv_timeout(Duration::from_secs(5)))
+            .await
+            .expect("join")
+            .expect("the host saw a Connect");
+        assert_eq!(who.userid, "Dan");
+        assert_eq!((who.width, who.height), (132, 25));
+        assert!(who.keys.evaluate("SYSOP"));
+
+        // `std_mpsc::Receiver` is not `Sync`, so it cannot be borrowed into
+        // `spawn_blocking`; share it behind a mutex and move clones in.
+        let rest = std::sync::Arc::new(std::sync::Mutex::new(rest));
+        let next = |rest: std::sync::Arc<std::sync::Mutex<std_mpsc::Receiver<In>>>| async move {
+            tokio::task::spawn_blocking(move || rest.lock().expect("lock").recv_timeout(Duration::from_secs(5)))
+                .await
+                .expect("join")
+                .expect("the host received a message")
+        };
+
+        match next(rest.clone()).await {
+            In::Input { bytes, .. } => assert_eq!(bytes, b"look\r"),
+            _ => panic!("expected the pipelined bytes as the first Input"),
+        }
+
+        out.send(Out::Bytes(vec![b'A', 0xFF, b'B'])).await.expect("send");
+        let mut got = [0u8; 3];
+        tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut got))
+            .await
+            .expect("bytes within 5s")
+            .expect("read");
+        assert_eq!(got, [b'A', 0xFF, b'B'], "no IAC doubling on a door");
+
+        sock.write_all(&[0xFF, b'X']).await.expect("write");
+        match next(rest.clone()).await {
+            In::Input { bytes, .. } => assert_eq!(bytes, vec![0xFF, b'X'], "no IAC stripping on a door"),
+            _ => panic!("expected Input"),
+        }
+
+        out.send(Out::Close).await.expect("send");
+        assert!(read_to_end(&mut sock).await.is_empty(), "Close ends the session with nothing more");
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_file_is_replaced_and_a_regular_file_is_not() {
+        let path = socket_path("door-stale");
+        std::os::unix::net::UnixListener::bind(&path).expect("a stale socket file");
+        let (tx, _rx) = std_mpsc::channel::<In>();
+        serve(path.clone(), tx.clone()).await.expect("rebinds over a stale socket");
+
+        let regular = mbbs::testing::scratch("door-regular")
+            .canonicalize()
+            .expect("scratch dir exists")
+            .join("door.sock");
+        std::fs::write(&regular, b"not a socket").expect("write");
+        let err = serve(regular, tx).await.expect_err("refuses a regular file");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 }

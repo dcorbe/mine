@@ -90,7 +90,7 @@ const OPT_SGA: u8 = 3;
 /// (`Full` treated like `Closed`), which made a burst of tiny writes
 /// lethal: see `host::offer`'s own doc comment for the measured
 /// character-creation drop that retired that rule.
-const OUT_CHANNEL_BOUND: usize = 32;
+pub(crate) const OUT_CHANNEL_BOUND: usize = 32;
 
 /// The keys `crates/mbbs/tests/wccmmud.rs:3623` uses for a player who reaches
 /// the Realm. This is a *default*, not a policy: [`serve`]'s `keys` parameter
