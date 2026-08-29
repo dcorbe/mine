@@ -14652,6 +14652,37 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_update_is_visible_to_a_record_model_rebuild() {
+        let (mut btrieve, _mem, _heap, at, _path) = session_with_v6("bundle-read-staged-update");
+        let pos = btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("insert");
+        btrieve.flush_bundles().expect("commit the baseline");
+        btrieve.block_mut(at).expect("open").update(pos, &v6_record(b"BBBB")).expect("staged update");
+        assert!(btrieve.block(at).expect("open").bundle.is_open(), "the update staged, not committed");
+        btrieve.block_mut(at).expect("open").records = None;
+        let recs = btrieve.block_mut(at).expect("open").records().expect("the rebuilt model");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            &at_position(recs, pos).expect("still there").bytes[..4],
+            b"BBBB",
+            "the rebuild must show the staged update, not the committed AAAA"
+        );
+    }
+
+    #[test]
+    fn a_staged_delete_is_visible_to_a_record_model_rebuild() {
+        let (mut btrieve, _mem, _heap, at, _path) = session_with_v6("bundle-read-staged-delete");
+        let pos = btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("insert");
+        btrieve.flush_bundles().expect("commit the baseline");
+        assert_eq!(btrieve.block_mut(at).expect("open").records().expect("reads").len(), 1);
+        btrieve.block_mut(at).expect("open").records = None;
+        btrieve.block_mut(at).expect("open").delete(pos).expect("staged delete");
+        assert!(btrieve.block(at).expect("open").bundle.is_open(), "the delete staged, not committed");
+        btrieve.block_mut(at).expect("open").records = None;
+        let recs = btrieve.block_mut(at).expect("open").records().expect("the rebuilt model");
+        assert_eq!(recs.len(), 0, "the rebuild must reflect the staged delete");
+    }
+
+    #[test]
     fn a_block_opened_by_the_session_carries_the_sessions_limits() {
         let (mut btrieve, mut mem, mut heap, at, path) = session_with_v6("bundle-limits-inherit");
         assert_eq!(btrieve.block(at).expect("open").bundle.limits(), Limits::default());
