@@ -667,10 +667,9 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
-    /// `--root` is no longer a clap-level required flag -- parsing succeeds
-    /// with it absent, since whether it is actually needed depends on
-    /// whether a `Wg16` machine ends up booting at all, which only `plan`
-    /// knows.
+    /// `--root` is not a clap-level required flag -- parsing succeeds with
+    /// it absent. `plan` requires it always; clap does not, so the check has
+    /// one testable home.
     #[test]
     fn root_is_optional_at_the_parse_layer() {
         let cli = Cli::try_parse_from(args(&["--terms", "2"])).expect("parses");
