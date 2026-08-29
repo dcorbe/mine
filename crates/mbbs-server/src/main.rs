@@ -21,7 +21,7 @@ const DEFAULT_TERMS: u16 = 2;
 /// The arena [`Wg32Cpu::new`]'s placeholder `Memory` reserves for a `Wg32`
 /// module's host-allocated regions (`ModuleMem::alloc_region`, design doc
 /// Part 3) -- everything a `Wg32` module asks the host to allocate at
-/// runtime, on top of its own loaded image.
+/// runtime, on top of its own loaded images.
 ///
 /// **Provisional, the same way `DEFAULT_POLLS_PER_SECOND` is provisional.** No
 /// real 32-bit module has ever run against this host long enough to measure
@@ -79,11 +79,11 @@ struct Cli {
     /// resolve against the module before it, but never dispatched a channel
     /// directly.
     ///
-    /// Which machine boots is decided by the module file's own header, not a
+    /// Which machine boots is decided by the module files' own header, not a
     /// flag: [`plan`] sniffs every given path with
     /// [`mbbs_machine::Format::sniff`] and boots a `Wg16` machine for NE
-    /// files, or a `Wg32` machine for a single PE file -- mixing formats, or
-    /// giving more than one PE file, is a named `Err`.
+    /// files, or a `Wg32` machine for PE files -- both repeatable, in the
+    /// order given; mixing formats is a named `Err`.
     ///
     /// Left empty, [`plan`] falls back to `DEFAULT_MODULE`, exactly this
     /// binary's original single-module behaviour -- deliberate backward
@@ -233,7 +233,7 @@ fn listeners(cli: &Cli) -> Vec<Listener<'_>> {
 #[derive(Debug, PartialEq, Eq)]
 enum Plan {
     Wg16 { modules: Vec<PathBuf>, root: PathBuf },
-    Wg32 { module: PathBuf, root: PathBuf },
+    Wg32 { modules: Vec<PathBuf>, root: PathBuf },
 }
 
 /// `--module` as given, or [`DEFAULT_MODULE`] when none was -- so
@@ -280,17 +280,7 @@ fn plan(cli: &Cli, formats: &[Format]) -> Result<Plan, String> {
     }
     match first {
         Format::Ne => Ok(Plan::Wg16 { modules, root }),
-        Format::Pe => {
-            let [module] = <[PathBuf; 1]>::try_from(modules).map_err(|modules| {
-                format!(
-                    "{} PE modules given; a Wg32 machine takes exactly one, because \
-                     mbbs_machine::m32::Memory::replace_image replaces the whole image on \
-                     every load and a second module would discard the first",
-                    modules.len()
-                )
-            })?;
-            Ok(Plan::Wg32 { module, root })
-        }
+        Format::Pe => Ok(Plan::Wg32 { modules, root }),
     }
 }
 
@@ -305,30 +295,11 @@ fn format_name(format: Format) -> &'static str {
 }
 
 /// Build [`Boot::build`]'s closure for a `Wg32` machine: an empty
-/// [`Wg32Cpu`] -- a [`mbbs_machine::m32::Machine`] plus an empty
-/// [`mbbs_machine::m32::Memory`], no image yet. `host::life` (in
-/// `mbbs-server/src/host.rs`) reads `boot.modules[0]` (and today the *only*
-/// path -- see `plan` on why this binary refuses more than one) immediately
-/// after this runs and calls `host.load`, whose `Wg32::load` pushes the real
-/// image onto this same `cpu.mem`, leaving the arena this closure reserved
-/// untouched.
-///
-/// Provisional, pending Task 3 of
-/// `docs/plans/2026-08-29-wg32-n-module-boot`: `Memory::new` no longer
-/// requires an image up front (Task 1), so the placeholder this closure used
-/// to build from `module_path`'s own bytes -- solely to fail fast on a file
-/// that cannot even be read or parsed as a PE -- is gone along with it.
-/// `std::fs::read` below still catches an unreadable file here; a file that
-/// reads but does not parse as PE32 now surfaces one step later, from
-/// `host.load` itself.
-///
-/// `Fn`, not `FnOnce`: [`host::run`]'s restart loop calls [`Boot::build`]
-/// once per life (see its own doc comment, "Surviving a module stop"), so
-/// this closure re-reads the file every restart rather than only once at
-/// process start.
-fn build_wg32_cpu(module_path: PathBuf) -> impl Fn() -> io::Result<Wg32Cpu> + Send {
-    move || {
-        std::fs::read(&module_path)?;
+/// [`mbbs_machine::m32::Memory`] with the host arena, and a fresh
+/// [`mbbs_machine::m32::Machine`]. Every module's image arrives through
+/// `Host::load` (`host::life`'s per-module loop), in `--module` order.
+fn build_wg32_cpu() -> impl Fn() -> io::Result<Wg32Cpu> + Send {
+    || {
         let mem = mbbs_machine::m32::Memory::new(DEFAULT_WG32_ARENA_BYTES)?;
         let machine = mbbs_machine::m32::Machine::new()?;
         Ok(Wg32Cpu::new(machine, mem))
@@ -432,10 +403,10 @@ async fn main() -> ExitCode {
             survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
             extension: cli.scripts.clone().map(build_lua_extension),
         }),
-        Plan::Wg32 { module, root } => conn::spawn_machine(Boot::<Wg32> {
-            build: Box::new(build_wg32_cpu(module.clone())),
+        Plan::Wg32 { modules, root } => conn::spawn_machine(Boot::<Wg32> {
+            build: Box::new(build_wg32_cpu()),
             root,
-            modules: vec![module],
+            modules,
             terms,
             bturno: cli.bturno.clone(),
             polls_per_second: cli.polls_per_second,
@@ -751,7 +722,7 @@ mod tests {
         let cli = Cli::try_parse_from(args(&["--root", "tmp", "--module", "W.DLL"])).expect("parses");
         assert_eq!(
             plan(&cli, &[Format::Pe]),
-            Ok(Plan::Wg32 { module: PathBuf::from("W.DLL"), root: PathBuf::from("tmp") })
+            Ok(Plan::Wg32 { modules: vec![PathBuf::from("W.DLL")], root: PathBuf::from("tmp") })
         );
     }
 
@@ -778,13 +749,16 @@ mod tests {
         assert!(err.contains("B.DLL") && err.contains("PE") && err.contains("NE"), "{err}");
     }
 
-    /// More than one PE module is refused, naming the reason
-    /// (`replace_image`), not just the count.
+    /// Every PE module given, in order, plans a `Wg32` board -- the same
+    /// N-module contract `ne_modules_plan_a_wg16_board_with_every_module_in_order`
+    /// proves for `Wg16`.
     #[test]
-    fn two_pe_modules_are_refused() {
+    fn two_pe_modules_plan_a_wg32_board_in_order() {
         let cli = Cli::try_parse_from(args(&["--root", "tmp", "--module", "A.DLL", "--module", "B.DLL"])).expect("parses");
-        let err = plan(&cli, &[Format::Pe, Format::Pe]).expect_err("two PE");
-        assert!(err.contains("replace_image"), "the reason must be named: {err}");
+        assert_eq!(
+            plan(&cli, &[Format::Pe, Format::Pe]),
+            Ok(Plan::Wg32 { modules: vec![PathBuf::from("A.DLL"), PathBuf::from("B.DLL")], root: PathBuf::from("tmp") })
+        );
     }
 
     /// `--root` absent is a named `Err` from `plan`, not a panic and not a
