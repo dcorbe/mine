@@ -6465,6 +6465,78 @@ mod tests {
         );
     }
 
+    /// Every step `entmdl` (`MENUING.C:655-687`) takes, each seeded dirty
+    /// first so that the step doing nothing is a different observation from
+    /// the step being absent.
+    ///
+    /// Direct on [`Host::enter_module`] rather than through `connect`,
+    /// because `connect` is where three of the five stop being falsifiable:
+    /// `connect_state` zeroes `substt` before `lonrou` ever runs, and the
+    /// `clear_vda` ahead of `lonrou` zeroes the area, so a test that seeds
+    /// through `connect` is agreeing with a channel that was already clean.
+    /// Here nothing has run first and every seed survives to the call.
+    #[test]
+    fn enter_module_performs_every_step_of_entmdl() {
+        let mut f = Fixture::new();
+        let console = f.console();
+
+        // A real volatile data area to dirty: null before `alcvda`, and
+        // `alcvda` cannot size one until a module has declared it.
+        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
+        f.host.alcvda(&mut f.machine).expect("allocated");
+        let vda = f.host.users().vda(console).expect("alcvda ran");
+        f.machine.write(vda, &[0xAA; 512]).expect("the whole area");
+
+        f.host
+            .users
+            .set_substt_mem(f.machine.mem_mut(), console, 99)
+            .expect("seed substt");
+
+        let template = f.text("left over");
+        f.invoke(crate::shims::text::prf, &[template.offset, template.selector])
+            .expect("seed prfbuf");
+        let prfbuf = f.host.globals().prf_buffer();
+        assert_eq!(f.read(prfbuf), "left over", "the seed really is in the buffer");
+
+        f.host.enter_module(&mut f.machine, console).expect("entered");
+
+        assert_eq!(
+            f.host.users().substt_mem(f.machine.mem(), console).expect("read"),
+            0,
+            "usrptr->substt=0 (MENUING.C:662)"
+        );
+        assert_ne!(
+            f.host.users().flags_mem(f.machine.mem(), console).expect("read") & 0x0400,
+            0,
+            "usrptr->flags|=X2MAIN (MENUING.C:663)"
+        );
+        assert!(
+            f.machine.resolve(vda, 512).expect("the area").iter().all(|&b| b == 0),
+            "setmem(vdaptr,vdasiz,0) (MENUING.C:684)"
+        );
+        assert_eq!(f.read(prfbuf), "", "clrprf() (MENUING.C:685)");
+        assert_eq!(
+            f.host.globals().pointer(&f.machine, "prfptr").expect("prfptr"),
+            prfbuf,
+            "and clrprf puts prfptr back at the start"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().take_line(console).as_deref(),
+            Some(b"Z ".as_slice()),
+            "the synthesised entry line (MENUING.C:669)"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(console),
+            Some(crate::gsbl::Gsbl::CRSTG),
+            "announced the way a terminal's own CR would be"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(console),
+            None,
+            "exactly one line, so exactly one status"
+        );
+    }
+
     /// A status that is read but never consumed must cost a red test, not the
     /// machine.
     ///
