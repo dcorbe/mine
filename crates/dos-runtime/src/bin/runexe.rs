@@ -528,17 +528,18 @@ fn run_pe32(
     interactive: bool,
 ) -> io::Result<()> {
     let mut loaded = win32::load::load(data)?;
-    // `Machine`'s own default per-entry-point watchdog is five wall-clock
-    // seconds (`mbbs_machine::m32::DEFAULT_BUDGET`), sized for the kind of
-    // module call this crate mostly runs. `-recover` genuinely burns that
-    // much native CPU *between* two import calls: measured, it walked a
-    // large record file (`WCCKNMS2.DAT`, 895 KB of monster records) with no
-    // `BTRCALL`/CRT call at all for the whole five seconds and got cut off
-    // mid-pass, not stuck -- the progress line it had already painted
-    // ("Known Monsters") is real work in flight, not a spin. A batch
-    // maintenance utility has no operator waiting on a prompt the way the
-    // door/interactive real-mode paths do, so there is no reason to hold
-    // it to the same five seconds.
+    // The watchdog budget here is CPU *between two import calls*, not for
+    // the run: `win32::process::run` re-arms it at every import it answers
+    // (`Machine::rearm_watchdog`). It used to be the machine's whole-entry
+    // budget, and 120 s of it cut off a database recovery that was still
+    // advancing ("/ Updating Rooms  M 2 R 361", 2026-08-29) -- a program's
+    // one entry point is its entire life, so a total cap can only ever
+    // stop correct work. The gap it bounds is real, though: `-recover`
+    // walked `WCCKNMS2.DAT` (895 KB of monster records) for five seconds
+    // with no `BTRCALL`/CRT call at all, so the machine's five-second
+    // default (`mbbs_machine::m32::DEFAULT_BUDGET`, sized for a module's
+    // entry point) is too tight for one pass of a batch utility, and 120 s
+    // of pure compute with no I/O is the shape of a spin.
     loaded.machine.set_budget(std::time::Duration::from_secs(120));
     println!(
         "{path}: PE32 image, {} imports, entry {:#010x}",

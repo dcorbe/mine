@@ -91,6 +91,9 @@ pub fn survey(
         if let Some(code) = process.exit_code {
             return Ok((seen, Outcome::Exited(code)));
         }
+        // Same rule as `process::run`: an import answered is progress, and a
+        // program's budget bounds the gap between two of them.
+        loaded.machine.rearm_watchdog()?;
         let (value, cleans) = match answer {
             Some(a) => (a.value, a.cleans),
             // Zero, cleaning nothing: the C runtime is cdecl, so the caller

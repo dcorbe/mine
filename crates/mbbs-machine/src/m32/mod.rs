@@ -679,6 +679,30 @@ impl Machine {
         self.ctx.armed()
     }
 
+    /// Start the budget over from now, on a module parked at an import --
+    /// for a loop whose module is a whole *program* rather than a BBS entry
+    /// point.
+    ///
+    /// [`Machine::call`] arms once and keeps the budget over the whole entry
+    /// point, and its doc comment says why re-arming per crossing would be
+    /// wrong for a module: one looping on a host call would never expire. A
+    /// standalone program under `dos_runtime::win32::process::run` is the
+    /// opposite case. Its one entry point is its entire life, its imports
+    /// are its I/O, and "still calling imports" is the definition of
+    /// progress: `wccmmutl.exe`'s database recovery walks a 90 MB room file
+    /// one `BTRCALL` at a time and was cut off after 120 s of correct work
+    /// (2026-08-29, "/ Updating Rooms M 2 R 361", still advancing). For that
+    /// loop the budget means "CPU with no import call" -- a compute spin
+    /// still expires, work never does -- and a program looping *on* an
+    /// import is the loop's own call budget's to stop, not this timer's.
+    ///
+    /// # Errors
+    ///
+    /// If the watchdog timer cannot be armed.
+    pub fn rearm_watchdog(&mut self) -> io::Result<()> {
+        self.ctx.arm(self.budget)
+    }
+
     pub fn poison(&mut self, reason: Poison) -> io::Result<()> {
         self.poisoned.get_or_insert(reason);
         self.frame_sp = None;
@@ -2133,6 +2157,65 @@ mod register_tests {
     /// A caller driving the machine by jumps alone still gets a watchdog.
     /// `call` is what arms it for a structured entry point, and a machine
     /// entered only by `jump` would otherwise run with the timer stopped.
+    /// A program loop defines progress as import crossings and re-arms the
+    /// budget at each one ([`Machine::rearm_watchdog`]), so the budget
+    /// bounds CPU *between* imports rather than the whole entry point. Two
+    /// crossings, the host burning seven tenths of the budget at each: with
+    /// the re-arm the module returns; the identical run without it is over
+    /// budget by the second resume (`resume`'s own expiry check) and times
+    /// out. Burn is measured on `CLOCK_THREAD_CPUTIME_ID`, the clock the
+    /// watchdog runs on, so scheduling noise cannot tip either half.
+    #[test]
+    fn rearming_the_watchdog_makes_the_budget_per_crossing() {
+        fn cpu_now() -> Duration {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: `ts` is a local the kernel only writes.
+            let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
+            assert_eq!(rc, 0, "clock_gettime");
+            Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        }
+        fn burn(cpu: Duration) {
+            let until = cpu_now() + cpu;
+            while cpu_now() < until {
+                std::hint::spin_loop();
+            }
+        }
+        const BUDGET: Duration = Duration::from_millis(300);
+
+        for rearm in [true, false] {
+            let mut machine = Machine::new().expect("a fresh machine");
+            machine.set_budget(BUDGET);
+            let (mut mapping, base) = mapped(&[]);
+            let thunk = machine.thunk_addr(SLOT);
+
+            // call thunk; call thunk; ret
+            let mut code = call_rel32(thunk, base + 5);
+            code.extend_from_slice(&call_rel32(thunk, base + 10));
+            code.push(0xc3);
+            mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+            let exit = machine.call(base, &[]).expect("the module traps");
+            assert_eq!(exit, Exit::Call { index: SLOT }, "rearm={rearm}: first crossing");
+            burn(BUDGET * 7 / 10);
+            if rearm {
+                machine.rearm_watchdog().expect("re-armed");
+            }
+            let exit = machine.resume(Ret::Void).expect("the module resumes");
+            assert_eq!(exit, Exit::Call { index: SLOT }, "rearm={rearm}: second crossing");
+            burn(BUDGET * 7 / 10);
+            if rearm {
+                machine.rearm_watchdog().expect("re-armed");
+            }
+            let exit = machine.resume(Ret::Void).expect("the machine answers either way");
+            if rearm {
+                assert!(matches!(exit, Exit::Returned { .. }), "re-armed: {exit:?}");
+            } else {
+                assert!(matches!(exit, Exit::Timeout { .. }), "whole-entry budget: {exit:?}");
+            }
+            drop(mapping);
+        }
+    }
+
     #[test]
     fn a_cold_jump_arms_the_watchdog() {
         let mut machine = Machine::new().expect("a fresh machine");

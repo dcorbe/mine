@@ -728,6 +728,12 @@ pub fn run(loaded: &mut Loaded, process: &mut Process, budget: usize) -> io::Res
                 if let Some(code) = process.exit_code {
                     return Ok(Outcome::Exited(code));
                 }
+                // An import answered is progress. The program's one entry
+                // point is its whole life, so the machine's whole-entry
+                // budget would only ever cut off correct work -- see
+                // `Machine::rearm_watchdog`; `budget` above is what stops a
+                // program that loops on an import instead.
+                loaded.machine.rearm_watchdog()?;
                 // A shim that redirected the module rather than answering it.
                 // The outstanding call is abandoned deliberately -- `RtlUnwind`
                 // does not return, so there is no frame to resume and no
