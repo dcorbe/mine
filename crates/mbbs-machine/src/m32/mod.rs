@@ -595,6 +595,10 @@ impl Machine {
     /// first. Machine-wide, never reused: two modules must not share a
     /// physical slot, because [`Exit::Call`] reports only the bare index.
     ///
+    /// [`MAX_THUNKS`] (512) is therefore a budget shared by every module on
+    /// this machine, not a per-module ceiling; MajorMUD and MajorMUD Plus
+    /// together reserve under 300 of it.
+    ///
     /// # Errors
     ///
     /// If fewer than `n` slots remain below [`MAX_THUNKS`]; nothing moves.

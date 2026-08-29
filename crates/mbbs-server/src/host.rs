@@ -159,11 +159,13 @@ pub struct Boot<A: Abi> {
     ///
     /// A trap's raw thunk index used to be ambiguous with two modules on one
     /// machine (each load numbered from zero): booting `WCCMMUD.DLL` then
-    /// `WCCMMPLS.DLL` stopped at `.thunk #66`, a slot both modules claimed.
-    /// Thunk slices are machine-wide now -- `m16` since `50944874`, `m32`
-    /// alongside it -- and `Host::import_owner` finds the true owner when
-    /// execution has crossed into another module's code. What remains is the
-    /// order contract above.
+    /// `WCCMMPLS.DLL` stopped at `.thunk #66`, and the far likelier reading
+    /// was a slot both modules claimed -- never confirmed symbol by symbol,
+    /// because the pair was not re-booted against the old numbering to prove
+    /// it. Thunk slices are machine-wide now -- `m16` since `50944874`,
+    /// `m32` alongside it -- so the ambiguity itself is gone, and
+    /// `Host::import_owner` finds the true owner when execution has crossed
+    /// into another module's code. What remains is the order contract above.
     pub modules: Vec<PathBuf>,
     /// The fixed channel count. Sizes every per-channel table at `Host::new`.
     pub terms: Terms,

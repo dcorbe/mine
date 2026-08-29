@@ -1115,7 +1115,9 @@ pub struct Host<A: Abi> {
     handed_back: Vec<Chan>,
 
     /// Every module [`Host::load`] has loaded so far in this life, keyed by
-    /// its own declared name ([`Abi::module_name`]) -- **not** the same
+    /// `registry_key` of its own declared name ([`Abi::module_name`]) --
+    /// uppercased, because a PE exports `wccmmud.DLL` and imports
+    /// `WCCMMUD.dll` -- **not** the same
     /// bookkeeping as [`Host::modules`] above, which is about a module
     /// *registering itself* with the running host (`register_module`) and
     /// is keyed by registration order, not name. This is purely a loader

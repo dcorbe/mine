@@ -71,12 +71,11 @@ fn module_with_code(code: &[u8]) -> Vec<u8> {
 }
 
 /// A `Wg32Cpu` ready to load: a real `Machine` (thunk table, TIB, fault
-/// recovery armed), and an empty `Memory` -- see `wg32_round_trip.rs`'s
-/// module doc comment, "The load-order hazard", for why a `Host<Wg32>`
-/// built before `load` must normally be discarded and rebuilt afterward.
-/// Irrelevant to *this* test: a `hlt` module faults on its very first
-/// instruction, before it ever calls a shim, so no host-owned buffer is ever
-/// touched -- one ordinary `Host::new` before `load` is enough here.
+/// recovery armed), and an empty `Memory`. One ordinary `Host::new` before
+/// `load`, nothing to rebuild afterward -- `Wg32::load` appends its image
+/// and leaves the arena alone, so every pointer the host already holds
+/// survives the load (`wg32_round_trip.rs`'s
+/// `loading_a_module_does_not_invalidate_a_pointer_the_host_already_holds`).
 fn cpu_module_and_host(code: &[u8]) -> (Wg32Cpu, mbbs_machine::m32::Module, Host<Wg32>) {
     let mem = Memory::new(0x0002_0000).expect("arena mapping");
     let machine = Machine::new().expect("thunk table, TIB, fault recovery");

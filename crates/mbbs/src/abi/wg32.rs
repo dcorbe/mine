@@ -565,14 +565,13 @@ impl Abi for Wg32 {
         module.import(index)
     }
 
-    /// `None`, always. [`Wg32::Module`] now carries the bound import table,
-    /// but not a section table or symbol map to resolve a return address
-    /// against -- "section and offset, once `Wg32::Module` carries enough
-    /// to answer it" (this trait method's own doc comment) is still future
-    /// work, not something this task's `Module` composes. Best-effort
-    /// diagnostics staying `None` costs nothing today: nothing through this
-    /// task calls `Host::run` against a `Wg32` module (that is Task 15's
-    /// synthetic round-trip), so nothing yet reads this answer.
+    /// `None`, always: `Wg32` does no caller naming at all. There is no
+    /// return-address walk here -- [`Wg32::Module`] carries the bound
+    /// import table but no section table or symbol map to resolve a return
+    /// address against, so "section and offset, once `Wg32::Module` carries
+    /// enough to answer it" (this trait method's own doc comment) is still
+    /// future work. Callers get the unnamed answer, which is what a
+    /// best-effort diagnostic is allowed to be.
     fn caller(_cpu: &Self::Cpu, _module: &Self::Module) -> Option<String> {
         None
     }

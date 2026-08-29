@@ -171,7 +171,7 @@ mod tests {
         let image = mem(&file);
 
         // `Mapping::new` (map.rs) never asks mmap for a fixed address --
-        // `MAP_32BIT`, no `MAP_FIXED` -- so `image.image().expect("image").base()` is a real,
+        // `MAP_32BIT`, no `MAP_FIXED` -- so the image's base is a real,
         // kernel-chosen address. It is never 0 (Linux refuses to hand back
         // the zero page), and it dwarfs this fixture's rva scale (a few
         // KiB). That is exactly the property `Image::relocate`'s own

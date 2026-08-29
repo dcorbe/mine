@@ -473,11 +473,11 @@ fn host_run_encodes_entry_args_in_order_through_arg() {
 /// carved out of the arena at `Host::new` time, then read and written by
 /// shims for the rest of the host's life, load included.
 ///
-/// Before `Wg32::load` was fixed to call `Memory::replace_image` instead of
+/// Before `Wg32::load` was fixed to call `Memory::push_image` instead of
 /// rebuilding `cpu.mem` wholesale, this failed with
 /// `Flat32PtrError::OutOfBounds`: the pattern below was written into the
 /// *old* arena, and `Wg32::load` had since `munmap`'d it out from under the
-/// pointer. See `Memory::replace_image`'s own doc comment
+/// pointer. See `Memory::push_image`'s own doc comment
 /// (`crates/mbbs-machine/src/m32/mem.rs`) and `Abi::load`'s own doc comment
 /// (`crates/mbbs/src/abi.rs`) for the invariant this now upholds generally,
 /// not just for this one buffer.
@@ -500,7 +500,7 @@ fn loading_a_module_does_not_invalidate_a_pointer_the_host_already_holds() {
 
     let got = ptr.resolve(&cpu.mem, 4).expect(
         "loading a module must not invalidate a pointer ModuleMem::alloc_region already \
-         returned -- see Memory::replace_image's own doc comment",
+         returned -- Memory::push_image appends, it does not rebuild the arena",
     );
     assert_eq!(got, pattern, "the pointer's bytes must survive the load unchanged");
 }
