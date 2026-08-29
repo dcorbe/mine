@@ -36,10 +36,10 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SYSOP_LEVEL)]
     sysop_level: u32,
     /// Terminal rows (`%R` under Synchronet).
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u8).range(1..))]
     rows: u8,
     /// Terminal columns (`%W` under Synchronet).
-    #[arg(long, default_value_t = 80)]
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..))]
     cols: u8,
 }
 
@@ -93,10 +93,11 @@ fn header(d: &Door32, sysop_level: u32, rows: u8, cols: u8) -> String {
     )
 }
 
-/// Raw mode on stdin for as long as this lives; restores on drop. The same
-/// twenty lines as `crates/dos-runtime/src/terminal.rs`'s `RawStdin`,
-/// duplicated rather than shared: pulling the DOS runtime in for a termios
-/// call would be the larger wrong.
+/// Raw mode on stdin for as long as this lives; restores on drop. Modelled
+/// on `crates/dos-runtime/src/terminal.rs`'s `RawStdin`; this one gates on
+/// `isatty` and uses `VMIN=1` because its reads are blocking. Duplicated
+/// rather than shared: pulling the DOS runtime in for a termios call would
+/// be the larger wrong.
 struct RawStdin {
     saved: libc::termios,
 }

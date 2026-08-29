@@ -76,13 +76,7 @@ pub fn parse(buf: &[u8]) -> Parse {
         }
     };
 
-    let first_line_end = if first_newline > 0 && buf[first_newline - 1] == b'\r' {
-        first_newline - 1
-    } else {
-        first_newline
-    };
-
-    let Ok(first_line) = std::str::from_utf8(&buf[..first_line_end]) else {
+    let Ok(first_line) = std::str::from_utf8(&buf[..first_newline]) else {
         return Parse::Invalid("header is not UTF-8");
     };
 
@@ -90,7 +84,11 @@ pub fn parse(buf: &[u8]) -> Parse {
         return Parse::Invalid("not an mbbs-door 1 header");
     }
 
-    // Now find the blank line
+    // LF-only, deliberately: a CRLF header would never match this
+    // terminator (`mbbs-door.rs`'s `header()` sends bare LF, and the
+    // protocol check above already refused anything else with a `\r`
+    // before its first `\n`), so it fails fast above rather than
+    // spinning here until `MAX_HEADER`.
     let end = match buf.windows(2).position(|w| w == b"\n\n") {
         Some(i) => i + 2,
         None if buf.len() >= MAX_HEADER => return Parse::Invalid("header too long"),
@@ -185,13 +183,35 @@ pub fn connection(h: &Handshake) -> Connection {
 
 /// Bind `path` and spawn its accept loop; returns as soon as it is bound.
 ///
-/// A socket file left by a previous process is unlinked first -- nothing
-/// can be listening on it, or `bind` would fail with `AddrInUse` on a live
-/// one. Anything at `path` that is *not* a socket is refused: that is a
-/// misconfiguration, not a stale socket.
+/// A socket file left by a previous process is not proof that nothing is
+/// listening on it -- a crashed process's socket file outlives it, but a
+/// live one's does too, and `bind` refuses either alike with
+/// `AddrInUse`, giving no way to tell them apart from that error. So a
+/// socket at `path` is probed first with a real connect: if that
+/// succeeds, another process is actually serving it and this call is
+/// refused rather than stealing the path out from under it; if it fails
+/// (`ConnectionRefused` or otherwise), nothing is listening and the file
+/// is stale, so it is unlinked before `bind`. Anything at `path` that is
+/// *not* a socket is refused outright: that is a misconfiguration, not a
+/// stale socket.
+///
+/// The socket is created `0600` (owner-only) immediately after `bind`:
+/// this door has no authentication of its own -- see the module doc
+/// comment and the spec's trust-boundary paragraph -- so anything that
+/// can connect can claim any `user=` and `sysop=1`. The directory `path`
+/// lives in must be traversable only by the serving user (`/run/user/<uid>`
+/// is `0700`) to close the window between `bind` and this call.
 pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>) -> io::Result<()> {
     match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(&path)?,
+        Ok(meta) if meta.file_type().is_socket() => {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("{} is already served by another process", path.display()),
+                ));
+            }
+            std::fs::remove_file(&path)?;
+        }
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -202,6 +222,7 @@ pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>) -> io::Result<()> {
         Err(e) => return Err(e),
     }
     let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -333,6 +354,19 @@ mod tests {
     fn the_wrong_protocol_line_is_refused() {
         assert_eq!(parse(b"mbbs-door 2\nuser=Dan\n\n"), Parse::Invalid("not an mbbs-door 1 header"));
         assert_eq!(parse(b"GET / HTTP/1.0\r\n\r\n"), Parse::Invalid("not an mbbs-door 1 header"));
+    }
+
+    /// CRLF is refused, not half-accepted: a `\r` before the first `\n`
+    /// makes the protocol line not match `PROTOCOL` (which has none), so
+    /// a CRLF relay is refused at once instead of spinning until
+    /// `MAX_HEADER` looking for a `\n\n` it can never find.
+    #[test]
+    fn a_crlf_header_is_refused_at_once() {
+        assert_eq!(
+            parse(b"mbbs-door 1\r\nuser=Dan\r\n\r\n"),
+            Parse::Invalid("not an mbbs-door 1 header")
+        );
+        assert_eq!(parse(b"mbbs-door 1\r\n"), Parse::Invalid("not an mbbs-door 1 header"));
     }
 
     #[test]
@@ -530,5 +564,36 @@ mod tests {
         std::fs::write(&regular, b"not a socket").expect("write");
         let err = serve(regular, tx).await.expect_err("refuses a regular file");
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    /// A socket file with a live listener behind it is not stale: `serve`
+    /// must refuse rather than unlink and steal the path, and the
+    /// original listener must still be answering afterward.
+    #[tokio::test]
+    async fn a_live_socket_is_refused_not_stolen() {
+        let path = socket_path("door-live");
+        let live = std::os::unix::net::UnixListener::bind(&path).expect("a live socket");
+        let (tx, _rx) = std_mpsc::channel::<In>();
+
+        let err = serve(path.clone(), tx).await.expect_err("refuses a live socket");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+
+        std::os::unix::net::UnixStream::connect(&path).expect("the original listener still accepts");
+        drop(live);
+    }
+
+    /// The door has no authentication of its own -- see the module doc
+    /// comment -- so the socket file must be reachable only by the
+    /// serving user.
+    #[tokio::test]
+    async fn the_door_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = socket_path("door-perms");
+        let (tx, _rx) = std_mpsc::channel::<In>();
+        serve(path.clone(), tx).await.expect("bind");
+
+        let mode = std::fs::symlink_metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

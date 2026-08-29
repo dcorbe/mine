@@ -10,7 +10,10 @@
 //! port, because not every client wants the same adaptation: a modern telnet
 //! client wants CP437 transcoded to UTF-8 ([`Stack::modern`]); a period DOS
 //! terminal, or anything that already speaks CP437 on the wire, wants its
-//! bytes left alone ([`Stack::raw`]).
+//! bytes left alone ([`Stack::raw`]); a BBS door session
+//! ([`Stack::door`]) wants its bytes left alone too, but with no telnet
+//! framing at all, because the BBS in front of it has already handled
+//! that. The kind of listener a session arrived on picks the `Stack`.
 //!
 //! **Both directions, same [`Stack`].** `outbound` (host -> client) has
 //! translated CP437 to UTF-8 since before this plan; `inbound` (client ->
@@ -46,7 +49,10 @@ const ESC_HOME: &[u8] = b"\x1b[H";
 /// below is a *sequence* match that can straddle two `Out::Bytes` chunks (a
 /// split `ESC[` / `2J`, for instance), and recognising that requires
 /// carrying how far into the pattern the previous call got. `ed2_match`
-/// is that carry-over; it is the only state either variant holds.
+/// is that carry-over, one of three pieces of state a variant can hold --
+/// alongside `filter` (telnet framing, live only when `telnet`) and
+/// `pending` (a split UTF-8 character, live only when `transcode`); which
+/// of the three actually accumulates anything differs by variant.
 pub struct Stack {
     /// Telnet framing on this wire: strip commands inbound, double `IAC`
     /// outbound when the bytes are not transcoded. `false` for
@@ -189,10 +195,14 @@ impl Stack {
 
     /// Adapt one chunk of bytes typed by this connection's client, for the
     /// host: UTF-8 -> CP437, [`Stack::outbound`]'s reverse. Only
-    /// [`Stack::modern`] does this; [`Stack::raw`] returns `bytes`
-    /// unchanged, because its client already sends CP437 on the wire -- see
+    /// [`Stack::modern`] transcodes; [`Stack::modern`] and [`Stack::raw`]
+    /// both strip telnet commands first (`self.filter`, when `telnet`);
+    /// [`Stack::door`] does neither and returns `bytes` unchanged, because
+    /// its client already sends CP437 on the wire with no telnet framing
+    /// to strip -- see
     /// `raw_inbound_leaves_a_cp437_clients_high_bit_bytes_alone` below for
-    /// what transcoding it anyway would do to that client's high-bit bytes.
+    /// what transcoding it anyway would do to a CP437 client's high-bit
+    /// bytes.
     ///
     /// **ASCII is unaffected**, which is why nothing noticed this gap
     /// existed until now: every ASCII byte is already both its own one-byte
