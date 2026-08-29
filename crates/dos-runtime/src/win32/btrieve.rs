@@ -238,7 +238,14 @@ fn read_args(machine: &Machine, mem: &Memory) -> Result<Marshalled, String> {
         Err(e) => return Err(format!("data length at {datalen_at:#010x}: {e}")),
     };
 
-    let databuf: Vec<u8> = if datalen == 0 {
+    // A non-zero length over a null pointer is "no data buffer", exactly as
+    // for `keybuf` below. `DFAAPI.C:649`, `dfaDelete`, is
+    // `btvu(4,NULL,NULL,dfa->lastkn,dfa->reclen)`: Delete reads no data, so
+    // the vendor offers no buffer while still passing the record length.
+    // Measured in a real `-recover` pass (2026-08-29, "Clearing Limited
+    // List", ten minutes in): op 4 with the data buffer at 0 and `datalen`
+    // 72 was refused as a 72-byte read through address zero.
+    let databuf: Vec<u8> = if datalen == 0 || databuf_at == 0 {
         Vec::new()
     } else {
         match Flat32Ptr(databuf_at).resolve(mem, datalen as usize) {
@@ -753,5 +760,57 @@ mod tests {
             .expect("the real length must resolve even with garbage above it");
         assert_eq!(args.datalen, u32::from(REAL_LEN), "the garbage upper bits are gone");
         assert_eq!(args.databuf, vec![DATABUF_FILL; REAL_LEN as usize]);
+    }
+
+    /// `dfaDelete` (`DFAAPI.C:649`) is `btvu(4,NULL,NULL,lastkn,reclen)`:
+    /// no data buffer, no key buffer, the record length still passed. Both
+    /// nulls marshal as empty buffers rather than as reads through address
+    /// zero, and the length survives so the engine still sees the vendor's
+    /// call. This is the shape that stopped a real recovery ten minutes in.
+    #[test]
+    fn a_delete_with_the_vendors_null_buffers_marshals_no_buffers() {
+        const RECLEN: u16 = 72;
+        let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
+        let mut l = crate::win32::load::load(&file).expect("loads");
+        let posblk_at = l.mem.alloc(128).expect("posblk region").0;
+        Flat32Ptr(posblk_at)
+            .write(&mut l.mem, &[0u8; 128])
+            .expect("posblk region is writable");
+        let datalen_at = l.mem.alloc(4).expect("datalen region").0;
+        Flat32Ptr(datalen_at)
+            .write(&mut l.mem, &u32::from(RECLEN).to_le_bytes())
+            .expect("datalen region is writable");
+        const SLOT: u16 = 452;
+        let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+        let base = code_mapping.base() as usize as u32;
+        let mut code = Vec::new();
+        let push_imm32 = |code: &mut Vec<u8>, v: u32| {
+            code.push(0x68);
+            code.extend_from_slice(&v.to_le_bytes());
+        };
+        push_imm32(&mut code, 3); // arg6: ckeynum (lastkn)
+        push_imm32(&mut code, 255); // arg5: keyLength, the vendor's blanket 255
+        push_imm32(&mut code, 0); // arg4: keyBuffer -- NULL
+        push_imm32(&mut code, datalen_at); // arg3: dataLength
+        push_imm32(&mut code, 0); // arg2: dataBuffer -- NULL
+        push_imm32(&mut code, posblk_at); // arg1: posBlock
+        push_imm32(&mut code, 0x4200_0004); // arg0: Delete, under stack noise
+        let target = l.machine.thunk_addr(SLOT);
+        let next_ip = base + code.len() as u32 + 5;
+        code.push(0xe8); // call rel32
+        code.extend_from_slice(&target.wrapping_sub(next_ip).to_le_bytes());
+        code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let exit = l
+            .machine
+            .call_on(l.mem.stack_mut(), base, &[])
+            .expect("the hand-built frame traps into the armed thunk");
+        assert_eq!(exit, Exit::Call { index: SLOT });
+        let args = read_args(&l.machine, &l.mem).expect("the vendor's own Delete marshals");
+        assert_eq!(args.op, 4);
+        assert_eq!(args.databuf_at, 0);
+        assert!(args.databuf.is_empty(), "no read through address zero");
+        assert_eq!(args.datalen, u32::from(RECLEN), "the length still reaches the engine");
+        assert!(args.keybuf.is_empty());
+        assert_eq!(args.keylen, 255);
     }
 }
