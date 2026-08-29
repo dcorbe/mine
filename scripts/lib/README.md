@@ -4,8 +4,20 @@ The primitive surface `crates/mbbs-lua` (specifically `bind.rs`, `namespace.rs`,
 `ptr.rs`) exposes to a `scripts/lib/<module>.lua` file. This is a reference
 card for writing one, not a tutorial -- read `scripts/lib/wccmmud.lua` for a
 complete worked example, and
-`docs/superpowers/specs/2026-08-27-lua-declared-bindings-design.md` for the
-design record behind this shape.
+`docs/superpowers/specs/2026-08-27-lua-declared-bindings-design.md` plus its
+supersession, `docs/superpowers/specs/2026-08-28-lua-thin-lib-split-design.md`,
+for the design record behind this shape.
+
+**The boundary a lib file must hold:** a `scripts/lib/<module>.lua` is the
+*machine layer* only -- export signatures, per-ABI offsets and call shapes,
+and (where a module has one) a typed record object over its raw memory. A
+command's recipe and policy -- what a command accepts, what it prints, how it
+decides to refuse -- belongs in the command script (`scripts/cash.lua`,
+`scripts/setexp.lua`, `scripts/summon.lua`, ...), written in plain,
+ABI-neutral Lua against the surface the lib returns. If you are tempted to
+write `if mmud.abi == "wg16" then ... else ...` in a command script, or to put
+player-facing text or input validation in a lib file, that is the split
+inverting.
 
 ## Binding a namespace
 
@@ -25,13 +37,23 @@ seam that decides availability. `M` is a fresh, empty namespace table.
 
 ```lua
 M.declare {
-  get_player = "ptr(int)",
-  save_player = "int(int)",
-  addon_adjust_user_wealth = "int(int, long)",
+  get_player               = "ptr(int)",
+  save_player              = "int(int)",
+  cleanup_currency         = "int(int)",
+  addon_adjust_user_wealth = "bool(int, long)",
+  get_item_from_name       = "ptr(str, ptr, ptr)",
+  add_item_to_inventory    = B.add_sig,
 }
 ```
 
-Each value is a `"ret(arg, ...)"` signature over five types:
+(`B.add_sig` above is not special syntax -- a declared value is just a Lua
+string, so a lib file free to compute one per-ABI before calling `declare`.
+`scripts/lib/wccmmud.lua` does exactly this for
+`add_item_to_inventory`, whose argument count differs between the 16-bit and
+PE32 call shapes: `"bool(int, int, int, int, ptr)"` on `wg16`,
+`"bool(int, int, int, ptr)"` on `wg32`.)
+
+Each value is a `"ret(arg, ...)"` signature over six types:
 
 | type   | meaning | marshalling |
 |--------|---------|-------------|
@@ -39,13 +61,16 @@ Each value is a `"ret(arg, ...)"` signature over five types:
 | `long` | `u32` | Plain non-negative `0..=0xffffffff`, no sign ambiguity. Split into low/high words by the marshaller on a 16-bit ABI; pushed as one dword on a 32-bit one. |
 | `ptr`  | far/flat pointer | `nil` maps to this ABI's null pointer; a pointer-handle table resolves through the invocation's own handle registry; **anything else -- a raw Lua number above all -- is refused.** A pointer is never built from a number. |
 | `str`  | C string | The Lua string's raw bytes, auto-copied NUL-terminated into the shared scratch region (see below). Refused if it contains an embedded NUL (would silently truncate what the module reads). |
+| `bool` | return only | Valid as `ret`; refused as an argument type at bind time (`bind.rs`: `"arg N: bool is not a valid argument type in ..."`), the same as `void`. |
 | `void` | return only | Valid as `ret`; refused as an argument type. |
 
 `str` is refused as a return type -- there is no defined "returns a string"
 contract. A declared export that returns something arrives back in Lua as:
-`void` -> `nil`; `int`/`long` -> a plain integer (the register's raw bit
-pattern -- reinterpret sign yourself if the field is signed); `ptr` -> a
-pointer handle, or `nil` for a null return.
+`void` -> `nil`; `bool` -> a Lua boolean, masking the low byte of the return
+register (`(lo & 0xff) != 0`) -- whatever the module left in the high bits of
+its return value is not part of the contract; `int`/`long` -> a plain integer
+(the register's raw bit pattern -- reinterpret sign yourself if the field is
+signed); `ptr` -> a pointer handle, or `nil` for a null return.
 
 ## Name resolution: the four-spelling probe
 
@@ -69,12 +94,17 @@ or forged `ptr` handle, a scratch-budget overflow, or (should it ever happen)
 a cross-ABI rebind mismatch. All of these throw an ordinary Lua runtime
 error, which `Extension::command` catches: it disables *that one command*
 and reports once via `c:note`-equivalent boot/runtime notes -- it does not
-fail the board. This is exactly why the offset/range validation in
-`scripts/lib/wccmmud.lua`'s own helpers (`whole_u32`, the NUL check in
-`M.summon`) reports ordinary `false, reason` pairs instead of just letting a
-bad player input reach a declared call and throw: a thrown argument error
-would disable the whole command over one bad line of input, not just refuse
-that one line.
+fail the board. This is also why assigning to a player-record field (below)
+throws on an out-of-range value rather than refusing quietly: it goes
+through a declared/primitive write underneath. A command script therefore
+validates untrusted input itself before it ever reaches a declared call or a
+record assignment -- `scripts/cash.lua` and `scripts/setexp.lua` each carry a
+`whole_u32` helper (whole number, `0..=0xffffffff`) for exactly this, and
+`scripts/summon.lua` rejects a NUL-embedded or over-long item name before
+calling `mud.find_item` (whose own NUL/length guard, inside
+`scripts/lib/wccmmud.lua`, exists so the `str` marshaller never throws --
+not to hand the player a reason). A thrown argument error would disable the
+whole command over one bad line of input, not just refuse that one line.
 
 ## `mmud.abi`
 
@@ -112,10 +142,99 @@ command errors rather than resolving to a live-but-wrong address.
 usual way to give a declared call a writable OUT-parameter cell:
 
 ```lua
-local cell = c:buffer(2)
+local cell = c:buffer(4)
 local item = M.get_item_from_name(name, nil, cell)
-local count = cell:u16(0)
+local count = cell:u32(0)
 ```
+
+(Four bytes and `u32`, not two and `u16`, even though the count fits in a
+16-bit word: PE32 stores the match count as a dword, and a 16-bit word
+written into a zeroed 4-byte cell lands in its low half either way -- see
+`M.find_item` below, the real caller of this shape.)
+
+## Building a record object over `ptr`
+
+A lib file is free to wrap a raw pointer handle in a Lua metatable so a
+command script never sees an offset, a width, or a `p:w32` call. This is not
+a primitive Rust provides -- it is plain Lua over the handles and offsets
+above -- but it is the shape `scripts/lib/wccmmud.lua` uses for the player
+record, and it is the pattern to reach for whenever a lib file's record has
+more than one or two fields:
+
+```lua
+function M.player(c)
+  local handle = M.get_player(c.chan)
+  if handle == nil or handle:u8(OFF.loaded) == 0 then
+    return nil
+  end
+  return setmetatable({}, {
+    __index = function(_, key)
+      if key == "copper" then return handle:u32(OFF.copper) end
+      -- ...
+      error("player record has no field " .. tostring(key))
+    end,
+    __newindex = function(_, key, v)
+      if key == "copper" then handle:w32(OFF.copper, v); return end
+      error("player record has no writable field " .. tostring(key))
+    end,
+  })
+end
+```
+
+`wccmmud.lua`'s actual `mud.player(c)` returns a record exposing exactly
+three keys:
+
+- `p.copper` -- a plain `u32` number, read and written directly at the
+  module's copper offset.
+- `p.experience` -- a *logical* field: the module stores total experience as
+  three physical dwords that must always agree (a raw copy, plus the total
+  split mod-1e9 into a "billions" word and a "modulus" word -- see the
+  comment above `make_record` in `wccmmud.lua` for why). The getter
+  reconstructs the one logical total from the two split words; the setter
+  writes all three physical fields from the one number you assign.
+- `p:save()` -- calls the module's own save export for this channel; not a
+  field, a bound method (`p.save` returns a closure, so `p:save()` and
+  `p.save()` both work, but the metatable exposes it as a method for the
+  `p:save()` spelling used everywhere in the command scripts).
+
+Any other key -- read or write, including an honest typo like `p.cooper` --
+throws (`error("player record has no field ...")` /
+`"... no writable field ..."`) rather than silently returning `nil` or
+writing nothing. There is no fourth field; do not extend this record from a
+command script.
+
+**Validate before you assign.** A record's `__newindex` writes straight
+through to `handle:w32`, which is a primitive write: an out-of-range value
+(anything outside `0..=0xffffffff`, or not a whole number) throws, and a
+thrown error inside a command handler disables *that command* board-wide
+until the board restarts (see "Bind-time errors vs. call-time errors"
+above). So `p.copper = amount` is only ever reached after the caller has
+already validated `amount` is a non-negative whole number in range -- this
+is why `scripts/cash.lua` and `scripts/setexp.lua` each run untrusted input
+through their own `whole_u32` check first, and never pass a raw
+`tonumber(c.args)` straight into a record field.
+
+## `mud.find_item(c, name)` and `mud.add_item(chan, item)`
+
+Two `wccmmud.lua`-specific conveniences built over the primitives above --
+not part of the Rust-provided surface, but worth knowing as the pattern for
+a lib file's own helper functions:
+
+- `mud.find_item(c, name) -> (item, count)` -- looks an item up by name,
+  hiding the `c:buffer(4)` OUT-param cell shown above. Returns the item
+  handle (or `nil`) and the match count. A NUL-embedded or over-long name is
+  refused *inside* `find_item` itself, before it ever reaches the `str`
+  marshaller (which would otherwise throw), so it reads back as `(nil, 0)`
+  for bad input -- indistinguishable from "no such item" by design; a
+  command script that wants to tell those apart for the player (as
+  `scripts/summon.lua` does, to print "not a valid item name.") checks the
+  name itself before calling in.
+- `mud.add_item(chan, item) -> bool` -- the ABI-neutral wrapper around
+  `add_item_to_inventory`, whose *argument count* (not just its offsets)
+  differs by ABI: five arguments on `wg16`, four on `wg32`. `wccmmud.lua`
+  picks the right closure (`B.add`) and signature (`B.add_sig`) once, at
+  load, keyed on `mmud.abi`, so `scripts/summon.lua` calls
+  `mud.add_item(c.chan, item)` without knowing either shape exists.
 
 ## The shared 128-byte scratch budget
 
