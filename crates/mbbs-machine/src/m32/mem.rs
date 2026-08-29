@@ -476,6 +476,13 @@ mod tests {
         assert_eq!(Flat32Ptr(b_base + 0x1010).resolve(&mem, 2).expect("read b"), &[0xAB, 0xCD]);
         assert_eq!(Flat32Ptr(a_base + 0x1010).resolve(&mem, 2).expect("read a"), &[0, 0]);
 
+        // `tail_from` (which `read_cstr` scans through) must reach the
+        // second image too, not just the first -- a loop that only ever
+        // checked `self.images.first()` would refuse this with OutOfBounds
+        // rather than answer the string.
+        Flat32Ptr(b_base + 0x1020).write(&mut mem, b"hi\0").expect("in image b");
+        assert_eq!(Flat32Ptr(b_base + 0x1020).read_cstr(&mem).expect("read b"), b"hi");
+
         // Past the end of either image, in neither, arena nor stack: refused.
         let nowhere = a_base.max(b_base).max(mem.arena_range().0) + 0x10_0000;
         assert!(Flat32Ptr(nowhere).resolve(&mem, 1).is_err());

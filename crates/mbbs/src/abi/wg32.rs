@@ -407,8 +407,8 @@ impl Abi for Wg32 {
     /// -- see [`Abi::load`]'s own doc comment, which states that as the
     /// border's general contract, not a `Wg32`-specific courtesy. This
     /// method upholds it through
-    /// [`mbbs_machine::m32::Memory::replace_image`], which swaps in a
-    /// freshly loaded `Image` while leaving `cpu.mem`'s arena -- and every
+    /// `mbbs_machine::m32::Memory::push_image`, which appends a freshly
+    /// loaded `Image` while leaving `cpu.mem`'s arena -- and every
     /// pointer already carved from it -- exactly as they were; see that
     /// method's own doc comment for why an outright `cpu.mem = Memory::new(image,
     /// ..)` cannot do the same (it drops the old arena `Mapping`, and

@@ -97,6 +97,19 @@ fn cpu() -> Wg32Cpu {
     Wg32Cpu::new(machine, mem)
 }
 
+/// The `Wg32::load(&mut cpu, ..)` sibling of [`cpu`]: an empty `Memory`,
+/// no placeholder image, so the module `load` pushes lands at `images[0]`
+/// -- the shape `cpu.mem.image()` expects. `cpu()` itself must keep its
+/// placeholder for the tests above that read `cpu.mem.image()` with no
+/// load in between; the two helpers serve disjoint sets of tests, and a
+/// single shared one cannot correctly serve both once a load can push a
+/// second image onto it.
+fn cpu_for_load() -> Wg32Cpu {
+    let mem = mbbs_machine::m32::Memory::new(0x1000).expect("arena mapping");
+    let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
+    Wg32Cpu::new(machine, mem)
+}
+
 /// The proof this task exists for. `f(ptr, int, int)`: `Wg16` reads bytes
 /// `0-4, 4-6, 6-8` (its `int` is 2 bytes); `Wg32` must read `0-4, 4-8, 8-12`
 /// (its `int` is 4). Not "the numbers differ" in the abstract -- the same
@@ -770,12 +783,12 @@ mod boot_bug {
     #[test]
     fn init_entry_resolves_ordinal_1_not_the_pe_entry_stub() {
         let Some(file) = lunatix_bytes() else { return };
-        let mut cpu = cpu();
+        let mut cpu = cpu_for_load();
 
         let module = Wg32::load(&mut cpu, &file, &no_host)
             .expect("LunatiX's own imports all bind -- unresolved ones just get a thunk");
 
-        let base = cpu.mem.images().last().expect("just loaded").base();
+        let base = cpu.mem.image().expect("image").base();
         let got = <Wg32 as Abi>::init_entry(&module).expect("LunatiX exports ordinal 1");
 
         assert_eq!(
@@ -819,7 +832,7 @@ mod boot_bug {
         // The bug, reproduced: entering `Module::entry()` -- what
         // `Wg32::init_entry` answered before this fix -- on the real,
         // unmodified module.
-        let mut stub_cpu = cpu();
+        let mut stub_cpu = cpu_for_load();
         let module = Wg32::load(&mut stub_cpu, &file, &no_host).expect("LunatiX loads");
         let stub = mbbs_machine::m32::Flat32Ptr(module.entry());
         let stub_exit =
@@ -841,7 +854,7 @@ mod boot_bug {
         // the server crashed when `init_entry` answered this address.
 
         // The fix: a fresh machine, entering `init_entry`'s answer instead.
-        let mut init_cpu = cpu();
+        let mut init_cpu = cpu_for_load();
         let module = Wg32::load(&mut init_cpu, &file, &no_host).expect("LunatiX loads");
         let entry = <Wg32 as Abi>::init_entry(&module).expect("LunatiX exports ordinal 1");
         let init_exit =
@@ -954,9 +967,9 @@ mod exports {
     #[test]
     fn export_address_answers_a_named_export_at_its_linear_address() {
         let file = exporting(&[("_alpha", 0x1300), ("_beta", 0x1310)]);
-        let mut cpu = cpu();
+        let mut cpu = cpu_for_load();
         let module = Wg32::load(&mut cpu, &file, &no_host).expect("a PE with no imports loads");
-        let base = cpu.mem.images().last().expect("just loaded").base();
+        let base = cpu.mem.image().expect("image").base();
 
         assert_eq!(
             <Wg32 as Abi>::export_address(&module, &name("_alpha")),
@@ -974,9 +987,9 @@ mod exports {
     #[test]
     fn export_address_answers_a_public_ordinal() {
         let file = exporting(&[("_alpha", 0x1300), ("_beta", 0x1310)]);
-        let mut cpu = cpu();
+        let mut cpu = cpu_for_load();
         let module = Wg32::load(&mut cpu, &file, &no_host).expect("a PE with no imports loads");
-        let base = cpu.mem.images().last().expect("just loaded").base();
+        let base = cpu.mem.image().expect("image").base();
         let ordinal = mbbs_machine::module::Symbol::Ordinal;
 
         assert_eq!(
@@ -1001,10 +1014,10 @@ mod exports {
             eprintln!("skipping: {} is not in this tree", path.display());
             return;
         };
-        let mut cpu = cpu();
+        let mut cpu = cpu_for_load();
         let module = Wg32::load(&mut cpu, &file, &no_host)
             .expect("MajorMUD NT's imports all bind -- unresolved ones just get a thunk");
-        let base = cpu.mem.images().last().expect("just loaded").base();
+        let base = cpu.mem.image().expect("image").base();
         let at = |rva: u32| Some(mbbs_machine::m32::Flat32Ptr(base + rva));
 
         assert_eq!(<Wg32 as Abi>::export_address(&module, &name("_get_item_from_name")), at(0x1ad5c));

@@ -651,8 +651,8 @@ pub trait Abi {
     /// the `Segments` a scratch `Machine::new` already carries, so nothing
     /// already allocated ever moves. `Wg32::load` has to earn it instead --
     /// see that implementation's own doc comment, and
-    /// [`mbbs_machine::m32::Memory::replace_image`], for how: only the
-    /// image is ever replaced, never the arena. This was not always true of
+    /// `mbbs_machine::m32::Memory::push_image`, for how: the image is
+    /// appended, never touching the arena. This was not always true of
     /// `Wg32::load` (`crates/mbbs/tests/wg32_round_trip.rs`'s module doc
     /// comment records the bug this invariant now rules out by
     /// construction, and this trait method's own doc comment previously
