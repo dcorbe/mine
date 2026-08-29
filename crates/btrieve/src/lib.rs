@@ -14851,6 +14851,21 @@ mod tests {
         assert_eq!(again.block_mut(at).expect("open").records().expect("reads").len(), 0, "its old self");
     }
 
+    /// DIAGNOSIS: a write outside a transaction stages into the cache, but
+    /// the record model it invalidates is rebuilt from the FILE, which does
+    /// not have the write yet.
+    #[test]
+    fn the_record_model_rebuilt_after_a_staged_insert_must_include_it() {
+        let (mut btrieve, _mem, _heap, at, _path) = session_with_v6("bundle-model-reload");
+        btrieve.set_bundle_limits(young());
+        btrieve.block_mut(at).expect("open").insert(&v6_record(b"AAAA")).expect("staged insert");
+        let block = btrieve.block_mut(at).expect("open");
+        assert!(block.bundle.is_open(), "still staged");
+        assert!(block.records.is_none(), "the write invalidated the model (v6_invalidate_keys)");
+        let seen = block.records().expect("reads").len();
+        assert_eq!(seen, 1, "the rebuilt model must include the staged record");
+    }
+
     #[test]
     fn abort_invalidates_the_v6_cache_not_just_disk_and_the_model() {
         let mut mem = FlatMem::new(64 * 1024);
