@@ -186,16 +186,25 @@ fn main() -> ExitCode {
 
     // Caller -> server. Ends when the BBS hangs up (stdin EOF): shut our
     // write half so the server sees the disconnect, and let the other
-    // thread run on until the server closes.
+    // thread run on until the server closes. A real error (as opposed to
+    // clean EOF) is reported through `tx`, non-blocking on the receiving
+    // end -- this thread is still blocked in `stdin.read` for as long as
+    // the BBS holds its end of the pty open, so `main` must never join it.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut to_server = sock.try_clone().expect("clone the socket");
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut buf = [0u8; 4096];
         loop {
             match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(e) => {
+                    let _ = tx.send(format!("reading from the caller: {e}"));
+                    break;
+                }
                 Ok(n) => {
-                    if to_server.write_all(&buf[..n]).is_err() {
+                    if let Err(e) = to_server.write_all(&buf[..n]) {
+                        let _ = tx.send(format!("writing to the server: {e}"));
                         break;
                     }
                 }
@@ -204,14 +213,24 @@ fn main() -> ExitCode {
         let _ = to_server.shutdown(std::net::Shutdown::Write);
     });
 
-    // Server -> caller. Ends when the server closes the session.
+    // Server -> caller. Ends when the server closes the session. A real
+    // I/O error here (dead socket, broken stdout pipe) is not the same as
+    // the server ending the session cleanly -- it is reported to stderr
+    // (sbbs's log, never the caller's CP437 stream) and exits 3, so a
+    // sysop can tell a transport fault from a logout.
     let mut stdout = io::stdout().lock();
     let mut buf = [0u8; 4096];
+    let mut error = None;
     loop {
         match sock.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(e) => {
+                error = Some(format!("reading from the server: {e}"));
+                break;
+            }
             Ok(n) => {
-                if stdout.write_all(&buf[..n]).and_then(|()| stdout.flush()).is_err() {
+                if let Err(e) = stdout.write_all(&buf[..n]).and_then(|()| stdout.flush()) {
+                    error = Some(format!("writing to the caller: {e}"));
                     break;
                 }
             }
@@ -219,6 +238,13 @@ fn main() -> ExitCode {
     }
     drop(stdout);
     drop(raw);
+
+    // Non-blocking: the stdin thread may still be running (see above).
+    let error = error.or_else(|| rx.try_recv().ok());
+    if let Some(reason) = error {
+        eprintln!("mbbs-door: {reason}");
+        return ExitCode::from(3);
+    }
     ExitCode::SUCCESS
 }
 

@@ -133,3 +133,34 @@ fn a_caller_hangup_closes_the_relays_write_half_toward_the_server() {
     drop(sock);
     assert_eq!(child.wait().expect("wait").code(), Some(0));
 }
+
+#[test]
+fn a_transport_error_mid_session_exits_3_with_a_stderr_line() {
+    let (drop_file, path) = fixture("mbbs-door-transport-error");
+    let listener = UnixListener::bind(&path).expect("bind");
+    let mut child = relay()
+        .arg(&drop_file)
+        .arg("--socket")
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mbbs-door");
+    let (mut sock, _) = listener.accept().expect("accept");
+    read_header(&mut sock);
+
+    // Close the relay's stdout: its next write to the caller fails with
+    // EPIPE (Rust ignores SIGPIPE by default, so the write returns `Err`
+    // rather than killing the process).
+    drop(child.stdout.take());
+    sock.write_all(b"more bytes than the caller will ever read").expect("write to relay");
+
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("mbbs-door: writing to the caller"),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
