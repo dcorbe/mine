@@ -12,6 +12,7 @@
 
 pub mod alarm;
 pub mod conn;
+pub mod door;
 pub mod host;
 pub mod iac;
 pub mod msg;
