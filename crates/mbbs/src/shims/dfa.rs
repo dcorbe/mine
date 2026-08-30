@@ -169,6 +169,36 @@ fn current_owner<A: Abi>(call: &mut Call<A>, host: &Host<A>) -> Option<u32> {
 /// comment's guard census): `btvu()` would have faulted dereferencing
 /// `dfa->posblk`, and this refuses by name instead of reproducing a crash a
 /// module could not have caught either.
+/// A Btrieve record position, as the module sees it: **high word first**.
+///
+/// Genuine Btrieve 6.15 hands `Get-Position` (op 22) back, and takes
+/// `Get-Direct`/`Step` positions in, as a word-swapped `LONG` -- the same
+/// "high word first" convention every pointer inside the file format uses
+/// (`crates/btrieve`'s `pages::long`/`to_long`). This crate carries a
+/// record's position internally as a plain little-endian `u32`
+/// (`layout.position` = `page*pagesize + header + slot*physical`), so the
+/// two halves have to be swapped at the module boundary.
+///
+/// **Measured, not assumed:** every one of the 7,060 records `btrvprobe
+/// step` yields from The Rose's `RCI_MOD1.DAT`, and every record of the v6
+/// oracle fixture `DUPKEY30.DAT`, reports a position that is exactly this
+/// swap of the plain slot position (`page 2, slot 0` -> `1030` -> engine
+/// `0x0406_0000`). Without it, `dfaAbs` hands back `0x0002_a4f0` where the
+/// engine says `0xa4f0_0002`, and a module that does arithmetic on the
+/// value -- The Rose's universe loader steps, `dfaAbs`, `dfaGetAbsLock`s and
+/// compares -- never terminates.
+///
+/// Its own inverse, so the same function encodes an outgoing position and
+/// decodes an incoming one. Scoped to `dfa*` deliberately: `WCCMMUD.DLL`
+/// reaches absolute positioning through `absbtv`/`gabbtv` (the `btv*`
+/// spellings), which round-trip the value opaquely and so are unaffected by
+/// which half leads -- swapping there is correct too but wants a live
+/// MajorMUD re-verify, so it is a separate step. See `shims::btrieve`'s
+/// `absbtv`/`current_position`.
+fn position_swap(position: u32) -> u32 {
+    (position << 16) | (position >> 16)
+}
+
 fn dfa_required<A: Abi>(host: &Host<A>, who: &str) -> Result<A::Ptr, ShimError> {
     let block = host.btrieve.dfa_current();
     if block == Btrieve::<AbiMem<A>>::null() {
@@ -674,9 +704,9 @@ pub fn dfaAbs<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
             .block(block)
             .map(|file| file.name().to_owned())
             .unwrap_or_default();
-        eprintln!("mbbs-btv: dfaAbs {name} -> {position}");
+        eprintln!("mbbs-btv: dfaAbs {name} -> {position} (module sees {:#010x})", position_swap(position));
     }
-    Ok(abi::Ret::Long(position))
+    Ok(abi::Ret::Long(position_swap(position)))
 }
 
 /// `dfaAcqAbsLock`/`dfaGetAbsLock`'s shared middle, which is now
@@ -766,7 +796,7 @@ fn dfa_acq_abs<A: Abi>(
 /// worker.
 pub fn dfaAcqAbsLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let recptr = call.ptr();
-    let abspos = call.long();
+    let abspos = position_swap(call.long());
     let keynum = btv::i16_arg::<A>(call.int());
     let loktyp = btv::i16_arg::<A>(call.int());
     let found = dfa_acq_abs(call, host, "dfaAcqAbsLock", recptr, abspos, keynum, loktyp)?;
@@ -786,7 +816,7 @@ pub fn dfaAcqAbsLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<a
 /// comment).
 pub fn dfaGetAbsLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let recptr = call.ptr();
-    let abspos = call.long();
+    let abspos = position_swap(call.long());
     let keynum = btv::i16_arg::<A>(call.int());
     let loktyp = btv::i16_arg::<A>(call.int());
     let found = dfa_acq_abs(call, host, "dfaGetAbsLock", recptr, abspos, keynum, loktyp)?;
@@ -1827,6 +1857,27 @@ mod tests {
     use crate::abi::Wg16;
     use crate::testing::Fixture;
     use mbbs_machine::m16::{FarPtr, Ret};
+
+    /// The position the module sees is the plain slot position with its two
+    /// 16-bit halves swapped -- the exact bytes genuine Btrieve 6.15 returns.
+    ///
+    /// Measured with `tools/btrieve-oracle/btrvprobe step`: The Rose's
+    /// `RCI_MOD1.DAT` record at page 338, slot 1 (plain `338*512+6+234 =
+    /// 173296 = 0x0002_a4f0`) reports position `0xa4f0_0002`; the v6 oracle
+    /// fixture `DUPKEY30.DAT`'s first record (page 2, slot 0, plain `1030 =
+    /// 0x0000_0406`) reports `0x0406_0000`. The swap is its own inverse, so
+    /// one function both encodes an outgoing `dfaAbs` and decodes an incoming
+    /// `dfaGetAbsLock`/`dfaAcqAbsLock`.
+    #[test]
+    fn position_swap_matches_genuine_btrieve_and_round_trips() {
+        assert_eq!(position_swap(0x0002_a4f0), 0xa4f0_0002, "RCI_MOD1 page 338 slot 1");
+        assert_eq!(position_swap(0x0000_0406), 0x0406_0000, "DUPKEY30 page 2 slot 0");
+        // Its own inverse: decode(encode(x)) == x, for every position a
+        // `dfaGetAbsLock` might have to un-swap back to what `dfaAbs` gave.
+        for p in [0u32, 1, 6, 1030, 173296, 0x0002_a4f0, 0xffff_ffff, 0x1234_5678] {
+            assert_eq!(position_swap(position_swap(p)), p, "round-trip {p:#x}");
+        }
+    }
 
     /// Open a file through `dfaOpen`, as a module would.
     fn open(f: &mut Fixture, name: &str, maxlen: u16) -> FarPtr {
