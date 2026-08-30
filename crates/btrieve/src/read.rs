@@ -399,9 +399,10 @@ fn v6_allocation_copy(bytes: &[u8], page_size: usize) -> V6AllocationBlockCopy {
 ///
 /// # Errors
 ///
-/// If either physical page does not carry the `"PP"` magic, if either
-/// claims a different block index than `block_index` names, or if the two
-/// generations tie.
+/// If either physical page does not carry the `"PP"` magic, or if the two
+/// generations tie. A stored self-index that disagrees with the position is
+/// not an error -- position is the identity, and the engine never reads that
+/// word (see the comment in the body).
 fn resolve_allocation_block(
     bytes: &[u8],
     page_size: usize,
@@ -427,18 +428,12 @@ fn resolve_allocation_block(
     let first_copy = v6_allocation_copy(page_bytes(first), page_size);
     let second_copy = v6_allocation_copy(page_bytes(second), page_size);
 
-    for (page, copy) in [(first, &first_copy), (second, &second_copy)] {
-        if copy.block != block_index {
-            return Err(NotBtrieve {
-                why: format!(
-                    "physical page {page} is where allocation-table block \
-                     {block_index} lives (harvest 3's own formula), but it \
-                     calls itself block {}",
-                    copy.block
-                ),
-            });
-        }
-    }
+    // The stored self-index is deliberately not compared against
+    // `block_index`: position is the block's identity. The engine's own
+    // fetch (`W32MKDE_decompiled.c:13571`, `FUN_00416fb0`) computes the page
+    // from the formula and never reads the on-disk word -- and The Rose
+    // 3.0's shipped `RCI_MOD1.DAT` (block 31's live pair self-labelled 21)
+    // is a real vendor file a comparison here refused.
 
     match first_copy.generation.cmp(&second_copy.generation) {
         std::cmp::Ordering::Greater => {

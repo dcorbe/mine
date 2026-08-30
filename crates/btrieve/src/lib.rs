@@ -2908,15 +2908,12 @@ impl<M: Mem> Block<M> {
                  logical id's own arithmetic says one must be"
             ));
         }
-        for &(page_number, page) in &candidates {
-            let stored = block_index(page);
-            if usize::from(stored) != block {
-                return Err(format!(
-                    "physical page {page_number} is where allocation-table \
-                     block {block} lives, but it calls itself block {stored}"
-                ));
-            }
-        }
+        // The stored self-index at 0x02 is deliberately not compared against
+        // `block`: position is the block's identity, and the engine's own
+        // fetch never reads the on-disk word (`W32MKDE_decompiled.c:13571`,
+        // `FUN_00416fb0`; The Rose 3.0's `RCI_MOD1.DAT` -- block 31's live
+        // pair self-labelled 21 -- is the vendor file a comparison refused).
+        let _ = block_index;
 
         let top_generation = candidates.iter().map(|&(_, page)| generation(page)).max().unwrap_or(0);
         let live: Vec<&[u8]> = candidates

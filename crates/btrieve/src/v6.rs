@@ -1259,17 +1259,17 @@ impl Map {
             if copies.is_empty() {
                 break;
             }
-            // Position is what identifies a block, so the index stored there has
-            // to agree -- the same check physical 2 and 3 already get below.
-            for &(page, _) in &copies {
-                let stored = word(store, page, BLOCK)?;
-                if stored != index {
-                    return Err(format!(
-                        "physical page {page} is where allocation-table block \
-                         {index} lives, but it calls itself block {stored}"
-                    ));
-                }
-            }
+            // Position alone identifies a block; the self-index at 0x02 is
+            // NOT consulted. The engine's own fetch derives the page from the
+            // formula -- `FUN_00416fb0`, `W32MKDE_decompiled.c:13571`,
+            // `iVar8 = (puVar5[0xfa] + 2) * (param_2 - 1); uVar7 = iVar8 + 2`
+            // -- and the `"PP" | index` tag it then compares is its in-memory
+            // cache key, never the on-disk word. A refusal here used to
+            // demand agreement and it rejected a real vendor file: The Rose
+            // 3.0's shipped `RCI_MOD1.DAT` carries a live block-31 pair at
+            // physical 3842/3843 whose self-index reads 21 (blocks 1-30
+            // agree with their positions; 31 on is stale), and the real
+            // engine boots it because it never looks.
             blocks.insert(index, copies);
         }
 
@@ -1298,8 +1298,8 @@ impl Map {
             }
             let live = live[0];
             // Which logical ids this block answers for. `block` is at least 1 --
-            // the position loop above numbers from 1 and refuses a page whose
-            // stored index disagrees -- so this subtraction cannot wrap.
+            // the position loop above numbers from 1 -- so this subtraction
+            // cannot wrap.
             // The engine derives the
             // block and slot *from* the logical id it wants -- block
             // `n / entries + 1` and slot `n % entries` for `n = logical - 1`
@@ -1489,9 +1489,11 @@ impl Map {
     /// # Errors
     ///
     /// If the block's pair would fall outside the file, if neither copy
-    /// carries the magic, if a copy calls itself some other block, or if the
-    /// two generations tie -- the same refusals [`Self::read`] makes, so a
-    /// file this can write is a file that can be read back.
+    /// carries the magic, or if the two generations tie -- the same refusals
+    /// [`Self::read`] makes, so a file this can write is a file that can be
+    /// read back. A copy whose stored self-index disagrees with its position
+    /// is NOT refused: position is the identity, and the engine never reads
+    /// that word (see [`Self::read`]).
     /// Where allocation-table block `index` (1-based) keeps its shadow pair,
     /// as physical page numbers -- position only, with no claim that a block
     /// is actually there.
@@ -1587,17 +1589,11 @@ impl Map {
                 first + 1
             ));
         }
-        for page in [first, first + 1] {
-            if magic(store, page)? {
-                let stored = word(store, page, BLOCK)?;
-                if usize::from(stored) != index {
-                    return Err(format!(
-                        "physical page {page} is where allocation-table block \
-                         {index} lives, but it calls itself block {stored}"
-                    ));
-                }
-            }
-        }
+        // The self-index at 0x02 is deliberately not checked -- position is
+        // the block's identity, and the engine's own fetch never reads the
+        // on-disk word (see `read`'s comment at its `blocks.insert`, with the
+        // `W32MKDE_decompiled.c:13571` citation and the `RCI_MOD1.DAT`
+        // counter-example a self-index refusal rejected).
         match word(store, first, GENERATION)?.cmp(&word(store, first + 1, GENERATION)?) {
             std::cmp::Ordering::Greater => Ok((first + 1, first)),
             std::cmp::Ordering::Less => Ok((first, first + 1)),
@@ -3333,12 +3329,15 @@ mod tests {
         }
     }
 
-    /// Position is what identifies block 1, so the block index found there
-    /// has to agree. A `"PP"` page at physical 2 calling itself block 7 would
-    /// otherwise become a lone unpaired copy -- and a single copy is
-    /// automatically live, never reaching the generation-tie check.
+    /// Position identifies a block; the self-index stored at 0x02 does not.
+    /// A `"PP"` page at physical 2 calling itself block 7 is still block 1,
+    /// because that is where block 1 lives -- the engine's own fetch
+    /// (`W32MKDE_decompiled.c:13571`, `FUN_00416fb0`) computes the page from
+    /// the formula and never reads the stored word. This used to be a
+    /// refusal, and it rejected a real vendor file: The Rose 3.0's shipped
+    /// `RCI_MOD1.DAT` carries a live block-31 pair whose self-index reads 21.
     #[test]
-    fn a_pp_page_at_physical_two_that_is_not_block_one_is_refused() {
+    fn a_mislabelled_self_index_at_a_formula_position_is_ignored() {
         let mut file = vec![0u8; 512 * 6];
         let at = |page: usize| page * 512;
 
@@ -3346,8 +3345,36 @@ mod tests {
         file[at(2) + BLOCK..at(2) + BLOCK + 2].copy_from_slice(&7u16.to_le_bytes());
         file[at(2) + GENERATION..at(2) + GENERATION + 2].copy_from_slice(&5u16.to_le_bytes());
 
-        let e = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512).unwrap_err();
-        assert!(e.contains("block 7"), "{e}");
+        let map = Map::read(&mut Store::from_bytes(&file, 512).expect("test fixture"), 512)
+            .expect("position wins over the stored self-index");
+        assert_eq!(map.entries().count(), 0, "an empty block resolves nothing");
+    }
+
+    /// The `RCI_MOD1.DAT` shape end to end on a committed fixture: a later
+    /// block's live pair self-labelled with a *different* block's index
+    /// resolves exactly as if the label agreed, because position is the
+    /// identity. `PP2BLOCK.DAT`'s block 2 pair at physical 130/131 gets The
+    /// Rose's stale "21" written into both copies, and every logical page
+    /// still answers with the same physical page as before.
+    #[test]
+    fn a_stale_self_index_on_a_later_block_changes_no_resolution() {
+        const PAGE: usize = 512;
+        let mut file = fixture("PP2BLOCK.DAT");
+        let before = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16)
+            .expect("the pristine fixture resolves");
+
+        for page in [130usize, 131] {
+            assert_eq!(&file[page * PAGE..page * PAGE + 2], MAGIC, "the fixture keeps block 2 there");
+            file[page * PAGE + BLOCK..][..2].copy_from_slice(&21u16.to_le_bytes());
+        }
+
+        let after = Map::read(&mut Store::from_bytes(&file, PAGE as u16).expect("test fixture"), PAGE as u16)
+            .expect("a stale self-index is not a refusal");
+        let mut b: Vec<_> = before.entries().collect();
+        let mut a: Vec<_> = after.entries().collect();
+        b.sort_unstable();
+        a.sort_unstable();
+        assert_eq!(a, b, "resolution is untouched by the label");
     }
 
     /// `Map::claim`, Task 13 Step 1 of the plan (allocation-table
