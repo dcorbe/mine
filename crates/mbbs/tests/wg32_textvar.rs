@@ -64,6 +64,9 @@ fn findtvar_of_an_unregistered_name_answers_all_ones_at_32_bits() {
 #[test]
 fn findtvar_still_finds_a_registered_name_at_32_bits() {
     let mut f = Fixture::<Wg32>::new_wg32();
+    // The host's standard suite (`shims::txtvbl`) is already in the table;
+    // a module's registration lands after it.
+    let base = u32::from(f.host.textvars().len());
 
     let name = f.text_wg32("MUDCHARINFO");
     let varrou = f.text_wg32("routine stand-in");
@@ -75,5 +78,99 @@ fn findtvar_still_finds_a_registered_name_at_32_bits() {
     let Ret::Int(value) = ret else {
         panic!("findtvar returns an int, got {ret:?}");
     };
-    assert_eq!(value, 0, "the first registered variable is index zero");
+    assert_eq!(value, base, "a module's first variable follows the standard suite");
+}
+
+/// Byte-for-byte the same fixture `crates/mbbs/tests/wg32_abi.rs`'s
+/// `minimal_with_one_section` builds -- duplicated per this crate family's
+/// own convention rather than shared. Loaded only so `Host::run` has a
+/// `Module` to be handed; nothing in it is executed.
+fn minimal_with_one_section() -> Vec<u8> {
+    const SIZE_OF_IMAGE: u32 = 0x0000_2000;
+    let mut v = vec![0u8; 0x200];
+    v[0..2].copy_from_slice(b"MZ");
+    v[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    v[0x80..0x84].copy_from_slice(b"PE\0\0");
+    v[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes());
+    v[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+    v[0x94..0x96].copy_from_slice(&0xe0u16.to_le_bytes());
+    v[0x96..0x98].copy_from_slice(&0x010eu16.to_le_bytes());
+    v[0x98..0x9a].copy_from_slice(&0x010bu16.to_le_bytes());
+
+    let opt = 0x98;
+    v[opt + 16..opt + 20].copy_from_slice(&0x0000_1111u32.to_le_bytes());
+    v[opt + 28..opt + 32].copy_from_slice(&0x2222_0000u32.to_le_bytes());
+    v[opt + 32..opt + 36].copy_from_slice(&0x0000_1000u32.to_le_bytes());
+    v[opt + 36..opt + 40].copy_from_slice(&0x0000_0400u32.to_le_bytes());
+    v[opt + 56..opt + 60].copy_from_slice(&SIZE_OF_IMAGE.to_le_bytes());
+
+    let sec = opt + 0xe0;
+    v.resize(sec + 40 + 0x200, 0);
+    v[sec..sec + 8].copy_from_slice(b"CODE\0\0\0\0");
+    v[sec + 8..sec + 12].copy_from_slice(&0x100u32.to_le_bytes());
+    v[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+    v[sec + 16..sec + 20].copy_from_slice(&0x80u32.to_le_bytes());
+    v[sec + 20..sec + 24].copy_from_slice(&((sec + 40) as u32).to_le_bytes());
+    v[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+    v
+}
+
+/// The Rose 3.0NT's crash path, end to end at 32 bits: its real-time kick
+/// does `txtvars[findtvar("SYSTEM_NAME")].varrou()` with no `-1` check --
+/// correct on a real board, where `init__galtxv` registered the standard
+/// suite before any module's init. This host used to register none, so the
+/// lookup answered `-1`, the table was NULL, and the module faulted at
+/// RVA `0x4c705` five times in sixty seconds. Now the lookup finds row 37
+/// (the vendor's own order), the row's `varrou` is a host thunk, and
+/// calling through it -- the module's own `call eax` -- answers `bbsttl`.
+#[test]
+fn system_name_is_registered_and_its_varrou_answers_the_board_title() {
+    use mbbs::abi::Abi as _;
+    use mbbs::testing::Fixture as F;
+    use mbbs::Outcome;
+    use mbbs_machine::m32::Flat32Ptr;
+    use mbbs_machine::ptr::ModulePtr as _;
+
+    let mut f = F::<Wg32>::new_wg32();
+    let module = f.host.load(&mut f.machine, &minimal_with_one_section()).expect("inert module loads");
+
+    let query = f.text_wg32("SYSTEM_NAME");
+    let ret = f.invoke_wg32(findtvar, &[query.0]).expect("findtvar");
+    let Ret::Int(index) = ret else {
+        panic!("findtvar returns an int, got {ret:?}");
+    };
+    assert_eq!(index, 37, "SYSTEM_NAME is row 37, TXTVBL.C's own order");
+
+    let row = f
+        .host
+        .textvars()
+        .get_mem(mbbs::abi::Wg32::mem_ref(&f.machine), 37)
+        .expect("readable")
+        .expect("a row");
+    assert_eq!(row.name, "SYSTEM_NAME");
+    let varrou = row.varrou.expect("a registered routine");
+    let thunk_base = f.machine.machine.thunk_addr(0);
+    let thunk_end = f.machine.machine.thunk_addr(mbbs_machine::m32::MAX_THUNKS - 1);
+    assert!(
+        (thunk_base..=thunk_end).contains(&varrou.0),
+        "varrou {varrou:?} must point into the thunk table [{thunk_base:#x}, {thunk_end:#x}]"
+    );
+
+    let outcome = f
+        .host
+        .run(&mut f.machine, &module, varrou, &[], None)
+        .expect("the call goes through the thunk and back");
+    let Outcome::Returned { lo, .. } = outcome else {
+        panic!("tvar_sysnam answers through the vector, got {outcome:?}");
+    };
+    let bbsttl = f
+        .host
+        .globals()
+        .pointer_mem(mbbs::abi::Wg32::mem_ref(&f.machine), "bbsttl")
+        .expect("bbsttl is placed");
+    assert_eq!(Flat32Ptr(lo), bbsttl, "the pointer itself, not a copy");
+    let text = Flat32Ptr(lo)
+        .read_cstr(mbbs::abi::Wg32::mem_ref(&f.machine))
+        .expect("terminated");
+    assert_eq!(text, b"Worldgroup");
 }

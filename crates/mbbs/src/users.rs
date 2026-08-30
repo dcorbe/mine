@@ -95,7 +95,7 @@ pub struct Field {
 }
 
 impl Field {
-    const fn new(at: u16, width: u8) -> Self {
+    pub(crate) const fn new(at: u16, width: u8) -> Self {
         Self { at, width }
     }
 }

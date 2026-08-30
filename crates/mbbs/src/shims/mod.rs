@@ -32,6 +32,7 @@ pub mod task;
 pub mod vda;
 pub mod text;
 pub mod tfscan;
+pub mod txtvbl;
 pub mod user;
 
 use crate::Host;
@@ -317,7 +318,7 @@ impl<A: Abi> Copy for Entry<A> {}
 /// if this table's count ever rises above. This number went stale once
 /// already, by exactly two hundred and two.
 pub(crate) fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evidence)> {
-    vec![
+    let mut table: Vec<(&'static str, &'static str, Shim<A>, Cleans, Evidence)> = vec![
         // Strings, numbers and the print buffer.
         (MAJORBBS, "spr", text::spr, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "sprintf", text::sprintf, Cleans::Caller, Evidence::Unclassified),
@@ -1409,7 +1410,16 @@ pub(crate) fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cl
         // see `dosenv::simpsnd`, and note it is NOT zero, which would mean
         // "still processing" and spin the caller.
         (GALME, "simpsnd", dosenv::simpsnd, Cleans::Caller, Evidence::Unclassified),
-    ]
+    ];
+    // The standard text-variable suite. Not imports at all -- a module
+    // reaches these through the thunks `Host::new` reserved
+    // (`shims::txtvbl::register_standard`, `Host::vectors`) -- but listed
+    // here so a call and a stop resolve by name like any other, the way
+    // `editor::VECTOR` already is.
+    table.extend(txtvbl::standard::<A>().into_iter().map(|(_, routine, shim)| {
+        (MAJORBBS, routine, shim, Cleans::Caller, Evidence::VendorBody("SRC/api/galtxv/TXTVBL.C"))
+    }));
+    table
 }
 
 /// The C library that `MAJORBBS` and `cw3220mt.DLL` **both** export, served

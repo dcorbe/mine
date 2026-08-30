@@ -3711,14 +3711,17 @@ mod tests {
         ptr
     }
 
-    /// A synthetic `fldvfy` that immediately far-calls thunk 0 -- an
-    /// import `f.minimal_module()` never registered, so [`Host::run`]
-    /// services the call (unlike the old bare `machine.call` this replaced)
-    /// but still stops the machine, naming the unimplemented import rather
-    /// than refusing to look at it at all.
+    /// A synthetic `fldvfy` that immediately far-calls the first thunk the
+    /// host itself did not reserve -- an import `f.minimal_module()` never
+    /// registered, so [`Host::run`] services the call (unlike the old bare
+    /// `machine.call` this replaced) but still stops the machine, naming
+    /// the unimplemented import rather than refusing to look at it at all.
+    /// Not thunk 0: `Host::new` claims 0..=60 for the standard text
+    /// variables (`shims::txtvbl`), and calling one of those succeeds.
     fn stub_calling_a_thunk(f: &mut Fixture, code_offset: u16) -> FarPtr {
+        let unclaimed = f.host.vectors.len() as u16;
         let mut code = vec![0x9au8]; // far call
-        code.extend_from_slice(&f.machine.thunk_address(0).to_bytes());
+        code.extend_from_slice(&f.machine.thunk_address(unclaimed).to_bytes());
         code.push(0xcb);
         let ptr = f.machine.code_ptr(code_offset);
         f.machine.write(ptr, &code).expect("stub fits");

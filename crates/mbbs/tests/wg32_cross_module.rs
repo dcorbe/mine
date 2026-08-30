@@ -284,9 +284,15 @@ fn an_import_from_a_loaded_pe_binds_to_its_export_not_a_thunk() {
 #[test]
 fn an_import_from_a_module_loaded_later_is_an_unresolved_thunk_named_at_first_use() {
     let mut cpu = machine();
-    let thunk0 = cpu.machine.thunk_addr(0);
-    let imp = module_with_import(&calls_unimplemented(thunk0), "EXPO.DLL", "_answer");
-    let (importer_mod, mut host) = load_module_and_host(&mut cpu, &imp);
+    // Host first: its own reserved thunks (the standard text variables)
+    // come before any module's slice, so the module's first thunk is
+    // `host_thunks`, not 0 -- slot 0 is `tvar_userid` now, and calling it
+    // would be answered, not refused.
+    let mut host = Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), Terms::new(1))
+        .expect("host builds against the empty memory");
+    let thunk = cpu.machine.thunk_addr(host.host_thunks());
+    let imp = module_with_import(&calls_unimplemented(thunk), "EXPO.DLL", "_answer");
+    let importer_mod = host.load(&mut cpu, &imp).expect("the synthetic module loads and binds");
     let entry = Flat32Ptr(importer_mod.entry());
     let outcome = host.run(&mut cpu, &importer_mod, entry, &[], None).expect("reported, not fatal");
     let Outcome::Stopped(mbbs_machine::m32::Poison::Unimplemented { module, symbol }) = outcome else {
@@ -303,27 +309,33 @@ fn an_import_from_a_module_loaded_later_is_an_unresolved_thunk_named_at_first_us
 #[test]
 fn a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner() {
     let mut cpu = machine();
-    // Module A: one unresolved import -> machine-wide slot 0.
-    let thunk0 = cpu.machine.thunk_addr(0);
+    // The host reserves its own thunks first (the standard text variables,
+    // `shims::txtvbl`), so the first module's slice starts at
+    // `Host::host_thunks`, not at zero -- which is why the host is built
+    // before module A's code can bake its own first thunk's address in.
+    let mut host = Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), Terms::new(1))
+        .expect("host builds against the empty memory");
+    let base = host.host_thunks();
+    // Module A: one unresolved import -> machine-wide slot `base`.
     let a = module_with_import_and_export(
-        &calls_unimplemented(thunk0),
+        &calls_unimplemented(cpu.machine.thunk_addr(base)),
         "NOWHERE.DLL",
         "_a_only",
         "AAA.DLL",
         "_a_entry",
     );
-    let (a_mod, mut host) = load_module_and_host(&mut cpu, &a);
-    // Module B: its own unresolved import -> slot 1, never slot 0.
+    let a_mod = host.load(&mut cpu, &a).expect("a loads");
+    // Module B: its own unresolved import -> the next slot, never A's.
     let b = module_with_import(&[0xC3], "NOWHERE.DLL", "_b_only");
     let b_mod = host.load(&mut cpu, &b).expect("b loads");
-    assert_eq!((a_mod.thunk_base(), b_mod.thunk_base()), (0, 1));
+    assert_eq!((a_mod.thunk_base(), b_mod.thunk_base()), (base, base + 1));
 
-    // And the base is actually *applied*: B's one IAT slot holds slot 1's
-    // thunk address, not slot 0's. `patch_thunk_addresses` numbers its
+    // And the base is actually *applied*: B's one IAT slot holds its own
+    // slot's thunk address, not A's. `patch_thunk_addresses` numbers its
     // sites locally; `Wg32::load`'s closure is what adds `thunk_base`.
     let iat = Flat32Ptr(cpu.mem.images()[1].base() + 0x1068);
     let bound = u32::from_le_bytes(iat.resolve(&cpu.mem, 4).expect("iat").try_into().unwrap());
-    assert_eq!(bound, cpu.machine.thunk_addr(1), "B's thunk is machine-wide slot 1");
+    assert_eq!(bound, cpu.machine.thunk_addr(base + 1), "B's thunk is the machine-wide slot after A's");
 
     // Enter A's code *as B*: the stop must still name A's import.
     let outcome = host.run(&mut cpu, &b_mod, Flat32Ptr(a_mod.entry()), &[], None).expect("reported");
@@ -395,9 +407,10 @@ fn the_ftol_capture_is_armed_at_the_second_modules_machine_wide_slot() {
     let first = module_with_import(&[0xC3], "NOWHERE.DLL", "_first");
     let (_first_mod, mut host) = load_module_and_host(&mut cpu, &first);
 
+    let base = _first_mod.thunk_base();
     let second_file = module_with_import(&[0xC3], "cw3220mt.DLL", "__ftol");
     let second = host.load(&mut cpu, &second_file).expect("the second module loads");
-    assert_eq!(second.thunk_base(), 1, "the first module's one import took slot 0");
+    assert_eq!(second.thunk_base(), base + 1, "the first module's one import took the slot before");
 
     // The second module's only import is local index 0; `thunk_base` is
     // what makes it machine-wide slot 1.
@@ -410,7 +423,7 @@ fn the_ftol_capture_is_armed_at_the_second_modules_machine_wide_slot() {
     );
     assert_eq!(
         cpu.machine.st0_capture_slots(),
-        [1],
+        [second.thunk_base()],
         "arming must land on the machine-wide slot, not the local index"
     );
 
@@ -430,8 +443,10 @@ fn the_ftol_capture_is_armed_at_the_second_modules_machine_wide_slot() {
 
     let exit = Wg32::call(&mut cpu, Flat32Ptr(base), &[]).expect("the call is recovered, not fatal");
     match exit {
-        Exit::Call { index } => assert_eq!(index, 1, "stopped at the second module's own slot"),
-        other => panic!("expected Exit::Call {{ index: 1 }}, got {other:?}"),
+        Exit::Call { index } => {
+            assert_eq!(index, second.thunk_base(), "stopped at the second module's own slot");
+        }
+        other => panic!("expected Exit::Call at the second module's slot, got {other:?}"),
     }
     assert_eq!(
         cpu.machine.take_st0(),

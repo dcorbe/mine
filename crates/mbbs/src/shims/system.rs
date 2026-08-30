@@ -1040,6 +1040,64 @@ const DATE_LEN: u16 = 9;
 const TIME_LEN: u16 = 9;
 const EDAT_LEN: u16 = 10;
 
+/// `MM/DD/YY` for a packed DOS date -- [`ncdate`]'s conversion, shared with
+/// `shims::txtvbl`'s `CREATION_DATE`/`LAST_ON`. `None` for date zero, which
+/// is [`ncdate`]'s own measured null case: an absent date, not `00/00/80`.
+pub(crate) fn ncdate_text(packed: u16) -> Option<String> {
+    (packed != 0).then(|| {
+        format!(
+            "{:02}/{:02}/{:02}",
+            (packed >> 5) & 0xf,
+            packed & 0x1f,
+            (((packed >> 9) & 0x7f) + 1980) % 100,
+        )
+    })
+}
+
+/// `MM/DD/YYYY` -- `ncdatel` (`SRC/api/gcommlib/DNTAPI.C:164-172`), the long
+/// form of [`ncdate_text`] and under the same null rule as its short sibling.
+pub(crate) fn ncdatel_text(packed: u16) -> Option<String> {
+    (packed != 0).then(|| {
+        format!(
+            "{:02}/{:02}/{}",
+            (packed >> 5) & 0xf,
+            packed & 0x1f,
+            ((packed >> 9) & 0x7f) + 1980,
+        )
+    })
+}
+
+/// `HH:MM:SS` -- [`nctime`]'s conversion. Total: `nctime(0)` is `00:00:00`.
+pub(crate) fn nctime_text(packed: u16) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        (packed >> 11) & 0x1f,
+        (packed >> 5) & 0x3f,
+        (packed << 1) & 0x3e,
+    )
+}
+
+/// `DD-MMM-YY` -- [`ncedat`]'s conversion, total like the original (see
+/// that shim's doc for why month 0 and 13..=15 are real answers).
+pub(crate) fn ncedat_text(packed: u16) -> String {
+    format!(
+        "{:02}-{}-{:02}",
+        packed & 0x1f,
+        MONAME[usize::from((packed >> 5) & 0xf)],
+        (((packed >> 9) & 0x7f) + 1980) % 100,
+    )
+}
+
+/// `DD-MMM-YYYY` -- `ncedatl` (`SRC/api/gcommlib/DNTAPI.C:194-202`).
+pub(crate) fn ncedatl_text(packed: u16) -> String {
+    format!(
+        "{:02}-{}-{}",
+        packed & 0x1f,
+        MONAME[usize::from((packed >> 5) & 0xf)],
+        ((packed >> 9) & 0x7f) + 1980,
+    )
+}
+
 /// The buffers the date routines format into, allocated the first time one of
 /// them runs.
 ///
@@ -1098,12 +1156,7 @@ fn buffers_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<DateBuffe
 pub fn nctime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let packed = Into::<u32>::into(call.int()) as u16;
     let at = buffers_mem(call.mem(), host)?.time;
-    let text = format!(
-        "{:02}:{:02}:{:02}",
-        (packed >> 11) & 0x1f,
-        (packed >> 5) & 0x3f,
-        (packed << 1) & 0x3e,
-    );
+    let text = nctime_text(packed);
     write_cstr_mem::<A>(call.mem(), at, text.as_bytes(), TIME_LEN)?;
     Ok(abi::Ret::Ptr(at))
 }
@@ -1133,16 +1186,9 @@ pub fn ncdate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
     // `or cx,cx / jnz` at `seg 33:0x0c10`, and the branch it does not take
     // writes nothing at all.
-    if packed == 0 {
+    let Some(text) = ncdate_text(packed) else {
         return Ok(abi::Ret::Ptr(all.empty));
-    }
-
-    let text = format!(
-        "{:02}/{:02}/{:02}",
-        (packed >> 5) & 0xf,
-        packed & 0x1f,
-        (((packed >> 9) & 0x7f) + 1980) % 100,
-    );
+    };
     write_cstr_mem::<A>(call.mem(), all.date, text.as_bytes(), DATE_LEN)?;
     Ok(abi::Ret::Ptr(all.date))
 }
@@ -1286,15 +1332,7 @@ pub fn ncedat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let packed = Into::<u32>::into(call.int()) as u16;
     let all = buffers_mem(call.mem(), host)?;
 
-    let month = usize::from((packed >> 5) & 0xf);
-    let name = MONAME[month];
-
-    let text = format!(
-        "{:02}-{}-{:02}",
-        packed & 0x1f,
-        name,
-        (((packed >> 9) & 0x7f) + 1980) % 100,
-    );
+    let text = ncedat_text(packed);
     write_cstr_mem::<A>(call.mem(), all.edat, text.as_bytes(), EDAT_LEN)?;
     Ok(abi::Ret::Ptr(all.edat))
 }
@@ -2097,18 +2135,9 @@ pub fn register_textvar<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Resul
     )
     .into_owned();
 
-    let mut table = std::mem::take(&mut host.textvars);
-    let pushed = table.push_mem(call.mem(), &mut host.heap, &name, varrou);
-    host.textvars = table;
-    let n = pushed?;
-
-    // The module reaches the table only through this. A host that filled the
-    // table and left the global null would have registered nothing.
-    let at = host.textvars.at().expect("a row was just added");
-    host.globals()
-        .write_mem(call.mem(), "txtvars", &A::ptr_to_bytes(at))
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-
+    // The module reaches the table only through the `txtvars` global, and
+    // `Host::add_textvar` is what keeps it pointed at a table that moves.
+    let n = host.add_textvar(call.mem(), &name, varrou)?;
     Ok(abi::Ret::Int(A::Int::from(n)))
 }
 
@@ -4004,6 +4033,9 @@ mod tests {
         // a host that filled a table and left the pointer null would have
         // registered nothing.
         let mut f = Fixture::new();
+        // The standard suite (`shims::txtvbl`) is already registered; a
+        // module's first variable lands after it.
+        let base = f.host.textvars().len();
         let name = f.text("MUDCHARINFO");
         let varrou = FarPtr {
             offset: 0x001e,
@@ -4013,8 +4045,8 @@ mod tests {
         let args = [name.offset, name.selector, varrou.offset, varrou.selector];
         assert_eq!(
             f.invoke(register_textvar, &args).expect("registered"),
-            Ret::U16(0),
-            "the first text variable is number zero"
+            Ret::U16(base),
+            "the first module-registered variable follows the standard suite"
         );
 
         let published = f
@@ -4028,7 +4060,7 @@ mod tests {
         let row = f
             .host
             .textvars()
-            .get_mem(f.machine.mem(), 0)
+            .get_mem(f.machine.mem(), base)
             .expect("readable")
             .expect("a row");
         assert_eq!(row.name, "MUDCHARINFO");
@@ -4042,6 +4074,7 @@ mod tests {
         // it, and the global points at where they went. An implementation that
         // allocated and forgot to copy would pass every test in Task 5.
         let mut f = Fixture::new();
+        let base = f.host.textvars().len();
         let first = f.text("MUDCHARINFO");
         let second = f.text("USERID");
         let a = FarPtr {
@@ -4058,18 +4091,18 @@ mod tests {
                 &[first.offset, first.selector, a.offset, a.selector]
             )
             .expect("registered"),
-            Ret::U16(0)
+            Ret::U16(base)
         );
         assert_eq!(
             f.invoke(register_textvar,
                 &[second.offset, second.selector, b.offset, b.selector]
             )
             .expect("registered"),
-            Ret::U16(1),
+            Ret::U16(base + 1),
             "the index counts up"
         );
 
-        assert_eq!(f.host.textvars().len(), 2);
+        assert_eq!(f.host.textvars().len(), base + 2);
         let published = f
             .host
             .globals()
@@ -4080,7 +4113,7 @@ mod tests {
         let row0 = f
             .host
             .textvars()
-            .get_mem(f.machine.mem(), 0)
+            .get_mem(f.machine.mem(), base)
             .expect("readable")
             .expect("a row");
         assert_eq!(row0.name, "MUDCHARINFO", "the first row came along");
@@ -4089,14 +4122,14 @@ mod tests {
         let row1 = f
             .host
             .textvars()
-            .get_mem(f.machine.mem(), 1)
+            .get_mem(f.machine.mem(), base + 1)
             .expect("readable")
             .expect("a row");
         assert_eq!(row1.name, "USERID");
         assert_eq!(row1.varrou, Some(b));
 
         assert_eq!(
-            f.host.textvars().get_mem(f.machine.mem(), 2).expect("readable"),
+            f.host.textvars().get_mem(f.machine.mem(), base + 2).expect("readable"),
             None,
             "and there is no third"
         );
@@ -4109,6 +4142,7 @@ mod tests {
         // unterminated and running into `varrou`, which is the bug `stzcpy`
         // exists to avoid -- so the original truncates, and so does this.
         let mut f = Fixture::new();
+        let base = f.host.textvars().len();
         let name = f.text("ABCDEFGHIJKLMNOPQRST");
         let varrou = FarPtr {
             offset: 0x001e,
@@ -4123,7 +4157,7 @@ mod tests {
         let row = f
             .host
             .textvars()
-            .get_mem(f.machine.mem(), 0)
+            .get_mem(f.machine.mem(), base)
             .expect("readable")
             .expect("a row");
         assert_eq!(row.name, "ABCDEFGHIJKLMNO", "fifteen and a terminator");
@@ -4137,6 +4171,7 @@ mod tests {
         // `or ax,[es:bx+0x12]` at `seg 23:0x22f5` -- so a null one is a row
         // that produces nothing, not a row that is wrong.
         let mut f = Fixture::new();
+        let base = f.host.textvars().len();
         let name = f.text("MUDCHARINFO");
 
         f.invoke(register_textvar, &[name.offset, name.selector, 0, 0])
@@ -4145,12 +4180,12 @@ mod tests {
         let row = f
             .host
             .textvars()
-            .get_mem(f.machine.mem(), 0)
+            .get_mem(f.machine.mem(), base)
             .expect("readable")
             .expect("a row");
         assert_eq!(row.name, "MUDCHARINFO");
         assert_eq!(row.varrou, None);
-        assert_eq!(f.host.textvars().len(), 1, "it is still a row");
+        assert_eq!(f.host.textvars().len(), base + 1, "it is still a row");
     }
 
     #[test]
@@ -4160,20 +4195,29 @@ mod tests {
         // is that a name arriving empty is a misread argument list, and a
         // nameless row in a table nobody prints is expensive to find later.
         let mut f = Fixture::new();
+        // Not an empty table: the standard suite (`shims::txtvbl`) is
+        // already in it. The refusal must leave both the table and the
+        // published global exactly as they were.
+        let before = f.host.textvars().len();
+        let published = f
+            .host
+            .globals()
+            .pointer(&f.machine, "txtvars")
+            .expect("txtvars");
         let name = f.text("");
 
         let e = f
             .invoke(register_textvar, &[name.offset, name.selector, 0x1e, 0x67])
             .expect_err("refused");
         assert!(format!("{e}").contains("no name"), "{e}");
-        assert!(f.host.textvars().is_empty());
+        assert_eq!(f.host.textvars().len(), before, "no row was added");
         assert_eq!(
             f.host
                 .globals()
                 .pointer(&f.machine, "txtvars")
                 .expect("txtvars"),
-            mbbs_machine::m16::FarPtr::NULL,
-            "and nothing was published"
+            published,
+            "and the published table did not move"
         );
     }
 

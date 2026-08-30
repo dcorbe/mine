@@ -680,6 +680,9 @@ mod tests {
     #[test]
     fn findtvar_finds_a_registered_name_case_insensitively() {
         let mut f = Fixture::new();
+        // The host's own standard suite (`shims::txtvbl`) is already in the
+        // table; module registrations land after it.
+        let base = f.host.textvars().len();
         let name = f.text("MUDCHARINFO");
         let varrou = FarPtr {
             offset: 0x001e,
@@ -691,13 +694,14 @@ mod tests {
         let query = f.text("mudcharinfo");
         assert_eq!(
             f.invoke(findtvar, &[query.offset, query.selector]).expect("ok"),
-            Ret::U16(0)
+            Ret::U16(base)
         );
     }
 
     #[test]
     fn findtvar_finds_the_second_of_two_by_the_right_index() {
         let mut f = Fixture::new();
+        let base = f.host.textvars().len();
         let first = f.text("ONE");
         let second = f.text("TWO");
         let varrou = FarPtr {
@@ -712,7 +716,7 @@ mod tests {
         let query = f.text("TWO");
         assert_eq!(
             f.invoke(findtvar, &[query.offset, query.selector]).expect("ok"),
-            Ret::U16(1)
+            Ret::U16(base + 1)
         );
     }
 

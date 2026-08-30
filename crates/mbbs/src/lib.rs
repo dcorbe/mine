@@ -1975,6 +1975,16 @@ impl<A: Abi> Host<A> {
         // `Clock::system()` is built inline in the literal above, so there is
         // no binding to read while it is being written.
         host.started = host.clock.epoch().unwrap_or(0);
+
+        // `init__galtxv` -- the standard text-variable suite, registered
+        // before any module is loaded, the way the real host's own
+        // `init__` modules precede every add-on's init. A module that does
+        // `txtvars[findtvar("SYSTEM_NAME")].varrou()` with no `-1` check --
+        // The Rose 3.0NT's real-time kick, and it is correct not to check,
+        // because on a real board the standard suite is always there --
+        // must find the table populated. See `shims::txtvbl`'s module doc
+        // for the fault this closes.
+        shims::txtvbl::register_standard(&mut host, machine)?;
         Ok(host)
     }
 
@@ -2434,6 +2444,43 @@ impl<A: Abi> Host<A> {
     /// substitution itself.
     pub fn textvars(&self) -> &TextVars<A> {
         &self.textvars
+    }
+
+    /// Add one row to the text-variable table and re-point the `txtvars`
+    /// global at it. The table grows by reallocating, so the global must
+    /// follow every push; a host that filled the table and left the global
+    /// stale (or null) would have registered nothing the module can see.
+    /// The one path both `register_textvar` and the host's own standard
+    /// suite ([`shims::txtvbl`]) go through.
+    ///
+    /// # Errors
+    ///
+    /// If the name is empty, the table cannot grow, or the global cannot be
+    /// written.
+    pub(crate) fn add_textvar(
+        &mut self,
+        mem: &mut A::Mem,
+        name: &str,
+        varrou: A::Ptr,
+    ) -> Result<u16, ShimError> {
+        let mut table = std::mem::take(&mut self.textvars);
+        let pushed = table.push_mem(mem, &mut self.heap, name, varrou);
+        self.textvars = table;
+        let n = pushed?;
+        let at = self.textvars.at().expect("a row was just added");
+        self.globals()
+            .write_mem(mem, "txtvars", &A::ptr_to_bytes(at))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(n)
+    }
+
+    /// How many thunks this host has reserved for itself -- the standard
+    /// text variables (`shims::txtvbl`, from `Host::new`) plus any vector
+    /// `finish_init` adds (`bgnedt`). A module loaded now gets this as its
+    /// `thunk_base`; tests that build code around a concrete thunk address
+    /// ask this instead of assuming the base is zero.
+    pub fn host_thunks(&self) -> u16 {
+        self.vectors.len() as u16
     }
 
     /// Every callback the module asked `rtkick` to run later.
@@ -9893,9 +9940,18 @@ mod tests {
 
     /// The first thunk index no module claims in a fresh `Fixture`, and the
     /// one a module loaded into it afterwards gets for its first import:
-    /// `finish_init` reserves thunk 0 for the `bgnedt` vector
-    /// (`Host::vectors`) before any module is loaded.
-    const FIRST_FREE: u16 = 1;
+    /// `Host::new` reserves thunks 0..=60 for the standard text variables
+    /// (`shims::txtvbl`) and `finish_init` reserves one more for the
+    /// `bgnedt` vector (`Host::vectors`), all before any module is loaded.
+    /// `first_free_is_the_hosts_own_thunk_count` pins this number to
+    /// `Host::vectors`'s actual length.
+    const FIRST_FREE: u16 = 62;
+
+    #[test]
+    fn first_free_is_the_hosts_own_thunk_count() {
+        let f = Fixture::new();
+        assert_eq!(usize::from(FIRST_FREE), f.host.vectors.len());
+    }
 
     /// Code that `lcall`s thunk `indices`, in that order, then `retf`s.
     ///
@@ -9929,7 +9985,7 @@ mod tests {
         match outcome {
             Outcome::Stopped(Poison::Unimplemented { module, symbol }) => {
                 assert_eq!(module, "");
-                assert!(symbol.starts_with("thunk #1"), "{symbol}");
+                assert!(symbol.starts_with(&format!("thunk #{FIRST_FREE}")), "{symbol}");
             }
             other => panic!("survey mode is off; must stop, not {other:?}"),
         }
@@ -9954,9 +10010,9 @@ mod tests {
 
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1);
-        assert_eq!(inv.count_of("", "thunk #1"), Some(1));
+        assert_eq!(inv.count_of("", &format!("thunk #{FIRST_FREE}")), Some(1));
         let text = inv.render();
-        assert!(text.contains("1\tunimplemented\t-\tthunk #1\t-\t0\t"), "{text}");
+        assert!(text.contains(&format!("1\tunimplemented\t-\tthunk #{FIRST_FREE}\t-\t0\t")), "{text}");
     }
 
     #[test]
@@ -9973,7 +10029,7 @@ mod tests {
 
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1, "one distinct symbol, called twice");
-        assert_eq!(inv.count_of("", "thunk #1"), Some(2));
+        assert_eq!(inv.count_of("", &format!("thunk #{FIRST_FREE}")), Some(2));
     }
 
     #[test]
@@ -9990,8 +10046,8 @@ mod tests {
 
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 2);
-        assert_eq!(inv.count_of("", "thunk #1"), Some(1));
-        assert_eq!(inv.count_of("", "thunk #2"), Some(1));
+        assert_eq!(inv.count_of("", &format!("thunk #{FIRST_FREE}")), Some(1));
+        assert_eq!(inv.count_of("", &format!("thunk #{}", FIRST_FREE + 1)), Some(1));
     }
 
     #[test]
@@ -10298,7 +10354,7 @@ mod tests {
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1);
         assert!(
-            inv.render().contains(&format!("unimplemented\t-\tthunk #1\t-\t{console}\t")),
+            inv.render().contains(&format!("unimplemented\t-\tthunk #{FIRST_FREE}\t-\t{console}\t")),
             "connect's own channel must be the one recorded: {}",
             inv.render()
         );
@@ -10353,7 +10409,7 @@ mod tests {
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1);
         assert!(
-            inv.render().contains(&format!("unimplemented\t-\tthunk #1\t-\t{console}\t")),
+            inv.render().contains(&format!("unimplemented\t-\tthunk #{FIRST_FREE}\t-\t{console}\t")),
             "the polled channel must be the one recorded: {}",
             inv.render()
         );
