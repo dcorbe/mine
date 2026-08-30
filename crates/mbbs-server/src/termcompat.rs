@@ -156,12 +156,20 @@ impl Stack {
     /// before the door sees a byte, and does not escape 0xFF on the way
     /// out, so doubling here would reach the caller as two non-breaking
     /// spaces and a filter here would eat the byte after every one.
+    ///
+    /// It homes after `ESC[2J` like [`Stack::modern`], not like `raw`:
+    /// the caller's terminal is whatever they pointed at the BBS, and the
+    /// BBS passes the module's bytes through (Synchronet transcodes the
+    /// charset for a UTF-8 terminal, nothing more). On foot -- or luit in
+    /// front of it -- an un-homed clear left `fsdbkg`'s template at the
+    /// bottom of the screen and the fields at the top. A SyncTERM-class
+    /// caller homed already; the extra `ESC[H` moves nothing there.
     pub fn door() -> Self {
         Stack {
             telnet: false,
             filter: Filter::default(),
             transcode: false,
-            home_on_clear: false,
+            home_on_clear: true,
             ed2_match: 0,
             pending: Vec::new(),
         }
@@ -965,6 +973,20 @@ mod tests {
         let mut stack = Stack::door();
         assert_eq!(stack.outbound(&box_drawing), box_drawing);
         assert_eq!(stack.inbound(&box_drawing), box_drawing);
+    }
+
+    /// The BBS in front of a door passes the module's `ESC[2J` through to
+    /// whatever terminal its caller has, and Synchronet does not add a
+    /// home after it (`xtrn.cpp` only transcodes). A caller on foot, or
+    /// on `luit` in front of it, then draws `fsdbkg`'s template at the
+    /// bottom of the screen with the fields at the top -- the same bug
+    /// `modern` homes for. A door session must home too; the second
+    /// `ESC[H` is invisible on a SyncTERM-class terminal that homed on
+    /// its own.
+    #[test]
+    fn door_homes_cursor_after_esc_2j() {
+        let mut stack = Stack::door();
+        assert_eq!(stack.outbound(b"\x1b[2J"), b"\x1b[2J\x1b[H");
     }
 
     /// Telnet framing is a property of the wire, so it lives here now: a
