@@ -977,6 +977,13 @@ impl Channel {
         self.paused = false;
         self.nonstop |= nonstop;
         self.lines_out = 0;
+        // A page turn begins a fresh screen: nothing printable has gone out on
+        // it yet. Without this reset a pause triggered by a clear-screen (or
+        // pause character) held those bytes and re-processed them here with
+        // `printable_since_return` still set, so they paused again at once,
+        // outputting nothing -- every keystroke re-showed the message and the
+        // screen never advanced. Live-caught on T-LORD's attract screen.
+        self.printable_since_return = false;
         if std::mem::take(&mut self.message_shown) {
             self.output.extend(b"\r\n");
         }
@@ -1834,6 +1841,23 @@ mod tests {
         g.channel_mut(chan()).pause_char = 0;
         g.transmit(chan(), b"hi\x0c");
         assert!(!g.channel(chan()).paused, "no pause character, no pause");
+    }
+
+    /// The bug that hung T-LORD's attract screen: a pause triggered by a
+    /// clear-screen must ADVANCE on the next keystroke, not re-pause on the
+    /// same held bytes forever.
+    #[test]
+    fn resuming_past_a_clear_screen_pause_makes_progress() {
+        let mut g = paged();
+        g.transmit(chan(), b"hi\x1b[2Jfresh screen text\r");
+        assert!(g.channel(chan()).paused, "paused ahead of the clear-screen");
+        g.drain_output(chan());
+        g.push_input(chan(), b" ");
+        assert!(!g.channel(chan()).paused, "one key advances, not a re-pause on the held clear-screen");
+        let out = g.drain_output(chan());
+        assert!(out.starts_with(b"\r\n\x1b[2Jfresh screen text"), "clear-screen and its screen came out: {out:?}");
+        g.transmit(chan(), b"a\x1b[2Jmore\r");
+        assert!(g.channel(chan()).paused, "the pager still works after resuming");
     }
 
     /// T-LORD opens every screen with `ESC[0m` then `ESC[2J`. The bytes of
