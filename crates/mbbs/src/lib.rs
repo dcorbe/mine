@@ -3897,6 +3897,9 @@ impl<A: Abi> Host<A> {
                 crate::abi::Arg::Int(A::Int::from(chan.number() as u16)),
                 crate::abi::Arg::Int(A::Int::from(u16::from(byte))),
             ];
+            // `btuche`'s idle notifications "will not begin until the
+            // first character is received" (guide page 45).
+            self.gsbl.channel_mut(chan).chi_seen_input = true;
             match self.run(machine, module, rou, &args, Some(chan))? {
                 Outcome::Returned { lo, .. } => {
                     // A `char` comes back in AL; whatever the rest of the
@@ -3913,6 +3916,47 @@ impl<A: Abi> Host<A> {
             }
         }
         self.gsbl.wake_after_delivery(chan, before);
+        Ok(None)
+    }
+
+    /// `btuche` (guide page 45): every channel whose echo buffer went empty
+    /// since the last sweep gets its `btuchi` interceptor called with
+    /// pseudo-key-code `-1` -- all-ones at the ABI's width, which is what a
+    /// C `int` of `-1` is; the return value is not read ("no return value
+    /// from the function is expected", page 46).
+    ///
+    /// A pending flag with no interceptor installed is consumed silently:
+    /// the guide's own example installs the interceptor first, and a
+    /// `btuche(chan,1)` with nothing to call has nothing to say.
+    ///
+    /// # Errors
+    ///
+    /// As [`Host::run`]'s. A handler that stops the machine is reported
+    /// with its channel, like a dispatched poll.
+    fn notify_idle(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        fired: &mut usize,
+    ) -> io::Result<Option<(A::Poison, Chan)>> {
+        for chan in self.gsbl.terms().all() {
+            let c = self.gsbl.channel_mut(chan);
+            if !std::mem::take(&mut c.idle_pending) {
+                continue;
+            }
+            let Some(rou) = self.chi[chan.index()] else {
+                continue;
+            };
+            let args = [
+                crate::abi::Arg::Int(A::Int::from(chan.number() as u16)),
+                crate::abi::Arg::Int(A::int_from_u32(u32::MAX)),
+            ];
+            *fired += 1;
+            match self.run(machine, module, rou, &args, Some(chan))? {
+                Outcome::Stopped(poison) => return Ok(Some((poison, chan))),
+                Outcome::Returned { .. } => {}
+            }
+        }
         Ok(None)
     }
 
@@ -4117,6 +4161,19 @@ impl<A: Abi> Host<A> {
                 .gsbl_mut()
                 .next_status(chan)
                 .expect("scan just found a channel with one");
+
+            // `susing()`'s `case ABOREQ:` -- the user answered a screen pause
+            // with the abort key -- is the host's: `btuclo(usrnum)`, then
+            // `injacr()`, which is `status=CRSTG; clrinp(); hdlinp();` -- the
+            // module is re-prompted with an empty line, exactly as if the
+            // user had pressed Return on nothing. (`ABOIP`/`INJOIP` are set
+            // around it there; this host does not model those flag bits.)
+            let status = if status == gsbl::Gsbl::ABOREQ {
+                self.gsbl_mut().channel_mut(chan).clear_output();
+                gsbl::Gsbl::CRSTG
+            } else {
+                status
+            };
 
             let dispatch = match status {
                 gsbl::Gsbl::CRSTG => PollTarget::Entry(1),
@@ -4505,6 +4562,13 @@ impl<A: Abi> Host<A> {
                 dispatched,
                 // `None`: a task belongs to no channel, same as a kick.
                 ended: Ended::Stopped(poison, None),
+            });
+        }
+        if let Some((poison, chan)) = self.notify_idle(machine, module, &mut dispatched)? {
+            return Ok(Cycles {
+                iterations,
+                dispatched,
+                ended: Ended::Stopped(poison, Some(chan)),
             });
         }
 
@@ -8875,6 +8939,47 @@ mod tests {
     }
 
     #[test]
+    fn push_input_marks_the_channel_as_having_seen_input_for_btuche() {
+        let (mut f, module, rou) = interceptor_fixture(1, SWALLOW);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        f.host.chi[chan.index()] = Some(rou);
+        assert!(!f.host.gsbl().channel(chan).chi_seen_input);
+        f.host.push_input(&mut f.machine, &module, chan, b"a").expect("delivered");
+        assert!(f.host.gsbl().channel(chan).chi_seen_input);
+    }
+
+    /// `btuche`: the interceptor is called with `-1` from the cycle once a
+    /// drain has emptied the channel -- and that call counts as a dispatch.
+    #[test]
+    fn cycle_notifies_an_idle_interceptor_with_minus_one() {
+        let (mut f, module, rou) = interceptor_fixture(1, SWALLOW);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+
+        f.host.gsbl_mut().channel_mut(chan).idle_pending = true;
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
+        assert_eq!(cycles.dispatched, 0, "no interceptor installed: nothing to notify");
+        assert!(!f.host.gsbl().channel(chan).idle_pending, "but the pending flag is consumed");
+
+        f.host.chi[chan.index()] = Some(rou);
+        f.host.gsbl_mut().channel_mut(chan).idle_pending = true;
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
+        assert_eq!(cycles.dispatched, 1, "the interceptor ran once for the notification");
+        assert!(!f.host.gsbl().channel(chan).idle_pending);
+    }
+
+    #[test]
+    fn an_idle_notification_that_stops_the_machine_ends_the_cycle() {
+        let (mut f, module, rou) = interceptor_fixture(1, FAULT);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.chi[chan.index()] = Some(rou);
+        f.host.gsbl_mut().channel_mut(chan).idle_pending = true;
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
+        assert!(matches!(cycles.ended, Ended::Stopped(_, Some(c)) if c == chan), "{:?}", cycles.ended);
+    }
+
+    #[test]
     fn prcrtk_counts_down_and_fires_exactly_once() {
         let (mut f, module, rou) = polling_fixture();
         f.host.kicks.push(Kick { delay: 2, dstrou: rou });
@@ -9514,6 +9619,40 @@ mod tests {
     /// to_wait_on` above ever exercises `Ended::Stopped` from a real
     /// dispatch -- they build `Waiting`/`Bound` from `cycle`'s kick-sweep
     /// path or by hand, never the poll-sourced stop this test pins.
+    /// `susing()`'s `case ABOREQ:` (`MAJORBBS.C`): `btuclo(usrnum)`, then
+    /// `injacr()` -- the module's `sttrou` runs on an empty line so it can
+    /// re-prompt.
+    #[test]
+    fn an_abort_request_clears_the_output_and_re_prompts_the_module() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let module = f.minimal_module();
+        let marker = f.bytes(&[0x00], false);
+        let sttrou = f.machine.code_ptr(0);
+        let state = register_module_with(&mut f, &[(1, sttrou)]);
+        f.machine.load_code(&marker_stub(marker, 0x2f)).expect("the stub fits");
+        f.host
+            .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
+            .expect("a user on the channel");
+        set_state(&mut f, console, state);
+
+        // A pause with output queued and held, the way `Q` finds it.
+        {
+            let c = f.host.gsbl_mut().channel_mut(console);
+            c.paused = true;
+            c.output.extend(b"shown");
+            c.held.extend(b"waiting");
+            c.status.push_back(gsbl::Gsbl::ABOREQ);
+        }
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled").expect("dispatched");
+        assert!(matches!(outcome, Outcome::Returned { .. }));
+        assert_eq!(f.machine.resolve(marker, 1).expect("readable"), &[0x2f], "sttrou ran");
+        let c = f.host.gsbl().channel(console);
+        assert!(c.output.is_empty() && c.held.is_empty() && !c.paused, "btuclo");
+        let input = f.host.globals().address("input").expect("placed");
+        assert_eq!(f.read(input), "", "clrinp: the module was handed an empty line");
+    }
+
     #[test]
     fn cycle_names_the_channel_a_poll_sourced_stop_happened_on() {
         let mut f = Fixture::new();

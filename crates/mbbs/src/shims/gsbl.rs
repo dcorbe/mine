@@ -535,9 +535,18 @@ pub(crate) fn apply_xnf(
          before calling -- see this function's own doc comment"
     );
     c.xoff = xoff.unsigned_abs() as u8;
-    if let Some((cnt, message)) = page {
-        c.page_lines = cnt;
-        c.page_message = Some(message);
+    match page {
+        Some((cnt, message)) => {
+            c.page_lines = cnt;
+            c.page_message = Some(message);
+        }
+        // The non-page form is how page mode is switched off -- `fsdcon`
+        // (`FSDBBS.C:99`) and `MENUING.C:963` both leave it with
+        // `btuxnf(usrnum,0,19)`.
+        None => {
+            c.page_lines = 0;
+            c.page_message = None;
+        }
     }
 }
 
@@ -635,12 +644,7 @@ pub(crate) fn apply_cpc(g: &mut Gsbl, chan: Chan, cpchar: u8) {
 /// SPACE it has not earned.
 pub fn btuclo<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
-    Ok(match on_channel(host, chan, |g, chan| {
-        let c = g.channel_mut(chan);
-        c.output.clear();
-        c.column = 0;
-        c.wrapped = false;
-    }) {
+    Ok(match on_channel(host, chan, |g, chan| g.channel_mut(chan).clear_output()) {
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
     })
@@ -2510,6 +2514,23 @@ mod tests {
         );
         f.invoke(btuhpk, &[0, 0x1234, 0x5678]).expect("ok");
         assert!(f.host.gsbl().channel(console).pause_handler_installed);
+    }
+
+    /// `fsdcon` (`FSDBBS.C:99`) and `MENUING.C:963` leave page mode with
+    /// `btuxnf(usrnum,0,19)`: the non-page form must switch pagination off,
+    /// not merely leave the last page setting in place.
+    #[test]
+    fn btuxnf_non_page_form_switches_page_mode_off() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let msg = f.text("More?");
+        f.invoke(btuxnf, &[0, 0, (-19i16) as u16, 24, msg.offset, msg.selector]).expect("page mode");
+        assert_eq!(f.host.gsbl().channel(console).page_lines, 24);
+        f.invoke(btuxnf, &[0, 0, 19]).expect("non-page");
+        let c = f.host.gsbl().channel(console);
+        assert_eq!(c.page_lines, 0);
+        assert_eq!(c.page_message, None);
+        assert_eq!(c.xoff, 19, "XON/XOFF itself stays configured");
     }
 
     #[test]

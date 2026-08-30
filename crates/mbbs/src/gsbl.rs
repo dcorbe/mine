@@ -243,64 +243,76 @@ pub struct Channel {
     /// unrecoverably lost.
     pub(crate) trunch: u8,
 
-    /// `btuxnf`'s page-mode parameters (R5, guide page 193): a negative
-    /// `xoff` selects page mode, and `cnt` is how many lines to show before
-    /// pausing. Recorded so the values are not lost, but **pagination itself
-    /// is not implemented** -- it needs the driver Batch C of this plan
-    /// builds, which decides when a screen's worth of lines has gone out.
+    /// `btuxnf`'s page-mode line count (guide page 192): a negative `xoff`
+    /// selects page mode, and `cnt` is "the total number of lines on the
+    /// user's screen". Zero is page mode off. [`Channel::release`] pauses
+    /// after `cnt - 2` lines -- the guide's own example: `cnt = 24`, "shown
+    /// at the end of each block of 22 lines".
     pub(crate) page_lines: u16,
-    /// `btuxnf`'s page-mode parameters (R5, guide page 193): the pause
-    /// message shown between screens, e.g. `"Hit any key to continue..."`.
-    /// Recorded, not acted on -- see `page_lines`.
+    /// `btuxnf`'s page-break pause message, shown when a pause fires.
     pub(crate) page_message: Option<Vec<u8>>,
 
-    /// `btupbc` -- the screen-pause character (guide `btupbc`, page 133):
-    /// when transmitted in the output stream, output pauses and the channel
-    /// goes into screen-pause mode (page 99). Zero disables it. Recorded for
-    /// the same reason as `page_lines` -- **screen-pause mode itself is not
-    /// implemented**, so no transmitted byte is ever compared against this.
-    /// `Channel::transmit` sends every byte the module gives it straight
-    /// through, `pause_char` included.
+    /// `btupbc` -- the screen-pause character (guide page 133): found in the
+    /// output stream it is consumed and, if printable output has gone out
+    /// since the user's last Return, the channel pauses. A clear-screen
+    /// (formfeed or `ESC[2J`) is treated as if the pause character preceded
+    /// it. Zero disables it.
     pub(crate) pause_char: u8,
 
-    /// `btucpc` -- the clear-pause-counter character (guide `btucpc`, page
-    /// 81): discovered in the output stream, it resets the pending-lines
-    /// counter to zero without itself being transmitted. The Major BBS uses
-    /// it to insert Control-S at strategic points and suppress a pause that
-    /// would otherwise land there. **Not acted on**, for the same reason as
-    /// `pause_char`: there is no pending-lines counter to reset, because
-    /// there is no pagination.
+    /// `btucpc` -- the clear-pause-counter character (guide page 81): found
+    /// in the output stream it zeroes `lines_out` and is never output. The
+    /// Major BBS "inserts the Control-S character at strategic points" to
+    /// put off a pause; so does T-LORD, every 6-9 lines inside its art.
     pub(crate) clear_pause_char: u8,
 
-    /// `btuhpk` -- whether a screen-pause keystroke handler has been
-    /// installed (guide `btuhpk`, page 99). The real call installs a far
-    /// pointer to the routine that will be handed each keystroke received
-    /// while paused; this host has exactly one caller of `btuhpk`
-    /// ([`crate::shims::screen::rstrxf`]) and it always installs the same
-    /// routine, `MAJORBBS.C:3793`'s `hpkrou` -- there is only ever one value
-    /// this could hold, so a `bool` records "installed" rather than a far
-    /// pointer nothing would ever call through. **What would reveal this is
-    /// wrong:** the day screen-pause mode is implemented, a "continue"/"go
-    /// nonstop"/"abort" keystroke sent during a pause would have nothing to
-    /// dispatch to -- this field says a handler exists, not what it is.
+    /// `btuhpk` -- whether a screen-pause keystroke handler is installed
+    /// (guide page 99). No surveyed module imports `btuhpk`; the only
+    /// handler ever installed is the host's own `hpkrou` (`MAJORBBS.C:4497`,
+    /// via `rstrxf`), so a `bool` says which of the two vendor behaviours
+    /// [`Channel::pause_key`] follows: `hpkrou`'s table, or `btuxnf`'s
+    /// "the xon character (or any character) resumes".
     pub(crate) pause_handler_installed: bool,
 
-    /// `btuche` -- whether the [`crate::shims::gsbl::btuchi`] interceptor
-    /// should be called an extra time, with pseudo-key-code `-1`, whenever
-    /// this channel's echo buffer goes idle (guide `btuche`, page 42).
-    ///
-    /// Recorded for the same reason [`Channel::pause_handler_installed`]
-    /// is: the mechanism this flag configures is not implemented, but the
-    /// caller's intent still is. `btuchi` never installs a live interceptor
-    /// on this host -- it refuses every call -- so today there is no
-    /// reachable state in which anything reads this flag. It is stored
-    /// anyway rather than discarded, on the same reasoning `pause_handler_
-    /// installed` documents: **what would reveal this is wrong** is a
-    /// future host that closes the `btuchi` gap (the wall is a driver-
-    /// thread access problem, not a fundamental one -- see `btuchi`'s own
-    /// doc comment) finding every `btuche` call before that day silently
-    /// unrecorded.
+    /// `btuche` -- whether the `btuchi` interceptor should be called an
+    /// extra time, with pseudo-key-code `-1`, "each time the channel's echo
+    /// buffer becomes empty" (guide page 45). [`Gsbl::drain_output`] raises
+    /// `idle_pending` when it is set; `Host::notify_idle` makes the call.
     pub(crate) chi_notify_on_idle: bool,
+
+    /// Screen-pause mode (guide page 99): output is stopped, waiting on a
+    /// keystroke. What reaches [`Channel::release`] meanwhile goes to
+    /// `held`; what reaches [`Channel::offer`] goes to
+    /// [`Channel::pause_key`] instead of the input pipeline.
+    pub(crate) paused: bool,
+    /// Transformed output not yet let through to `output` -- everything
+    /// past the point a pause fired. Released through the same counting on
+    /// resume, so one long block can pause more than once.
+    pub(crate) held: VecDeque<u8>,
+    /// Lines out since the counter was last cleared: by a page turn, the
+    /// clear-pause character, or a Return from the user. `btucpc`'s
+    /// "internal line counter".
+    pub(crate) lines_out: u16,
+    /// `hpkrou` answered 2 ("continue nonstop"): no page pauses until the
+    /// user's next Return.
+    pub(crate) nonstop: bool,
+    /// Printable output has gone out since the user's last Return -- the
+    /// pause character's precondition (guide page 99, condition 2).
+    pub(crate) printable_since_return: bool,
+    /// A page message was shown for the current pause, so resuming owes the
+    /// terminal a CRLF to leave its line. An XOFF pause shows nothing.
+    pub(crate) message_shown: bool,
+    /// [`Channel::release`]'s own escape-sequence scanner, so the bytes of
+    /// a colour code or a cursor move are not mistaken for printable output
+    /// (T-LORD opens every screen with `ESC[0m` and then `ESC[2J` -- the
+    /// `[0m` must not arm the clear-screen pause). Persistent for the same
+    /// reason [`Channel::csi`] is: a sequence can straddle two blocks.
+    pub(crate) release_csi: CsiScan,
+    /// `btuche`: the echo buffer went empty and the interceptor has not been
+    /// told. Set by [`Gsbl::drain_output`], consumed by `Host::notify_idle`.
+    pub(crate) idle_pending: bool,
+    /// `btuche`'s "will not begin until the first character is received":
+    /// set the first time the interceptor is handed a real byte.
+    pub(crate) chi_seen_input: bool,
 
     /// Set when the last byte written was a CR whose LF this host supplied, so
     /// that a module sending an explicit `\r\n` does not get two linefeeds.
@@ -342,6 +354,15 @@ impl Default for Channel {
             clear_pause_char: 0,
             pause_handler_installed: false,
             chi_notify_on_idle: false,
+            paused: false,
+            held: VecDeque::new(),
+            lines_out: 0,
+            nonstop: false,
+            printable_since_return: false,
+            message_shown: false,
+            release_csi: CsiScan::Text,
+            idle_pending: false,
+            chi_seen_input: false,
             supplied_lf: false,
             csi: CsiScan::Text,
         }
@@ -465,6 +486,12 @@ impl Gsbl {
     /// `OUTMT` -- the output buffer went from not-empty to empty (status 5).
     /// Only ever raised when `btuoes` has enabled it.
     pub const OUTMT: i16 = 5;
+
+    /// Abort request: the user answered a screen pause with the abort key
+    /// (guide `btuhpk`, page 100: "inject a status 7 (this is what happens
+    /// in The Major BBS)"). `susing()` handles it for the module: `btuclo`,
+    /// then an injected CR -- see `Host::poll`.
+    pub const ABOREQ: i16 = 7;
 
     /// `OVRFLW` -- data output circular-buffer overflow (status 253). Guide,
     /// `btuxmt` CAUTIONS, page 191: when the string does not fit in the output buffer, btuxmt returns 0, queues status 253 for btusts, and outputs none of the string `btuxct`
@@ -608,6 +635,12 @@ impl Gsbl {
         let out: Vec<u8> = c.output.drain(..).collect();
         if c.oes {
             c.status.push_back(Self::OUTMT);
+        }
+        // `btuche`: "each time the channel's echo buffer becomes empty" --
+        // and "this process will not begin until the first character is
+        // received" (guide page 45).
+        if c.chi_notify_on_idle && c.chi_seen_input {
+            c.idle_pending = true;
         }
         out
     }
@@ -829,6 +862,14 @@ impl Channel {
     /// handler is module code, which only the host can run; the pipeline on
     /// either side of it is this one.
     pub(crate) fn offer(&mut self, byte: u8) -> Offer {
+        // Screen-pause mode, ahead of everything: "each character received
+        // triggers a call to the hpkrou routine" (guide page 99). At
+        // interrupt level in the original, so before the input pipeline.
+        if self.paused {
+            self.pause_key(byte);
+            return Offer::Taken;
+        }
+
         // 2. Input lockout. The byte never happened.
         if self.locked {
             return Offer::Taken;
@@ -893,7 +934,152 @@ impl Channel {
         //    character translation function ... the effects of all
         //    functions associated with ASCII input mode are still in
         //    effect", which is why the caller, not this method, chooses.
+        //
+        // 4. XOFF (guide `btuxnf`, page 192): a caller pauses output to their terminal by sending the XOFF character -- ASCII output
+        //    mode only, hence after the raw and binary branches. What ends
+        //    it is `pause_key`'s business.
+        if self.xoff != 0 && byte == self.xoff {
+            self.paused = true;
+            return Offer::Taken;
+        }
         Offer::Translate(byte)
+    }
+
+    /// A keystroke received in screen-pause mode (guide `btuhpk`, page
+    /// 99-100). With the host's handler installed this is `hpkrou`
+    /// (`MAJORBBS.C:4497`) to the letter: `N` continues nonstop, `Q` injects
+    /// `ABOREQ` and echoes the key and a CRLF while staying paused, XON and
+    /// XOFF are ignored, anything else turns the page. Without one, `btuxnf`
+    /// (page 192): they type the XON character when one is configured, or any character when XON is zero.
+    fn pause_key(&mut self, byte: u8) {
+        if !self.pause_handler_installed {
+            if self.xon == 0 || byte == self.xon {
+                self.resume(false);
+            }
+            return;
+        }
+        match byte.to_ascii_uppercase() {
+            b'N' => self.resume(true),
+            b'Q' => {
+                self.status.push_back(Gsbl::ABOREQ);
+                self.output.push_back(byte);
+                self.output.extend(b"\r\n");
+            }
+            0x11 | 0x13 => {}
+            _ => self.resume(false),
+        }
+    }
+
+    /// Leave screen-pause mode: the counter starts over, the terminal gets
+    /// off the message's line if one was shown, and what was held goes out
+    /// -- through the same counting, so it can pause again.
+    fn resume(&mut self, nonstop: bool) {
+        self.paused = false;
+        self.nonstop |= nonstop;
+        self.lines_out = 0;
+        if std::mem::take(&mut self.message_shown) {
+            self.output.extend(b"\r\n");
+        }
+        let held: Vec<u8> = self.held.drain(..).collect();
+        self.release(&held);
+    }
+
+    /// Stop output here and show the page message, if there is one.
+    fn enter_pause(&mut self) {
+        self.paused = true;
+        if let Some(message) = &self.page_message {
+            self.output.extend(message.iter().copied());
+            self.message_shown = true;
+        }
+    }
+
+    /// The last stage of output, after [`Channel::transmit`]'s
+    /// transformation and before `output`: the screen-pause bookkeeping of
+    /// guide pages 81, 99 and 133, byte by byte.
+    ///
+    /// * The clear-pause character zeroes the line counter and is dropped.
+    /// * The pause character is dropped and, if printable output has gone
+    ///   out since the user's last Return, pauses. A formfeed or `ESC[2J`
+    ///   pauses the same way but goes out itself, after the pause -- the
+    ///   guide: btuxmt places the btupbc pause character just ahead of it. An `ESC[2J` split across two `transmit`
+    ///   calls is not recognised; `prf` flushes whole blocks.
+    /// * In page mode, the `page_lines - 2`nd line since the counter was
+    ///   cleared pauses, unless `hpkrou` said nonstop.
+    ///
+    /// Once paused, the rest of the bytes wait in `held`.
+    fn release(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+        while i < bytes.len() {
+            if self.paused {
+                self.held.extend(bytes[i..].iter().copied());
+                return;
+            }
+            let byte = bytes[i];
+            i += 1;
+            if byte != 0 && byte == self.clear_pause_char {
+                self.lines_out = 0;
+                continue;
+            }
+            let clears_screen = byte == 0x0c || (byte == 0x1b && bytes[i..].starts_with(b"[2J"));
+            if self.pause_char != 0 && (byte == self.pause_char || clears_screen) {
+                if self.printable_since_return {
+                    self.enter_pause();
+                }
+                if byte == self.pause_char {
+                    continue;
+                }
+                if self.paused {
+                    // The clear-screen itself goes out after the pause.
+                    i -= 1;
+                    continue;
+                }
+            }
+            // "Printable output" means text the user can see: a byte inside
+            // an escape sequence is neither, whatever its value.
+            match self.release_csi {
+                CsiScan::Text => {
+                    if byte == 0x1b {
+                        self.release_csi = CsiScan::Esc;
+                    } else if byte >= 0x20 && byte != 0x7f {
+                        self.printable_since_return = true;
+                    }
+                }
+                CsiScan::Esc => {
+                    self.release_csi = if byte == b'[' { CsiScan::Csi } else { CsiScan::Text };
+                }
+                CsiScan::Csi => {
+                    if (0x40..=0x7e).contains(&byte) {
+                        self.release_csi = CsiScan::Text;
+                    }
+                }
+            }
+            self.output.push_back(byte);
+            if byte == b'\n' {
+                self.lines_out += 1;
+                if self.page_lines > 2 && !self.nonstop && self.lines_out >= self.page_lines - 2 {
+                    self.enter_pause();
+                }
+            }
+        }
+    }
+
+    /// `btuclo`: throw away output that has not gone out yet -- queued or
+    /// held -- which also ends a screen pause, since there is nothing left
+    /// to be paused on (the guide's abort recipe, page 100: inject `ABOREQ`
+    /// "and have the mainline program handle the status by clearing output
+    /// using btuclo()").
+    ///
+    /// Resets `column` to zero -- the cursor is back at the left margin of a
+    /// blank line -- and `wrapped` along with it (`Channel::wrapped`'s own
+    /// doc comment: "Reset wherever `column` is reset to zero").
+    pub(crate) fn clear_output(&mut self) {
+        self.output.clear();
+        self.held.clear();
+        self.paused = false;
+        self.message_shown = false;
+        self.lines_out = 0;
+        self.column = 0;
+        self.wrapped = false;
     }
 
     /// Steps 7 to 11: what happens to a byte the translate stage let
@@ -918,6 +1104,12 @@ impl Channel {
                 if self.echo {
                     self.output.extend(b"\r\n");
                 }
+                // A Return starts a new screen: the page counter, the pause
+                // character's "printable output since the last time he hit
+                // Return", and `hpkrou`'s nonstop all start over.
+                self.lines_out = 0;
+                self.printable_since_return = false;
+                self.nonstop = false;
             }
 
             _ => {
@@ -997,16 +1189,6 @@ impl Channel {
         let mut wrapped = self.wrapped;
 
         for &byte in bytes {
-            // `btucpc` (guide page 81): the clear-pause character is consumed
-            // where it is found -- "resets the pending-lines counter to zero
-            // without itself being transmitted". This host has no counter to
-            // reset, but the byte still never reaches the wire: every channel
-            // gets Control-S at login (`rstrxf`, via `Host::connect_state`),
-            // and T-LORD writes one ahead of every `<MORE>` it paints itself.
-            // Sent on, it is XOFF to a terminal that honours flow control.
-            if csi == CsiScan::Text && byte != 0 && byte == self.clear_pause_char {
-                continue;
-            }
             match csi {
                 CsiScan::Text => Self::dispatch_normal(
                     &mut out,
@@ -1104,11 +1286,11 @@ impl Channel {
         // reached the wire. `wrapped` joins that guarantee for the same
         // reason: a block that never reached the wire must not be able to
         // arm or disarm the *next* accepted block's soft-CR behaviour.
-        if self.output.len() + out.len() > OUTSIZ {
+        if self.output.len() + self.held.len() + out.len() > OUTSIZ {
             self.status.push_back(Gsbl::OVRFLW);
             return false;
         }
-        self.output.extend(out);
+        self.release(&out);
         self.column = column;
         self.supplied_lf = supplied_lf;
         self.csi = csi;
@@ -1507,6 +1689,228 @@ mod tests {
         let mut g = one();
         g.transmit(chan(), b"ab\x13cd");
         assert_eq!(g.drain_output(chan()), b"ab\x13cd".to_vec());
+    }
+
+    // --- screen-pause mode (guide btuxnf p.192, btupbc p.133, btuhpk p.99, btucpc p.81) ---
+
+    /// A channel `rstrxf` left in page mode with the host's own pause-key
+    /// handler installed: 24-line screen, so 22-line blocks per the guide's
+    /// own example.
+    fn paged() -> Gsbl {
+        let mut g = one();
+        let c = g.channel_mut(chan());
+        c.page_lines = 24;
+        c.page_message = Some(b"More?".to_vec());
+        c.pause_handler_installed = true;
+        c.pause_char = 20;
+        c.clear_pause_char = 19;
+        c.xoff = 19;
+        g
+    }
+
+    fn lines(n: usize) -> Vec<u8> {
+        (0..n).flat_map(|i| format!("line {i}\r").into_bytes()).collect()
+    }
+
+    #[test]
+    fn page_mode_pauses_after_cnt_minus_two_lines_with_the_message() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(30));
+        let out = g.drain_output(chan());
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 22, "a block is cnt-2 lines");
+        assert!(out.ends_with(b"line 21\r\nMore?"), "the message follows the block: {:?}", String::from_utf8_lossy(&out));
+        let c = g.channel(chan());
+        assert!(c.paused);
+        assert!(c.held.iter().copied().collect::<Vec<u8>>().starts_with(b"line 22\r\n"), "the rest waits");
+    }
+
+    #[test]
+    fn a_key_during_the_pause_releases_the_next_page() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(50));
+        g.drain_output(chan());
+        g.push_input(chan(), b" ");
+        let out = g.drain_output(chan());
+        assert!(out.starts_with(b"\r\nline 22\r\n"), "{:?}", String::from_utf8_lossy(&out));
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1 + 22, "another block, then the message again");
+        assert!(out.ends_with(b"More?"));
+        assert!(g.channel(chan()).paused);
+        assert!(g.channel(chan()).line.is_empty(), "the key was the handler's, not the line's");
+    }
+
+    #[test]
+    fn n_during_the_pause_goes_nonstop_until_the_next_return() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(60));
+        g.drain_output(chan());
+        g.push_input(chan(), b"n");
+        let out = g.drain_output(chan());
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1 + 38, "everything held, no further pause");
+        assert!(!g.channel(chan()).paused);
+        g.transmit(chan(), &lines(30));
+        assert!(!g.channel(chan()).paused, "still nonstop");
+        g.drain_output(chan());
+        g.push_input(chan(), b"\r");
+        g.transmit(chan(), &lines(30));
+        assert!(g.channel(chan()).paused, "a Return ends nonstop");
+    }
+
+    #[test]
+    fn q_during_the_pause_asks_the_module_to_abort_and_stays_paused() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(30));
+        g.drain_output(chan());
+        g.push_input(chan(), b"q");
+        assert_eq!(g.drain_output(chan()), b"q\r\n".to_vec(), "hpkrou echoes the key as typed, then CRLF");
+        assert_eq!(g.next_status(chan()), Some(Gsbl::ABOREQ));
+        assert!(g.channel(chan()).paused, "hpkrou returns 0 for Q");
+    }
+
+    #[test]
+    fn xon_and_xoff_during_the_pause_are_ignored_by_the_vendors_handler() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(30));
+        g.drain_output(chan());
+        g.push_input(chan(), b"\x11\x13");
+        assert!(g.drain_output(chan()).is_empty());
+        assert!(g.channel(chan()).paused);
+    }
+
+    #[test]
+    fn without_a_handler_the_xon_character_resumes() {
+        let mut g = paged();
+        g.channel_mut(chan()).pause_handler_installed = false;
+        g.channel_mut(chan()).xon = b'g';
+        g.transmit(chan(), &lines(30));
+        g.drain_output(chan());
+        g.push_input(chan(), b"x");
+        assert!(g.channel(chan()).paused, "not the xon character");
+        g.push_input(chan(), b"g");
+        assert!(!g.channel(chan()).paused);
+    }
+
+    #[test]
+    fn the_clear_pause_character_resets_the_counter_and_is_never_sent() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(21));
+        g.transmit(chan(), b"\x13");
+        g.transmit(chan(), &lines(21));
+        assert!(!g.channel(chan()).paused, "21 + 21 lines with a reset between them");
+        assert!(!g.drain_output(chan()).contains(&0x13));
+    }
+
+    #[test]
+    fn a_return_from_the_user_resets_the_counter() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(21));
+        g.push_input(chan(), b"\r");
+        g.transmit(chan(), &lines(21));
+        assert!(!g.channel(chan()).paused);
+    }
+
+    #[test]
+    fn the_pause_character_pauses_only_after_printable_output() {
+        let mut g = paged();
+        g.transmit(chan(), b"\x14");
+        assert!(!g.channel(chan()).paused, "nothing printable since the last Return");
+        assert!(g.drain_output(chan()).is_empty(), "and the character itself is never output");
+
+        g.transmit(chan(), b"hi\x14rest");
+        assert!(g.channel(chan()).paused);
+        assert_eq!(g.drain_output(chan()), b"hiMore?".to_vec());
+        assert_eq!(g.channel(chan()).held.iter().copied().collect::<Vec<u8>>(), b"rest");
+    }
+
+    #[test]
+    fn a_clear_screen_pauses_ahead_of_itself() {
+        for clear in [&b"\x0c"[..], b"\x1b[2J"] {
+            let mut g = paged();
+            g.transmit(chan(), b"hi");
+            g.transmit(chan(), clear);
+            assert!(g.channel(chan()).paused, "{clear:?}");
+            assert_eq!(g.channel(chan()).held.iter().copied().collect::<Vec<u8>>(), clear, "the clear itself waits");
+        }
+        let mut g = paged();
+        g.channel_mut(chan()).pause_char = 0;
+        g.transmit(chan(), b"hi\x0c");
+        assert!(!g.channel(chan()).paused, "no pause character, no pause");
+    }
+
+    /// T-LORD opens every screen with `ESC[0m` then `ESC[2J`. The bytes of
+    /// the colour code are not "printable output transmitted since the last
+    /// time he hit Return" -- with them counted, every screen paused before
+    /// it was drawn.
+    #[test]
+    fn escape_sequences_are_not_printable_output() {
+        let mut g = paged();
+        g.transmit(chan(), b"\x1b[0m\x1b[1;37;44m\x1b[2J");
+        assert!(!g.channel(chan()).paused, "nothing visible went out");
+        g.transmit(chan(), b"hi\x1b[0m\x1b[2J");
+        assert!(g.channel(chan()).paused, "\"hi\" did");
+    }
+
+    #[test]
+    fn xoff_from_the_user_pauses_output_without_a_message() {
+        let mut g = paged();
+        g.channel_mut(chan()).pause_handler_installed = false;
+        g.push_input(chan(), b"\x13");
+        assert!(g.channel(chan()).paused);
+        g.transmit(chan(), b"abc");
+        assert!(g.drain_output(chan()).is_empty(), "held, not sent");
+        g.push_input(chan(), b"x");
+        assert_eq!(g.drain_output(chan()), b"abc".to_vec(), "no message was shown, so no CRLF either");
+    }
+
+    #[test]
+    fn clearing_output_ends_the_pause_and_drops_what_was_held() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(30));
+        g.channel_mut(chan()).clear_output();
+        let c = g.channel(chan());
+        assert!(!c.paused);
+        assert!(c.held.is_empty());
+        assert!(c.output.is_empty());
+        assert_eq!(c.lines_out, 0);
+    }
+
+    #[test]
+    fn overflow_counts_what_is_held_as_well_as_what_is_queued() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(30));
+        g.drain_output(chan());
+        let held = g.channel(chan()).held.len();
+        assert!(held > 0);
+        let big = vec![b'x'; OUTSIZ - held + 1];
+        g.transmit(chan(), &big);
+        assert_eq!(g.next_status(chan()), Some(Gsbl::OVRFLW));
+        assert_eq!(g.channel(chan()).held.len(), held, "nothing of it was committed");
+    }
+
+    #[test]
+    fn a_reset_channel_is_not_paused_and_holds_nothing() {
+        let mut g = paged();
+        g.transmit(chan(), &lines(30));
+        g.reset(chan());
+        let c = g.channel(chan());
+        assert!(!c.paused && c.held.is_empty() && c.page_lines == 0);
+    }
+
+    // --- btuche (guide p.45-46) ---
+
+    #[test]
+    fn draining_to_empty_marks_the_idle_notification_only_once_input_has_been_seen() {
+        let mut g = one();
+        g.channel_mut(chan()).chi_notify_on_idle = true;
+        g.transmit(chan(), b"x");
+        g.drain_output(chan());
+        assert!(!g.channel(chan()).idle_pending, "will not begin until the first character is received");
+        g.channel_mut(chan()).chi_seen_input = true;
+        g.transmit(chan(), b"x");
+        g.drain_output(chan());
+        assert!(g.channel(chan()).idle_pending);
+        g.channel_mut(chan()).idle_pending = false;
+        g.drain_output(chan());
+        assert!(!g.channel(chan()).idle_pending, "nothing drained, nothing became empty");
     }
 
     #[test]

@@ -1167,9 +1167,14 @@ pub fn vfyadn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// Generic outright (Task 5): touches only `Host::gsbl_mut`, which has never
 /// been `A`-dependent -- terminal state, not module memory.
 fn fsdcon<A: Abi>(host: &mut Host<A>, chan: Chan) {
-    let ch = host.gsbl_mut().channel_mut(chan);
+    let g = host.gsbl_mut();
+    let ch = g.channel_mut(chan);
     ch.raw = true;
     ch.echo = false;
+    // `btuxnf(usrnum,0,19); btupbc(usrnum,0);` (`FSDBBS.C:99-100`): a
+    // full-screen paint must never page-pause or trip on a pause character.
+    super::gsbl::apply_xnf(g, chan, 0, 19, None);
+    super::gsbl::apply_pbc(g, chan, 0);
 }
 
 /// `fsdcof()`, `FSDBBS.C:103-113`. Undo [`fsdcon`]: restore cooked input and
@@ -1179,12 +1184,18 @@ fn fsdcon<A: Abi>(host: &mut Host<A>, chan: Chan) {
 /// (which never touched width, see its doc comment), but it is still exactly
 /// what the original always does on the way out, so this host does too.
 ///
-/// Generic outright (Task 5), for the same reason [`fsdcon`] is.
-fn fsdcof<A: Abi>(host: &mut Host<A>, chan: Chan, scnwid: u16) {
+/// `rstrxf()` (`FSDBBS.C:111`) puts pagination back the way `fsdcon` took
+/// it away -- that is what `mem` is for: the account's `scnbrk`.
+///
+/// # Errors
+///
+/// If the account's `scnbrk` cannot be read.
+fn fsdcof<A: Abi>(host: &mut Host<A>, mem: &A::Mem, chan: Chan, scnwid: u16) -> Result<(), ShimError> {
     let ch = host.gsbl_mut().channel_mut(chan);
     ch.raw = false;
     ch.echo = true;
     ch.width = scnwid;
+    super::screen::restore_screen(host, mem, chan)
 }
 
 /// `usrptr->substt` while an entry session is under way. `FSDBBS.C:54`:
@@ -1855,7 +1866,7 @@ pub(crate) fn goback<A: Abi>(
     })?;
 
     let scnwid = account_scnwid(machine, host, chan)?;
-    fsdcof(host, chan, scnwid);
+    fsdcof(host, A::mem(machine), chan, scnwid)?;
     crate::shims::text::clrprf_mem(A::mem(machine), host)?;
 
     // `if (fsdusr->flags&FBFULL) { prf("\x1B[%d;1f",min(ANSILN,fsdscb->maxy+1)); }`
@@ -3368,6 +3379,32 @@ mod tests {
         );
     }
 
+    /// `fsdcon` (`FSDBBS.C:99-100`): `btuxnf(usrnum,0,19); btupbc(usrnum,0)`
+    /// -- a full-screen session must never page-pause or trip on a pause
+    /// character in its own paint -- and `fsdcof` (`FSDBBS.C:111`) puts them
+    /// back with `rstrxf()`.
+    #[test]
+    fn fsdcon_switches_pagination_off_and_fsdcof_restores_it() {
+        let mut f = Fixture::new();
+        let chan = f.console();
+        {
+            let ch = f.host.gsbl_mut().channel_mut(chan);
+            ch.page_lines = 24;
+            ch.page_message = Some(b"More?".to_vec());
+            ch.pause_char = 20;
+        }
+        fsdcon(&mut f.host, chan);
+        let ch = f.host.gsbl().channel(chan);
+        assert_eq!((ch.page_lines, ch.pause_char, ch.xon, ch.xoff), (0, 0, 0, 19));
+        assert_eq!(ch.page_message, None);
+
+        fsdcof(&mut f.host, f.machine.mem(), chan, 80).expect("restored");
+        let ch = f.host.gsbl().channel(chan);
+        assert_eq!(ch.pause_char, 20, "rstrxf: btupbc(usrnum,20)");
+        assert_eq!(ch.clear_pause_char, 19);
+        assert!(ch.page_lines > 0, "page mode is back");
+    }
+
     #[test]
     fn fsdcof_restores_what_fsdcon_changed() {
         let mut f = Fixture::new();
@@ -3386,7 +3423,7 @@ mod tests {
         // argument_not_whatever_fsdcon_left_behind proves more directly.
         // Kept equal to the fixture's own value here only so this test can
         // also serve as an end-to-end fsdcon-then-fsdcof round trip.
-        fsdcof(&mut f.host, chan, 41);
+        fsdcof(&mut f.host, f.machine.mem(), chan, 41).expect("restored");
 
         let ch = f.host.gsbl_mut().channel_mut(chan);
         assert!(!ch.raw, "fsdcof must turn raw input back off");
@@ -3404,7 +3441,7 @@ mod tests {
         let chan = f.console();
         f.host.gsbl_mut().channel_mut(chan).width = 0;
 
-        fsdcof(&mut f.host, chan, 132);
+        fsdcof(&mut f.host, f.machine.mem(), chan, 132).expect("restored");
 
         assert_eq!(f.host.gsbl_mut().channel_mut(chan).width, 132);
     }
