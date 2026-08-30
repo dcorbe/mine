@@ -4972,6 +4972,18 @@ impl<A: Abi> Host<A> {
         at.write(A::mem(machine), &[who.width])
             .map_err(|e| ShimError::Failed(e.to_string()))?;
 
+        // `figlang` (`MAJORBBS.C:2465-2468`), the last thing the real host
+        // does to a channel before its first screen: `usaptr->scnbrk=24`,
+        // then `rstrxf()` -- page length, pause-key handler, and the
+        // Control-T pause / Control-S clear-pause characters every logged-in
+        // channel has. T-LORD writes a Control-S ahead of every `<MORE>` it
+        // paints itself and expects GSBL to consume it (`btucpc`); without
+        // this it reached the wire, 27 times a session.
+        let at = A::ptr_offset(account, account_layout.scnbrk);
+        at.write(A::mem(machine), &[24])
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        shims::screen::restore_screen(self, A::mem(machine), chan)?;
+
         let at = A::ptr_offset(account, account_layout.scnfse);
         at.write(A::mem(machine), &[who.height])
             .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -8840,6 +8852,26 @@ mod tests {
         f.host.chi[chan.index()] = Some(rou);
         f.host.rstchn(&mut f.machine, chan).expect("reset");
         assert_eq!(f.host.chi[chan.index()], None, "the next caller must not inherit it");
+    }
+
+    /// `figlang` (`MAJORBBS.C:2465-2468`): a channel arrives at the module
+    /// with `rstrxf()`'s settings already made -- Control-T pause and
+    /// Control-S clear-pause characters, the pause-key handler, and a
+    /// 24-line screen.
+    #[test]
+    fn connect_gives_the_channel_the_login_screen_defaults() {
+        let mut f = crate::testing::Fixture::new();
+        let console = f.console();
+        f.host
+            .connect_state(&mut f.machine, console, &Connection::ansi("dan"))
+            .expect("connected");
+        let c = f.host.gsbl().channel(console);
+        assert_eq!(c.pause_char, 20, "btupbc(usrnum,20)");
+        assert_eq!(c.clear_pause_char, 19, "btucpc(usrnum,19)");
+        assert!(c.pause_handler_installed, "btuhpk(usrnum,hpkrou)");
+        let account = f.host.users().account(console);
+        let at = Wg16::ptr_offset(account, f.host.users().account_layout().scnbrk);
+        assert_eq!(mbbs_machine::ptr::ModulePtr::resolve(&at, f.machine.mem(), 1).expect("readable"), &[24], "usaptr->scnbrk=24");
     }
 
     #[test]

@@ -200,7 +200,20 @@ fn account_scnbrk<A: Abi>(mem: &A::Mem, host: &Host<A>, chan: Chan) -> Result<i8
 /// had to (`shims::text`'s own doc comment).
 pub fn rstrxf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = host.current_channel_mem(call.mem())?;
-    let scnbrk = account_scnbrk(call.mem(), host, chan)?;
+    restore_screen(host, call.mem(), chan)?;
+    Ok(abi::Ret::Void)
+}
+
+/// `rstrxf`'s body, for the two callers that need it: the shim above, and
+/// [`crate::Host::connect_state`] -- the host's own `figlang`
+/// (`MAJORBBS.C:2465-2468`) calls `rstrxf()` for every channel at login, so
+/// a connecting channel has these settings before the module sees it.
+///
+/// # Errors
+///
+/// If the account's `scnbrk` cannot be read.
+pub(crate) fn restore_screen<A: Abi>(host: &mut Host<A>, mem: &A::Mem, chan: Chan) -> Result<(), ShimError> {
+    let scnbrk = account_scnbrk(mem, host, chan)?;
     let cnt = (i16::from(scnbrk) - CTNUOS) as u16;
 
     let g = host.gsbl_mut();
@@ -208,8 +221,7 @@ pub fn rstrxf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     apply_hpk(g, chan);
     apply_pbc(g, chan, 20);
     apply_cpc(g, chan, 19);
-
-    Ok(abi::Ret::Void)
+    Ok(())
 }
 
 /// `void explode(char *sctptr, int wulx, int wuly, int wlrx, int wlry)` --

@@ -997,6 +997,16 @@ impl Channel {
         let mut wrapped = self.wrapped;
 
         for &byte in bytes {
+            // `btucpc` (guide page 81): the clear-pause character is consumed
+            // where it is found -- "resets the pending-lines counter to zero
+            // without itself being transmitted". This host has no counter to
+            // reset, but the byte still never reaches the wire: every channel
+            // gets Control-S at login (`rstrxf`, via `Host::connect_state`),
+            // and T-LORD writes one ahead of every `<MORE>` it paints itself.
+            // Sent on, it is XOFF to a terminal that honours flow control.
+            if csi == CsiScan::Text && byte != 0 && byte == self.clear_pause_char {
+                continue;
+            }
             match csi {
                 CsiScan::Text => Self::dispatch_normal(
                     &mut out,
@@ -1486,6 +1496,19 @@ mod tests {
     /// `btuxct` (binary output) is genuine GALGSBL's bulk/verbatim path -- the
     /// drain sends its span unfiltered -- so it must keep `0x00`/`0x01`, unlike
     /// the wrapped `btuxmt` text path above.
+    #[test]
+    fn transmit_consumes_the_clear_pause_character_without_sending_it() {
+        let mut g = one();
+        g.channel_mut(chan()).clear_pause_char = 19;
+        g.transmit(chan(), b"ab\x13cd\x13");
+        assert_eq!(g.drain_output(chan()), b"abcd".to_vec(), "Control-S is bookkeeping, not output");
+
+        // Zero disables it (guide `btucpc`): a bare channel passes the byte on.
+        let mut g = one();
+        g.transmit(chan(), b"ab\x13cd");
+        assert_eq!(g.drain_output(chan()), b"ab\x13cd".to_vec());
+    }
+
     #[test]
     fn transmit_raw_keeps_the_terminator_bytes() {
         let mut g = one();
