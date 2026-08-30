@@ -42,6 +42,21 @@ use dos_runtime::pit::Pit;
 use dos_runtime::screen::Screen;
 use dos_runtime::win32;
 
+/// A load-time diagnostic line. In door mode `stdout` is the caller's own
+/// terminal, so the report goes to `stderr` -- which a BBS captures into its
+/// node log -- rather than onto the player's screen; an attended or local run
+/// keeps it on `stdout`, where the report is the whole point. Same split as
+/// the `--trace` output, for the same reason.
+macro_rules! diag {
+    ($door:expr, $($arg:tt)*) => {
+        if $door {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    };
+}
+
 /// 1 MiB: the whole real-mode address space.
 const MEM: usize = 1 << 20;
 /// Above the BIOS data area. `hook_all` fills `dos_runtime::kvm::
@@ -893,7 +908,8 @@ fn main() -> io::Result<()> {
     }
 
     let img = MzImage::parse(&data)?;
-    println!(
+    diag!(
+        door,
         "{path}: {} byte image, {} relocations, entry {:#06x}:{:#06x}, \
          stack {:#06x}:{:#06x}, needs {} paragraphs",
         img.bytes.len(),
@@ -979,7 +995,8 @@ fn main() -> io::Result<()> {
         let (tsr_prog, tsr_tail) = split_tsr_arg(spec);
         let tsr_data = std::fs::read(&tsr_prog)?;
         let tsr_img = MzImage::parse(&tsr_data)?;
-        println!(
+        diag!(
+            door,
             "{tsr_prog}: {} byte image, {} relocations, entry {:#06x}:{:#06x}, \
              stack {:#06x}:{:#06x}, needs {} paragraphs (resident)",
             tsr_img.bytes.len(),
@@ -996,7 +1013,8 @@ fn main() -> io::Result<()> {
     };
 
     let at = mz::load(&mut vm, &boot_img, PSP_SEG, ENV_SEG, boot_tail.as_bytes())?;
-    println!(
+    diag!(
+        door,
         "loaded: psp {:#06x}, image {:#06x}, entering {:#06x}:{:#06x} sp {:#06x}:{:#06x}",
         at.psp_seg, at.image_seg, at.cs, at.ip, at.ss, at.sp
     );
@@ -1006,7 +1024,7 @@ fn main() -> io::Result<()> {
         // from the start would take about a hundred minutes for a two-second
         // program (re/spikes/kvm_singlestep.c).
         vm.debug(Some(addr), false)?;
-        println!("watching {addr:#07x} for a data access");
+        diag!(door, "watching {addr:#07x} for a data access");
     }
     // A human takes as long as they take: no spin timer when attended. See
     // `SPIN_TIMEOUT` for what the unattended one measures.
@@ -1019,7 +1037,7 @@ fn main() -> io::Result<()> {
     // descriptor, enforced by openat2(RESOLVE_BENEATH), not by path munging.
     std::fs::create_dir_all(&root_dir)?;
     let root = std::fs::File::open(&root_dir)?;
-    println!("root: {root_dir}");
+    diag!(door, "root: {root_dir}");
 
     // In door mode the guest talks to a caller rather than to our screen, and
     // which way it does that is the door's own configuration -- LORDCFG's
@@ -1035,7 +1053,7 @@ fn main() -> io::Result<()> {
     let mut pit = Pit::default();
     let _raw = door.then(RawStdin::enter).transpose()?;
     if door {
-        println!("door mode: COM1 at {COM1_BASE:#06x}, IRQ4, baud {baud:?}\r");
+        eprintln!("door mode: COM1 at {COM1_BASE:#06x}, IRQ4, baud {baud:?}");
     }
 
     let mut kernel = dos_runtime::dos::Dos::default();
@@ -1623,6 +1641,17 @@ fn main() -> io::Result<()> {
     };
 
     drop(driver);
+
+    // A door served a live game over stdin/stdout; the DOS-probe report that
+    // follows -- a B800 screen dump, a DOS-call histogram, a file ledger -- is
+    // for an analysis run (`runexe <prog>` without `--door`), not a player's
+    // connection, where it would spray the caller's terminal on exit and bloat
+    // the BBS's node log on every game. The guest's exit code is not carried
+    // out of the real-mode path anyway (`main` returns `Ok(())`), so ending
+    // here changes only the output.
+    if door {
+        return Ok(());
+    }
 
     // From here on the report reads state back out of the composed services,
     // which own it now that they have been composed (Step 4). `counters()` is
