@@ -51,7 +51,10 @@
 #define B_GET_FIRST 12
 #define B_CREATE    14
 #define B_STAT      15
+#define B_GET_POSITION 22
+#define B_STEP_NEXT  24
 #define B_STOP      25
+#define B_STEP_FIRST 33
 
 /* Open modes, passed in the key-number slot of B_OPEN. */
 #define MODE_NORMAL     0
@@ -358,6 +361,68 @@ static void cmd_stat(const char *path)
                i, keys[first].position, length, keys[first].flags,
                (unsigned long)keys[first].approx_count, keys[first].ext_type, segments);
     }
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/* Walk the whole file in PHYSICAL order via STEP_FIRST/STEP_NEXT -- the pair
+ * MAJORBBS's dfaStepLock(33)/dfaStepNext(24) drive -- and print each record's
+ * position (B_GET_POSITION after every step) plus its first bytes. This is
+ * the oracle for crates/btrieve's v6 physical-order walk: which records the
+ * real engine yields, in which order, at which positions -- including on a
+ * file whose allocation table sits off the formula (The Rose's RCI_MOD1.DAT,
+ * blocks 31-34 at formula+8). */
+static void cmd_step(const char *path)
+{
+    static unsigned char data[DATA_SIZE];
+    char posblk[POSBLK_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    FileSpec fs;
+    KeySpec keys[24];
+    DWORD dlen;
+    unsigned long count = 0;
+    int st;
+
+    st = open_file(posblk, path, MODE_READ_ONLY);
+    if (st != ST_OK)
+        die("open", st);
+    st = stat_file(posblk, &fs, keys, 24);
+    if (st != ST_OK)
+        die("stat", st);
+
+    dlen = DATA_SIZE;
+    memset(keybuf, 0, sizeof keybuf);
+    st = btrcall(B_STEP_FIRST, posblk, data, &dlen, keybuf,
+                 sizeof keybuf - 1, (char)0);
+    while (st == ST_OK) {
+        unsigned char head[8];
+        unsigned long pos = 0;
+        DWORD plen = sizeof pos, reclen = dlen, i, n;
+
+        n = reclen < sizeof head ? reclen : sizeof head;
+        memcpy(head, data, n);
+        count++;
+        st = btrcall(B_GET_POSITION, posblk, &pos, &plen, keybuf,
+                     sizeof keybuf - 1, (char)0);
+        if (st != ST_OK)
+            die("get_position", st);
+        printf("step %6lu pos %10lu len %5lu head ", count, pos,
+               (unsigned long)reclen);
+        for (i = 0; i < n; i++)
+            printf("%02x", head[i]);
+        printf("\n");
+
+        dlen = DATA_SIZE;
+        st = btrcall(B_STEP_NEXT, posblk, data, &dlen, keybuf,
+                     sizeof keybuf - 1, (char)0);
+    }
+    if (st != ST_END_OF_FILE)
+        printf("STEP STOPPED EARLY at %lu: status %d (%s)\n",
+               count, st, status_name(st));
+    printf("stepped     %lu\n", count);
+    printf("stat says   %lu\n", (unsigned long)fs.records);
+    printf("%s\n", (st == ST_END_OF_FILE && count == fs.records)
+                       ? "STEP OK" : "STEP MISMATCH");
 
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
@@ -1093,9 +1158,11 @@ int main(int argc, char **argv)
 
     if (argc < 3) {
         fprintf(stderr,
-            "usage: btrvprobe <stat|walk|descend|keys|dump|create|insert|serve> <file.VIR>|<port> [keynum|count]\n"
+            "usage: btrvprobe <stat|walk|step|descend|keys|dump|create|insert|serve> <file.VIR>|<port> [keynum|count]\n"
             "  stat     print the engine's own view of the file and its indexes\n"
             "  walk     GET_FIRST/GET_NEXT the whole file, check key order\n"
+            "  step     STEP_FIRST/STEP_NEXT the whole file (physical order),\n"
+            "           printing each record's B_GET_POSITION\n"
             "  descend  GET_EQUAL every key -- forces root-to-leaf traversal\n"
             "  keys     print every KEY in index order, for diffing two files\n"
             "  dump     print every record's BYTES, in key order, as hex\n"
@@ -1127,6 +1194,8 @@ int main(int argc, char **argv)
         cmd_stat(path);
     else if (!strcmp(cmd, "walk"))
         cmd_walk(path, keynum);
+    else if (!strcmp(cmd, "step"))
+        cmd_step(path);
     else if (!strcmp(cmd, "descend"))
         cmd_descend(path, keynum);
     else if (!strcmp(cmd, "keys"))
