@@ -285,6 +285,81 @@ pub(crate) struct Store {
     structural_pairs: std::collections::BTreeSet<(usize, usize)>,
 }
 
+/// The 4 KiB reserve gap genuine Btrieve 6.15 inserts into a v6 file's
+/// physical layout immediately before allocation-table block 31, and the
+/// page-space translation that undoes it.
+///
+/// **Measured, and reproduced from a fresh engine-created file.** `W32MKDE`
+/// computes a threshold into the file header block (`W32MKDE_decompiled.c`
+/// FCR-parse, `((page_size-8)/4 * 0x1e + 0x3e) * page_size` at `+0x1f0`) and
+/// its page-fetch adds `+0x1000` (4096) bytes to any page offset at or past
+/// it (`uVar5 = uVar5 + 0x1000`). Growing a brand-new 512-byte-page file to
+/// 6360 pages (this crate's oracle, `tools/btrieve-oracle` `insert`) placed
+/// allocation-table block 31 at physical page 3850 = 3842 + 8, with pages
+/// 3842..3850 left zeroed -- byte-for-byte the layout The Rose 3.0's shipped
+/// `RCI_MOD1.DAT` carries, whose stepped 7060 records the real engine yields
+/// and this crate now reproduces.
+///
+/// `0x1e`/`0x3e` are the engine's own literals: `62 = 30 blocks * 2 shadow
+/// pages + the 2-page file control record`, so the threshold is exactly
+/// block 31's own naive first page. Everything the allocation table numbers
+/// -- both a block's own shadow-pair position and the physical page each of
+/// its entries names -- is in the *gapless* space this undoes; the gap is a
+/// property of where those pages physically land in the file, not of the
+/// numbering.
+///
+/// A no-op for every page before block 31, which is every page of every file
+/// in this repository's corpus except `RCI_MOD1.DAT` (surveyed: 272 v6 files,
+/// one reaches block 31). So this is inert for all of MajorMUD, whose largest
+/// file is 14 blocks.
+pub(crate) mod gap {
+    /// The reserve the engine leaves, in bytes -- `+0x1000` in the page-fetch.
+    const RESERVE_BYTES: usize = 0x1000;
+
+    /// Allocation-table entries one block holds: `(page_size - 8) / 4`, the
+    /// engine's `(page_size - 8) >> 2`.
+    fn entries(page_size: usize) -> usize {
+        (page_size - super::ENTRIES) / super::ENTRY
+    }
+
+    /// The first naive page the reserve gap sits before -- block 31's own
+    /// naive first page, `entries * 30 + 62`. A page at or after this lands
+    /// one reserve later in the real file.
+    pub(crate) fn threshold_page(page_size: usize) -> usize {
+        entries(page_size) * 0x1e + 0x3e
+    }
+
+    /// How many whole pages the reserve is, or `None` when the page size does
+    /// not divide it. Only a 1536-byte-page file has that problem, and none
+    /// in the corpus comes within an order of magnitude of block 31 -- a
+    /// caller that reaches this on such a file refuses rather than guess a
+    /// fractional-page shift the engine's byte-offset arithmetic would not
+    /// actually produce.
+    fn reserve_pages(page_size: usize) -> Option<usize> {
+        RESERVE_BYTES.is_multiple_of(page_size).then(|| RESERVE_BYTES / page_size)
+    }
+
+    /// The real physical page a `naive` page (in the gapless space the
+    /// allocation table numbers in) lands at. Identity below the threshold.
+    ///
+    /// # Errors
+    ///
+    /// Only when `naive` is past the threshold on a page size that does not
+    /// divide the 4 KiB reserve -- unreachable for the corpus, refused rather
+    /// than mis-read.
+    pub(crate) fn real_page(naive: usize, page_size: usize) -> Result<usize, String> {
+        if naive < threshold_page(page_size) {
+            return Ok(naive);
+        }
+        let shift = reserve_pages(page_size).ok_or_else(|| {
+            format!(
+                "page {naive} is past allocation-table block 31's reserve gap, but a                  {page_size}-byte page does not divide the engine's 4096-byte reserve                  -- no corpus file reaches this and the fractional shift is unmeasured"
+            )
+        })?;
+        Ok(naive + shift)
+    }
+}
+
 impl Store {
     /// Open `path` for a page-at-a-time write. Nothing is read yet -- only
     /// the file's length, to know how many pages it starts with -- but the
@@ -1247,6 +1322,12 @@ impl Map {
         let mut blocks: HashMap<u16, Vec<(usize, u16)>> = HashMap::new();
         for index in 1u16.. {
             let (first, second) = Self::pair_position(page_size_usize, usize::from(index));
+            // The pair's *file* position is its naive position shifted past
+            // the reserve gap (`gap`), which every page from block 31 on
+            // rides. Below block 31 this is the identity, so nothing here
+            // changes for any file but The Rose's `RCI_MOD1.DAT`.
+            let first = gap::real_page(first, page_size_usize)?;
+            let second = gap::real_page(second, page_size_usize)?;
             if second >= pages {
                 break;
             }
@@ -1266,10 +1347,11 @@ impl Map {
             // -- and the `"PP" | index` tag it then compares is its in-memory
             // cache key, never the on-disk word. A refusal here used to
             // demand agreement and it rejected a real vendor file: The Rose
-            // 3.0's shipped `RCI_MOD1.DAT` carries a live block-31 pair at
-            // physical 3842/3843 whose self-index reads 21 (blocks 1-30
-            // agree with their positions; 31 on is stale), and the real
-            // engine boots it because it never looks.
+            // 3.0's `RCI_MOD1.DAT` keeps its live block-31 pair at the real
+            // (post-gap) page 3850/3851 self-labelled 31, and a *stale* pair
+            // self-labelled 21 sits abandoned at the block's own naive
+            // position 3842/3843. Position (after the `gap` shift) is what
+            // finds the live one; the self-index would have picked neither.
             blocks.insert(index, copies);
         }
 
@@ -1342,13 +1424,17 @@ impl Map {
                     // Now that a physical page comes from a table entry rather
                     // than from having been found in the file, one past the end
                     // is reachable and would hand a caller a read past EOF.
-                    if usize::from(claimed_page) >= pages {
+                    // The entry names a page in the same gapless space the
+                    // pair positions are in, so it rides the reserve gap too.
+                    let claimed_real = gap::real_page(usize::from(claimed_page), page_size_usize)?;
+                    if claimed_real >= pages {
                         return Err(format!(
                             "allocation-table block {block} claims physical page \
-                             {claimed_page}, and the file has only {pages} pages"
+                             {claimed_page} (file page {claimed_real}), and the file \
+                             has only {pages} pages"
                         ));
                     }
-                    physical.insert(first + entry as u32 + 1, u32::from(claimed_page));
+                    physical.insert(first + entry as u32 + 1, claimed_real as u32);
                 }
             }
         }
@@ -2361,6 +2447,50 @@ pub(crate) fn write_fcr(
 mod tests {
     use super::*;
     use std::collections::HashMap as Map16;
+
+    /// The reserve-gap math, at the page sizes the format uses.
+    ///
+    /// The threshold is block 31's own naive first page, and the shift is the
+    /// engine's fixed 4096-byte reserve expressed in whole pages. The 512-byte
+    /// numbers are the ones measured live: a fresh engine-created file grew to
+    /// place block 31 at page 3850 = 3842 + 8, and The Rose's `RCI_MOD1.DAT`
+    /// carries the same layout (`tools/btrieve-oracle`).
+    #[test]
+    fn the_reserve_gap_shifts_only_pages_from_block_31_on() {
+        // 512-byte pages: 126 entries/block, threshold 3842, shift 8.
+        assert_eq!(gap::threshold_page(512), 126 * 30 + 62);
+        assert_eq!(gap::threshold_page(512), 3842);
+        assert_eq!(gap::real_page(3841, 512).unwrap(), 3841, "block 30's last page is not shifted");
+        assert_eq!(gap::real_page(3842, 512).unwrap(), 3850, "block 31's naive page lands at 3850");
+        assert_eq!(gap::real_page(3843, 512).unwrap(), 3851);
+        assert_eq!(gap::real_page(0, 512).unwrap(), 0);
+        assert_eq!(gap::real_page(2, 512).unwrap(), 2, "the FCR pair is untouched");
+
+        // Larger pages: threshold is far higher, shift is 4096/page_size.
+        assert_eq!(gap::real_page(gap::threshold_page(1024), 1024).unwrap(), gap::threshold_page(1024) + 4);
+        assert_eq!(gap::real_page(gap::threshold_page(2048), 2048).unwrap(), gap::threshold_page(2048) + 2);
+        assert_eq!(gap::real_page(gap::threshold_page(4096), 4096).unwrap(), gap::threshold_page(4096) + 1);
+
+        // Below threshold every page size is the identity -- which is every
+        // page of every corpus file but RCI_MOD1.DAT.
+        for &ps in &[512usize, 1024, 1536, 2048, 4096] {
+            let below = gap::threshold_page(ps) - 1;
+            assert_eq!(gap::real_page(below, ps).unwrap(), below);
+        }
+    }
+
+    /// A 1536-byte page does not divide the 4096-byte reserve, so a page past
+    /// its threshold is refused rather than shifted by a fractional page. No
+    /// corpus file comes within an order of magnitude of that threshold, so
+    /// this is an honest refusal of an unmeasured shape, not a live path.
+    #[test]
+    fn a_page_size_that_does_not_divide_the_reserve_is_refused_past_the_threshold() {
+        let past = gap::threshold_page(1536);
+        let err = gap::real_page(past, 1536).unwrap_err();
+        assert!(err.contains("does not divide"), "{err}");
+        // Still the identity below the threshold, where nothing divides.
+        assert_eq!(gap::real_page(past - 1, 1536).unwrap(), past - 1);
+    }
 
     /// `CARGO_MANIFEST_DIR`-relative, not workspace-root-relative -- the
     /// convention `btrieve.rs`'s v6 tests and `pages.rs`'s `dupkey30()`

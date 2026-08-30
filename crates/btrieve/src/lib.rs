@@ -2844,7 +2844,15 @@ impl<M: Mem> Block<M> {
     fn v6_resolve_logical(&self, logical: u32) -> Result<u32, String> {
         let page_size = usize::from(self.geometry.page);
         let (block, entry) = format::alloc::block_of(logical, page_size)?;
+        // A block's shadow pair and the pages its entries name are numbered
+        // in the gapless space; the real file inserts a 4 KiB reserve before
+        // block 31 (`v6::gap`). Identity below block 31, so this changes
+        // nothing for any file but The Rose's `RCI_MOD1.DAT` -- the same
+        // translation `v6::Map::read` applies, kept in step with it because
+        // this is the second, per-logical resolver of the same table.
         let (first, second) = format::alloc::pair_position(page_size, block);
+        let first = v6::gap::real_page(first, page_size)?;
+        let second = v6::gap::real_page(second, page_size)?;
 
         // Read through this block's attached cache when it has one (every
         // v6 `Block` a real `opnbtv` reaches -- see `Self::cache`'s own doc
@@ -2948,15 +2956,19 @@ impl<M: Mem> Block<M> {
                  shadow pair and cannot hold a logical page"
             ));
         }
-        if u32::from(claimed_page) >= self.geometry.pages {
+        // The entry names a gapless page too; shift it past block 31's
+        // reserve to the page it physically occupies.
+        let claimed_real = v6::gap::real_page(usize::from(claimed_page), page_size)? as u32;
+        if claimed_real >= self.geometry.pages {
             return Err(format!(
                 "allocation-table block {block} claims physical page \
-                 {claimed_page}, and the file has only {} pages",
+                 {claimed_page} (file page {claimed_real}), and the file has \
+                 only {} pages",
                 self.geometry.pages
             ));
         }
 
-        Ok(u32::from(claimed_page))
+        Ok(claimed_real)
     }
 
     /// Everything [`nav::TreeCursor::seek`] needs for `key`'s tree: the FCR
