@@ -1581,6 +1581,35 @@ pub struct Host<A: Abi> {
     /// and which is not hot by construction: a `Datum` resolves at load time
     /// and never traps, and an `Unimplemented` stops the module.
     resolved: Vec<Option<(shims::Shim<A>, shims::Cleans)>>,
+
+    /// Thunks this host reserved for itself, and the routine each stands
+    /// for: how [`Host::run`] names a stop at a thunk no module's import
+    /// table claims.
+    ///
+    /// A module reaches most host routines through imports, which the
+    /// loader numbers. A few it reaches through a *function-pointer global*
+    /// the real host fills in at boot -- `bgnedt`, `FSD.H:54`'s
+    /// `int (*bgnedt)(...)`, set by the editor's own `init__inifse()`
+    /// (`EDITFSE.C:251`, `bgnedt=fse_bgnedt`). Nothing numbers those, so
+    /// [`Host::finish_init`] reserves a thunk per vector
+    /// ([`Abi::reserve_host_thunk`]), writes its address into the global,
+    /// and records `(index, site)` here; `Host::import_owner` answers the
+    /// `site` for that index, and the ordinary `shims::entry` path takes it
+    /// from there. Before this, `bgnedt` held zero and MajorMUD's sysop
+    /// menu editors (`B`, `E`) faulted at `0x00000000` the instant they
+    /// called through it.
+    vectors: Vec<(u16, mbbs_machine::module::ImportSite)>,
+
+    /// The line editor's own `state` slot, registered in
+    /// [`Host::finish_init`] the way `init__inifse()` registers `fseedit`
+    /// (`EDITFSE.C:245`). `None` before `finish_init` has run. Beside
+    /// [`Host::fsd_state`] for the same reason it exists.
+    pub(crate) editor_state: Option<usize>,
+
+    /// Each channel's editing session, if one is under way -- the vendor's
+    /// `fseusr[usrnum]` (`EDITFSE.H`), Rust-side because no module ever
+    /// addresses it. Indexed by [`Chan::index`], like [`Host::fsd_sessions`].
+    pub(crate) editor_sessions: Vec<Option<shims::editor::Session<A>>>,
 }
 
 /// What `poll` does with a status.
@@ -1937,6 +1966,9 @@ impl<A: Abi> Host<A> {
             inited: false,
             survey: None,
             resolved: Vec::new(),
+            vectors: Vec::new(),
+            editor_state: None,
+            editor_sessions: vec![None; usize::from(terms.count())],
         };
 
         // `clock()` counts from here. Set after construction because
@@ -3069,9 +3101,21 @@ impl<A: Abi> Host<A> {
         if let Some(site) = A::import(entered, index) {
             return Some((None, site.clone()));
         }
-        self.loaded_modules
+        if let Some(found) = self
+            .loaded_modules
             .values()
             .find_map(|candidate| A::import(candidate, index).map(|site| (Some(candidate.clone()), site.clone())))
+        {
+            return Some(found);
+        }
+        // Not an import of any module: a thunk this host reserved for a
+        // routine modules reach through a pointer global -- see
+        // [`Host::vectors`]. Owned by no module, so the owner is `None`
+        // exactly as for `entered`'s own imports.
+        self.vectors
+            .iter()
+            .find(|(at, _)| *at == index)
+            .map(|(_, site)| (None, site.clone()))
     }
 
     /// Parse and map `file`, resolving every import against this host's own
@@ -4114,8 +4158,8 @@ impl<A: Abi> Host<A> {
     /// `goback` and their `FarPtr`-typed helpers all took `A::Cpu`/`A::Ptr`
     /// instead), which retired the `Abi::native_dispatch` bridge Task 11 had
     /// added to reach this arm while `fsd_dispatch` was still `Wg16`-only.
-    /// `Native::Fsd` is the only [`shims::system::Native`] variant, so this
-    /// match has nothing else to route.
+    /// Each [`shims::system::Native`] variant routes to its own handler:
+    /// [`Host::fsd_dispatch`] and [`shims::editor::dispatch`].
     fn poll_with_chan(
         &mut self,
         machine: &mut A::Cpu,
@@ -4316,8 +4360,11 @@ impl<A: Abi> Host<A> {
             let entry = match entry {
                 Ok(Dispatch::Module(Some(entry))) => Ok(Serviced::Call(entry)),
                 Ok(Dispatch::Module(None)) => Ok(Serviced::Unregistered),
-                Ok(Dispatch::Native(_native)) => {
+                Ok(Dispatch::Native(Native::Fsd)) => {
                     self.fsd_dispatch(machine, module, chan, entry_index)
+                }
+                Ok(Dispatch::Native(Native::Editor)) => {
+                    shims::editor::dispatch(machine, self, module, chan, entry_index)
                 }
                 // The module handed this channel back to a BBS this host does
                 // not have -- see `Registration::AbsentBbs`. There is nothing
@@ -5048,20 +5095,26 @@ impl<A: Abi> Host<A> {
             .map_err(|e| ShimError::Failed(e.to_string()))?;
         shims::screen::restore_screen(self, A::mem(machine), chan)?;
 
-        // ...but leave page-LINE mode off by default. `rstrxf` above set the
-        // 22-line page pause `figlang` gives a real 24-line terminal; on a
-        // modern client with its own scrollback that only collides with
-        // modules -- like T-LORD (no `btuxnf` import, so it cannot turn GSBL
-        // paging off) -- that paginate themselves, double-prompting every
-        // screen. The pause-character, clear-pause and `hpkrou` machinery
-        // `rstrxf` installed stay (T-LORD's `^S` must still be consumed); only
-        // the line counter is disabled, exactly as a user setting a nonstop
-        // screen length would. A module that wants GSBL paging still gets it
-        // by calling `btuxnf` itself.
+        // ...but leave screen pausing off by default. `rstrxf` above set the
+        // page pause `figlang` gives a real 24-line terminal; on a modern
+        // client with its own scrollback that only collides with modules --
+        // like T-LORD (no `btuxnf` import, so it cannot turn GSBL paging off)
+        // -- that paginate themselves, double-prompting every screen. Worse,
+        // the pause-character enables a pause on every *clear-screen* too
+        // (`btupbc` guide p.133), and a module that clears the screen mid-flow
+        // -- T-LORD does, entering character creation -- then leaves the
+        // channel paused with our handler eating the keystrokes the module is
+        // waiting for. So nonstop means all three off: the line counter
+        // (`page_lines`), and the pause character that gates both the
+        // pause-char and clear-screen pauses (`pause_char`). The clear-pause
+        // character stays (`clear_pause_char` still consumes T-LORD's `^S`),
+        // as does `hpkrou` (inert unless a pause fires). A module that wants
+        // GSBL paging still gets it by calling `btuxnf`/`btupbc` itself.
         {
             let c = self.gsbl.channel_mut(chan);
             c.page_lines = 0;
             c.page_message = None;
+            c.pause_char = 0;
         }
 
         let at = A::ptr_offset(account, account_layout.scnfse);
@@ -5201,6 +5254,10 @@ impl<A: Abi> Host<A> {
         // the previous player's buffers and terminal settings.
         self.gsbl.reset(chan);
         self.chi[chan.index()] = None;
+        // A session the channel hung up on. The vendor's `fsehup` clears the
+        // FSE's `EDITING` flag on hangup for the same reason: the next caller
+        // on this channel must not inherit a half-edited buffer.
+        self.editor_sessions[chan.index()] = None;
         Ok(())
     }
 
@@ -5756,6 +5813,22 @@ impl<A: Abi> Host<A> {
         // so nothing can reach a channel's `state` before the FSD's slot
         // exists to be named.
         self.fsd_state = Some(self.register_native(Native::Fsd));
+        // `init__inifse()` (`EDITFSE.C:243-256`): register the editor as a
+        // module of its own, and point `bgnedt` at it. The pointer is a
+        // host-reserved thunk -- see [`Host::vectors`] for why an import
+        // could never have supplied one.
+        self.editor_state = Some(self.register_native(Native::Editor));
+        let (index, vector) = A::reserve_host_thunk(machine)?;
+        self.globals()
+            .write_mem(A::mem(machine), "bgnedt", &A::ptr_to_bytes(vector))?;
+        self.vectors.push((
+            index,
+            mbbs_machine::module::ImportSite {
+                module: crate::exports::MAJORBBS.to_owned(),
+                symbol: Symbol::Name(shims::editor::VECTOR.to_owned()),
+                resolved: true,
+            },
+        ));
         self.inited = true;
         Ok(())
     }
@@ -6826,7 +6899,7 @@ mod tests {
         // state 3 with one module registered are now different sentences,
         // and conflating them is what this assertion exists to stop.
         assert!(
-            err.to_string().contains("state 99") && err.to_string().contains("2 module(s)"),
+            err.to_string().contains("state 99") && err.to_string().contains("3 module(s)"),
             "expected the missing-registration message, got: {err}"
         );
     }
@@ -7634,18 +7707,19 @@ mod tests {
         f.machine.load_code(&stub).expect("the stub fits");
 
         // Slot 0 is `Registration::AbsentBbs`, the menuing system this host
-        // does not have, and `Fixture::new` -> `finish_init` has taken slot 1
-        // for the FSD -- so three slots are occupied (the absent BBS, the
-        // FSD, then "only") and the count the error names has grown to match.
-        set_state(&mut f, console, 3);
+        // does not have, and `Fixture::new` -> `finish_init` has taken slots
+        // 1 and 2 for the FSD and the editor -- so four slots are occupied
+        // (the absent BBS, the FSD, the editor, then "only") and the count
+        // the error names has grown to match.
+        set_state(&mut f, console, 4);
         f.host.gsbl_mut().push_input(console, b"look\r");
         let err = f
             .host
             .poll(&mut f.machine, &module)
-            .expect_err("state 3 names nothing");
+            .expect_err("state 4 names nothing");
         let text = err.to_string();
         assert!(
-            text.contains("state 3") && text.contains("3 module(s)"),
+            text.contains("state 4") && text.contains("4 module(s)"),
             "the error names the state and the count, got: {text}"
         );
     }
@@ -8946,9 +9020,9 @@ mod tests {
             .connect_state(&mut f.machine, console, &Connection::ansi("dan"))
             .expect("connected");
         let c = f.host.gsbl().channel(console);
-        assert_eq!(c.pause_char, 20, "btupbc(usrnum,20)");
-        assert_eq!(c.clear_pause_char, 19, "btucpc(usrnum,19)");
-        assert!(c.pause_handler_installed, "btuhpk(usrnum,hpkrou)");
+        assert_eq!(c.pause_char, 0, "nonstop default: no pause char, so no clear-screen pause to eat module input");
+        assert_eq!(c.clear_pause_char, 19, "btucpc(usrnum,19) kept -- still consumes T-LORD's ^S");
+        assert!(c.pause_handler_installed, "btuhpk(usrnum,hpkrou) installed (inert unless a pause fires)");
         assert_eq!(c.page_lines, 0, "page-LINE mode off by default -- modern-client nonstop, no double paging");
         let account = f.host.users().account(console);
         let at = Wg16::ptr_offset(account, f.host.users().account_layout().scnbrk);
@@ -9817,6 +9891,12 @@ mod tests {
         std::rc::Rc::new(std::cell::RefCell::new(crate::survey::Inventory::in_memory()))
     }
 
+    /// The first thunk index no module claims in a fresh `Fixture`, and the
+    /// one a module loaded into it afterwards gets for its first import:
+    /// `finish_init` reserves thunk 0 for the `bgnedt` vector
+    /// (`Host::vectors`) before any module is loaded.
+    const FIRST_FREE: u16 = 1;
+
     /// Code that `lcall`s thunk `indices`, in that order, then `retf`s.
     ///
     /// `minimal_module` (used by every test below) imports nothing, so
@@ -9843,13 +9923,13 @@ mod tests {
         let mut f = Fixture::new();
         assert!(f.host.survey.is_none(), "off unless enable_survey was called");
         let module = f.minimal_module();
-        let entry = lcall_thunks(&mut f.machine, &[0]);
+        let entry = lcall_thunks(&mut f.machine, &[FIRST_FREE]);
 
         let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
         match outcome {
             Outcome::Stopped(Poison::Unimplemented { module, symbol }) => {
                 assert_eq!(module, "");
-                assert!(symbol.starts_with("thunk #0"), "{symbol}");
+                assert!(symbol.starts_with("thunk #1"), "{symbol}");
             }
             other => panic!("survey mode is off; must stop, not {other:?}"),
         }
@@ -9859,7 +9939,7 @@ mod tests {
     fn survey_mode_continues_past_a_single_unimplemented_call_and_records_it() {
         let mut f = Fixture::new();
         let module = f.minimal_module();
-        let entry = lcall_thunks(&mut f.machine, &[0]);
+        let entry = lcall_thunks(&mut f.machine, &[FIRST_FREE]);
         let chan = f.console();
 
         let inventory = survey_inventory();
@@ -9874,16 +9954,16 @@ mod tests {
 
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1);
-        assert_eq!(inv.count_of("", "thunk #0"), Some(1));
+        assert_eq!(inv.count_of("", "thunk #1"), Some(1));
         let text = inv.render();
-        assert!(text.contains("1\tunimplemented\t-\tthunk #0\t-\t0\t"), "{text}");
+        assert!(text.contains("1\tunimplemented\t-\tthunk #1\t-\t0\t"), "{text}");
     }
 
     #[test]
     fn survey_mode_counts_a_repeat_call_to_the_same_symbol_without_a_second_entry() {
         let mut f = Fixture::new();
         let module = f.minimal_module();
-        let entry = lcall_thunks(&mut f.machine, &[0, 0]);
+        let entry = lcall_thunks(&mut f.machine, &[FIRST_FREE, FIRST_FREE]);
 
         let inventory = survey_inventory();
         f.host.enable_survey(inventory.clone());
@@ -9893,14 +9973,14 @@ mod tests {
 
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1, "one distinct symbol, called twice");
-        assert_eq!(inv.count_of("", "thunk #0"), Some(2));
+        assert_eq!(inv.count_of("", "thunk #1"), Some(2));
     }
 
     #[test]
     fn survey_mode_records_two_different_symbols_as_two_entries() {
         let mut f = Fixture::new();
         let module = f.minimal_module();
-        let entry = lcall_thunks(&mut f.machine, &[0, 1]);
+        let entry = lcall_thunks(&mut f.machine, &[FIRST_FREE, FIRST_FREE + 1]);
 
         let inventory = survey_inventory();
         f.host.enable_survey(inventory.clone());
@@ -9910,14 +9990,14 @@ mod tests {
 
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 2);
-        assert_eq!(inv.count_of("", "thunk #0"), Some(1));
         assert_eq!(inv.count_of("", "thunk #1"), Some(1));
+        assert_eq!(inv.count_of("", "thunk #2"), Some(1));
     }
 
     #[test]
     fn survey_mode_still_stops_on_a_fault_reached_after_a_continued_call() {
         // Constraint 1: never continue past `Poison::Fault`. The module
-        // reaches a fabricated return from thunk 0, then walks straight
+        // reaches a fabricated return from an unclaimed thunk, then walks straight
         // into `hlt` -- if survey mode's `continue` somehow looped past a
         // terminal `Exit` instead of returning through the normal
         // `Exit::Fault` arm, this would come back `Returned` instead.
@@ -9925,7 +10005,7 @@ mod tests {
         let module = f.minimal_module();
 
         let mut code = vec![0x9a];
-        code.extend_from_slice(&f.machine.thunk_address(0).to_bytes());
+        code.extend_from_slice(&f.machine.thunk_address(FIRST_FREE).to_bytes());
         code.push(0xf4); // hlt
         f.machine.load_code(&code).expect("code fits");
         let entry = f.machine.code_ptr(0);
@@ -9953,7 +10033,7 @@ mod tests {
         let module = f.minimal_module();
 
         let mut code = vec![0x9a];
-        code.extend_from_slice(&f.machine.thunk_address(0).to_bytes());
+        code.extend_from_slice(&f.machine.thunk_address(FIRST_FREE).to_bytes());
         code.extend_from_slice(&[0xeb, 0xfe]); // jmp $ -- never returns on its own
         f.machine.load_code(&code).expect("code fits");
         let entry = f.machine.code_ptr(0);
@@ -10115,9 +10195,10 @@ mod tests {
         let bytes = module_with_one_import("TESTDLL", &mbbs_machine::m16::Symbol::Ordinal(42));
         let module = f.host.load(&mut f.machine, &bytes).expect("loads");
 
-        // Thunk index 0: the module's one and only import, and the first
-        // (and only) relocation `map_ne` ever resolves for it.
-        let entry = lcall_thunks(&mut f.machine, &[0]);
+        // The module's one and only import, and the first (and only)
+        // relocation `map_ne` ever resolves for it -- numbered after the
+        // host's own vector, see `FIRST_FREE`.
+        let entry = lcall_thunks(&mut f.machine, &[FIRST_FREE]);
 
         let inventory = survey_inventory();
         f.host.enable_survey(inventory.clone());
@@ -10151,7 +10232,7 @@ mod tests {
             &mbbs_machine::m16::Symbol::Name("f_lxdiv@_not_a_real_routine".to_owned()),
         );
         let module = f.host.load(&mut f.machine, &bytes).expect("loads");
-        let entry = lcall_thunks(&mut f.machine, &[0]);
+        let entry = lcall_thunks(&mut f.machine, &[FIRST_FREE]);
 
         let inventory = survey_inventory();
         f.host.enable_survey(inventory.clone());
@@ -10199,7 +10280,7 @@ mod tests {
         // reaches `lonrou` through `first_module()`, not the channel's
         // `state`, so nothing here needs `set_state`.
         let module_number = register_module_with(&mut f, &[]);
-        let lonrou = lcall_thunks(&mut f.machine, &[0]);
+        let lonrou = lcall_thunks(&mut f.machine, &[FIRST_FREE]);
         register_module_with_lonrou_at(&mut f, module_number, lonrou);
 
         let inventory = survey_inventory();
@@ -10217,7 +10298,7 @@ mod tests {
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1);
         assert!(
-            inv.render().contains(&format!("unimplemented\t-\tthunk #0\t-\t{console}\t")),
+            inv.render().contains(&format!("unimplemented\t-\tthunk #1\t-\t{console}\t")),
             "connect's own channel must be the one recorded: {}",
             inv.render()
         );
@@ -10252,7 +10333,7 @@ mod tests {
         let mut f = Fixture::new();
         let module = f.minimal_module();
         let console = f.console();
-        let rou = lcall_thunks(&mut f.machine, &[0]);
+        let rou = lcall_thunks(&mut f.machine, &[FIRST_FREE]);
 
         f.host
             .users
@@ -10272,7 +10353,7 @@ mod tests {
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1);
         assert!(
-            inv.render().contains(&format!("unimplemented\t-\tthunk #0\t-\t{console}\t")),
+            inv.render().contains(&format!("unimplemented\t-\tthunk #1\t-\t{console}\t")),
             "the polled channel must be the one recorded: {}",
             inv.render()
         );
