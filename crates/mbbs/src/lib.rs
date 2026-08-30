@@ -3902,6 +3902,9 @@ impl<A: Abi> Host<A> {
                     // A `char` comes back in AL; whatever the rest of the
                     // register holds is the callee's business, not the byte.
                     let answer = lo as u8;
+                    if shims::traced() {
+                        eprintln!("mbbs-trace: chan={chan:?} btuchi handler({byte:#04x}) -> {answer:#04x}");
+                    }
                     if answer != 0 {
                         self.gsbl.channel_mut(chan).cooked(answer);
                     }
