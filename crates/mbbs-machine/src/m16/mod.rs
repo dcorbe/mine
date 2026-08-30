@@ -157,6 +157,22 @@ const THUNK_STRIDE: usize = 32;
 /// 408 symbols, so this is room to spare.
 pub const MAX_THUNKS: u16 = 512;
 
+/// A [`Machine::reserve_thunks`] that would run past [`MAX_THUNKS`]. The
+/// `m16` twin of `crate::m32::ThunkExhausted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThunkExhausted {
+    pub wanted: u16,
+    pub free: u16,
+}
+
+impl std::fmt::Display for ThunkExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} import thunks wanted but only {} of {MAX_THUNKS} are free", self.wanted, self.free)
+    }
+}
+
+impl std::error::Error for ThunkExhausted {}
+
 /// Where the 64-bit trampoline is copied to: immediately past the thunk table,
 /// in the same segment. It must live below 4 GiB, because the 16-bit far jump
 /// that reaches it can name a 32-bit offset and no more.
@@ -582,6 +598,28 @@ impl Machine {
         }
         self.frame_sp = None;
         self.ctx.disarm()
+    }
+
+    /// Reserve `n` consecutive machine-wide thunk indices and return the
+    /// first, so a caller that is not an NE load can own a slot of its own
+    /// -- the host's editor vector is one: a routine a module reaches through
+    /// a function-pointer global rather than an import, which therefore has
+    /// no import site to be numbered under. The `m32` twin of
+    /// `crate::m32::Machine::reserve_thunks`; the same bump allocation
+    /// `load_ne` uses (`ne::Thunks::new(self.next_thunk)`), so a reservation
+    /// and a load never collide whichever order they happen in.
+    ///
+    /// # Errors
+    ///
+    /// [`ThunkExhausted`] if fewer than `n` slots remain.
+    pub fn reserve_thunks(&mut self, n: u16) -> Result<u16, ThunkExhausted> {
+        let free = MAX_THUNKS - self.next_thunk;
+        if n > free {
+            return Err(ThunkExhausted { wanted: n, free });
+        }
+        let base = self.next_thunk;
+        self.next_thunk += n;
+        Ok(base)
     }
 
     /// The far pointer a module should `lcall` to reach import `index`.

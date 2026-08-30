@@ -9,6 +9,7 @@ pub mod dfa;
 pub mod crt;
 pub mod dosenv;
 pub mod echo;
+pub mod editor;
 pub mod evidence;
 pub mod fsd;
 pub mod ftf;
@@ -737,6 +738,12 @@ pub(crate) fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cl
          Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         (MAJORBBS, "oldbgnedt", system::oldbgnedt, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        // Not an import: the routine behind the `bgnedt` pointer global,
+        // reached through the thunk `Host::finish_init` reserves for it
+        // (`Host::vectors`). Listed here so that stop resolves like any
+        // other.
+        (MAJORBBS, editor::VECTOR, editor::fse_bgnedt, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/wgsfse/EDITFSE.C")),
         (MAJORBBS, "begin_polling", user::begin_polling, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "stop_polling", user::stop_polling, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "fsdroom", fsd::fsdroom, Cleans::Caller, Evidence::Unclassified),

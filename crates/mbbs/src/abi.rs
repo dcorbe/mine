@@ -689,6 +689,23 @@ pub trait Abi {
     /// (`mbbs_machine::m16::Module::import` for `Wg16`).
     fn import(module: &Self::Module, index: u16) -> Option<&mbbs_machine::module::ImportSite>;
 
+    /// Reserve one machine-wide thunk the *host* owns, and the address a
+    /// module calls to reach it: `Exit::Call { index }` when it does.
+    ///
+    /// For a routine a module reaches through a function-pointer global
+    /// rather than an import -- `bgnedt`, `FSD.H:54`'s `int (*bgnedt)(...)`,
+    /// is the one so far. An import gets its thunk from the loader; a
+    /// pointer global has no import site, so nothing would ever number it,
+    /// and the global would hold nothing callable. `Host::finish_init`
+    /// writes the address this hands back into the global and records the
+    /// index in `Host::vectors`, which is how `Host::run` names the call
+    /// when it stops here.
+    ///
+    /// # Errors
+    ///
+    /// If the machine's thunk table is full.
+    fn reserve_host_thunk(cpu: &mut Self::Cpu) -> std::io::Result<(u16, Self::Ptr)>;
+
     /// Where in the module the call being refused came from, as a place a
     /// disassembly names -- best-effort diagnostics for `Host::run`'s own
     /// stop message, never load-bearing for anything this crate decides.
@@ -1397,6 +1414,10 @@ mod tests {
 
         fn import(_module: &Self::Module, _index: u16) -> Option<&mbbs_machine::module::ImportSite> {
             unreachable!("Call's read tests never call Abi::import")
+        }
+
+        fn reserve_host_thunk(_cpu: &mut Self::Cpu) -> std::io::Result<(u16, Self::Ptr)> {
+            unreachable!("Call's read tests never call Abi::reserve_host_thunk")
         }
 
         fn caller(_cpu: &Self::Cpu, _module: &Self::Module) -> Option<String> {

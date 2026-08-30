@@ -565,6 +565,11 @@ impl Abi for Wg32 {
         module.import(index)
     }
 
+    fn reserve_host_thunk(cpu: &mut Self::Cpu) -> std::io::Result<(u16, Self::Ptr)> {
+        let index = cpu.machine.reserve_thunks(1).map_err(std::io::Error::other)?;
+        Ok((index, mbbs_machine::m32::Flat32Ptr(cpu.machine.thunk_addr(index))))
+    }
+
     /// `None`, always: `Wg32` does no caller naming at all. There is no
     /// return-address walk here -- [`Wg32::Module`] carries the bound
     /// import table but no section table or symbol map to resolve a return

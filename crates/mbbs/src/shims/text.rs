@@ -1321,9 +1321,20 @@ fn write_parse<A: Abi>(
 /// Generic (Task 5): each `margn[n]` slot is [`Abi::PTR_WIDTH`] bytes apart,
 /// not a hardcoded 4, same as [`write_parse`].
 pub fn rstrin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    rstrin_mem(call.mem(), host)?;
+    Ok(abi::Ret::Void)
+}
+
+/// [`rstrin`] against memory directly, for host code that needs the whole
+/// line back after `parsin` -- the editor's `bgncnc()` (`shims::editor`).
+///
+/// # Errors
+///
+/// If `margc` or `margn` is not placed, or a write runs off the segment.
+pub(crate) fn rstrin_mem<A: Abi>(mem: &mut A::Mem, host: &Host<A>) -> Result<(), ShimError> {
     let margc = host
         .globals()
-        .word_mem(call.mem(), "margc")
+        .word_mem(mem, "margc")
         .map_err(|e| ShimError::Failed(e.to_string()))? as i16;
     let margn = host
         .globals()
@@ -1335,13 +1346,13 @@ pub fn rstrin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         // `resolve` is how this crate reads raw bytes out of module memory --
         // `read_cstr` is for strings and there is no buffer-filling `read`.
         let bytes = slot
-            .resolve(call.mem(), A::PTR_WIDTH)
+            .resolve(mem, A::PTR_WIDTH)
             .map_err(|e| ShimError::Failed(e.to_string()))?;
         let end = A::ptr_from_bytes(bytes);
-        end.write(call.mem(), b" ")
+        end.write(mem, b" ")
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
-    Ok(abi::Ret::Void)
+    Ok(())
 }
 
 /// `long atol(char *s)`.

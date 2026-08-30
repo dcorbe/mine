@@ -452,8 +452,10 @@ fn lcall_thunk(machine: &mut Machine, index: u16) -> FarPtr {
 fn a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner() {
     let mut f = Fixture::new();
 
-    // Loaded first: one unresolved import, so it gets machine-wide thunk
-    // index 0. Named distinctly from MODB (`Host::loaded_modules` keys a
+    // Loaded first: one unresolved import, so it gets the first machine-wide
+    // thunk index after the host's own -- `finish_init` reserves index 0 for
+    // the `bgnedt` vector (`Host::vectors`), so MODA's is 1. Named distinctly
+    // from MODB (`Host::loaded_modules` keys a
     // loaded module by its own declared name -- see `importer_bytes_named`'s
     // own doc comment), so both stay reachable through that registry rather
     // than the second silently overwriting the first's entry.
@@ -466,7 +468,7 @@ fn a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner() {
         .expect("MODA loads with an unresolved import of its own");
 
     // Loaded second: its own unresolved import must land on a *different*
-    // machine-wide index than MODA's -- 1, not 0 -- or the two collide on
+    // machine-wide index than MODA's -- 2, not 1 -- or the two collide on
     // the same physical trampoline slot.
     let mod_b = f
         .host
@@ -476,15 +478,15 @@ fn a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner() {
         )
         .expect("MODB loads with its own unresolved import");
 
-    // Call MODA's own thunk (index 0) directly, but enter under MODB --
+    // Call MODA's own thunk (index 1) directly, but enter under MODB --
     // exactly the mismatch a cross-module far call into MODA's code,
     // triggered from MODB's own entry point, would produce.
-    let entry = lcall_thunk(&mut f.machine, 0);
+    let entry = lcall_thunk(&mut f.machine, 1);
 
     let outcome = f.host.run(&mut f.machine, &mod_b, entry, &[], None).expect("ran");
     match outcome {
         Outcome::Stopped(Poison::Unimplemented { module, symbol }) => {
-            assert_eq!(module, "MISSING_DLL_A", "thunk 0 is MODA's own import, not MODB's");
+            assert_eq!(module, "MISSING_DLL_A", "thunk 1 is MODA's own import, not MODB's");
             assert!(
                 symbol.to_lowercase().starts_with("syma"),
                 "expected MODA's own symbol, got {symbol:?}"
@@ -496,8 +498,8 @@ fn a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner() {
 
 /// The sibling proof `a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner`
 /// cannot give on its own: that test names `MODA`'s thunk by its numeric
-/// value (0), which is the same whether or not indices are disjoint --
-/// `MODA` is loaded first either way, so its own base is 0 regardless. It
+/// value (1), which is the same whether or not indices are disjoint --
+/// `MODA` is loaded first either way, so its own base is 1 regardless. It
 /// says nothing about whether `MODB`'s *own* thunk actually landed on a
 /// different physical slot, only that slot 0 belongs to `MODA`.
 ///

@@ -234,6 +234,11 @@ impl Abi for Wg16 {
         module.import(index)
     }
 
+    fn reserve_host_thunk(cpu: &mut Self::Cpu) -> std::io::Result<(u16, Self::Ptr)> {
+        let index = cpu.reserve_thunks(1).map_err(std::io::Error::other)?;
+        Ok((index, cpu.thunk_address(index)))
+    }
+
     /// Delegates to `caller16` below (private, so not doc-linked from here)
     /// -- the free function this crate had as `crate::caller` in `lib.rs`
     /// before `Abi` grew a loading surface. See `caller16`'s own doc comment

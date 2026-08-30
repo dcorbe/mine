@@ -2312,8 +2312,7 @@ impl<A: Abi> PartialEq for Registration<A> {
 
 impl<A: Abi> Eq for Registration<A> {}
 
-/// A host-native handler occupying a `state` slot. One variant today; a
-/// second module (MajorMUD Plus) would add a second.
+/// A host-native handler occupying a `state` slot.
 ///
 /// Not generic -- a native handler has no module pointer of its own to vary
 /// by ABI.
@@ -2321,6 +2320,9 @@ impl<A: Abi> Eq for Registration<A> {}
 pub enum Native {
     /// The full-screen data entry engine, `FSDBBS.C`'s `inifsd()` registers.
     Fsd,
+    /// The line editor behind `bgnedt`, `EDITFSE.C`'s `init__inifse()`
+    /// registers as `fseedit`. See `crate::shims::editor`.
+    Editor,
 }
 
 /// A client/server agent that has been taken online.
