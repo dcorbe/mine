@@ -5048,6 +5048,22 @@ impl<A: Abi> Host<A> {
             .map_err(|e| ShimError::Failed(e.to_string()))?;
         shims::screen::restore_screen(self, A::mem(machine), chan)?;
 
+        // ...but leave page-LINE mode off by default. `rstrxf` above set the
+        // 22-line page pause `figlang` gives a real 24-line terminal; on a
+        // modern client with its own scrollback that only collides with
+        // modules -- like T-LORD (no `btuxnf` import, so it cannot turn GSBL
+        // paging off) -- that paginate themselves, double-prompting every
+        // screen. The pause-character, clear-pause and `hpkrou` machinery
+        // `rstrxf` installed stay (T-LORD's `^S` must still be consumed); only
+        // the line counter is disabled, exactly as a user setting a nonstop
+        // screen length would. A module that wants GSBL paging still gets it
+        // by calling `btuxnf` itself.
+        {
+            let c = self.gsbl.channel_mut(chan);
+            c.page_lines = 0;
+            c.page_message = None;
+        }
+
         let at = A::ptr_offset(account, account_layout.scnfse);
         at.write(A::mem(machine), &[who.height])
             .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -8933,6 +8949,7 @@ mod tests {
         assert_eq!(c.pause_char, 20, "btupbc(usrnum,20)");
         assert_eq!(c.clear_pause_char, 19, "btucpc(usrnum,19)");
         assert!(c.pause_handler_installed, "btuhpk(usrnum,hpkrou)");
+        assert_eq!(c.page_lines, 0, "page-LINE mode off by default -- modern-client nonstop, no double paging");
         let account = f.host.users().account(console);
         let at = Wg16::ptr_offset(account, f.host.users().account_layout().scnbrk);
         assert_eq!(mbbs_machine::ptr::ModulePtr::resolve(&at, f.machine.mem(), 1).expect("readable"), &[24], "usaptr->scnbrk=24");
