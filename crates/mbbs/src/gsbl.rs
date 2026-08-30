@@ -489,11 +489,26 @@ impl Gsbl {
     /// transport has to mint a [`Chan`] from [`Gsbl::terms`] before it can call
     /// this at all, and that is where a channel that does not exist is refused.
     pub fn push_input(&mut self, chan: Chan, bytes: &[u8]) {
+        let before = self.delivery_start(chan);
         let c = self.channel_mut(chan);
-        let before = c.input.len();
         for &byte in bytes {
             c.take(byte);
         }
+        self.wake_after_delivery(chan, before);
+    }
+
+    /// Where a delivery begins, for [`Gsbl::wake_after_delivery`] to
+    /// measure against. Its own method so [`crate::Host::push_input`] --
+    /// the delivery that runs a `btuchi` handler per byte -- brackets its
+    /// loop with the same pair this one does, rather than a second copy of
+    /// the wake-up rule.
+    pub(crate) fn delivery_start(&self, chan: Chan) -> usize {
+        self.channel(chan).input.len()
+    }
+
+    /// The end of a delivery: wake the module for raw bytes, once.
+    pub(crate) fn wake_after_delivery(&mut self, chan: Chan, before: usize) {
+        let c = self.channel_mut(chan);
         // Raw mode queues no status of its own inside `take`, so nothing would
         // ever wake the loop for these bytes. One `CYCLE` per delivery, and only
         // if one is not already waiting: the handler drains `input` completely
@@ -752,6 +767,17 @@ impl Gsbl {
     }
 }
 
+/// What [`Channel::offer`] did with a byte.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// Consumed ahead of the translate stage -- locked out, stored raw, or
+    /// counted in binary mode. Nothing more to do with it.
+    Taken,
+    /// Reached the translate stage, untouched: the caller supplies that stage
+    /// and hands its answer to [`Channel::cooked`].
+    Translate(u8),
+}
+
 /// The default input translate table, `btuxlt` page 184.
 ///
 /// In force whether or not anyone calls `btuxlt` -- which `WCCMMUD.DLL` never
@@ -788,9 +814,24 @@ impl Channel {
     /// in the original runs at interrupt level and therefore before any of
     /// these eleven steps too.
     fn take(&mut self, byte: u8) {
+        if let Offer::Translate(byte) = self.offer(byte)
+            && let Some(byte) = translate(byte)
+        {
+            self.cooked(byte);
+        }
+    }
+
+    /// Steps 2 and 3, and the raw short-circuit: everything that runs
+    /// **ahead of** the translate stage. Answers whether the byte reached
+    /// that stage, so the caller can decide what stands in for it -- the
+    /// default table ([`translate`]) or the module's own `btuchi` handler
+    /// ([`crate::Host::push_input`]). The two callers exist because the
+    /// handler is module code, which only the host can run; the pipeline on
+    /// either side of it is this one.
+    pub(crate) fn offer(&mut self, byte: u8) -> Offer {
         // 2. Input lockout. The byte never happened.
         if self.locked {
-            return;
+            return Offer::Taken;
         }
 
         // Raw mode, before everything: a keystroke is a keystroke, and the FSD
@@ -803,7 +844,7 @@ impl Channel {
             if self.input.len() < INPSIZ {
                 self.input.push_back(byte);
             }
-            return;
+            return Offer::Taken;
         }
 
         // 3. Binary mode. None of the ASCII processing applies -- a CR in
@@ -839,18 +880,27 @@ impl Channel {
                 self.status.push_back(Gsbl::INBLK);
                 self.since_trigger -= self.trigger;
             }
-            return;
+            return Offer::Taken;
         }
 
-        // 6. The default input translate table. Not optional: it is what
-        //    turns DEL into a backspace for terminals without one, drops
-        //    every other control character (a telnet client's CR NUL would
-        //    otherwise leak a NUL into the next command), and strips the
-        //    high bit (telnet IAC, 0xFF, would otherwise land in the line).
-        let Some(byte) = translate(byte) else {
-            return;
-        };
+        // 6. The translate stage -- the default table ([`translate`]): not
+        //    optional, it is what turns DEL into a backspace for terminals
+        //    without one, drops every other control character (a telnet
+        //    client's CR NUL would otherwise leak a NUL into the next
+        //    command), and strips the high bit (telnet IAC, 0xFF, would
+        //    otherwise land in the line). A `btuchi` handler stands in for
+        //    exactly this stage and nothing else: the guide's "replaces the
+        //    character translation function ... the effects of all
+        //    functions associated with ASCII input mode are still in
+        //    effect", which is why the caller, not this method, chooses.
+        Offer::Translate(byte)
+    }
 
+    /// Steps 7 to 11: what happens to a byte the translate stage let
+    /// through -- the default table's answer, or a `btuchi` handler's
+    /// return value, which the guide says passes on through the remainder of the input path untranslated (T-LORD's own handler answers `\r` to
+    /// end a line on a single keystroke, and it must arrive here as a CR).
+    pub(crate) fn cooked(&mut self, byte: u8) {
         match byte {
             // 7. Backspace. At column zero there is nothing to erase and
             //    nothing to echo -- the guide's default is to leave the

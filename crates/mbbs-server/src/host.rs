@@ -1318,7 +1318,11 @@ fn apply<A: Abi>(
                 // in someone else's session -- so they are dropped instead.
                 return Ok(());
             }
-            host.gsbl_mut().push_input(chan, &bytes);
+            // A `btuchi` handler that stops the machine surfaces the same
+            // way a stop inside `Host::connect` does: the poison is on the
+            // machine, and the next cycle reports it. Nothing to do with
+            // the outcome here.
+            host.push_input(machine, module, chan, &bytes)?;
             Ok(())
         }
         In::Disconnect { chan } => {

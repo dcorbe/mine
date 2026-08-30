@@ -1268,6 +1268,17 @@ pub struct Host<A: Abi> {
     /// in a global, neither of which is channel-scoped.
     pub(crate) tasks: Vec<A::Ptr>,
 
+    /// Each channel's `btuchi` input character interceptor, `None` where
+    /// none is installed. Per channel, unlike `tasks`: `btuchi(chan, rou)`
+    /// is a channel setting (`CHARIN` in `BRKTHU.H:69`'s `btuchs` list),
+    /// and `bturst` clears it with the rest -- [`Host::rstchn`] does.
+    ///
+    /// Held here rather than in [`gsbl::Channel`] because it is the one
+    /// per-channel setting that is a module address, and `Channel` is
+    /// deliberately not generic over the ABI. [`Host::push_input`] is what
+    /// runs it.
+    pub(crate) chi: Vec<Option<A::Ptr>>,
+
     /// Whether each of DOS's five pre-opened standard handles is currently
     /// in binary mode, for `shims::crt::setmode`/`read`/`write` -- Borland's
     /// low-level POSIX-shaped `int handle` I/O, not the `FILE *` streams
@@ -1793,6 +1804,7 @@ impl<A: Abi> Host<A> {
         // `terms`, because what the module bounds its own loops by is the word
         // in the segment, not the value this function meant to write there.
         let gsbl = gsbl::Gsbl::new(terms);
+        let chi_slots = usize::from(gsbl.terms().count());
         let nterms = globals
             .word_mem(A::mem_ref(machine), "nterms")
             .map_err(|e| io::Error::other(format!("nterms: {e}")))?;
@@ -1896,6 +1908,7 @@ impl<A: Abi> Host<A> {
             kicks: Vec::new(),
             rtirs: Vec::new(),
             tasks: Vec::new(),
+            chi: vec![None; chi_slots],
             stdio_modes: [false; 5],
             tfscan: shims::tfscan::TfScan::default(),
             polls_left: 0,
@@ -3839,6 +3852,67 @@ impl<A: Abi> Host<A> {
     ///
     /// If a task's own call tree fails in a way [`Host::run`] reports as an
     /// error rather than a poisoning.
+    /// Bytes have arrived from the terminal for `chan` -- [`gsbl::Gsbl::push_input`]
+    /// with the module's own `btuchi` handler standing in for the translate
+    /// stage when one is installed.
+    ///
+    /// The handler is `char (*rouadr)(int chan, int c)`: called once per
+    /// byte that reaches the translate stage (a locked, raw or binary-mode
+    /// channel never gets that far -- [`gsbl::Channel::offer`]), with the
+    /// byte exactly as the wire delivered it, high bit and all. Its answer
+    /// is the character that continues down the pipeline; `0` swallows the
+    /// byte, the same as the default table dropping a control character.
+    /// Neither the guide nor the vendor's own handler (`fsdchi`,
+    /// `FSDBBS.C:333`, which returns 0 for everything it consumed) translate
+    /// the answer again.
+    ///
+    /// Why here and not in `Gsbl`: the handler is module code, and running
+    /// it needs `machine` and `module` -- which the driver thread holds at
+    /// the moment it delivers input (`mbbs-server`'s `apply`, `In::Input`),
+    /// the same way it holds them for [`Host::connect`]. That is the whole of
+    /// what `btuchi` refused for before: not a wall, a missing method here.
+    ///
+    /// # Errors
+    ///
+    /// As [`Host::run`]'s. A handler that stops the machine comes back as
+    /// `Some(Outcome::Stopped)` and the rest of the delivery is dropped --
+    /// there is no machine left to run it through.
+    pub fn push_input(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        chan: Chan,
+        bytes: &[u8],
+    ) -> io::Result<Option<Outcome<A>>> {
+        let Some(rou) = self.chi[chan.index()] else {
+            self.gsbl.push_input(chan, bytes);
+            return Ok(None);
+        };
+        let before = self.gsbl.delivery_start(chan);
+        for &byte in bytes {
+            let gsbl::Offer::Translate(byte) = self.gsbl.channel_mut(chan).offer(byte) else {
+                continue;
+            };
+            let args = [
+                crate::abi::Arg::Int(A::Int::from(chan.number() as u16)),
+                crate::abi::Arg::Int(A::Int::from(u16::from(byte))),
+            ];
+            match self.run(machine, module, rou, &args, Some(chan))? {
+                Outcome::Returned { lo, .. } => {
+                    // A `char` comes back in AL; whatever the rest of the
+                    // register holds is the callee's business, not the byte.
+                    let answer = lo as u8;
+                    if answer != 0 {
+                        self.gsbl.channel_mut(chan).cooked(answer);
+                    }
+                }
+                stopped @ Outcome::Stopped(_) => return Ok(Some(stopped)),
+            }
+        }
+        self.gsbl.wake_after_delivery(chan, before);
+        Ok(None)
+    }
+
     fn prctask(
         &mut self,
         machine: &mut A::Cpu,
@@ -5031,6 +5105,7 @@ impl<A: Abi> Host<A> {
         // above clear the module's view of the channel while GSBL's view keeps
         // the previous player's buffers and terminal settings.
         self.gsbl.reset(chan);
+        self.chi[chan.index()] = None;
         Ok(())
     }
 
@@ -8641,6 +8716,127 @@ mod tests {
         assert_eq!(f.host.prctask(&mut f.machine, &module, &mut fired).expect("ran"), None);
         assert_eq!(fired, 2, "and again -- a task is not consumed the way a kick is");
         assert_eq!(f.host.tasks.len(), 1, "and stays registered");
+    }
+
+    /// A `char (*)(int chan, int c)` in real 16-bit code, at `count`
+    /// channels. Far-called cdecl: `[bp+6]` is `chan`, `[bp+8]` is `c`, the
+    /// answer goes back in `AX`.
+    fn interceptor_fixture(count: u16, code: &[u8]) -> (crate::testing::Fixture, mbbs_machine::m16::Module, FarPtr) {
+        let mut f = crate::testing::Fixture::rooted_with_terms(testing::data(), Terms::new(count));
+        let module = f.minimal_module();
+        f.machine.load_code(code).expect("the handler fits");
+        let rou = f.machine.code_ptr(0);
+        (f, module, rou)
+    }
+
+    /// `push bp; mov bp,sp; mov ax,[bp+8]; inc ax; pop bp; retf` -- answers
+    /// `c + 1`, which shows both that `c` arrived and that the answer is what
+    /// continues down the pipeline.
+    const PLUS_ONE: &[u8] = &[0x55, 0x8b, 0xec, 0x8b, 0x46, 0x08, 0x40, 0x5d, 0xcb];
+    /// `push bp; mov bp,sp; mov ax,[bp+6]; pop bp; retf` -- answers `chan`.
+    const CHAN_AS_CHAR: &[u8] = &[0x55, 0x8b, 0xec, 0x8b, 0x46, 0x06, 0x5d, 0xcb];
+    /// `xor ax,ax; retf` -- swallows everything, as the vendor's `fsdchi` does.
+    const SWALLOW: &[u8] = &[0x31, 0xc0, 0xcb];
+    /// `mov ax,0x0d; retf` -- T-LORD's hot-key idiom: every key ends the line.
+    const ANSWER_CR: &[u8] = &[0xb8, 0x0d, 0x00, 0xcb];
+    /// `ud2` -- a handler that faults.
+    const FAULT: &[u8] = &[0x0f, 0x0b];
+
+    #[test]
+    fn push_input_without_an_interceptor_is_the_plain_pipeline() {
+        let (mut f, module, _) = interceptor_fixture(1, PLUS_ONE);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        // DEL goes through the default table (-> backspace) because nothing
+        // stands in for it.
+        f.host.push_input(&mut f.machine, &module, chan, b"ab\x7f\r").expect("delivered");
+        assert_eq!(f.host.gsbl_mut().take_line(chan).as_deref(), Some(&b"a"[..]));
+    }
+
+    #[test]
+    fn the_interceptor_replaces_the_translate_stage_and_its_answer_is_not_translated_again() {
+        let (mut f, module, rou) = interceptor_fixture(1, PLUS_ONE);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        f.host.chi[chan.index()] = Some(rou);
+        // 'a' -> 'b'; DEL (0x7f) -> 0x80, which the default table would have
+        // stripped the high bit off, and which reaches the line intact.
+        let outcome = f.host.push_input(&mut f.machine, &module, chan, b"a\x7f").expect("delivered");
+        assert!(outcome.is_none(), "the handler returned");
+        assert_eq!(f.host.gsbl().channel(chan).line, b"b\x80");
+    }
+
+    #[test]
+    fn the_interceptor_is_told_which_channel() {
+        let (mut f, module, rou) = interceptor_fixture(2, CHAN_AS_CHAR);
+        let terms = f.host.gsbl().terms();
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+        f.host.chi[zero.index()] = Some(rou);
+        f.host.chi[one.index()] = Some(rou);
+        f.host.push_input(&mut f.machine, &module, zero, b"a").expect("delivered");
+        f.host.push_input(&mut f.machine, &module, one, b"a").expect("delivered");
+        assert_eq!(f.host.gsbl().channel(zero).line, b"", "channel 0's answer is 0: swallowed");
+        assert_eq!(f.host.gsbl().channel(one).line, b"\x01", "channel 1's answer is 1");
+    }
+
+    #[test]
+    fn an_answer_of_zero_swallows_the_byte_without_echo() {
+        let (mut f, module, rou) = interceptor_fixture(1, SWALLOW);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        f.host.chi[chan.index()] = Some(rou);
+        f.host.push_input(&mut f.machine, &module, chan, b"abc\r").expect("delivered");
+        let c = f.host.gsbl().channel(chan);
+        assert_eq!(c.line, b"");
+        assert!(c.ready.is_empty(), "the CR was swallowed too: no line");
+        assert!(c.output.is_empty(), "nothing accepted, nothing echoed");
+    }
+
+    /// T-LORD's hot-key idiom: the handler stashes the key itself and answers
+    /// CR, so one keystroke ends an (empty) line and the module's `sttrou`
+    /// runs at once.
+    #[test]
+    fn an_answer_of_cr_ends_the_line_on_a_single_keystroke() {
+        let (mut f, module, rou) = interceptor_fixture(1, ANSWER_CR);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        f.host.chi[chan.index()] = Some(rou);
+        f.host.push_input(&mut f.machine, &module, chan, b"x").expect("delivered");
+        assert_eq!(f.host.gsbl_mut().take_line(chan).as_deref(), Some(&b""[..]));
+        assert_eq!(f.host.gsbl_mut().next_status(chan), Some(gsbl::Gsbl::CRSTG));
+    }
+
+    #[test]
+    fn a_locked_or_raw_channel_never_consults_the_interceptor() {
+        let (mut f, module, rou) = interceptor_fixture(1, PLUS_ONE);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        f.host.chi[chan.index()] = Some(rou);
+
+        f.host.gsbl_mut().channel_mut(chan).locked = true;
+        f.host.push_input(&mut f.machine, &module, chan, b"a").expect("delivered");
+        assert_eq!(f.host.gsbl().channel(chan).line, b"", "locked: the byte never happened");
+
+        f.host.gsbl_mut().channel_mut(chan).locked = false;
+        f.host.gsbl_mut().channel_mut(chan).raw = true;
+        f.host.push_input(&mut f.machine, &module, chan, b"a").expect("delivered");
+        let c = f.host.gsbl().channel(chan);
+        assert_eq!(c.line, b"", "raw: not cooked at all");
+        assert_eq!(c.input.iter().copied().collect::<Vec<u8>>(), b"a", "raw: stored as it came, not as 'b'");
+    }
+
+    #[test]
+    fn a_handler_that_stops_the_machine_comes_back_as_stopped() {
+        let (mut f, module, rou) = interceptor_fixture(1, FAULT);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        f.host.chi[chan.index()] = Some(rou);
+        let outcome = f.host.push_input(&mut f.machine, &module, chan, b"ab").expect("an io::Result, not an error");
+        assert!(matches!(outcome, Some(Outcome::Stopped(_))), "{outcome:?}");
+    }
+
+    #[test]
+    fn rstchn_clears_the_interceptor_with_the_rest_of_the_channel() {
+        let (mut f, _, rou) = interceptor_fixture(1, PLUS_ONE);
+        let chan = f.host.gsbl().terms().chan(0).expect("channel 0");
+        f.host.chi[chan.index()] = Some(rou);
+        f.host.rstchn(&mut f.machine, chan).expect("reset");
+        assert_eq!(f.host.chi[chan.index()], None, "the next caller must not inherit it");
     }
 
     #[test]

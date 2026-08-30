@@ -1205,96 +1205,33 @@ pub fn btuche<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// pipeline (backspace handling, line assembly, echo, ...). A `NULL`
 /// `rouadr` de-installs it.
 ///
-/// # The wall, stated precisely -- not "no shim can ever invoke a callback"
+/// Records the pointer in [`Host::chi`](crate::Host) and answers `0`;
+/// [`crate::Host::push_input`] runs it, per byte, from the driver thread --
+/// the one place that holds the module at the moment input arrives. That
+/// is the `initask`/`prctask` shape this routine's refusal used to name as
+/// the model: the shim remembers, the host calls back.
 ///
-/// A shim genuinely cannot call *synchronously* into a module: `Call` holds
-/// only `cpu`, so a routine dispatched through the shim table has no
-/// `A::Module` to run against, ever. But this host already routes around
-/// that for a different callback, and the precise version of the wall has
-/// to say why the same route does not reach here.
-///
-/// [`crate::shims::task::initask`] does not refuse: it appends the far
-/// pointer it is handed to `host.tasks` and returns success, and
-/// [`Host::prctask`] (`lib.rs`) later calls `self.run(machine, module,
-/// task, ...)` for every one of them -- it can, because `Host::cycle`,
-/// which calls `prctask`, is invoked by the driver thread
-/// (`crates/mbbs-server/src/host.rs`) with both `machine` and `module`
-/// already in scope; the shim only ever had to remember the pointer, not
-/// invoke it. That is a real, working precedent for "record now, call back
-/// later from somewhere that has `A::Module`" -- not a wall this host
-/// cannot route around in general.
-///
-/// What `btuchi` is missing is not that precedent's *shape*, it is a place
-/// for that shape to attach to: `prctask` exists because `Host::cycle`
-/// already sweeps `host.tasks` once every cycle, on its own schedule. A
-/// character interceptor does not fire once a cycle -- it fires **on
-/// arrival**, from `Channel::take` (`crates/mbbs/src/gsbl.rs`), which is
-/// driven directly by the transport layer's `push_input`, not by
-/// `Host::cycle` and not by anything holding `A::Module`. There is no
-/// per-character equivalent of `tasks`/`prctask` today. Building one would
-/// mean giving the input-cooking path the same treatment `initask` gets --
-/// record the pointer somewhere `Host::cycle` (or a new per-character sweep
-/// with the same access) can reach, and invoke it from there instead of
-/// from `Channel::take` directly. That is real work on the input path,
-/// which this task does not do -- it is out of scope here, the same way it
-/// was named out of scope when this refusal was written, and the shape
-/// above is recorded so the next task that does take it on does not have
-/// to rediscover `initask`/`prctask` as the model.
-///
-/// # Why this still refuses at install, now that recording is possible
-///
-/// `crate::gsbl::Channel` is in scope for this task (see `btutru`'s own
-/// revision), so storing *something* at install time is no longer
-/// physically blocked the way it was in this routine's first version. Two
-/// reasons this still refuses rather than recording `rouadr` and deferring
-/// the refusal to the first character, the way [`btuche`] now defers to a
-/// flag nothing reads:
-///
-/// 1. **`Channel` is not generic over `A`.** `host.tasks: Vec<A::Ptr>`
-///    works because `Host<A>` is generic and can hold a typed pointer per
-///    ABI; `Channel` holds concrete `u8`/`u16`/`bool` fields shared by both
-///    ABIs, precisely so it does not need to be. Storing a genuinely
-///    invokable `A::Ptr` here would need `Channel` (or `Gsbl`) to grow an
-///    ABI parameter -- a structural change to every existing field's
-///    owner, not a task-sized addition next to `chi_notify_on_idle`.
-/// 2. **The consequence of a wrong deferral is worse here than `btuche`'s.**
-///    `btuche`'s flag gates one *additional* notification nothing else
-///    depends on; recording it and never firing it changes nothing else
-///    about the channel. `btuchi`'s callback *replaces* the translate-table
-///    stage of every character's processing from then on (the guide is
-///    explicit: "Our character handler routine replaces the character
-///    translation function... However, the effects of all functions
-///    associated with ASCII input mode are still in effect" -- guide page
-///    46). A module that installed one and got `0` back would believe
-///    every subsequent keystroke is running through its own logic; this
-///    host would silently keep running the default translate table
-///    instead, with no error at the moment that stops mattering and no
-///    error ever, for as long as the channel lives. That is an active,
-///    continuous divergence from what the caller was told succeeded, not
-///    an inert flag -- refusing at the one moment this host can still be
-///    honest about it is the smaller failure.
+/// What a real one does with it, so the contract is not guessed: T-LORD's
+/// handler (`RTSLORD.DLL` RVA `0x26e5`, 4 install sites and 3 `NULL`
+/// uninstalls) masks the byte to 7 bits, and in its hot-key modes stashes
+/// the key in the player's record and returns `\r` -- so GSBL ends the
+/// line on that single keystroke and `sttrou` reads the stashed key. A
+/// line-oriented host driving a single-key game, through exactly this hook.
 ///
 /// A channel out of range still refuses with the ordinary `-11`, ahead of
-/// the capability question, matching every other routine in this file.
+/// everything else, matching every other routine in this file.
+///
+/// `btuche`'s `c == -1` output-idle notification into this handler is
+/// still recorded and never fired -- see [`btuche`]. T-LORD turns it off
+/// (`btuche(chan, 0)`) before every install.
 pub fn btuchi<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
     let rouadr = call.ptr();
-    if host.gsbl().terms().chan(chan).is_none() {
+    let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
-    }
-    Err(ShimError::Failed(format!(
-        "btuchi({chan}, {rouadr}): this host has no per-character equivalent \
-         of shims::task::initask's tasks/Host::prctask arrangement -- \
-         Channel::take fires on every byte the transport layer delivers, \
-         not once a cycle from Host::cycle, so there is nowhere with \
-         A::Module access to invoke this from, and building one is input-\
-         path work outside this task. Even setting invocation aside, the \
-         callback replaces the translate-table stage of every future \
-         character (guide page 46) rather than gating an optional feature, \
-         so recording success now and silently keeping the default \
-         pipeline would be an active, continuing divergence from what this \
-         call told the caller succeeded -- worse than refusing here"
-    )))
+    };
+    host.chi[chan.index()] = (rouadr != A::null_ptr()).then_some(rouadr);
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
 
 /// `int btutru(int chan, char trunch)` -- set the output-abort character
@@ -2713,18 +2650,29 @@ mod tests {
     }
 
     #[test]
-    fn btuchi_refuses_on_a_valid_channel_and_names_the_input_path_gap() {
+    fn btuchi_records_the_interceptor_per_channel_and_null_uninstalls() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let terms = f.host.gsbl().terms();
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+        let rou = mbbs_machine::m16::FarPtr { offset: 0x0010, selector: 0x1234 };
+
+        assert_eq!(f.host.chi[zero.index()], None, "nothing installed by default");
+        let ret = f.invoke(btuchi, &[1, rou.offset, rou.selector]).expect("installs");
+        assert_eq!(ret, Ret::U16(0));
+        assert_eq!(f.host.chi[one.index()], Some(rou), "channel 1 has it");
+        assert_eq!(f.host.chi[zero.index()], None, "channel 0 does not");
+
+        f.invoke(btuchi, &[1, 0, 0]).expect("NULL uninstalls");
+        assert_eq!(f.host.chi[one.index()], None);
+    }
+
+    #[test]
+    fn btuchi_answers_the_ordinary_code_for_a_channel_this_host_does_not_have() {
         let mut f = Fixture::new();
-        // rouadr as a far pointer: offset 0x0010, segment 0x1234 -- the same
-        // shape btuhpk's own test uses for its (deliberately unread) handler
-        // pointer.
-        let e = f
-            .invoke(btuchi, &[0, 0x0010, 0x1234])
-            .expect_err("no per-character equivalent of tasks/Host::prctask exists");
-        let msg = e.to_string();
-        assert!(msg.contains("btuchi"), "{msg}");
-        assert!(msg.contains("1234:0010"), "must name the far pointer it was handed: {msg}");
-        assert!(msg.contains("initask"), "{msg}");
+        let ret = f.invoke(btuchi, &[7, 0x0010, 0x1234]).expect("answers, does not stop");
+        assert_eq!(ret, Ret::U16(OUT_OF_RANGE));
+        assert!(f.host.chi.iter().all(Option::is_none));
     }
 
     /// Mirrors `btupbc_and_btucpc_record_their_characters`: `trunch` is
