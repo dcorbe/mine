@@ -1640,9 +1640,9 @@ pub fn vtmsend<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// `CHAR *gmdnam(CHAR *mdfnam)` -- `GCOMM.H:954-956` -- a module's name, out
 /// of its `.MDF`.
 ///
-/// The real one (`MAJORBBS.C:1137`) opens the file, finds the line beginning
-/// `Module Name:`, unpads it and returns a pointer past the label into its own
-/// static buffer. This does the same into a buffer the host owns, so the
+/// The real one (`INTEGROU.C:1532`) opens the file, finds the line that
+/// `sameto("Module Name:",...)` -- case-insensitively -- unpads it and
+/// returns `skpwht` past the label into its own static buffer. This does the same into a buffer the host owns, so the
 /// pointer the module keeps stays valid.
 ///
 /// A file it cannot open is `catastro` in the original. Here it stops the
@@ -1661,11 +1661,14 @@ pub fn gmdnam<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let text = std::fs::read_to_string(&path)
         .map_err(|e| ShimError::Failed(format!("gmdnam: {}: {e}", path.display())))?;
 
-    const LABEL: &str = "Module Name:";
+    // `sameto("Module Name:",tmpbuf)` -- a case-insensitive prefix, so the
+    // nine corpus MDFs written `Module name:` (T-LORD, ELWFAZ, ELWKYR,
+    // CXO-LORD) find their name as they do under the real host.
+    const LABEL: &[u8] = b"Module Name:";
     let module = text
         .lines()
-        .find_map(|line| line.strip_prefix(LABEL))
-        .map(str::trim)
+        .find(|line| crate::strings::sameto(LABEL, line.as_bytes()))
+        .map(|line| line[LABEL.len()..].trim_matches(' ').trim_end())
         .ok_or_else(|| ShimError::Failed(format!("gmdnam: no module name in {name}")))?;
 
     let at = host.mdf_buffer();
@@ -3456,6 +3459,21 @@ mod tests {
         let mut f = Fixture::new();
         let name = f.text("sample.mdf");
         assert!(f.invoke(gmdnam, &Fixture::far(name)).is_ok());
+    }
+
+    #[test]
+    fn gmdnam_matches_the_label_in_whatever_case_the_vendor_wrote_it() {
+        // RTSLORD.MDF: "Module name: -= T-LORD =-" -- lowercase n, and the
+        // real host's `sameto` does not care.
+        let root = crate::testing::scratch("gmdnam_lowercase_label");
+        std::fs::write(root.join("LOWER.MDF"), "; LOWER.MDF\r\n\r\nModule name: -= T-LORD =-\r\n\r\nDeveloper: RTSoft\r\n")
+            .expect("write");
+        let mut f = Fixture::rooted(root);
+        let name = f.text("LOWER.MDF");
+        let Ret::Far(at) = f.invoke(gmdnam, &Fixture::far(name)).expect("read") else {
+            panic!("gmdnam returns a pointer");
+        };
+        assert_eq!(f.read(at), "-= T-LORD =-");
     }
 
     #[test]
