@@ -881,7 +881,17 @@ pub(crate) fn duplicate_key<A: Abi>(
         if key.duplicates {
             continue;
         }
-        let value = key.extract(bytes);
+        // Extract the key off the *keyed* record, not the bare bytes: a key's
+        // `offset` field is measured from the physical slot, so on v6 it sits
+        // two bytes ahead of `Record::bytes`. `Block::keyed` pads that gap --
+        // the same shift `insert_v6` applies before it computes the very key
+        // this pre-check races (`lib.rs`, `value = key.extract(keyed_bytes)`).
+        // Without it a v6 key landed two bytes late, read past the record into
+        // zero padding, and reported an all-zero key that collided with
+        // nothing that was really there -- which is what turned The Rose's
+        // first character save into a spurious `dfaInsert` duplicate.
+        let keyed = file.keyed(bytes);
+        let value = key.extract(&keyed);
         let found = match file.query(key.number, EngineOp::Equal, &value) {
             Ok(found) => found,
             Err(e) => {
