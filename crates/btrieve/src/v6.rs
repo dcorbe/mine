@@ -358,6 +358,55 @@ pub(crate) mod gap {
         })?;
         Ok(naive + shift)
     }
+
+    /// The naive (gapless) page a `real` file page corresponds to -- the
+    /// inverse of [`real_page`], for writing a page number back into an
+    /// allocation-table entry, which stores naive numbers the reader turns
+    /// real again. Identity below the threshold.
+    ///
+    /// # Errors
+    ///
+    /// If `real` falls *inside* the reserve gap itself -- the reserved pages
+    /// between block 30's end and block 31's shifted start, which no logical
+    /// page is ever stored at, so a caller handing one in has a real page
+    /// that could not have come from a naive one; or if the page size does
+    /// not divide the reserve (as [`real_page`]).
+    pub(crate) fn naive_page(real: usize, page_size: usize) -> Result<usize, String> {
+        let threshold = threshold_page(page_size);
+        if real < threshold {
+            return Ok(real);
+        }
+        let shift = reserve_pages(page_size).ok_or_else(|| {
+            format!(
+                "physical page {real} is past block 31's reserve gap, but a {page_size}-byte \
+                 page does not divide the engine's 4096-byte reserve -- unmeasured"
+            )
+        })?;
+        if real < threshold + shift {
+            return Err(format!(
+                "physical page {real} is inside block 31's {shift}-page reserve gap \
+                 ({threshold}..{}), which no logical page is ever stored at",
+                threshold + shift
+            ));
+        }
+        Ok(real - shift)
+    }
+
+    /// Whether `real` sits inside block 31's reserve region -- the pages the
+    /// naive numbering skips over, so no live logical page is ever homed
+    /// there. A page-reuse scan must exclude these: an aged file (RCI_MOD1)
+    /// leaves stale, abandoned pages in the reserve, and reusing one would
+    /// home a live logical id at a real page [`naive_page`] cannot name.
+    /// Never true when the page size does not divide the reserve (no
+    /// whole-page region to exclude; such a file is refused past the
+    /// threshold anyway).
+    pub(crate) fn in_reserve(real: usize, page_size: usize) -> bool {
+        let threshold = threshold_page(page_size);
+        match reserve_pages(page_size) {
+            Some(shift) => real >= threshold && real < threshold + shift,
+            None => false,
+        }
+    }
 }
 
 impl Store {
@@ -1652,12 +1701,22 @@ impl Map {
     /// [`Self::read`] reads headers rather than pages.
     fn pair_of(store: &mut Store, page_size: usize, index: usize) -> Result<(usize, usize), String> {
         let pages = store.total_pages();
-        let (first, _) = Self::pair_position(page_size, index);
-        if first + 1 >= pages {
+        let (first_naive, second_naive) = Self::pair_position(page_size, index);
+        // The allocation table numbers pages in a gapless space; the real file
+        // inserts a 4 KiB reserve before block 31, so a block from 31 on sits
+        // `gap::real_page` later. `Map::read` maps the same way -- `pair_of`
+        // skipping it looked for block 32 at its naive 3970 (a data page)
+        // instead of its real 3978 and refused a live block, which is what
+        // stopped The Rose's finrou dfaupdate on rci_mod1.dat. The pair never
+        // straddles the threshold (a block's two pages are consecutive, and
+        // the threshold is block 31's own first page), so both halves shift
+        // together and `second` stays `first + 1`.
+        let first = gap::real_page(first_naive, page_size)?;
+        let second = gap::real_page(second_naive, page_size)?;
+        if second >= pages {
             return Err(format!(
                 "allocation-table block {index} would have its shadow pair at \
-                 physical {first} and {}, past the end of a {pages}-page file",
-                first + 1
+                 physical {first} and {second}, past the end of a {pages}-page file"
             ));
         }
         let word = |store: &mut Store, page: usize, offset: usize| -> Result<u16, String> {
@@ -1668,11 +1727,10 @@ impl Map {
             Ok(store.header(page)?[..2] == *MAGIC)
         };
 
-        if !(magic(store, first)? || magic(store, first + 1)?) {
+        if !(magic(store, first)? || magic(store, second)?) {
             return Err(format!(
-                "neither physical page {first} nor {} carries the \"PP\" \
-                 allocation-table magic -- there is no block {index} there",
-                first + 1
+                "neither physical page {first} nor {second} carries the \"PP\" \
+                 allocation-table magic -- there is no block {index} there"
             ));
         }
         // The self-index at 0x02 is deliberately not checked -- position is
@@ -1680,9 +1738,9 @@ impl Map {
         // on-disk word (see `read`'s comment at its `blocks.insert`, with the
         // `W32MKDE_decompiled.c:13571` citation and the `RCI_MOD1.DAT`
         // counter-example a self-index refusal rejected).
-        match word(store, first, GENERATION)?.cmp(&word(store, first + 1, GENERATION)?) {
-            std::cmp::Ordering::Greater => Ok((first + 1, first)),
-            std::cmp::Ordering::Less => Ok((first, first + 1)),
+        match word(store, first, GENERATION)?.cmp(&word(store, second, GENERATION)?) {
+            std::cmp::Ordering::Greater => Ok((second, first)),
+            std::cmp::Ordering::Less => Ok((first, second)),
             std::cmp::Ordering::Equal => Err(format!(
                 "both copies of block {index} claim generation {}, and there is \
                  no rule measured for choosing between them",
@@ -1844,11 +1902,15 @@ impl Map {
         let live_page = store.page(live)?.to_vec();
         store.write_page(stale, &live_page)?;
 
+        // The entry stores the *naive* page; the reader turns it real again
+        // (`gap::real_page`). The notes below stay real -- they index the file.
+        let new_physical_naive16 = u16::try_from(gap::naive_page(new_physical, page_size_usize)?)
+            .map_err(|_| format!("naive page for physical {new_physical} does not fit in u16"))?;
         let stale_bytes = store.page_mut(stale)?;
         let entry_at_new = ENTRIES + free_entry * ENTRY;
         let marker = u16::from_le_bytes([tag[0], tag[1]]);
         stale_bytes[entry_at_new..entry_at_new + 2].copy_from_slice(&marker.to_le_bytes());
-        stale_bytes[entry_at_new + 2..entry_at_new + 4].copy_from_slice(&new_physical16.to_le_bytes());
+        stale_bytes[entry_at_new + 2..entry_at_new + 4].copy_from_slice(&new_physical_naive16.to_le_bytes());
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
         store.note_page_logical(usize::from(new_physical16), new_logical16);
@@ -2032,7 +2094,14 @@ impl Map {
                  there is nothing to relocate"
             ));
         }
-        let claimed_physical = usize::from(u16::from_le_bytes([live_bytes[at + 2], live_bytes[at + 3]]));
+        // The entry stores a *naive* page number; as a real file page index it
+        // must go through the reserve gap, exactly as `Map::read` does
+        // (`gap::real_page`). Below block 31 this is the identity; past it,
+        // reading it raw addressed a page eight too low.
+        let claimed_physical = gap::real_page(
+            usize::from(u16::from_le_bytes([live_bytes[at + 2], live_bytes[at + 3]])),
+            page_size_usize,
+        )?;
 
         let header = store.header(live)?;
         let new_generation = u16::from_le_bytes([header[GENERATION], header[GENERATION + 1]]).wrapping_add(1);
@@ -2084,7 +2153,7 @@ impl Map {
         // not once per relocation within it.
         let mut twin = None;
         for page in 4..pages {
-            if page == claimed_physical || claimed[page] {
+            if page == claimed_physical || claimed[page] || gap::in_reserve(page, page_size_usize) {
                 continue;
             }
             // `logical_at` answers `0` for the `"PP"` allocation-table pages,
@@ -2116,9 +2185,14 @@ impl Map {
         let live_page = store.page(live)?.to_vec();
         store.write_page(stale, &live_page)?;
 
+        // The entry stores the *naive* page; the reader turns it real again
+        // (`gap::real_page`). Storing the real page put a block-31+ id's home
+        // eight pages too high. The notes below stay real -- they index the file.
+        let new_physical_naive16 = u16::try_from(gap::naive_page(new_physical, page_size_usize)?)
+            .map_err(|_| format!("naive page for physical {new_physical} does not fit in u16"))?;
         let stale_bytes = store.page_mut(stale)?;
         let repoint = ENTRIES + entry * ENTRY;
-        stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
+        stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical_naive16.to_le_bytes());
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
         store.note_page_logical(usize::from(new_physical16), logical16);
@@ -2164,7 +2238,14 @@ impl Map {
                  there is nothing to retire"
             ));
         }
-        let claimed_physical = usize::from(u16::from_le_bytes([live_bytes[at + 2], live_bytes[at + 3]]));
+        // The entry stores a *naive* page number; as a real file page index it
+        // must go through the reserve gap, exactly as `Map::read` does
+        // (`gap::real_page`). Below block 31 this is the identity; past it,
+        // reading it raw addressed a page eight too low.
+        let claimed_physical = gap::real_page(
+            usize::from(u16::from_le_bytes([live_bytes[at + 2], live_bytes[at + 3]])),
+            page_size_usize,
+        )?;
 
         let header = store.header(live)?;
         let new_generation = u16::from_le_bytes([header[GENERATION], header[GENERATION + 1]]).wrapping_add(1);
@@ -2250,7 +2331,14 @@ impl Map {
                  retired to reclaim"
             ));
         }
-        let claimed_physical = usize::from(u16::from_le_bytes([live_bytes[at + 2], live_bytes[at + 3]]));
+        // The entry stores a *naive* page number; as a real file page index it
+        // must go through the reserve gap, exactly as `Map::read` does
+        // (`gap::real_page`). Below block 31 this is the identity; past it,
+        // reading it raw addressed a page eight too low.
+        let claimed_physical = gap::real_page(
+            usize::from(u16::from_le_bytes([live_bytes[at + 2], live_bytes[at + 3]])),
+            page_size_usize,
+        )?;
 
         let header = store.header(live)?;
         let new_generation = u16::from_le_bytes([header[GENERATION], header[GENERATION + 1]]).wrapping_add(1);
@@ -2262,7 +2350,7 @@ impl Map {
         store.mark_claimed(page_size, &mut claimed)?;
         let mut twin = None;
         for page in 4..pages {
-            if page == claimed_physical || claimed[page] {
+            if page == claimed_physical || claimed[page] || gap::in_reserve(page, page_size_usize) {
                 continue;
             }
             // `logical_at` answers `0` for the `"PP"` allocation-table pages,
@@ -2291,11 +2379,15 @@ impl Map {
         let live_page = store.page(live)?.to_vec();
         store.write_page(stale, &live_page)?;
 
+        // The entry stores the *naive* page; the reader turns it real again
+        // (`gap::real_page`). The notes below stay real -- they index the file.
+        let new_physical_naive16 = u16::try_from(gap::naive_page(new_physical, page_size_usize)?)
+            .map_err(|_| format!("naive page for physical {new_physical} does not fit in u16"))?;
         let stale_bytes = store.page_mut(stale)?;
         let repoint = ENTRIES + entry * ENTRY;
         let new_marker = u16::from_le_bytes([tag[0], tag[1]]);
         stale_bytes[repoint..repoint + 2].copy_from_slice(&new_marker.to_le_bytes());
-        stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical16.to_le_bytes());
+        stale_bytes[repoint + 2..repoint + 4].copy_from_slice(&new_physical_naive16.to_le_bytes());
         stale_bytes[GENERATION..GENERATION + 2].copy_from_slice(&new_generation.to_le_bytes());
 
         store.note_page_logical(usize::from(new_physical16), logical16);
@@ -2477,6 +2569,54 @@ mod tests {
             let below = gap::threshold_page(ps) - 1;
             assert_eq!(gap::real_page(below, ps).unwrap(), below);
         }
+    }
+
+    #[test]
+    fn naive_page_is_the_inverse_of_real_page() {
+        // Below the threshold it is the identity; above the shifted threshold
+        // it undoes the reserve; inside the gap itself no logical page lives,
+        // so it refuses rather than invent one. This is what the write path
+        // stores back into an allocation-table entry.
+        for &ps in &[512usize, 1024, 2048, 4096] {
+            let t = gap::threshold_page(ps);
+            assert_eq!(gap::naive_page(0, ps).unwrap(), 0);
+            assert_eq!(gap::naive_page(t - 1, ps).unwrap(), t - 1, "below threshold is identity");
+            for naive in [t - 1, t, t + 1, t + 500] {
+                let real = gap::real_page(naive, ps).unwrap();
+                assert_eq!(gap::naive_page(real, ps).unwrap(), naive, "real_page then naive_page round-trips");
+            }
+            // The first reserved page sits inside the gap and has no naive form.
+            assert!(gap::naive_page(t, ps).is_err(), "a page inside the reserve has no naive preimage");
+        }
+    }
+
+    #[test]
+    fn pair_of_finds_a_block_past_the_reserve_gap() {
+        // Regression for The Rose's finrou dfaupdate on rci_mod1.dat: block
+        // 32's shadow pair lives at its gap-shifted real pages (3978/3979 at
+        // 512-byte pages), not the naive formula position (3970/3971).
+        // `pair_of` skipping `gap::real_page` looked at 3970 -- a data page --
+        // and refused a live block. The magic is placed ONLY at the real pair,
+        // so the pre-fix formula finds nothing there: this fails without the
+        // gap conversion.
+        const PAGE: usize = 512;
+        let (naive_first, _) = Map::pair_position(PAGE, 32);
+        assert_eq!(naive_first, 3970, "block 32's naive first page");
+        let real_first = gap::real_page(naive_first, PAGE).unwrap();
+        assert_eq!(real_first, 3978, "shifted past block 31's reserve");
+
+        let mut file = vec![0u8; (real_first + 2) * PAGE];
+        // Live copy (3978) carries the higher generation.
+        for (page, generation) in [(real_first, 2u16), (real_first + 1, 1u16)] {
+            let at = page * PAGE;
+            file[at..at + 2].copy_from_slice(MAGIC);
+            file[at + GENERATION..at + GENERATION + 2].copy_from_slice(&generation.to_le_bytes());
+        }
+
+        let (stale, live) = via_store(&mut file, PAGE as u16, |s| Map::pair_of(s, PAGE, 32))
+            .expect("block 32 lives at its gap-shifted pair, not its naive one");
+        assert_eq!(live, real_first, "the higher-generation copy is live");
+        assert_eq!(stale, real_first + 1);
     }
 
     /// A 1536-byte page does not divide the 4096-byte reserve, so a page past
