@@ -1981,39 +1981,40 @@ mod tests {
     /// divergence invisible to the type system the task that added this test
     /// was written to catch.
     #[test]
-    fn dfasetblk_pushing_the_current_pointer_again_diverges_from_the_setbtv_shape() {
+    fn dfasetblk_then_dfarstblk_restores_the_previous_current_file() {
+        // `dfaRstBlk` is `movmem(dfastk+1,dfastk,..); dfa=*dfastk`
+        // (`DFAAPI.C:194-199`) -- it shifts the stack DOWN first and only
+        // then reads `dfastk[0]`. This is the one place it genuinely differs
+        // from `btv`'s `rstbtv` (`bb=*bbstk;` read-then-shift), and the
+        // difference is load-bearing: `dfaSetBlk` pushes the NEW pointer
+        // (`*dfastk=dfa=dfaptr`), so the value to restore lives one slot down
+        // and the shift-down is what brings it to the top. Reading before the
+        // shift returns the block just popped, leaving the file the inner
+        // call switched to current forever -- which is exactly what stalled
+        // The Rose's universe loader (an outer `dfaStepLock` walk of file A,
+        // an inner `dfaSetBlk(B)`/query/`dfaGetAbsLock`/`dfaRstBlk`).
         let mut f = Fixture::new();
         let a = open(&mut f, "SAMPLE.DAT", 64);
-        assert_eq!(f.host.btrieve().dfa_current(), a, "dfaOpen makes the new file current");
+        let b = open(&mut f, "OTHER.DAT", 32);
+        // Two opens leave B current with A saved beneath it.
+        assert_eq!(f.host.btrieve().dfa_current(), b, "the second open is current");
 
-        // The redundant, explicit re-set: the module calling dfaSetBlk again
-        // on the file that is already current. Nothing in DFAAPI.C guards
-        // against this.
-        f.invoke(dfaSetBlk, &[a.offset, a.selector]).expect("re-sets the same pointer");
-        assert_eq!(f.host.btrieve().dfa_current(), a);
-
-        f.invoke(dfaRstBlk, &[]).expect("restores");
+        // The inner call's `dfaSetBlk(B)` on the file already effectively in
+        // play, then its balancing `dfaRstBlk`, must land back on A -- the
+        // outer walk's file. (Set B explicitly to model the inner switch.)
+        f.invoke(dfaSetBlk, &[b.offset, b.selector]).expect("inner set");
+        assert_eq!(f.host.btrieve().dfa_current(), b);
+        f.invoke(dfaRstBlk, &[]).expect("inner restore");
+        assert_eq!(
+            f.host.btrieve().dfa_current(),
+            b,
+            "one restore undoes the redundant set, still B (A is still beneath)"
+        );
+        f.invoke(dfaRstBlk, &[]).expect("restore to A");
         assert_eq!(
             f.host.btrieve().dfa_current(),
             a,
-            "first restore after the redundant set: still A -- a setbtv-shape \
-             implementation would already be null here"
-        );
-
-        f.invoke(dfaRstBlk, &[]).expect("restores");
-        assert_eq!(
-            f.host.btrieve().dfa_current(),
-            a,
-            "second restore: STILL A. dfaSetBlk pushed the pointer it was handed \
-             twice, and popping twice answers it twice -- this is the assertion a \
-             setbtv-shape simplification fails"
-        );
-
-        f.invoke(dfaRstBlk, &[]).expect("restores");
-        assert_eq!(
-            f.host.btrieve().dfa_current(),
-            Btrieve::<AbiMem<Wg16>>::null(),
-            "only the third restore runs the stack out"
+            "the next restore reaches A -- the file the outer loop was walking.              The read-then-shift bug left this on B instead, stepping the wrong              file forever"
         );
     }
 

@@ -7522,9 +7522,25 @@ impl<M: Mem> Btrieve<M> {
     /// own `dfaRstBlk` calls was written to get null back, not a refusal.
     ///
     /// Returns what to put in `dfa`, and whether the stack was empty.
+    ///
+    /// **Shift first, then read `dfastk[0]` -- NOT read-then-shift.** This is
+    /// the one place `dfaRstBlk` and `btv`'s `rstbtv` genuinely differ, and
+    /// the difference is load-bearing. `rstbtv` is `bb=*bbstk;
+    /// movmem(bbstk+1,bbstk,..)` (read then shift) because its *push*
+    /// (`setbtv`) saves the OLD `bb` onto the stack. `dfaRstBlk` is
+    /// `movmem(dfastk+1,dfastk,..); dfa=*dfastk` (shift then read) because
+    /// its push ([`Self::dfa_set`]/`dfaSetBlk`) stores the NEW pointer
+    /// (`*dfastk=dfa=dfaptr`), so the value to restore is the *previous*
+    /// push's, which the shift-down brings to `dfastk[0]`. Reading before the
+    /// shift returns the block just popped instead of the one beneath it --
+    /// so `dfaSetBlk(B); ...; dfaRstBlk()` left `dfa` on B instead of
+    /// restoring A. The Rose's universe loader is exactly that shape (an
+    /// outer `dfaStepLock` walk of one file, an inner `dfaSetBlk`/query/
+    /// `dfaGetAbsLock`/`dfaRstBlk` on another), and the wrong order left its
+    /// outer walk stepping the inner's file forever.
     pub fn dfa_restore(&mut self) -> (M::Ptr, bool) {
-        let restored = self.dfa_stack[0];
         self.dfa_stack.copy_within(1..DFSTSZ, 0);
+        let restored = self.dfa_stack[0];
         self.dfa_current = restored;
         (restored, restored == M::null_ptr())
     }
