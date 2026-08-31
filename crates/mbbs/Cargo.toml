@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 btrieve = { path = "../btrieve" }
+dos_kernel = { package = "dos", path = "../dos" }
 libc = "0.2"
 mbbs-machine = { path = "../mbbs-machine" }
 

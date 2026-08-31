@@ -44,6 +44,7 @@ pub mod btrieve;
 pub mod chan;
 pub mod clock;
 pub mod dos;
+pub mod dosint;
 pub mod extension;
 mod exports;
 mod fmt;
