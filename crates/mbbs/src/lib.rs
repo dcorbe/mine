@@ -2235,6 +2235,24 @@ impl<A: Abi> Host<A> {
             )
         };
 
+        // The host's own drive, spelled absolutely, is this board -- not
+        // somewhere else. The Rose 2.0 (NE) embeds `\rciuint.flg` and
+        // prepends the *current* drive at runtime, which it learnt from this
+        // host's own `int 21h AH=19h` answer: drive 2, `C:` (the dos
+        // kernel's `DosState::default`). So `C:\rciuint.flg` is the same
+        // name as `\rciuint.flg`, and that one already maps onto
+        // [`Host::root`] below. Only the drive-absolute spelling is
+        // accepted: a drive-relative `C:name` has no defensible reading
+        // here, and any other drive still means what the refusal says.
+        let bare = match bare.split_at_checked(2) {
+            Some((drive, rest))
+                if drive.eq_ignore_ascii_case("c:") && rest.starts_with(['\\', '/']) =>
+            {
+                rest
+            }
+            _ => bare,
+        };
+
         // A colon is a drive letter under every DOS reading this crate has
         // found (`D:`, but also the bare `:` a well-formed name never has),
         // so any of it at all is refused before separators are even looked
@@ -10537,6 +10555,37 @@ mod tests {
         let e = Host::<Wg16>::dos_name("D:\\MUD\\DATA\\X.DAT")
             .expect_err("a drive is somewhere this host does not look");
         assert!(e.contains("D:\\MUD\\DATA\\X.DAT"), "{e}");
+    }
+
+    /// The Rose 2.0 (NE) builds `C:\rciuint.flg` at runtime: the image
+    /// embeds only `\rciuint.flg`, and the drive comes from `int 21h`
+    /// `AH=19h` -- this host's own answer, drive 2, `C:`. A module
+    /// prepending the current drive to a root-absolute name is naming this
+    /// board's own disk, exactly what a bare leading separator already maps
+    /// onto [`Host::root`].
+    #[test]
+    fn dos_name_maps_the_hosts_own_drive_onto_root() {
+        for (named, want) in [
+            (r"C:\rciuint.flg", "rciuint.flg"),
+            (r"c:\rciuint.flg", "rciuint.flg"),
+            ("C:/MUD/DATA/X.DAT", "MUD/DATA/X.DAT"),
+        ] {
+            assert_eq!(Host::<Wg16>::dos_name(named).as_deref(), Ok(want), "{named}");
+        }
+    }
+
+    /// The load-bearing half of the drive rule survives the C: mapping: a
+    /// DIFFERENT drive still means somewhere this host does not look, a
+    /// drive-relative `C:name` has no defensible reading here, and the `..`
+    /// check still runs behind the stripped prefix.
+    #[test]
+    fn dos_name_hosts_drive_is_not_a_way_out() {
+        for named in [r"C:\..\etc\passwd", "C:FOO.DAT", r"D:\rciuint.flg", r"CC:\x", r":\x"] {
+            assert!(
+                Host::<Wg16>::dos_name(named).is_err(),
+                "{named} must still refuse"
+            );
+        }
     }
 
     /// **Deliberate behaviour change, 2026-08-15**, replacing

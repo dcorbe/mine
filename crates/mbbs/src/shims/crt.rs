@@ -3822,7 +3822,10 @@ mod tests {
         // check this very assertion left a stray `..\ESCAPE.TXT` in
         // `crates/mbbs/tests/data/`, which is how the hazard was found.
         let mut f = Fixture::rooted(scratch("crt-open-sandbox"));
-        for named in ["..\\ESCAPE.TXT", "..\\..\\etc\\passwd", "C:\\ESCAPE.TXT"] {
+        // `D:`, not `C:` -- the host's own drive maps onto the board root
+        // now (`dos_name_maps_the_hosts_own_drive_onto_root`); a different
+        // drive is what still means somewhere else.
+        for named in ["..\\ESCAPE.TXT", "..\\..\\etc\\passwd", "D:\\ESCAPE.TXT"] {
             let at = f.text(named);
             let e = f
                 .invoke(open, &[at.offset, at.selector, O_WRONLY_CREAT_TRUNC])
@@ -4059,7 +4062,8 @@ mod tests {
     #[test]
     fn rmdir_cannot_escape_the_sandbox() {
         let mut f = Fixture::rooted(scratch("crt-rmdir-sandbox"));
-        let named = f.text("C:\\ESCAPE");
+        // `D:`, not `C:` -- see `dos_name_maps_the_hosts_own_drive_onto_root`.
+        let named = f.text("D:\\ESCAPE");
         let e = f.invoke(rmdir, &Fixture::far(named)).expect_err("a drive letter is refused");
         assert!(format!("{e}").contains("outside this host's own"), "{e}");
     }
@@ -4235,7 +4239,10 @@ mod tests {
     #[test]
     fn creattemp_cannot_escape_the_sandbox() {
         let mut f = Fixture::rooted(scratch("crt-creattemp-sandbox"));
-        let fname = f.text("C:\\ESCAPE\\");
+        // `D:`, not `C:` -- the host's own drive maps onto the board root
+        // now (`dos_name_maps_the_hosts_own_drive_onto_root`); a different
+        // drive is what still means somewhere else.
+        let fname = f.text("D:\\ESCAPE\\");
         let e = f
             .invoke(creattemp, &[fname.offset, fname.selector, 0])
             .expect_err("a drive letter is refused");
