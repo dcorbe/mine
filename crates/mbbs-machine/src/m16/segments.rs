@@ -340,6 +340,11 @@ impl Segments {
         Ok(&tail[..n])
     }
 
+    /// `len` bytes at `ptr`, bounds-checked against its segment.
+    pub fn read(&self, ptr: FarPtr, len: usize) -> Result<&[u8], FarPtrError> {
+        self.resolve(ptr, len)
+    }
+
     /// Write into module memory through a far pointer.
     ///
     /// The same rules as [`Segments::resolve`]: found by selector, bounds

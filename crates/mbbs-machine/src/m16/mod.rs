@@ -1088,6 +1088,12 @@ impl Machine {
         self.mem.read_cstr(ptr)
     }
 
+    /// Read `len` bytes through a far pointer. Same rules as
+    /// [`Machine::read_cstr`]: found by selector, bounds checked.
+    pub fn read(&self, ptr: FarPtr, len: usize) -> Result<&[u8], FarPtrError> {
+        self.mem.read(ptr, len)
+    }
+
     /// Write into module memory through a far pointer.
     ///
     /// The same rules as [`Machine::resolve`]: found by selector, bounds

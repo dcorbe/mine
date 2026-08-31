@@ -1,6 +1,6 @@
 //! `int 21h` from a 16-bit module: a resumable exit, not a death.
 
-use mbbs_machine::m16::{Exit, Machine};
+use mbbs_machine::m16::{Exit, FarPtr, Machine};
 
 /// `pushf; pop ax; retf` -- hands the flags the module was entered with back
 /// in AX.
@@ -77,4 +77,14 @@ fn a_genuine_fault_still_poisons() {
         other => panic!("expected a fault, got {other:?}"),
     }
     assert!(machine.poisoned().is_some());
+}
+
+#[test]
+fn read_answers_exactly_the_bytes_written_and_refuses_past_the_segment() {
+    let mut machine = Machine::new().expect("16-bit machine");
+    let at = FarPtr { selector: machine.data_selector(), offset: 0x10 };
+    machine.write(at, b"hello").expect("fits");
+    assert_eq!(machine.read(at, 5).expect("in bounds"), b"hello");
+    let far = FarPtr { selector: machine.data_selector(), offset: 0xfffe };
+    assert!(machine.read(far, 4).is_err(), "4 bytes at 0xfffe leave the segment");
 }
