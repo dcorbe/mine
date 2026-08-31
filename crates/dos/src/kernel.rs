@@ -18,6 +18,7 @@ pub const ERR_INVALID_HANDLE: u16 = 0x06;
 pub const ERR_INSUFFICIENT_MEMORY: u16 = 0x08;
 /// `AH=49h`/`4Ah` naming a segment nothing has allocated.
 pub const ERR_INVALID_MEMORY_BLOCK: u16 = 0x09;
+pub const ERR_INVALID_DRIVE: u16 = 0x0f;
 
 /// Conventional memory ends here: segment `0xa000` is where video RAM
 /// (`0xb800` for text mode, `0xa000` itself for EGA/VGA graphics planes)
@@ -401,7 +402,7 @@ pub fn is_implemented(ah: u8) -> bool {
     matches!(
         ah,
         0x02 | 0x09 | 0x0e | 0x19 | 0x1a | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x2f | 0x30 | 0x31
-            | 0x34 | 0x35 | 0x3c | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x48
+            | 0x34 | 0x35 | 0x3c | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x47 | 0x48
             | 0x49 | 0x4a | 0x4c | 0x4e | 0x4f | 0x56 | 0x58 | 0x5c | 0x62 | 0x67
     )
 }
@@ -585,6 +586,23 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
             };
             regs.es = at.seg;
             regs.bx = at.off;
+            ok(g, regs)
+        }
+
+        // 47h -- get current directory. `DL` names the drive (0 = default),
+        // `DS:SI` a 64-byte buffer for the ASCIIZ path *without* its leading
+        // backslash. This host's only directory is the sandbox root, so the
+        // answer is the empty path; a drive that is not the default is not a
+        // drive this host has.
+        0x47 => {
+            let dl = regs.dl();
+            if dl != 0 && dl != dos.drive + 1 {
+                return fail(g, regs, ERR_INVALID_DRIVE);
+            }
+            let at = Ptr::new(regs.ds, regs.si);
+            if let Err(f) = g.write(at, b"\0") {
+                return Outcome::Fault(f);
+            }
             ok(g, regs)
         }
 
@@ -1124,6 +1142,38 @@ mod tests {
 
         assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
         assert_eq!(g.regs().al(), 3);
+    }
+
+    #[test]
+    fn get_current_directory_of_the_default_drive_is_the_sandbox_root() {
+        let mut g = TestGuest::new(64 * 1024);
+        let buf = Ptr::new(0x100, 0x40);
+        g.poke(buf, b"junkjunk");
+        let mut regs = Regs::default();
+        regs.set_ah(0x47);
+        regs.dx = 0; // DL = 0, the default drive
+        regs.ds = buf.seg;
+        regs.si = buf.off;
+        g.call_with(regs);
+        let mut dos = DosState::default();
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(g.peek(buf, 1), b"\0", "the root is the empty path, NUL-terminated");
+    }
+
+    #[test]
+    fn get_current_directory_of_another_drive_is_an_invalid_drive() {
+        let mut g = TestGuest::new(64 * 1024);
+        let mut regs = Regs::default();
+        regs.set_ah(0x47);
+        regs.dx = 1; // DL = 1 is A:, and the default is C:
+        regs.ds = 0x100;
+        regs.si = 0x40;
+        g.call_with(regs);
+        let mut dos = DosState::default();
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, ERR_INVALID_DRIVE);
     }
 
     #[test]
