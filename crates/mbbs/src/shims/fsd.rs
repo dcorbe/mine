@@ -89,15 +89,24 @@ fn control_block<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>, chan: Chan) -> Re
     let at = match host.fsdscb[chan.index()] {
         Some(at) => at,
         None => {
-            let at = mem.alloc_region(usize::from(fsd::FSDSCB)).map_err(|e| {
+            // The whole `struct fsdbbs`, not just its `fsdscb` prefix: a
+            // module that imports `fsdusr` (The Rose) reads the tail. `WCCMMUD`
+            // touches only the prefix, so the extra bytes cost it nothing.
+            let at = mem.alloc_region(usize::from(fsd::FSDBBS)).map_err(|e| {
                 ShimError::Failed(format!("fsdroom: no room for a session block: {e}"))
             })?;
             host.fsdscb[chan.index()] = Some(at);
             at
         }
     };
+    // `fsdscb == &fsdusr->fsdscb`, the same address (`setfsd`, FSDBBS.C:61),
+    // so both globals point at this one block. `fsdusr` was null before, and
+    // The Rose dereferences it (`fsdusr->tmpmsg`) -- see `fsd::FSDBBS`.
     host.globals()
         .write_mem(mem, "fsdscb", &A::ptr_to_bytes(at))
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    host.globals()
+        .write_mem(mem, "fsdusr", &A::ptr_to_bytes(at))
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(at)
 }
@@ -326,6 +335,17 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
             .pointer_mem(call.mem(), "curmbk")
             .map_err(|e| ShimError::Failed(e.to_string()))?;
         host.fsdtmp[chan.index()] = Some((curmbk, number, amode));
+
+        // `fsdusr->tmpmsg = tmpmsg` (FSDBBS.C:139): the module-visible copy,
+        // for a module that reads `fsdusr` directly (The Rose, six sites of
+        // `getasc(fsdusr->tmpmsg)`). Written at the tail offset its build
+        // bakes in (`fsd::FSDBBS_TMPMSG`), past the `fsdscb` prefix this host
+        // otherwise models; `curmbk`/`amode` live host-side in `fsdtmp` and
+        // are not read from the struct by any module, so only `tmpmsg` is
+        // mirrored out.
+        A::ptr_offset(at, fsd::FSDBBS_TMPMSG)
+            .write(call.mem(), &A::int_to_bytes(A::int_from_u32(u32::from(number))))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
 
     Ok(abi::Ret::Int(A::Int::from(size)))

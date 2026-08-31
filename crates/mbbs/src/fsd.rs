@@ -220,6 +220,24 @@ impl FieldLayout {
 /// into the structure with offsets its compiler baked in.
 pub const FSDSCB: u16 = 166;
 
+/// The whole `struct fsdbbs` a module that imports `fsdusr` sees -- the
+/// [`FSDSCB`] prefix plus the `ainscb`/`curmbk`/`tmpmsg`/`amode`/`flags`/
+/// `whndun` tail (`FSDBBS.H:217`). The host allocates one per channel and
+/// points **both** `fsdscb` (the prefix) and `fsdusr` (the whole struct) at
+/// it, because `fsdscb == &fsdusr->fsdscb` -- the same address (`setfsd`,
+/// `FSDBBS.C:61`). Sized for The Rose's build, the only module that imports
+/// `fsdusr`: it reads `fsdusr->tmpmsg` at [`FSDBBS_TMPMSG`], and a few bytes
+/// of slack keep any tail read inside the allocation. `WCCMMUD` reaches the
+/// same struct only through the FSD routines, so its narrower [`FSDSCB`]
+/// prefix is all its own reads ever touch.
+pub const FSDBBS: u16 = 0xe0;
+
+/// `fsdusr->tmpmsg`'s byte offset in The Rose's `struct fsdbbs` -- measured:
+/// `RCIROSE.DLL` reads `[fsdusr+0xc8]` and hands it to `getasc` at six sites
+/// (the FSD template message to re-render). `fsdroom` writes the template
+/// number here so that read answers correctly.
+pub const FSDBBS_TMPMSG: u16 = 0xc8;
+
 /// Where each member of `struct fsdscb` sits. `FSD.H:275`.
 ///
 /// **Byte alignment, not word.** Borland's default (`-a-`), and not an
