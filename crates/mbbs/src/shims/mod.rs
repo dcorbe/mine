@@ -398,6 +398,10 @@ pub(crate) fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cl
         // GALMSG one. Both refuse for the same reason -- neither the Messaging
         // Engine nor its 6.x compatibility entry exists here.
         (GALMSG, "oldsend", misc::oldsend, Cleans::Caller, Evidence::Unclassified),
+        // MBBS 6.25's spelling of the same ordinal 30: wg1 `GME.H` declares
+        // `oldsend` "backward-compatible to 6.X sendmsg()". One routine, two
+        // names, the way `malloc`/`galmalloc` below already are.
+        (GALMSG, "sendmsg", misc::oldsend, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "initask", task::initask, Cleans::Caller, Evidence::Unclassified),
 
         // The `dfa*` facade -- the 32-bit Btrieve API. Registered under
@@ -2985,6 +2989,17 @@ mod import_surface {
         assert!(
             matches!(entry::<Wg16>(MAJORBBS, "simpsnd"), Entry::Unimplemented),
             "simpsnd is GALME's, not MAJORBBS's"
+        );
+    }
+
+    /// MBBS 6.25 spells ordinal 30 `sendmsg`; wg1's `GME.H` marks `oldsend`
+    /// "backward-compatible to 6.X sendmsg()". A board whose profile resolves
+    /// to mbbs625 asks under the old spelling and must get the same routine.
+    #[test]
+    fn galmsg_ordinal_thirty_is_served_under_its_mbbs625_spelling_too() {
+        assert!(
+            matches!(entry::<Wg16>(GALMSG, "sendmsg"), Entry::Routine(..)),
+            "sendmsg is oldsend, and is served"
         );
     }
 

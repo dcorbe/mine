@@ -848,6 +848,36 @@ pub enum Outcome {
     },
 }
 
+/// Ordinals the vendor kept while renaming the routine behind them, so two
+/// generations spell one routine two ways. A module cannot observe which
+/// spelling its host uses, so these never discriminate.
+///
+/// Every entry is the vendor's own word: wg1 `MAJORBBS.C:4689/4701/4708`
+/// declare `oldbgnedt`/`oldedtimr`/`oldinedit` "API for binary
+/// compatibility"; `GCOMM.H:63-64` is `#define malloc galmalloc` and
+/// `#define free galfree`; `GME.H` marks `oldsend` "backward-compatible to
+/// 6.X sendmsg()". Anything not listed here that differs by name is taken to
+/// differ by routine -- MAJORBBS 965 is `setpfn` in wg101 and `dftpfn` in
+/// wg2, and that refuses.
+const RENAMES: &[(&str, u16, &[&str])] = &[
+    (MAJORBBS, 88, &["bgnedt", "oldbgnedt"]),
+    (MAJORBBS, 184, &["edtimr", "oldedtimr"]),
+    (MAJORBBS, 230, &["free", "galfree"]),
+    (MAJORBBS, 400, &["malloc", "galmalloc"]),
+    (MAJORBBS, 739, &["inedit", "oldinedit"]),
+    (GALMSG, 30, &["sendmsg", "oldsend"]),
+];
+
+/// Whether every spelling in `names` is one the vendor's rename of `lib`'s
+/// `ordinal` accounts for.
+fn is_rename(lib: &str, ordinal: u16, names: &[(&'static str, Box<str>)]) -> bool {
+    RENAMES.iter().any(|(l, o, spellings)| {
+        l.eq_ignore_ascii_case(lib)
+            && *o == ordinal
+            && names.iter().all(|(_, n)| spellings.iter().any(|s| s.eq_ignore_ascii_case(n)))
+    })
+}
+
 /// Which profile the modules' own imports support.
 pub fn detect(demand: &Demand) -> Outcome {
     let mut admissible: Vec<&'static Profile> = Vec::new();
@@ -879,7 +909,9 @@ pub fn detect(demand: &Demand) -> Outcome {
                                 .map(|n| (p.name, n))
                         })
                         .collect();
-                    if named.iter().map(|(_, n)| n).collect::<BTreeSet<_>>().len() > 1 {
+                    if named.iter().map(|(_, n)| n).collect::<BTreeSet<_>>().len() > 1
+                        && !is_rename(lib, o, &named)
+                    {
                         discriminating.push(Discriminator { library: lib, ordinal: o, names: named });
                     }
                 }
@@ -1288,6 +1320,41 @@ mod tests {
                 assert!(agreeing.contains(&"wg101"), "got {agreeing:?}");
             }
             other => panic!("expected unobservable, got {other:?}"),
+        }
+    }
+
+    /// The Rose 2.0's three discriminators are all vendor renames at a kept
+    /// ordinal: 6.25's `free`/`malloc`/`sendmsg` became wg101's
+    /// `galfree`/`galmalloc`/`oldsend` with the ordinal and the routine
+    /// unchanged. A rename cannot be observed by the module, so it must not
+    /// refuse.
+    #[test]
+    fn a_vendor_rename_at_a_kept_ordinal_does_not_discriminate() {
+        let mut d = Demand::new();
+        d.add("MAJORBBS", 230);
+        d.add("MAJORBBS", 400);
+        d.add("GALMSG", 30);
+        match detect(&d) {
+            Outcome::Unobservable { chosen, agreeing } => {
+                assert_eq!(chosen.name, ANCHOR);
+                assert!(agreeing.contains(&"mbbs625"), "got {agreeing:?}");
+            }
+            other => panic!("expected unobservable, got {other:?}"),
+        }
+    }
+
+    /// A different routine at a shared ordinal is not a rename: wg101's
+    /// `setpfn` and wg2's `dftpfn` both sit at MAJORBBS 965. That must still
+    /// refuse, and name the ordinal.
+    #[test]
+    fn a_different_routine_at_a_shared_ordinal_still_refuses() {
+        let mut d = Demand::new();
+        d.add("MAJORBBS", 965);
+        match detect(&d) {
+            Outcome::Ambiguous { discriminating } => {
+                assert!(discriminating.iter().any(|x| x.ordinal == 965), "got {discriminating:?}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 
