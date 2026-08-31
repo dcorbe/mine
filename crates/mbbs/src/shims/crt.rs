@@ -862,15 +862,16 @@ pub fn getenv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// Drawn from [`crate::Host::clock`]'s own [`crate::clock::Civil`] the same
 /// way `now`/`today`/`time` already are.
 ///
-/// # `ti_hund` is always zero
+/// # `ti_hund` is the real sub-second
 ///
-/// [`crate::clock::Civil`] has no field finer than whole seconds -- `now`,
-/// `today` and `time` never needed one, since DOS's own packed `time_t`/date
-/// words do not carry sub-second precision either. `gettime` is the first
-/// caller in this crate that could observe hundredths, and this host
-/// genuinely does not track them, so `ti_hund` is `0` rather than a value
-/// this host does not have. Disclosed rather than hidden: a module polling
-/// for the clock to visibly tick within one second would see it stand still.
+/// [`crate::clock::Civil`] carries only whole seconds -- `now`, `today` and
+/// `time` never needed finer, since DOS's own packed `time_t`/date words do
+/// not either. `gettime` is the first caller that can observe hundredths, and
+/// it reports the real ones (`Clock::hundredths`): a system clock's
+/// sub-second nanos, or a stepped clock's millisecond position. It used to
+/// report a flat `0`, and a module that polls the clock to watch it tick
+/// *within* one second saw it stand still -- a whole-second pin (`gettime`'s
+/// own test) still reads `0` there, since it has no sub-second to show.
 ///
 /// # Errors
 ///
@@ -889,8 +890,10 @@ pub fn gettime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
         .map_err(|e| ShimError::Failed(format!("gettime: {e}")))?;
 
     // `ti_min, ti_hour, ti_hund, ti_sec` -- see this routine's own doc
-    // comment for the field order and for why `ti_hund` is always zero.
-    let bytes = [t.minute as u8, t.hour as u8, 0u8, t.second as u8];
+    // comment for the field order. `ti_hund` is the real sub-second now, so a
+    // module (The Rose) that polls the clock to watch it tick within a second
+    // sees it move -- a flat zero froze its action/round timer.
+    let bytes = [t.minute as u8, t.hour as u8, host.clock().hundredths(), t.second as u8];
     out.write(call.mem(), &bytes)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Void)

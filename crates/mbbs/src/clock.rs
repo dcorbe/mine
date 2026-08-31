@@ -219,6 +219,27 @@ impl Clock {
     pub fn offset(&self) -> i32 {
         self.offset
     }
+
+    /// Hundredths of the current second (`0..=99`), for DOS's `gettime`
+    /// `ti_hund`.
+    ///
+    /// [`Clock::civil`] carries only whole seconds, so `gettime` used to
+    /// report `ti_hund` as a flat `0` -- and a module that polls the clock to
+    /// watch it tick *inside* one second (The Rose does this to pace its
+    /// action/round timer) then saw it stand still, so the timer never
+    /// advanced and a player could not act. A system clock reads the real
+    /// sub-second nanos; a stepped clock reports whatever fraction its
+    /// millisecond position has reached, so it visibly moves under a pin too.
+    pub fn hundredths(&self) -> u8 {
+        let millis_in_second = match self.at {
+            Some(at) => (at % 1000) as u32,
+            None => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_millis())
+                .unwrap_or(0),
+        };
+        (millis_in_second / 10) as u8
+    }
 }
 
 impl Civil {
@@ -445,5 +466,20 @@ mod tests {
         let c = Clock::stepped(1_135_952_405, 1000).advanced();
         let civil = c.civil().expect("broken down");
         assert_eq!(civil.second, 6, "1_135_952_405 is :05, one second on is :06");
+    }
+
+    #[test]
+    fn hundredths_report_the_sub_second_position() {
+        // A whole-second pin has nothing below the second: flat zero, which is
+        // what `gettime`'s own test still reads.
+        assert_eq!(Clock::pinned(1_135_952_405).hundredths(), 0);
+        // A stepped clock's millisecond position moves, so the clock visibly
+        // ticks within one second -- the fix The Rose needed from `gettime`.
+        let c = Clock::stepped(1_135_952_405, 250); // quarter-second a read
+        assert_eq!(c.hundredths(), 0);
+        let c = c.advanced();
+        assert_eq!(c.hundredths(), 25, "250 ms in is 25 hundredths");
+        let c = c.advanced();
+        assert_eq!(c.hundredths(), 50);
     }
 }
