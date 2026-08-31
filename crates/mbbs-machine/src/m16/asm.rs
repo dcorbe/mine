@@ -55,6 +55,12 @@ pub(crate) struct Ctx {
     /// Also callee-saved: a shim must hand back the `DS` the module had.
     pub ds: u64,
 
+    /// `EFLAGS` to enter with. A serviced `int 21h` answers through `CF`, and
+    /// the far jump alone would hand the module whatever flags the host
+    /// happened to have. Only bit 0 (`CF`) is ever set by the host; bit 1 is
+    /// reserved-set and `IF` (bit 9) is on, as a module in ring 3 expects.
+    pub flags: u64,
+
     /// `BX` and `CX` as the module had them at the call, handed straight back.
     ///
     /// cdecl makes both scratch, so no compiled *cdecl* caller depends on them
@@ -92,6 +98,11 @@ pub(crate) struct Ctx {
     pub out_di: u64,
     pub out_bp: u64,
     pub out_ds: u64,
+
+    /// `EFLAGS` at a serviced trap, captured by the signal handler from
+    /// `REG_EFL` so the flags the module was running with survive the
+    /// crossing and are what it resumes with (plus the host's `CF` answer).
+    pub out_flags: u64,
 
     /// Nonzero once a watchdog tick has been recorded against this module,
     /// whether or not it was in 16-bit mode at the time. The assembly never
@@ -164,6 +175,18 @@ mbbs16_enter:
     movzwl  {ss16}(%r14), %ecx          /* the 16-bit stack selector */
     movq    {sp}(%r14), %rbx            /* SP, as a segment offset */
 
+    pushq   {flags}(%r14)               /* the flags the module resumes with --
+                                            on the *host's* stack, while %rsp
+                                            is still a real linear address.
+                                            Long mode forces every data
+                                            segment's base to zero, %ss
+                                            included, so once %rsp below holds
+                                            the module's segment-relative SP
+                                            it is no longer a valid address to
+                                            push through until the far jump
+                                            lands in compatibility mode. */
+    popfq
+
     movw    %cx, %ss                    /* paired with the next instruction: */
     movq    %rbx, %rsp                  /* MOV SS's shadow covers the gap */
 
@@ -190,6 +213,7 @@ mbbs16_enter:
     bp = const offset_of!(Ctx, bp),
     ss16 = const offset_of!(Ctx, ss16),
     sp = const offset_of!(Ctx, sp),
+    flags = const offset_of!(Ctx, flags),
     options(att_syntax)
 );
 

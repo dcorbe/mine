@@ -534,11 +534,14 @@ impl Machine {
         let (code_sel, stack_sel) = (code.selector(), stack.selector());
         let (data_sel, bridge_sel) = (data.selector(), bridge.selector());
 
+        let mut ctx = Watched::new()?;
+        ctx.flags = 0x202;
+
         Ok(Self {
             mem: Segments::new(vec![code, stack, data, bridge], code_sel, stack_sel, data_sel),
             bridge: bridge_sel,
             next_thunk: 0,
-            ctx: Watched::new()?,
+            ctx,
             frame_sp: None,
             call_ax: 0,
             call_cx: 0,
@@ -1209,6 +1212,21 @@ impl Machine {
     /// [`Machine::set_ax`].
     pub fn set_dx(&mut self, dx: u16) {
         self.ctx.dx = u64::from(dx);
+    }
+
+    /// The carry flag the module will be entered with -- how a serviced
+    /// `int 21h` reports success (`CF=0`) or failure (`CF=1`).
+    pub fn set_carry(&mut self, on: bool) {
+        if on {
+            self.ctx.flags |= 1;
+        } else {
+            self.ctx.flags &= !1;
+        }
+    }
+
+    /// The carry flag the next entry carries.
+    pub fn carry(&self) -> bool {
+        self.ctx.flags & 1 != 0
     }
 
     /// `BX`, which Borland's runtime helpers leave alone and so a module may
