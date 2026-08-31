@@ -240,6 +240,23 @@ impl Clock {
         };
         (millis_in_second / 10) as u8
     }
+
+    /// Milliseconds since the epoch. For a free-running sub-second counter
+    /// (`hrtval`) that must advance *within* one second, not jump once at each
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// If this is a system clock and the machine's is before 1970.
+    pub fn epoch_millis(&self) -> Result<u64, String> {
+        match self.at {
+            Some(at) => Ok(at),
+            None => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .map_err(|e| e.to_string()),
+        }
+    }
 }
 
 impl Civil {
@@ -481,5 +498,14 @@ mod tests {
         assert_eq!(c.hundredths(), 25, "250 ms in is 25 hundredths");
         let c = c.advanced();
         assert_eq!(c.hundredths(), 50);
+    }
+
+    #[test]
+    fn epoch_millis_keeps_the_sub_second_epoch_drops() {
+        // `hrtval` derives its smooth 65,536/second advance from milliseconds,
+        // so `epoch_millis` must carry what `epoch`'s whole seconds throw away.
+        let c = Clock::stepped(100, 250).advanced(); // a quarter-second in
+        assert_eq!(c.epoch_millis().unwrap(), 100_250);
+        assert_eq!(c.epoch().unwrap(), 100, "epoch is whole seconds only");
     }
 }

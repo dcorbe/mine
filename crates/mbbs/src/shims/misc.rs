@@ -150,8 +150,20 @@ pub fn dfsthn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// so wrapping here reproduces the real counter's own eventual overflow
 /// rather than introducing a new failure this host did not have to.
 pub fn hrtval<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let seconds = host.clock().epoch().map_err(ShimError::Failed)?;
-    Ok(abi::Ret::Long(seconds.wrapping_mul(65536)))
+    // hrtval is a free-running high-resolution counter that advances 65,536 per
+    // second. Modules (RCIROSE) time short delays as (hrtval() - baseline) /
+    // timeunit >= threshold, where timeunit sums to ~65,200 for a ~1-second
+    // unit. Deriving the value from whole epoch seconds makes it a step
+    // function -- flat within a second, then a 65,536 jump at the boundary --
+    // so any sub-second delay cannot elapse until the next whole second, and a
+    // chain of them (a combat round steps many per action) stretches to one
+    // second apiece. Compute from milliseconds so it advances smoothly.
+    let millis = host.clock().epoch_millis().map_err(ShimError::Failed)?;
+    let val = (millis.wrapping_mul(65536) / 1000) as u32;
+    if std::env::var_os("MBBS_TRACE_HRT").is_some() {
+        eprintln!("mbbs-hrt: wall_ms={millis} hrtval={val}");
+    }
+    Ok(abi::Ret::Long(val))
 }
 
 /// `char *msgscan(char *msgfil,char *vblnam)` -- `GCOMM.H:358` -- the value
