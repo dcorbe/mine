@@ -5,7 +5,7 @@
 //! `seg << 4`. Every access goes through the machine's own selector check.
 
 use dos_kernel::guest::{Fault, Flag, Guest, Ptr, Regs};
-use mbbs_machine::m16::{FarPtr, Machine};
+use mbbs_machine::m16::{FarPtr, FarPtrError, Machine};
 
 pub struct Guest16<'a> {
     cpu: &'a mut Machine,
@@ -45,19 +45,33 @@ impl Guest for Guest16<'_> {
 
     fn read_until(&self, at: Ptr, term: u8, max: usize) -> Result<&[u8], Fault> {
         // `read_cstr` is NUL-only and unbounded; DOS also terminates with `$`.
-        // Read the largest span the segment allows, then scan.
-        let mut len = max;
-        let tail = loop {
-            match self.cpu.read(far(at), len) {
-                Ok(t) => break t,
-                Err(_) if len > 1 => len /= 2,
-                Err(_) => return Err(out_of_bounds(at, 1)),
+        // Ask for `max` first; if the segment is shorter, `OutOfBounds` carries
+        // the segment's `limit`, which gives the exact readable span in one
+        // more read -- no need to guess by halving (that undershot: it could
+        // report `OutOfBounds` for a length that was actually still in bounds).
+        match self.cpu.read(far(at), max) {
+            Ok(tail) => match tail.iter().position(|&b| b == term) {
+                Some(n) => Ok(&tail[..n]),
+                None => Err(Fault::Unterminated { at, term, max }),
+            },
+            Err(FarPtrError::OutOfBounds { limit, .. }) => {
+                let avail = limit.saturating_sub(usize::from(at.off));
+                if avail == 0 {
+                    return Err(out_of_bounds(at, 1));
+                }
+                // Bounds already computed from `limit`; a failure here means
+                // `limit` and `read` disagree -- a bug, not a guest fault.
+                let tail = self
+                    .cpu
+                    .read(far(at), avail)
+                    .map_err(|_| out_of_bounds(at, avail))?;
+                match tail.iter().position(|&b| b == term) {
+                    Some(n) => Ok(&tail[..n]),
+                    // The terminator would have to live past the segment.
+                    None => Err(out_of_bounds(at, avail + 1)),
+                }
             }
-        };
-        match tail.iter().position(|&b| b == term) {
-            Some(n) => Ok(&tail[..n]),
-            None if len < max => Err(out_of_bounds(at, len + 1)),
-            None => Err(Fault::Unterminated { at, term, max }),
+            Err(_) => Err(out_of_bounds(at, 1)),
         }
     }
 
@@ -135,6 +149,50 @@ mod tests {
         assert_eq!(cpu.regs().ax, 0x1902);
         assert_eq!(cpu.regs().bx, 0x1234);
         assert!(cpu.carry());
+    }
+
+    #[test]
+    fn read_until_reports_the_true_readable_span_not_the_halving_loops_guess() {
+        let mut cpu = machine();
+        let ds = cpu.data_selector();
+
+        // Binary-search the segment's true limit (largest length readable
+        // from offset 0), then land 10 bytes short of it.
+        let mut lo: usize = 0;
+        let mut hi: usize = 1 << 20;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if cpu.read(FarPtr { selector: ds, offset: 0 }, mid).is_ok() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let offset = (lo - 10) as u16;
+        let at = FarPtr { selector: ds, offset };
+        let ptr = Ptr::new(ds, offset);
+
+        // Confirm the boundary directly: exactly 10 bytes are readable from `at`.
+        assert!(cpu.read(at, 10).is_ok());
+        assert!(cpu.read(at, 11).is_err());
+
+        // Terminator at the 10th (last) byte of the segment: a naive
+        // halving-from-`max` search (try 64, 32, 16, 8 -- 8 succeeds, stop)
+        // would only ever look at the first 8 bytes and miss it entirely.
+        let term = 0xFFu8;
+        let mut bytes = [1u8; 10];
+        bytes[9] = term;
+        cpu.write(at, &bytes).expect("fits");
+        let mut g = Guest16::new(&mut cpu);
+        assert_eq!(g.read_until(ptr, term, 64).expect("terminated"), &bytes[..9]);
+        drop(g);
+
+        // No terminator anywhere in the segment's remaining span: this must
+        // be a real `OutOfBounds` (a bigger read really would fail), not a
+        // false `Unterminated` implying more bytes were there to search.
+        cpu.write(at, &[1u8; 10]).expect("fits");
+        let mut g = Guest16::new(&mut cpu);
+        assert!(matches!(g.read_until(ptr, term, 64), Err(Fault::OutOfBounds { .. })));
     }
 }
 
