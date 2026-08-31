@@ -1,6 +1,8 @@
 //! `int 21h` from a 16-bit module: a resumable exit, not a death.
 
-use mbbs_machine::m16::{Exit, FarPtr, Machine};
+use std::time::Duration;
+
+use mbbs_machine::m16::{Exit, FarPtr, Machine, Poison};
 
 /// `pushf; pop ax; retf` -- hands the flags the module was entered with back
 /// in AX.
@@ -123,6 +125,65 @@ fn a_trap_reports_and_a_resume_preserves_the_modules_own_moved_ds() {
         ),
         other => panic!("expected a return, got {other:?}"),
     }
+}
+
+/// The budget `tests/watchdog.rs` uses: small enough to keep the suite
+/// quick, large enough that a scheduling hiccup cannot make a well-behaved
+/// crossing look wedged.
+const BUDGET: Duration = Duration::from_millis(50);
+
+/// This thread's CPU time so far, from the same clock the watchdog arms.
+/// Duplicated from `tests/watchdog.rs::cpu_time` -- integration test binaries
+/// do not share code with each other.
+fn cpu_time() -> Duration {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `clock_gettime` writes the `timespec` and nothing else.
+    let ok = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
+    assert_eq!(ok, 0, "the thread CPU clock is not readable");
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// Burn `d` of **this thread's CPU time**, the clock the watchdog measures --
+/// not wall clock. See `tests/watchdog.rs::burn` for why that distinction is
+/// the whole point.
+fn burn(d: Duration) {
+    let start = cpu_time();
+    while cpu_time() - start < d {
+        std::hint::black_box(0u64);
+    }
+}
+
+/// A tick that lands while the host is servicing a trap must still be honoured
+/// at the next entry, not discarded because nothing was in 16-bit mode to
+/// interrupt. `resume_cleaning` (the outstanding-call resume path) already
+/// refuses to re-enter once `ctx.expired()`; `int 21h`'s resume goes through
+/// `Machine::jump` instead, which is `tests/watchdog.rs`'s
+/// `an_overrun_spent_in_host_code_still_counts` played out over that path:
+/// the host burns the whole budget deciding how to service the trap, and the
+/// module must not get to run again on the strength of a stale answer.
+#[test]
+fn jump_refuses_to_resume_a_trap_once_the_budget_is_gone() {
+    let mut machine = Machine::new().expect("16-bit machine");
+    machine.set_budget(BUDGET);
+    machine.load_code(&get_drive_module()).expect("module fits");
+
+    let Exit::Interrupt { ip, .. } = machine.call(machine.code_ptr(0), &[]).expect("called") else {
+        panic!("expected an interrupt");
+    };
+    machine.set_ax(0x1902);
+    machine.set_carry(false);
+    machine.set_ip(ip + 2);
+
+    burn(BUDGET * 3);
+
+    match machine.jump().expect("jumped") {
+        Exit::Timeout { .. } => {}
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+    assert!(
+        matches!(machine.poisoned(), Some(Poison::Timeout { .. })),
+        "a timed-out machine is poisoned"
+    );
 }
 
 #[test]

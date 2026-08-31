@@ -1325,6 +1325,17 @@ impl Machine {
                 "refusing to enter a poisoned module: {poison}"
             )));
         }
+        if self.ctx.expired() {
+            // A tick that landed while the host was servicing a trap -- an
+            // `int 21h`, most often -- proves the budget is gone just as
+            // surely as one that interrupts 16-bit code, and there is no
+            // sense re-entering a module whose time is up in order to stop
+            // it a moment later. See `resume_cleaning`'s identical guard.
+            return self.terminate(Exit::Timeout {
+                cs: self.ctx.target_selector,
+                ip: self.ctx.target_offset as u16,
+            });
+        }
         for (name, selector) in [("CS", self.ctx.target_selector), ("SS", self.ctx.ss16)] {
             self.mem.segment(selector).map_err(|_| {
                 io::Error::other(format!(
