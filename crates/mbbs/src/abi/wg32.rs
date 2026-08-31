@@ -191,6 +191,10 @@ impl Abi for Wg32 {
     const FILE_FD_WIDTH: u16 = 4;
     const FSD_FIELD: crate::fsd::FieldLayout = crate::fsd::FieldLayout::WG32;
 
+    /// Measured on the PE32 `RCIROSE.DLL` (Rose 3.0NT): it reads
+    /// `[fsdusr+0xc8]` and hands it to `getasc` at six sites.
+    const FSDBBS_TMPMSG: u16 = 0xc8;
+
     /// The `Wg32`-only routines, the mirror of `Wg16`'s own override.
     ///
     /// One entry: `__ftol`, whose argument arrives in the x87 register stack

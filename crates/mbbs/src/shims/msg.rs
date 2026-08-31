@@ -262,6 +262,13 @@ pub fn rawmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 pub fn getasc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let msgnum = Into::<u32>::into(call.int()) as u16;
     let compact = read_mem(call.mem(), host, msgnum)?;
+    if super::traced() {
+        eprintln!(
+            "mbbs-trace: GETASC msgnum={msgnum} compact_len={} first={:?}",
+            compact.len(),
+            String::from_utf8_lossy(&compact[..compact.len().min(40)])
+        );
+    }
     let expanded = crate::msg::getasc(&compact);
 
     let size = u16::try_from(expanded.len() + 1)

@@ -46,6 +46,12 @@ impl Abi for Wg16 {
     const FILE_FD_WIDTH: u16 = 1;
     const FSD_FIELD: crate::fsd::FieldLayout = crate::fsd::FieldLayout::WG16;
 
+    /// Measured on the NE `RCIROSE.DLL` (The Rose 2.0): `les bx,[fsdusr];
+    /// push word es:[bx+0x00AB]; call far getasc` at seg 28:0x2ed-0x2fc --
+    /// and the header math agrees: `sizeof(struct fsdscb)` 166 (`FSD.H:275`)
+    /// + `sizeof(struct ainscb)` 1 (`AIN.H:51`) + `sizeof(FILE *)` 4.
+    const FSDBBS_TMPMSG: u16 = 0x00ab;
+
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
         mbbs_machine::m16::FarPtr::from_bytes(bytes.try_into().expect("PTR_WIDTH bytes"))
     }

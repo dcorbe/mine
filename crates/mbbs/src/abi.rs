@@ -255,6 +255,13 @@ pub trait Abi {
     /// measurement both numbers come from.
     const FSD_FIELD: crate::fsd::FieldLayout;
 
+    /// `fsdusr->tmpmsg`'s byte offset in this ABI's `struct fsdbbs`
+    /// (`FSDBBS.H:211-215`: the `fsdscb` prefix, one `ainscb` byte, a
+    /// `FILE *curmbk`, then `tmpmsg`). The Rose re-fetches its template as
+    /// `getasc(fsdusr->tmpmsg)`, so `fsdroom` mirrors the number here, and
+    /// the offset is per-build: each impl carries its own measurement.
+    const FSDBBS_TMPMSG: u16;
+
     /// Decode a pointer from exactly [`PTR_WIDTH`](Abi::PTR_WIDTH) bytes, in
     /// this ABI's own layout.
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr;
@@ -1318,6 +1325,7 @@ mod tests {
         const FILE_FD_OFFSET: u16 = Wg16::FILE_FD_OFFSET;
         const FILE_FD_WIDTH: u16 = Wg16::FILE_FD_WIDTH;
         const FSD_FIELD: crate::fsd::FieldLayout = Wg16::FSD_FIELD;
+        const FSDBBS_TMPMSG: u16 = Wg16::FSDBBS_TMPMSG;
 
         fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
             Wg16::ptr_from_bytes(bytes)

@@ -232,11 +232,6 @@ pub const FSDSCB: u16 = 166;
 /// prefix is all its own reads ever touch.
 pub const FSDBBS: u16 = 0xe0;
 
-/// `fsdusr->tmpmsg`'s byte offset in The Rose's `struct fsdbbs` -- measured:
-/// `RCIROSE.DLL` reads `[fsdusr+0xc8]` and hands it to `getasc` at six sites
-/// (the FSD template message to re-render). `fsdroom` writes the template
-/// number here so that read answers correctly.
-pub const FSDBBS_TMPMSG: u16 = 0xc8;
 
 /// Where each member of `struct fsdscb` sits. `FSD.H:275`.
 ///

@@ -221,6 +221,9 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     let number = Into::<u32>::into(call.int()) as u16;
     let fldspc = call.ptr();
     let amode = Into::<u32>::into(call.int()) as i16;
+    if super::traced() {
+        eprintln!("mbbs-trace: FSDROOM number={number} amode={amode}");
+    }
 
     if amode != 0 && amode != 1 && amode != -1 {
         return Err(ShimError::Failed(format!(
@@ -337,13 +340,13 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
         host.fsdtmp[chan.index()] = Some((curmbk, number, amode));
 
         // `fsdusr->tmpmsg = tmpmsg` (FSDBBS.C:139): the module-visible copy,
-        // for a module that reads `fsdusr` directly (The Rose, six sites of
+        // for a module that reads `fsdusr` directly (The Rose, both builds:
         // `getasc(fsdusr->tmpmsg)`). Written at the tail offset its build
-        // bakes in (`fsd::FSDBBS_TMPMSG`), past the `fsdscb` prefix this host
-        // otherwise models; `curmbk`/`amode` live host-side in `fsdtmp` and
-        // are not read from the struct by any module, so only `tmpmsg` is
-        // mirrored out.
-        A::ptr_offset(at, fsd::FSDBBS_TMPMSG)
+        // bakes in (`A::FSDBBS_TMPMSG` -- per-ABI, each impl carries its own
+        // measurement), past the `fsdscb` prefix this host otherwise models;
+        // `curmbk`/`amode` live host-side in `fsdtmp` and are not read from
+        // the struct by any module, so only `tmpmsg` is mirrored out.
+        A::ptr_offset(at, A::FSDBBS_TMPMSG)
             .write(call.mem(), &A::int_to_bytes(A::int_from_u32(u32::from(number))))
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
@@ -1098,6 +1101,13 @@ pub fn fsdbkg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
 
+    if super::traced() {
+        eprintln!(
+            "mbbs-trace: FSDBKG templt={templt:?} len={} first={:?}",
+            template.len(),
+            String::from_utf8_lossy(&template[..template.len().min(60)])
+        );
+    }
     // `prf("\x1B[0m\x1B[2J\x1B[0m")` -- reset, clear screen, reset again.
     crate::shims::text::append_mem(call.mem(), host, b"\x1b[0m\x1b[2J\x1b[0m")?;
 
@@ -3214,6 +3224,31 @@ mod tests {
         assert_eq!(
             block.mbleng(),
             f.host.forms()[&(0, 0)].punctuation.len() as u16
+        );
+    }
+
+    #[test]
+    fn fsdroom_mirrors_tmpmsg_where_the_sixteen_bit_rose_reads_it() {
+        // The Rose 2.0 (NE) re-fetches its template as `getasc(fsdusr->tmpmsg)`:
+        // `les bx,[fsdusr]; push word es:[bx+0x00AB]; call far getasc` -- seg
+        // 28:0x2ed-0x2fc of RCIROSE.DLL, and 0xAB is also the header math,
+        // sizeof fsdscb (166, FSD.H:275) + sizeof ainscb (1, AIN.H:51) +
+        // sizeof(FILE *curmbk) (4). Written at the 32-bit build's 0xc8, the
+        // NE build read zeros and painted a template-less screen.
+        let mut f = Fixture::new();
+        let _ = open(&mut f);
+        let spec = f.text("ONE TWO");
+        f.invoke(fsdroom, &[7, spec.offset, spec.selector, 0]).expect("sized");
+
+        let fsdusr = f.host.globals().pointer(&f.machine, "fsdusr").expect("placed");
+        let word = f
+            .machine
+            .read(FarPtr { selector: fsdusr.selector, offset: fsdusr.offset + 0x00ab }, 2)
+            .expect("in the block");
+        assert_eq!(
+            u16::from_le_bytes([word[0], word[1]]),
+            7,
+            "fsdusr->tmpmsg at the 16-bit build's own offset"
         );
     }
 
