@@ -357,6 +357,12 @@ impl Abi for Wg32 {
         Ok(exit)
     }
 
+    fn interrupt(_cpu: &mut Self::Cpu, vector: u8, _dos: &mut dos_kernel::kernel::Dos) -> std::io::Result<Result<Exit<Self>, String>> {
+        Ok(Err(format!(
+            "int {vector:#04x} from a 32-bit module: a PE32 module imports its runtime and never traps"
+        )))
+    }
+
     /// Direct delegation -- `mbbs_machine::m32::Machine::arg_frame` (Task 6)
     /// already returns exactly the window `Call<Wg32>::new` needs: the bytes
     /// starting right after the near return address, running to the end of

@@ -188,6 +188,30 @@ impl Abi for Wg16 {
         Ok(exit)
     }
 
+    fn interrupt(cpu: &mut Self::Cpu, vector: u8, dos: &mut dos_kernel::kernel::Dos) -> std::io::Result<Result<Exit<Self>, String>> {
+        use dos_kernel::kernel::{dispatch, is_implemented, Outcome};
+        if vector != 0x21 {
+            return Ok(Err(format!("int {vector:#04x} is not serviced")));
+        }
+        let regs = cpu.regs();
+        let ah = (regs.ax >> 8) as u8;
+        if !is_implemented(ah) {
+            return Ok(Err(format!("int 21h AH={ah:#04x} is not serviced")));
+        }
+        let outcome = {
+            let mut guest = crate::dosint::Guest16::new(cpu);
+            dispatch(&mut guest, &mut dos.state)
+        };
+        match outcome {
+            Outcome::Continue => {}
+            Outcome::Terminate(code) => return Ok(Err(format!("int 21h AH={ah:#04x} asked to terminate with {code}"))),
+            Outcome::StayResident { .. } => return Ok(Err("int 21h AH=0x31 asked to stay resident".to_owned())),
+            Outcome::Fault(f) => return Ok(Err(format!("int 21h AH={ah:#04x}: {f}"))),
+        }
+        cpu.set_ip(regs.ip.wrapping_add(2));
+        cpu.jump().map(|exit| Ok(convert_exit(exit)))
+    }
+
     fn arg_frame(cpu: &Self::Cpu) -> &[u8] {
         cpu.arg_frame()
     }
@@ -389,7 +413,7 @@ fn convert_exit(exit: mbbs_machine::m16::Exit) -> Exit<Wg16> {
             hi: u32::from(dx),
         },
         mbbs_machine::m16::Exit::Fault { .. } | mbbs_machine::m16::Exit::Timeout { .. } => Exit::Stopped,
-        mbbs_machine::m16::Exit::Interrupt { .. } => unreachable!("serviced in Task 6"),
+        mbbs_machine::m16::Exit::Interrupt { vector, .. } => Exit::Interrupt { vector },
     }
 }
 

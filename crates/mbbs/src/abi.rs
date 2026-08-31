@@ -544,6 +544,21 @@ pub trait Abi {
     where
         Self: Sized;
 
+    /// Service the `int vector` the machine just exited with and resume it.
+    ///
+    /// `Ok(Ok(exit))` is the next exit; `Ok(Err(why))` is a refusal the host
+    /// turns into a poison (an unserviced vector or `AH`, a bad guest
+    /// pointer, a request to terminate the process). Only `Wg16` can be
+    /// asked; `Wg32` never produces [`Exit::Interrupt`] and answers with a
+    /// refusal that says so rather than panicking.
+    fn interrupt(
+        cpu: &mut Self::Cpu,
+        vector: u8,
+        dos: &mut dos_kernel::kernel::Dos,
+    ) -> std::io::Result<Result<Exit<Self>, String>>
+    where
+        Self: Sized;
+
     /// The outstanding call's raw argument frame -- what [`Cursor`]/[`Call`]
     /// read. Direct delegation to the machine's own `arg_frame`.
     fn arg_frame(cpu: &Self::Cpu) -> &[u8];
@@ -1130,6 +1145,11 @@ pub enum Exit<A: Abi> {
     /// The module reached host thunk `index` (`u16` in both machines).
     Call { index: u16 },
 
+    /// The module executed `int vector`. Only a 16-bit machine produces
+    /// this -- a PE32 module imports its runtime and never traps -- and the
+    /// machine is resumable: [`Abi::interrupt`] services and resumes it.
+    Interrupt { vector: u8 },
+
     /// The module returned. `lo` is `AX`/`EAX` zero-extended, `hi` is
     /// `DX`/`EDX`; each `Abi` implementation's own conversion documents the
     /// mapping (`Ret`'s own doc comment covers the direction back in).
@@ -1168,6 +1188,7 @@ impl<A: Abi> std::fmt::Debug for Exit<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Call { index } => f.debug_struct("Call").field("index", index).finish(),
+            Self::Interrupt { vector } => f.debug_struct("Interrupt").field("vector", vector).finish(),
             Self::Returned { lo, hi } => f.debug_struct("Returned").field("lo", lo).field("hi", hi).finish(),
             Self::Stopped => write!(f, "Stopped"),
             // `_Phantom` holds an `Infallible`, which has no values -- this
@@ -1371,6 +1392,10 @@ mod tests {
 
         fn resume(_cpu: &mut Self::Cpu, _ret: Ret<Self>, _cleans: crate::shims::Cleans) -> std::io::Result<Exit<Self>> {
             unreachable!("Call's read tests never call Abi::resume")
+        }
+
+        fn interrupt(_cpu: &mut Self::Cpu, vector: u8, _dos: &mut dos_kernel::kernel::Dos) -> std::io::Result<Result<Exit<Self>, String>> {
+            Ok(Err(format!("the test ABI services no interrupt (asked for {vector:#04x})")))
         }
 
         fn arg_frame(_cpu: &Self::Cpu) -> &[u8] {

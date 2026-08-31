@@ -931,6 +931,10 @@ pub struct Host<A: Abi> {
     /// and in whatever case it likes.
     pub root: PathBuf,
 
+    /// The DOS kernel a 16-bit module reaches through `int 21h`, rooted at
+    /// [`Host::root`]. Built on first use: most modules never trap.
+    dos: Option<dos_kernel::kernel::Dos>,
+
     /// Behaviour installed above this host -- see [`crate::extension`].
     ///
     /// `None` is the supported default and must remain one: a board with no
@@ -1900,6 +1904,7 @@ impl<A: Abi> Host<A> {
                 .expect("the anchor names a real profile"),
             globals,
             root: root.into(),
+            dos: None,
             extension: None,
             last_line: String::new(),
             spr: A::ptr_offset(base, 0),
@@ -3415,6 +3420,20 @@ impl<A: Abi> Host<A> {
         Ok(module)
     }
 
+    /// The DOS kernel for `int 21h`, rooted at [`Host::root`] on first use.
+    ///
+    /// Drive C: (`drive = 2`), no PSP and no DTA: a module sets its own with
+    /// `AH=1Ah` before any `4Eh`, and `dispatch` refuses a `4Eh` without one.
+    fn dos(&mut self) -> io::Result<&mut dos_kernel::kernel::Dos> {
+        if self.dos.is_none() {
+            let dir = std::fs::File::open(&self.root)?;
+            let mut state = dos_kernel::kernel::DosState::default();
+            state.files = Some(dos_kernel::files::Files::new(dir.into(), self.root.clone()));
+            self.dos = Some(dos_kernel::kernel::Dos { state });
+        }
+        Ok(self.dos.as_mut().expect("just built"))
+    }
+
     /// Call a module entry point, servicing its imports until it stops.
     ///
     /// `chan` names which channel this call is being made on -- purely for
@@ -3464,6 +3483,16 @@ impl<A: Abi> Host<A> {
                     return Ok(Outcome::Stopped(poison));
                 }
                 crate::abi::Exit::Call { index } => index,
+                crate::abi::Exit::Interrupt { vector } => {
+                    let dos = self.dos()?;
+                    exit = match A::interrupt(machine, vector, dos)? {
+                        Ok(next) => next,
+                        Err(why) => {
+                            return self.stop(machine, A::refused("mbbs".to_owned(), format!("int {vector:#04x}"), why));
+                        }
+                    };
+                    continue;
+                }
                 // Not a real variant -- see `Exit`'s own doc comment.
                 crate::abi::Exit::_Phantom(never, _) => match never {},
             };
