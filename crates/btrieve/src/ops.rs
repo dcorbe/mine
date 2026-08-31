@@ -2311,7 +2311,14 @@ impl<M: Mem> Block<M> {
                 if candidate.duplicates {
                     continue;
                 }
-                let value = candidate.extract(bytes);
+                // Off the *keyed* record: a key's `offset` is a physical-slot
+                // offset, two bytes ahead of `Record::bytes` on v6, and
+                // `self.insert` below keys the same record through `keyed()`
+                // when it reaches `insert_v6`. Extracting off the bare `bytes`
+                // read a v6 key two bytes late, off the end of the record --
+                // the same defect `shims::btrieve::duplicate_key` carried.
+                let keyed = self.keyed(bytes);
+                let value = candidate.extract(&keyed);
                 match self.key_exists(candidate.number, &value) {
                     Ok(true) => {
                         return Err(InsertExtendedError {
