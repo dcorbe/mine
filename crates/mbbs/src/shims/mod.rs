@@ -1555,16 +1555,19 @@ const CRT_SHARED: &[&str] = &[
     "abort", "exit",
 ];
 
-/// The three that travel the other way: keyed `CW3220MT` in [`routines`], and
+/// The ones that travel the other way: keyed `CW3220MT` in [`routines`], and
 /// imported from `MAJORBBS` by **16-bit** modules, which have nowhere else to
 /// get a C runtime from. Measured in the committed corpus tables -- three NE
 /// rows for `_localeconvention` (LunatiX's NE build and SFAELF) and one each
-/// for the other two, against zero PE32 rows for all three.
+/// for `_fgetc`, `_fputc` and `_write`, against zero PE32 rows for any.
+/// `_doserror` is The Rose 2.0's: its own linked-in `findfirst` near-calls
+/// `__DOSerror` on the DOS-error path, an `OFFSET` fixup on `MAJORBBS`
+/// ordinal 14, which the loader pre-checks and refused as an unplaced global.
 ///
 /// A list of their own rather than a `(name, home)` pair on every one of
 /// [`CRT_SHARED`]'s sixty-seven: which list a name is in *is* its home, so
 /// nothing is repeated and [`crt_home`] still answers in one pass.
-const CRT_SHARED_16: &[&str] = &["_localeconvention", "_fgetc", "_fputc", "_write"];
+const CRT_SHARED_16: &[&str] = &["_localeconvention", "_fgetc", "_fputc", "_write", "_doserror"];
 
 /// The second door: routines that answer only for `Wg16`. See
 /// [`Abi::native`]'s own doc comment for why these twenty-seven are here and
@@ -2360,6 +2363,20 @@ mod tests {
                 "{name} is imported from MAJORBBS by a real NE module"
             );
         }
+    }
+
+    /// `_doserror` travels the other way as well. The Rose 2.0 (NE) links
+    /// Borland's `findfirst` into its own segment 1, whose DOS-error path is
+    /// `push bx; call __DOSerror` -- a near call, so an `OFFSET` fixup on
+    /// `MAJORBBS` ordinal 14 (`__DOSERROR`), which the loader pre-checks as
+    /// an address-taken routine. Keyed `CW3220MT` alone it pre-checked as a
+    /// global the host lacks, and the module never loaded.
+    #[test]
+    fn doserror_answers_under_majorbbs_for_a_sixteen_bit_module() {
+        assert!(
+            matches!(entry::<Wg16>(MAJORBBS, "_doserror"), Entry::Routine(..)),
+            "a 16-bit module imports _doserror from MAJORBBS"
+        );
     }
 
     /// And the thirteen the split moved that have no 16-bit evidence stay
