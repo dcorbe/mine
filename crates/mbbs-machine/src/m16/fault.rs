@@ -185,6 +185,37 @@ unsafe fn recover_fault(signo: libc::c_int, ctx: *mut libc::c_void, host_cs: u16
     // recovery possible.
     let ctx16 = gregs[libc::REG_R14 as usize] as *mut Ctx;
 
+    // An `int nn` is how a module that linked its own DOS runtime asks for
+    // a service, not a crash. Recognise exactly that -- two bytes, `cd nn`,
+    // inside a segment this machine owns -- and leave the excursion
+    // resumable. Everything else is a real fault. The lookup walks
+    // `Segments` by value and reads the segment's own mapping: no
+    // allocation, no lock, no syscall.
+    let ip = gregs[libc::REG_RIP as usize] as usize;
+    // SAFETY: `ctx16` is the live `Ctx` (claimed by `is_ldt_selector`), and
+    // `segments` was set by `Machine::enter` from a `Segments` the machine
+    // owns for the whole excursion.
+    // SAFETY (pointer): `segments` is the address of the live `Segments`
+    // `Machine::enter` recorded; zero before the first entry, and
+    // `as_ref` answers `None` for zero.
+    let trap = unsafe { ((*ctx16).segments as *const crate::m16::segments::Segments).as_ref() }
+        .and_then(|segs| segs.segment(faulting_cs).ok())
+        .filter(|seg| ip.checked_add(2).is_some_and(|end| end <= seg.len()))
+        .map(|seg| seg.slice(ip, 2))
+        .filter(|bytes| bytes[0] == 0xcd)
+        .map(|bytes| bytes[1]);
+    // SAFETY: as above.
+    unsafe {
+        match trap {
+            Some(vector) => {
+                (*ctx16).out_kind = 1;
+                (*ctx16).out_vector = u64::from(vector);
+                (*ctx16).out_flags = gregs[libc::REG_EFL as usize] as u64;
+            }
+            None => (*ctx16).out_kind = 0,
+        }
+    }
+
     // SAFETY: `ctx16`, `gregs` and `packed` all come from this same fault;
     // `ctx16` is the live `Ctx` this excursion was entered with.
     unsafe { rewrite(uc, packed, ctx16, signo, faulting_cs, host_cs) };

@@ -26,7 +26,10 @@
 //!             let _ = index;
 //!             exit = machine.resume(Ret::U16(sum))?;
 //!         }
-//!         Exit::Returned { .. } | Exit::Fault { .. } | Exit::Timeout { .. } => break,
+//!         Exit::Returned { .. }
+//!         | Exit::Fault { .. }
+//!         | Exit::Timeout { .. }
+//!         | Exit::Interrupt { .. } => break,
 //!     }
 //! }
 //! # Ok(())
@@ -223,6 +226,12 @@ pub enum Exit {
     /// The module far-called an import thunk. Arguments are readable with
     /// [`Machine::arg_u16`]; [`Machine::resume`] continues it.
     Call { index: u16 },
+
+    /// The module executed `int vector` at `cs:ip` (the instruction's own
+    /// address, an offset within its code segment). Resumable: the machine
+    /// is **not** poisoned. Service it, then `set_ip(ip + 2)` (and
+    /// `set_ax`/`set_carry` as the answer needs) and [`Machine::jump`].
+    Interrupt { vector: u8, cs: u16, ip: u16 },
 
     /// The module returned from the entry point it was called at, by `RETF`.
     /// `ax` alone for an `int`, `dx:ax` for anything 32 bits wide.
@@ -1439,6 +1448,8 @@ impl Machine {
         self.ctx.out_ss = 0;
         self.ctx.out_signo = 0;
         self.ctx.out_cx = 0;
+        self.ctx.out_kind = 0;
+        self.ctx.segments = std::ptr::from_ref(&self.mem) as usize;
 
         // SAFETY: every field the assembly reads is set by whichever entry
         // point called this, or immediately above; the code and stack
@@ -1477,6 +1488,15 @@ impl Machine {
             self.ctx.ss16 = self.ctx.out_ss as u16;
             self.ctx.target_selector = cs;
             self.ctx.target_offset = u32::from(ip);
+
+            if self.ctx.out_kind == 1 && signo != watchdog::signo() {
+                self.ctx.flags = self.ctx.out_flags;
+                return Ok(Exit::Interrupt {
+                    vector: self.ctx.out_vector as u8,
+                    cs,
+                    ip,
+                });
+            }
 
             // Which signal it was is the whole distinction. Everything else --
             // the recovery, the poisoning, the lost state -- is identical.

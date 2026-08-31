@@ -65,6 +65,9 @@ fn a_module_image_may_fill_its_whole_code_segment() {
                 panic!("module faulted with signal {signo} at {cs:#06x}:{ip:#06x}")
             }
             Exit::Timeout { cs, ip } => panic!("module timed out at {cs:#06x}:{ip:#06x}"),
+            Exit::Interrupt { vector, cs, ip } => {
+                panic!("module executed int {vector:#04x} at {cs:#06x}:{ip:#06x}")
+            }
         }
     }
 

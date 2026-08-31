@@ -389,6 +389,7 @@ fn convert_exit(exit: mbbs_machine::m16::Exit) -> Exit<Wg16> {
             hi: u32::from(dx),
         },
         mbbs_machine::m16::Exit::Fault { .. } | mbbs_machine::m16::Exit::Timeout { .. } => Exit::Stopped,
+        mbbs_machine::m16::Exit::Interrupt { .. } => unreachable!("serviced in Task 6"),
     }
 }
 

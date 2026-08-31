@@ -124,6 +124,20 @@ pub(crate) struct Ctx {
     /// unless `out_signo` is nonzero.
     pub out_cs: u64,
     pub out_ip: u64,
+
+    /// `1` when the signal handler recognised the faulting instruction as
+    /// `int nn` and left the machine resumable; `0` for a real fault. Only
+    /// meaningful when `out_signo` is nonzero.
+    pub out_kind: u64,
+    /// The `nn` of that `int`.
+    pub out_vector: u64,
+    /// This machine's `Segments`, as an address, so the handler can read the
+    /// two bytes at the faulting `CS:IP` without loading a selector. Set
+    /// before every entry by `Machine::enter`; an address rather than a
+    /// `*const` because `Ctx` derives `Default` and a raw pointer has none.
+    /// Read-only in the handler, which runs while the excursion holds the
+    /// machine.
+    pub segments: usize,
 }
 
 impl Ctx {
