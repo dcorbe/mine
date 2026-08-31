@@ -1150,6 +1150,39 @@ static void cmd_serve(const char *port_str)
      * every command shares that one call rather than each sending its own. */
 }
 
+/* Open a file and immediately B_STEP_NEXT (op 24) without any prior
+ * positioning -- to measure what genuine Btrieve does for a cold step-next:
+ * the first record (status 0), or "no current record" (status 8). */
+static void cmd_stepcold(const char *path)
+{
+    static unsigned char data[DATA_SIZE];
+    char posblk[POSBLK_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    DWORD dlen;
+    int st;
+    st = open_file(posblk, path, MODE_READ_ONLY);
+    if (st != ST_OK) die("open", st);
+    dlen = DATA_SIZE;
+    memset(keybuf, 0, sizeof keybuf);
+    st = btrcall(B_STEP_NEXT, posblk, data, &dlen, keybuf, sizeof keybuf - 1, (char)0);
+    printf("cold B_STEP_NEXT: status %d (%s), len %lu\n", st, status_name(st), (unsigned long)dlen);
+    if (st == ST_OK) {
+        unsigned long pos = 0; DWORD plen = sizeof pos;
+        int p = btrcall(B_GET_POSITION, posblk, &pos, &plen, keybuf, sizeof keybuf - 1, (char)0);
+        printf("  position: status %d, pos %lu\n", p, pos);
+    }
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+
+    /* fresh open, cold STEP_PREV (35) */
+    st = open_file(posblk, path, MODE_READ_ONLY);
+    if (st == ST_OK) {
+        dlen = DATA_SIZE; memset(keybuf, 0, sizeof keybuf);
+        st = btrcall(35, posblk, data, &dlen, keybuf, sizeof keybuf - 1, (char)0);
+        printf("cold STEP_PREV(35): status %d (%s)\n", st, status_name(st));
+        { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+    }
+}
+
 int main(int argc, char **argv)
 {
     HMODULE dll;
@@ -1196,6 +1229,8 @@ int main(int argc, char **argv)
         cmd_walk(path, keynum);
     else if (!strcmp(cmd, "step"))
         cmd_step(path);
+    else if (!strcmp(cmd, "stepcold"))
+        cmd_stepcold(path);
     else if (!strcmp(cmd, "descend"))
         cmd_descend(path, keynum);
     else if (!strcmp(cmd, "keys"))

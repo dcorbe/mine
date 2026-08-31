@@ -1368,9 +1368,16 @@ impl<M: Mem> Block<M> {
                     None => return Ok(None),
                 }
             }
-            (Step::Next | Step::Previous, Cursor::Nowhere) => {
-                return Err(OpError::NotPositioned);
-            }
+            // A file with no position yet sits *before the first record*, so
+            // a cold `Step-Next` returns the first record and a cold
+            // `Step-Previous` is already at end-of-file. Measured against
+            // genuine Btrieve 6.15 (`tools/btrieve-oracle` `stepcold`): a
+            // fresh `B_STEP_NEXT` answers status 0 with record 0 (or status 9
+            // on an empty file), and a fresh `B_STEP_PREV` answers status 9.
+            // Refusing this stopped The Rose's post-init pass, which does
+            // `dfaStepLock(24)` on `rci_play.dat` without positioning first.
+            (Step::Next, Cursor::Nowhere) => 0,
+            (Step::Previous, Cursor::Nowhere) => return Ok(None),
         };
 
         if at >= count {
@@ -3207,16 +3214,24 @@ mod tests {
     }
 
     #[test]
-    fn step_next_and_previous_with_nothing_positioned_are_refused() {
-        let mut b = fixture("step_next_and_previous_with_nothing_positioned_are_refused");
+    fn step_next_from_cold_is_the_first_record_and_previous_is_end_of_file() {
+        // A file with no position sits *before the first record*: a cold
+        // `Step-Next` returns the first record, a cold `Step-Previous` is
+        // already at end-of-file. Measured against genuine Btrieve 6.15
+        // (`tools/btrieve-oracle` `stepcold`): `B_STEP_NEXT` on a fresh open
+        // answers status 0 with record 0, `B_STEP_PREV` answers status 9.
+        let mut b = fixture("step_next_from_cold_is_the_first_record_and_previous_is_end_of_file");
         let mut locks = LockTable::default();
-        assert_eq!(
-            b.step(Step::Next, 0, &mut locks, RECLEN).expect_err("nothing has positioned this file"),
-            OpError::NotPositioned
-        );
-        assert_eq!(
-            b.step(Step::Previous, 0, &mut locks, RECLEN).expect_err("nothing has positioned this file"),
-            OpError::NotPositioned
+        let cold = b.step(Step::Next, 0, &mut locks, RECLEN).unwrap().expect("cold next = first");
+        // Same record `Step::First` reaches, from a fresh file.
+        let mut b2 = fixture("step_next_from_cold_is_the_first_record_and_previous_is_end_of_file_b");
+        let first = b2.step(Step::First, 0, &mut locks, RECLEN).unwrap().expect("first");
+        assert_eq!(tag(&cold), tag(&first), "cold Step-Next lands on the first record");
+        // A cold Step-Previous is end-of-file, not a refusal.
+        let mut b3 = fixture("step_next_from_cold_is_the_first_record_and_previous_is_end_of_file_c");
+        assert!(
+            b3.step(Step::Previous, 0, &mut locks, RECLEN).unwrap().is_none(),
+            "cold Step-Previous is end-of-file"
         );
     }
 
@@ -4149,13 +4164,26 @@ mod tests {
     }
 
     #[test]
-    fn step_next_extended_with_nothing_positioned_is_refused_not_silently_empty() {
-        let mut b = fixture("step_next_extended_with_nothing_positioned_is_refused_not_silently_empty");
+    fn step_next_extended_from_cold_starts_at_the_first_record() {
+        // `Step Next Extended` is repeated `Step Next`, so from a cold file
+        // it begins at the first record -- the same "before the first record"
+        // start `step_next_from_cold_is_the_first_record_...` measures for the
+        // plain op. A refusal here would have made Step Next Extended the one
+        // reader that could not begin a file without a separate positioning
+        // call.
+        let mut b = fixture("step_next_extended_from_cold_starts_at_the_first_record");
         let mut locks = LockTable::default();
-        let err = b
-            .step_next_extended(3, 0, &mut locks, RECLEN)
-            .expect_err("Step Next Extended needs prior positioning, same as Step Next");
-        assert_eq!(err, OpError::NotPositioned);
+        let cold = b.step_next_extended(3, 0, &mut locks, RECLEN).unwrap();
+        let mut b2 = fixture("step_next_extended_from_cold_starts_at_the_first_record_b");
+        b2.step(Step::First, 0, &mut locks, RECLEN).unwrap().expect("first");
+        let warm = b2.step_next_extended(2, 0, &mut locks, RECLEN).unwrap();
+        // Cold(3) is First plus the next two -- so cold[1..] equals warm.
+        assert_eq!(cold.len(), 3, "three records from cold");
+        assert_eq!(
+            cold[1..].iter().map(tag).collect::<Vec<_>>(),
+            warm.iter().map(tag).collect::<Vec<_>>(),
+            "cold Step-Next-Extended begins at the first record, then walks forward"
+        );
     }
 
     // Insert Extended (40)
