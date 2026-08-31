@@ -5893,10 +5893,27 @@ impl<A: Abi> Host<A> {
         // the global must hold something callable before any module reads it
         // -- a null tail made The Rose save null and then call it. Seed it
         // with a host thunk, the same way `bgnedt` is (see `Host::vectors`).
+        // `syscyc` is a function-pointer global the real host seeds with its
+        // own `prctask` tail (`MAJORBBS.H:715`). A module extends the chain by
+        // saving `*syscyc` and calling it from its own installed routine, so
+        // the global must hold something callable before any module reads it
+        // -- a null tail made The Rose save null and then call it.
+        //
+        // **Only when it is still null.** A module that installs its own
+        // handler during *its own* init -- MajorMUD does, writing
+        // `_majormud_syscyc` before `finish_init` runs -- has already put a
+        // real handler here. Seeding over it replaced that handler with the
+        // no-op tail, so `Host::syscyc` fired the tail instead of MajorMUD's
+        // routine and its per-cycle work (the "silent meditation" exit timer
+        // among it) never ran. The Rose installs later, from a kick, so at
+        // `finish_init` its `syscyc` is still the null this seeds.
         let (index, tail) = A::reserve_host_thunk(machine)?;
         self.syscyc_tail = Some(tail);
-        self.globals()
-            .write_mem(A::mem(machine), "syscyc", &A::ptr_to_bytes(tail))?;
+        let current = self.globals().pointer_mem(A::mem(machine), "syscyc")?;
+        if current == A::null_ptr() {
+            self.globals()
+                .write_mem(A::mem(machine), "syscyc", &A::ptr_to_bytes(tail))?;
+        }
         self.vectors.push((
             index,
             mbbs_machine::module::ImportSite {
