@@ -79,6 +79,52 @@ fn a_genuine_fault_still_poisons() {
     assert!(machine.poisoned().is_some());
 }
 
+/// `push ds; mov ax,ss; mov ds,ax; int 21h; mov ax,ds; pop ds; retf` -- the
+/// module moves DS away from its own DGROUP (to SS, a segment distinct from
+/// both DGROUP and the code segment) before trapping, then reports what DS
+/// held right after resuming.
+fn ds_mover() -> Vec<u8> {
+    vec![
+        0x1e, // push ds
+        0x8c, 0xd0, // mov ax, ss
+        0x8e, 0xd8, // mov ds, ax
+        0xcd, 0x21, // int 21h
+        0x8c, 0xd8, // mov ax, ds
+        0x1f, // pop ds
+        0xcb, // retf
+    ]
+}
+
+/// A trap must report the module's *live* DS, not whichever segment the last
+/// crossing happened to leave behind -- and a resume must hand that same DS
+/// back, not silently replace it with the pre-trap value. Pins the fix to
+/// `m16/fault.rs::rewrite`, which used to capture every `out_*` register but
+/// `out_ds`, leaving [`Machine::regs`] to report a stale fold
+/// (`Machine::enter`'s unconditional `self.ctx.ds = self.ctx.out_ds`) instead
+/// of what the hardware DS register actually held at the trap.
+#[test]
+fn a_trap_reports_and_a_resume_preserves_the_modules_own_moved_ds() {
+    let mut machine = Machine::new().expect("16-bit machine");
+    machine.load_code(&ds_mover()).expect("module fits");
+    let Exit::Interrupt { ip, .. } = machine.call(machine.code_ptr(0), &[]).expect("called") else {
+        panic!("expected an interrupt");
+    };
+    assert_eq!(
+        machine.regs().ds,
+        machine.stack_selector(),
+        "the trap must report the DS the module actually moved to, not data_selector()'s DGROUP"
+    );
+    machine.set_ip(ip + 2);
+    match machine.jump().expect("resumed") {
+        Exit::Returned { ax, .. } => assert_eq!(
+            ax,
+            machine.stack_selector(),
+            "the resume must hand the module's own DS back, not the pre-trap crossing's"
+        ),
+        other => panic!("expected a return, got {other:?}"),
+    }
+}
+
 #[test]
 fn read_answers_exactly_the_bytes_written_and_refuses_past_the_segment() {
     let mut machine = Machine::new().expect("16-bit machine");

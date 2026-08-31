@@ -349,6 +349,17 @@ unsafe fn rewrite(
     // back. Set it here instead -- the change outlives the handler precisely
     // because nothing will overwrite it. R12 holds the host's, put there by
     // `mbbs16_enter` for the trampoline that this is standing in for.
+    // The module's DS is still in the hardware register here -- the next
+    // lines are what replace it with the host's. Capture it the way the
+    // trampoline's ordinary exit does (`asm.rs`, `movw %ds, {out_ds}`), so
+    // a resumable trap reports the DS the module was actually running with
+    // and a resume hands it back instead of the last crossing's.
+    let module_ds: u16;
+    // SAFETY: reading a segment register has no side effects.
+    unsafe { std::arch::asm!("mov {0:x}, ds", out(reg) module_ds, options(nostack, preserves_flags)) };
+    // SAFETY: as this function's own safety section (`ctx16` is live).
+    unsafe { (*ctx16).out_ds = u64::from(module_ds) };
+
     let host_ds = gregs[libc::REG_R12 as usize] as u16;
     // SAFETY: loading a selector the host was already running under.
     unsafe { std::arch::asm!("mov ds, {0:x}", in(reg) host_ds, options(nostack, preserves_flags)) };
