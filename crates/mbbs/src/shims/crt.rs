@@ -1151,8 +1151,9 @@ fn standard_handle(handle: i32) -> Result<usize, ShimError> {
 ///
 /// # Errors
 ///
-/// If `handle` is not one of the five standard handles this host resolves
-/// (see [`standard_handle`]); if `amode` is neither `O_TEXT` nor `O_BINARY`
+/// If `handle` is neither a standard handle (see [`standard_handle`]) nor a
+/// descriptor of an open stream (5 and above resolve through
+/// [`crate::stream::Streams::setmode_fd`]); if `amode` is neither `O_TEXT` nor `O_BINARY`
 /// -- real Borland's own header defines no third value, and guessing one
 /// would be inventing behaviour rather than reading it off a source.
 ///
@@ -1166,10 +1167,7 @@ pub fn setmode<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
     let handle = sign_extend::<A>(call.int().into());
     let amode = Into::<u32>::into(call.int());
-    let idx = standard_handle(handle)?;
-
-    let previous = if host.stdio_modes[idx] { O_BINARY } else { O_TEXT };
-    host.stdio_modes[idx] = match amode {
+    let binary = match amode {
         O_BINARY => true,
         O_TEXT => false,
         _ => {
@@ -1178,6 +1176,23 @@ pub fn setmode<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
             )));
         }
     };
+
+    // A descriptor a real `fopen` issued names `Streams`'s own state, the
+    // same routing `read`/`write`/`lseek` already use -- the fold
+    // `Host::stdio_modes`'s doc comment left for whoever touched
+    // `stream.rs` next. The Rose 2.0 (NE) is who needs it: seg 25:0x041e
+    // calls `setmode` on the file it just opened.
+    if let Some(fd) = descriptor(handle) {
+        let was = host
+            .streams
+            .setmode_fd(fd, binary)
+            .map_err(|e| ShimError::Failed(format!("setmode({handle}, {amode:#06x}): {e}")))?;
+        return Ok(abi::Ret::Int(A::int_from_u32(if was { O_BINARY } else { O_TEXT })));
+    }
+    let idx = standard_handle(handle)?;
+
+    let previous = if host.stdio_modes[idx] { O_BINARY } else { O_TEXT };
+    host.stdio_modes[idx] = binary;
     Ok(abi::Ret::Int(A::int_from_u32(previous)))
 }
 
@@ -4066,6 +4081,70 @@ mod tests {
         let named = f.text("D:\\ESCAPE");
         let e = f.invoke(rmdir, &Fixture::far(named)).expect_err("a drive letter is refused");
         assert!(format!("{e}").contains("outside this host's own"), "{e}");
+    }
+
+    // ---- setmode on a descriptor an fopen issued ---------------------------
+
+    /// What `fileno(fp)` expands to, done by hand -- the same extraction
+    /// `read_accepts_a_descriptor_fopen_issued_and_reads_that_file` does.
+    fn fd_of(f: &mut Fixture, fp: FarPtr) -> u16 {
+        let image = f.machine.resolve(fp, crate::stream::FILE_SIZE).expect("a FILE").to_vec();
+        let at = usize::from(Wg16::FILE_FD_OFFSET);
+        let width = usize::from(Wg16::FILE_FD_WIDTH);
+        let mut raw = [0u8; 4];
+        raw[..width].copy_from_slice(&image[at..at + width]);
+        let fd = u32::from_le_bytes(raw);
+        assert!(fd >= 5, "a real descriptor, not a standard handle: {fd}");
+        fd as u16
+    }
+
+    /// The Rose 2.0 (NE) calls `setmode` on the descriptor of a file it just
+    /// opened (seg 25:0x041e). A descriptor names `Streams`'s own state, so
+    /// the answer and the flip both live there -- not in the five-handle
+    /// stdio table.
+    #[test]
+    fn setmode_flips_a_real_streams_own_mode_and_answers_the_previous() {
+        let root = scratch("crt-setmode-fd");
+        let mut f = Fixture::rooted(root);
+        let fp = opened(&mut f, "OUT.DAT", "w");
+        let fd = fd_of(&mut f, fp);
+
+        let was = f.invoke(setmode, &[fd, 0x8000]).expect("to binary");
+        assert_eq!(word(was), 0x4000, "a bare \"w\" opens in text mode");
+        let was = f.invoke(setmode, &[fd, 0x4000]).expect("back to text");
+        assert_eq!(word(was), 0x8000, "the previous mode was binary");
+    }
+
+    /// The flip reaches `Stream::write`'s own translation, not merely a
+    /// flag: the same `\n` lands as `\r\n` before and as itself after.
+    #[test]
+    fn setmode_to_binary_stops_the_newline_translation_mid_stream() {
+        let root = scratch("crt-setmode-fd-write");
+        let mut f = Fixture::rooted(root.clone());
+        let fp = opened(&mut f, "OUT.DAT", "w");
+        let fd = fd_of(&mut f, fp);
+        let nl = f.bytes(b"\n", false);
+
+        f.invoke(write, &[fd, nl.offset, nl.selector, 1]).expect("text-mode write");
+        f.invoke(setmode, &[fd, 0x8000]).expect("to binary");
+        f.invoke(write, &[fd, nl.offset, nl.selector, 1]).expect("binary write");
+        assert_eq!(
+            std::fs::read(root.join("OUT.DAT")).expect("written"),
+            b"\r\n\n",
+            "translated before the flip, untouched after"
+        );
+    }
+
+    #[test]
+    fn setmode_still_refuses_a_descriptor_nothing_opened_and_a_made_up_mode() {
+        let root = scratch("crt-setmode-fd-refuse");
+        let mut f = Fixture::rooted(root);
+        let e = f.invoke(setmode, &[99, 0x8000]).expect_err("nothing open at 99");
+        assert!(format!("{e}").contains("99"), "{e}");
+        let fp = opened(&mut f, "OUT.DAT", "w");
+        let fd = fd_of(&mut f, fp);
+        let e = f.invoke(setmode, &[fd, 0x1234]).expect_err("no third mode exists");
+        assert!(format!("{e}").contains("0x1234"), "{e}");
     }
 
     // ---- setvbuf ----------------------------------------------------------

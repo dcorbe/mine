@@ -1116,6 +1116,25 @@ impl<A: Abi> Streams<A> {
         Ok(self.open[self.find_fd(fd)?].mode.binary)
     }
 
+    /// Set whether `fd` translates -- `setmode`'s half of [`Streams::binary_fd`]
+    /// -- and answer what it was before.
+    ///
+    /// Real Borland flips the `O_TEXT` bit in `_openfd[fd]` (`WRITE.C`'s own
+    /// `_openfd[fd] & O_TEXT`, quoted on `crate::shims::crt::write`'s doc
+    /// comment), and every read and write consults it at call time -- which
+    /// [`Stream::write`]/[`Stream::getc`] already do here, so a mid-stream
+    /// flip takes effect on the very next call, exactly as it does there.
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream.
+    pub fn setmode_fd(&mut self, fd: u8, binary: bool) -> Result<bool, String> {
+        let at = self.find_fd(fd)?;
+        let was = self.open[at].mode.binary;
+        self.open[at].mode.binary = binary;
+        Ok(was)
+    }
+
     /// Where the stream `cookie` names is, or why it names none.
     fn find(&self, cookie: A::Ptr) -> Result<usize, String> {
         if let Some(at) = self.open.iter().position(|s| s.cookie == Some(cookie)) {
