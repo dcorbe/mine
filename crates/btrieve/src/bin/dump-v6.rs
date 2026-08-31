@@ -113,9 +113,11 @@ fn main() -> ExitCode {
     for (i, kd) in file.key_descriptors.iter().enumerate() {
         println!(
             "key[{i}] number={:#04x} root_page={} records={} attributes={:#06x} \
-             key_length={} entry_size={} max_entries={} half_entries={} chain={}",
+             key_length={} entry_size={} max_entries={} half_entries={} chain={} \
+             offset={} length={} self_tag={:#04x} extended={:#04x}",
             kd.key_number, kd.root_page, kd.records, kd.attributes,
             kd.key_length, kd.entry_size, kd.max_entries, kd.half_entries, kd.chain,
+            kd.offset, kd.length, kd.self_tag, kd.extended,
         );
     }
 
