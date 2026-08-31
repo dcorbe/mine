@@ -4593,11 +4593,24 @@ mod tests {
     /// because changing a refusal on an ambiguous measurement is exactly the
     /// mistake the other three fixes were correcting.
     #[test]
-    fn a_step_or_a_position_with_nothing_to_be_next_to_refuses() {
+    fn a_cold_step_next_is_the_first_record_but_a_cold_position_refuses() {
+        // The fresh-handle measurement the old refusal's own note asked for:
+        // `tools/btrieve-oracle` `stepcold` opens a file and immediately
+        // `B_STEP_NEXT` (24) -- genuine Btrieve 6.15 answers status 0 with the
+        // first record (status 9 on an empty file), so a cold Step-Next is the
+        // first record, not a refusal. `Get Position` (`absbtv`) from a fresh
+        // open is still status 8 -- "invalid positioning" -- because there is
+        // no current record to report the position of.
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        assert!(f.invoke(stpbtvl, &[0, 0, 24, 0]).is_err());
-        assert!(f.invoke(absbtv, &[]).is_err(), "and nowhere has no position");
+        assert!(
+            f.invoke(stpbtvl, &[0, 0, 24, 0]).is_ok(),
+            "a cold Step-Next answers the first record, not a refusal"
+        );
+        // A second file, freshly opened, to keep `absbtv`'s check cold.
+        let mut g = Fixture::new();
+        open(&mut g, "SAMPLE.DAT", 64);
+        assert!(g.invoke(absbtv, &[]).is_err(), "Get Position from nowhere has no position");
     }
 
     #[test]

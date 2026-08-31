@@ -1826,6 +1826,33 @@ pub fn rtkick<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// # Errors
 ///
 /// On the eleventh handler, where the real host `catastro`s.
+/// The name the routine table serves [`syscyc_tail`] under -- the host end
+/// of the `syscyc` chain a module extends.
+pub const SYSCYC_VECTOR: &str = "syscyc_tail";
+
+/// `VOID syscyc(VOID)` -- the tail of the system-cycle vector chain
+/// (`MAJORBBS.H:715`, "system-cycle vector (tail is prctask())").
+///
+/// `syscyc` is a *function-pointer global* the main loop calls once per
+/// cycle. A module extends it the way The Rose does: read `*syscyc`, save it,
+/// install its own routine, and have that routine call the saved one -- so
+/// the installed handlers run as a chain ending at the host's own tail. The
+/// real host seeds `syscyc` with `prctask` so that chain always terminates
+/// at something callable; a host that left it null made a module chaining
+/// onto it save a null pointer and then **call** it, which is where The Rose
+/// crashed (`call [saved]`, `signal 11 at 0x0`, RVA 0x26e0d) the moment its
+/// per-cycle kick first fired.
+///
+/// This is that tail, installed into the `syscyc` global by
+/// [`Host::finish_init`] through a host-reserved thunk -- the same mechanism
+/// [`crate::Host::vectors`] uses for `bgnedt`. It is a no-op: this host does
+/// its own per-cycle task and timer work in [`crate::Host::cycle`]
+/// (`prcrtk`, the poll sweep), so the chain terminator only has to be
+/// callable and return, not re-do it.
+pub fn syscyc_tail<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Void)
+}
+
 pub fn rtihdlr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     /// `RTIMAX`, `MAJORBBS.C:143` -- the depth of the `rtirs` array.
     const RTIMAX: usize = 10;

@@ -745,6 +745,11 @@ pub(crate) fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cl
         // other.
         (MAJORBBS, editor::VECTOR, editor::fse_bgnedt, Cleans::Caller,
          Evidence::VendorBody("SRC/api/wgsfse/EDITFSE.C")),
+        // Not an import either: the host tail of the `syscyc` vector chain,
+        // reached through the thunk `Host::finish_init` reserves for it and
+        // writes into the `syscyc` global. See `system::syscyc_tail`.
+        (MAJORBBS, system::SYSCYC_VECTOR, system::syscyc_tail, Cleans::Caller,
+         Evidence::Guessed("host-invented tail of the syscyc chain (MAJORBBS.H:715, \"tail is prctask()\"); a no-op because this host does its per-cycle work in Host::cycle")),
         (MAJORBBS, "begin_polling", user::begin_polling, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "stop_polling", user::stop_polling, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "fsdroom", fsd::fsdroom, Cleans::Caller, Evidence::Unclassified),

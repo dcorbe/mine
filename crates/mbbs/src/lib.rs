@@ -1605,6 +1605,12 @@ pub struct Host<A: Abi> {
     /// (`EDITFSE.C:245`). `None` before `finish_init` has run. Beside
     /// [`Host::fsd_state`] for the same reason it exists.
     pub(crate) editor_state: Option<usize>,
+    /// The host thunk seeded into the `syscyc` global as the chain tail (see
+    /// `shims::system::syscyc_tail`). `Host::syscyc` treats a `syscyc` still
+    /// equal to this as "no module has chained a real handler", so the
+    /// no-op tail is available for a module to save and call without the host
+    /// itself firing it every cycle.
+    pub(crate) syscyc_tail: Option<A::Ptr>,
 
     /// Each channel's editing session, if one is under way -- the vendor's
     /// `fseusr[usrnum]` (`EDITFSE.H`), Rust-side because no module ever
@@ -1968,6 +1974,7 @@ impl<A: Abi> Host<A> {
             resolved: Vec::new(),
             vectors: Vec::new(),
             editor_state: None,
+            syscyc_tail: None,
             editor_sessions: vec![None; usize::from(terms.count())],
         };
 
@@ -4100,7 +4107,11 @@ impl<A: Abi> Host<A> {
         dispatched: &mut usize,
     ) -> io::Result<Option<A::Poison>> {
         let vector = self.globals().pointer_mem(A::mem(machine), "syscyc")?;
-        if vector == A::null_ptr() {
+        // Null, or still the bare host tail: no module has chained a real
+        // handler, so there is nothing of the module's to fire. The tail
+        // exists only so a module can save and call it (`shims::system::
+        // syscyc_tail`); the host does not run it on its own.
+        if vector == A::null_ptr() || Some(vector) == self.syscyc_tail {
             return Ok(None);
         }
         match self.run(machine, module, vector, &[], None)? {
@@ -5873,6 +5884,24 @@ impl<A: Abi> Host<A> {
             mbbs_machine::module::ImportSite {
                 module: crate::exports::MAJORBBS.to_owned(),
                 symbol: Symbol::Name(shims::editor::VECTOR.to_owned()),
+                resolved: true,
+            },
+        ));
+        // `syscyc` is a function-pointer global the real host seeds with its
+        // own `prctask` tail (`MAJORBBS.H:715`). A module extends the chain by
+        // saving `*syscyc` and calling it from its own installed routine, so
+        // the global must hold something callable before any module reads it
+        // -- a null tail made The Rose save null and then call it. Seed it
+        // with a host thunk, the same way `bgnedt` is (see `Host::vectors`).
+        let (index, tail) = A::reserve_host_thunk(machine)?;
+        self.syscyc_tail = Some(tail);
+        self.globals()
+            .write_mem(A::mem(machine), "syscyc", &A::ptr_to_bytes(tail))?;
+        self.vectors.push((
+            index,
+            mbbs_machine::module::ImportSite {
+                module: crate::exports::MAJORBBS.to_owned(),
+                symbol: Symbol::Name(shims::system::SYSCYC_VECTOR.to_owned()),
                 resolved: true,
             },
         ));
@@ -9941,11 +9970,11 @@ mod tests {
     /// The first thunk index no module claims in a fresh `Fixture`, and the
     /// one a module loaded into it afterwards gets for its first import:
     /// `Host::new` reserves thunks 0..=60 for the standard text variables
-    /// (`shims::txtvbl`) and `finish_init` reserves one more for the
-    /// `bgnedt` vector (`Host::vectors`), all before any module is loaded.
-    /// `first_free_is_the_hosts_own_thunk_count` pins this number to
-    /// `Host::vectors`'s actual length.
-    const FIRST_FREE: u16 = 62;
+    /// (`shims::txtvbl`) and `finish_init` reserves two more -- the `bgnedt`
+    /// vector and the `syscyc` chain tail (`Host::vectors`) -- all before any
+    /// module is loaded. `first_free_is_the_hosts_own_thunk_count` pins this
+    /// number to `Host::vectors`'s actual length.
+    const FIRST_FREE: u16 = 63;
 
     #[test]
     fn first_free_is_the_hosts_own_thunk_count() {
