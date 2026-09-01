@@ -4830,7 +4830,25 @@ impl<A: Abi> Host<A> {
             // on "the module returned zero" instead of "`sttrou` returned
             // zero" would hang up on most status callbacks.
             if entry_index == 1
-                && let Outcome::Returned { lo: 0, .. } = outcome
+                && let Outcome::Returned { lo, hi } = &outcome
+                && std::env::var_os("MBBS_TRACE_STTROU").is_some()
+            {
+                eprintln!("mbbs-sttrou: chan={chan} state-entry-1 returned lo={lo} hi={hi} (AX==0 => go2mnu)");
+            }
+            // `sttrou` returns **`GBOOL`** -- `typedef short GBOOL`
+            // (`wg33src/INC/GCTYPDEF.H`), a 16-bit value. Genuine `hdlcri`
+            // (`MAJORBBS.C:3358`) reads it through a `GBOOL (*)(VOID)` pointer
+            // into an `INT`, which discards the high word, so only `AX`
+            // decides. A 32-bit module can leave that high word dirty and mean
+            // nothing by it: RCIROSE's `sttrou` epilogue is `mov ax,
+            // [usrptr->state]` with no `movzx`, so on exit (`state == 0`) it
+            // returns `AX == 0` under a leftover pointer in the high word.
+            // Comparing the full `lo` here missed that and left Rose unable to
+            // hand a channel back -- quitting dropped the user straight back
+            // in. Mask to `AX`, as the `GBOOL` return type always meant.
+            if entry_index == 1
+                && let Outcome::Returned { lo, .. } = outcome
+                && (lo & 0xffff) == 0
                 && let Err(e) = self.go2mnu(machine, chan)
             {
                 return self.shim_stop(machine, "go2mnu", e).map(|o| Some((o, chan)));
