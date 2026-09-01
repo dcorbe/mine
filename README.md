@@ -116,15 +116,6 @@ from the file format up: pages, keys, duplicate chains, transactions. See
 translation happens at the socket, never in the module's view of the world.
 See `crates/mbbs-server`.
 
-## Verification
-
-The method is oracles rather than opinion. Genuine Pervasive Btrieve runs under
-Wine and answers the same calls, so the Btrieve implementation is diffed
-against the real thing instead of against expectations. The original host
-executable is loadable and callable, so host behaviour can be asked of the
-host itself. The tests that need vendor binaries are not in this repository;
-what remains runs on committed fixtures alone.
-
 ## Repository layout
 
 | crate | what it does |
@@ -140,6 +131,7 @@ what remains runs on committed fixtures alone.
 | `cnf` | An editor for a module's sysop-configurable options. |
 | `bropey` | A byte-first persistent rope. |
 | `mud-core`, `mud-server`, `mud-client`, `mud-oracle` | A game-specific side track that predates MINE. Not part of the host; slated to leave this repository. |
+
 
 ## What this is not
 
