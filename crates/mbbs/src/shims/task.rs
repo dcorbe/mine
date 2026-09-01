@@ -81,12 +81,12 @@ pub fn mfytask<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     let taskid: u32 = call.int().into();
     let tskaddr = call.ptr();
 
-    if tskaddr == A::null_ptr() {
-        return Err(ShimError::Failed(format!(
-            "mfytask({taskid}, null): a null task routine, which would fault on the next system cycle"
-        )));
-    }
-
+    // A null `tskaddr` *disables* the slot; it is not a fault. Genuine
+    // `mfytask` (`GCOMMLIB/TASKS.C`) `catastro`s only on a bad `taskid` and
+    // stores whatever address it is handed, NULL included -- and `prctask`
+    // skips a NULL slot rather than jumping to zero. The Rose disables its
+    // tasks exactly this way (`mfytask(id, NULL)`), and refusing it stopped
+    // the module.
     let idx = taskid as usize;
     let Some(slot) = host.tasks.get_mut(idx) else {
         return Err(ShimError::Failed(format!(
@@ -114,10 +114,19 @@ pub fn mfytask<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// negative delay.
 pub fn initask<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let tskaddr = call.ptr();
-    if tskaddr == A::null_ptr() {
-        return Err(ShimError::Failed(
-            "initask: a null task routine, which would fault on the next system cycle".to_string(),
-        ));
+    // Reuse the first freed (NULL) slot before growing the table, and answer
+    // its id -- genuine `initask` (`GCOMMLIB/TASKS.C`) does exactly this, so a
+    // task disabled with `mfytask(id, NULL)` frees id `id` for the next
+    // `initask`. A module that disables then re-registers (The Rose) counts
+    // on the same id coming back; appending instead would drift its
+    // bookkeeping and leave it modifying the wrong slot later. NULL is a valid
+    // address to register -- a slot that starts disabled -- and `prctask`
+    // skips it, so no null check is needed.
+    if let Some(idx) = host.tasks.iter().position(|&t| t == A::null_ptr()) {
+        host.tasks[idx] = tskaddr;
+        // `idx < tasks.len()`, and the length fit an `id` when that slot was
+        // first pushed, so this cast cannot lose.
+        return Ok(abi::Ret::Int(A::Int::from(idx as u16)));
     }
     let id = host.tasks.len();
     let Ok(id) = u16::try_from(id) else {
@@ -210,21 +219,39 @@ mod tests {
     }
 
     #[test]
-    fn mfytask_refuses_a_null_routine_like_initask_does() {
+    fn mfytask_null_disables_the_task_rather_than_being_refused() {
         let mut f = Fixture::new();
         let id = word(f.invoke(initask, &[0x0010, 0x1234]).expect("initask"));
 
-        let e = f
-            .invoke(mfytask, &[id, 0, 0])
-            .expect_err("a null task routine must be refused, the same as initask refuses one");
-        assert!(e.to_string().contains("null"), "{e}");
+        // `mfytask(id, NULL)` disables the slot -- genuine `TASKS.C` stores
+        // the address it is handed, NULL included, and `prctask` skips a NULL
+        // slot. The Rose relies on this; refusing it stopped the module.
+        f.invoke(mfytask, &[id, 0, 0])
+            .expect("mfytask(id, null) disables the slot -- it is not a fault");
         assert_eq!(
             f.host.tasks[usize::from(id)],
-            FarPtr {
-                offset: 0x0010,
-                selector: 0x1234
-            },
-            "a refused mfytask must not clobber the existing routine with null"
+            FarPtr { offset: 0, selector: 0 },
+            "the slot is now the null (disabled) routine"
+        );
+    }
+
+    /// Genuine `initask` (`TASKS.C`) reuses the first freed (NULL) slot before
+    /// growing, so a task disabled with `mfytask(id, NULL)` frees id `id` for
+    /// the next `initask`. A module that disables then re-registers counts on
+    /// the same id coming back.
+    #[test]
+    fn initask_reuses_a_slot_a_null_mfytask_freed() {
+        let mut f = Fixture::new();
+        let id = word(f.invoke(initask, &[0x0010, 0x1234]).expect("initask"));
+        f.invoke(mfytask, &[id, 0, 0]).expect("disable the slot");
+
+        let id2 = word(f.invoke(initask, &[0x0020, 0x5678]).expect("initask"));
+        assert_eq!(id2, id, "the freed slot is reused, its id handed back again");
+        assert_eq!(f.host.tasks.len(), 1, "no new slot grew");
+        assert_eq!(
+            f.host.tasks[usize::from(id)],
+            FarPtr { offset: 0x0020, selector: 0x5678 },
+            "and it now holds the new routine"
         );
     }
 

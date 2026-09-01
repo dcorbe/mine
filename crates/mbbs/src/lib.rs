@@ -4202,6 +4202,14 @@ impl<A: Abi> Host<A> {
     ) -> io::Result<Option<A::Poison>> {
         for at in 0..self.tasks.len() {
             let task = self.tasks[at];
+            // A null slot is a *disabled* task, not a routine to jump to:
+            // `mfytask(id, NULL)` sets one, and genuine `prctask`
+            // (`GCOMMLIB/TASKS.C`, `if (tsktbl[rrobin] != NULL)`) skips it
+            // rather than calling address zero. The Rose disables tasks this
+            // way; firing the slot faulted the module.
+            if task == A::null_ptr() {
+                continue;
+            }
             *fired += 1;
             match self.run(machine, module, task, &[], None)? {
                 Outcome::Stopped(poison) => return Ok(Some(poison)),
@@ -9446,6 +9454,24 @@ mod tests {
         assert_eq!(f.host.prctask(&mut f.machine, &module, &mut fired).expect("ran"), None);
         assert_eq!(fired, 2, "and again -- a task is not consumed the way a kick is");
         assert_eq!(f.host.tasks.len(), 1, "and stays registered");
+    }
+
+    /// A null slot is a *disabled* task -- `mfytask(id, NULL)` sets one -- and
+    /// `prctask` must skip it, exactly as genuine `TASKS.C` does
+    /// (`if (tsktbl[rrobin] != NULL)`). Jumping to it faulted The Rose, which
+    /// disables its tasks this way.
+    #[test]
+    fn prctask_skips_a_null_disabled_slot_instead_of_jumping_to_it() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.tasks.push(FarPtr::NULL); // a disabled slot, ahead of the live one
+        f.host.tasks.push(rou);
+
+        let mut fired = 0;
+        assert_eq!(f.host.prctask(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(
+            fired, 1,
+            "only the live task ran; the null slot was skipped, not called as a routine"
+        );
     }
 
     /// A `char (*)(int chan, int c)` in real 16-bit code, at `count`
