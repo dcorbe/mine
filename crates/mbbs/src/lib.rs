@@ -914,6 +914,18 @@ impl Default for Display {
     }
 }
 
+/// A call into module code that a shim asked [`Host::cycle`] to make for
+/// it -- see [`Host::defer`].
+pub(crate) struct Deferred<A: Abi> {
+    /// The channel the call is made on behalf of: made current first, and
+    /// where `prfbuf` is flushed afterwards.
+    pub(crate) chan: Chan,
+    /// The module routine.
+    pub(crate) entry: A::Ptr,
+    /// Its arguments, pushed the way [`Host::run`] pushes them.
+    pub(crate) args: Vec<crate::abi::Arg<A>>,
+}
+
 pub struct Host<A: Abi> {
     exports: Exports,
 
@@ -1251,6 +1263,11 @@ pub struct Host<A: Abi> {
     /// was asked. [`Host::cycle`] runs them, once per elapsed second, via
     /// [`Host::prcrtk`]. See [`Host::kicks`].
     pub(crate) kicks: Vec<Kick<A>>,
+
+    /// Calls into module code a shim asked for and could not make itself,
+    /// in the order asked. [`Host::cycle`] runs them via [`Host::prcdfr`].
+    /// See [`Host::defer`].
+    pub(crate) deferred: Vec<Deferred<A>>,
 
     /// Real-time interrupt routines a module installed with `rtihdlr`, in
     /// the order it installed them.
@@ -1973,6 +1990,7 @@ impl<A: Abi> Host<A> {
             notes: Vec::new(),
             noted: HashSet::new(),
             kicks: Vec::new(),
+            deferred: Vec::new(),
             rtirs: Vec::new(),
             tasks: Vec::new(),
             chi: vec![None; chi_slots],
@@ -4212,6 +4230,69 @@ impl<A: Abi> Host<A> {
         }
     }
 
+    /// Ask the next [`Host::cycle`] pass to call `entry(args)` on behalf of
+    /// `chan`.
+    ///
+    /// A `Shim<A>` is handed `&mut Call<A>` and `&mut Host<A>`, never the
+    /// `&A::Module` that [`Host::run`] needs -- so a host routine whose
+    /// contract includes calling back into the module (`listing`'s `whndun`)
+    /// cannot make that call itself. It records it here instead, and
+    /// [`Host::prcdfr`] makes it from the one place that has a module: the
+    /// same arrangement [`Host::kicks`] already has for `rtkick`, with a
+    /// channel and arguments added because these callbacks, unlike a timer,
+    /// run for a user and read `usrnum`/`usrptr` to find out which.
+    ///
+    /// The call is made later, not now, which is also what the real host did:
+    /// `listing` hands the file to the tagspec engine and `whndun` fires from
+    /// a later pass of `MAJORBBS.C:169`'s loop, after the caller's own
+    /// `sttrou` has returned.
+    pub(crate) fn defer(&mut self, chan: Chan, entry: A::Ptr, args: Vec<crate::abi::Arg<A>>) {
+        self.deferred.push(Deferred { chan, entry, args });
+    }
+
+    /// Make every call [`Host::defer`] recorded, in order, each with its
+    /// channel current and `prfbuf` flushed to that channel afterwards --
+    /// what the real host's own caller of such a callback did around it
+    /// (`FILEXFER.C:914`'s `tshlst`: "implicit inputs: ftgptr,usrnum,usrptr";
+    /// "expect caller to do outprf() if any"), and what
+    /// `_END_RELEASE_NOTE_LISTING` in `WCCMMUD.DLL` relies on: it writes
+    /// `usrptr->state`/`substt` and `prf`s two messages without an `outprf`.
+    ///
+    /// The queue is taken whole before anything runs, so a callback that
+    /// defers another (a `whndun` that calls `listing` again) lands in the
+    /// next drain; `cycle`'s idle gate keeps turning while any is queued.
+    ///
+    /// A stop -- the callback faulting, or `point_curusr`/`outprf` failing --
+    /// comes back with the channel it was serving, for [`Ended::Stopped`].
+    fn prcdfr(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        fired: &mut usize,
+    ) -> io::Result<Option<(A::Poison, Chan)>> {
+        let stopped = |outcome: Outcome<A>| match outcome {
+            Outcome::Stopped(poison) => poison,
+            Outcome::Returned { .. } => unreachable!("Host::stop only ever stops"),
+        };
+        for call in std::mem::take(&mut self.deferred) {
+            let chan = call.chan;
+            if shims::traced() || std::env::var_os("MBBS_TRACE_KICKS").is_some() {
+                eprintln!("mbbs-trace: DEFER-FIRE chan={chan} entry={:?}", call.entry);
+            }
+            if let Err(e) = self.point_curusr_mem(A::mem(machine), chan) {
+                return Ok(Some((stopped(self.shim_stop(machine, "point_curusr", e)?), chan)));
+            }
+            match self.run(machine, module, call.entry, &call.args, Some(chan))? {
+                Outcome::Stopped(poison) => return Ok(Some((poison, chan))),
+                Outcome::Returned { .. } => *fired += 1,
+            }
+            if let Err(e) = shims::output::outprf_mem(A::mem(machine), self, chan) {
+                return Ok(Some((stopped(self.shim_stop(machine, "outprf", e)?), chan)));
+            }
+        }
+        Ok(None)
+    }
+
     fn prcrtk(
         &mut self,
         machine: &mut A::Cpu,
@@ -4811,6 +4892,17 @@ impl<A: Abi> Host<A> {
                 None => {}
             }
 
+            // Whatever that dispatch asked to have called back (`listing`'s
+            // `whndun`) runs now, before its output is emitted below, so the
+            // file and the prompt that follows it leave together.
+            if let Some((poison, chan)) = self.prcdfr(machine, module, &mut dispatched)? {
+                return Ok(Cycles {
+                    iterations,
+                    dispatched,
+                    ended: Ended::Stopped(poison, Some(chan)),
+                });
+            }
+
             // **Ahead of the tick catch-up below, and that is the point.**
             // Whatever the status dispatch above just produced -- a
             // keystroke's echo, most of the time -- goes to the caller now,
@@ -5006,7 +5098,10 @@ impl<A: Abi> Host<A> {
             // second, and no other source of work exists -- the 16-bit world
             // only advances when this host dispatches into it. Spinning here
             // was the whole of the old busy-wait.
-            if !self.gsbl().pending() && self.polls_left == 0 {
+            // `deferred` too: a callback queued after this pass's drain (by
+            // the poll firing above, or by a drained callback itself) is work
+            // only the next pass can do, and parking would strand it.
+            if !self.gsbl().pending() && self.polls_left == 0 && self.deferred.is_empty() {
                 // A module whose `syscyc` does per-call work (RCIROSE steps one
                 // entry of its timer ring per call) advances its world only as
                 // fast as this vector fires. Parked to the next whole second it
@@ -9343,6 +9438,48 @@ mod tests {
         f.host.gsbl_mut().channel_mut(chan).idle_pending = true;
         let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
         assert!(matches!(cycles.ended, Ended::Stopped(_, Some(c)) if c == chan), "{:?}", cycles.ended);
+    }
+
+    /// `listing` defers `whndun` for a channel; the next `cycle` pass makes
+    /// the call with that channel current, then flushes `prfbuf` to it --
+    /// the two things `_END_RELEASE_NOTE_LISTING` relies on its caller for.
+    /// Channel 1, not the console, so "made current" is observable.
+    #[test]
+    fn a_deferred_call_runs_on_the_next_pass_with_its_channel_current_and_prfbuf_flushed() {
+        let (mut f, module, _) = polling_fixture_with(2);
+        let console = f.console();
+        let chan = f.host.gsbl().terms().chan(1).expect("channel 1");
+        f.host.point_curusr(&mut f.machine, console).expect("channel 0 is current first");
+        let text = f.text("prompt");
+        f.invoke(crate::shims::text::prf, &[text.offset, text.selector]).expect("printed");
+        // `invoke` loads its own code over the fixture's `retf`; put it back.
+        f.machine.load_code(&[0xcb]).expect("a retf fits");
+        let rou = f.machine.code_ptr(0);
+        f.host.defer(chan, rou, vec![crate::abi::Arg::Int(1)]);
+
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
+        assert_eq!(cycles.dispatched, 1, "the callback ran");
+        assert_eq!(cycles.ended, Ended::Idle, "and nothing is left queued");
+        assert!(f.host.deferred.is_empty());
+        assert_eq!(
+            f.host.globals().word_mem(f.machine.mem(), "usrnum").expect("usrnum"),
+            1,
+            "its channel was made current before the call"
+        );
+        let out: Vec<u8> = f.host.gsbl().channel(chan).output.iter().copied().collect();
+        assert_eq!(out, b"prompt", "prfbuf flushed to the callback's channel afterwards");
+        assert!(f.host.gsbl().channel(console).output.is_empty(), "and to no other");
+        assert_eq!(f.read(f.host.globals().prf_buffer()), "", "and cleared");
+    }
+
+    #[test]
+    fn a_deferred_call_that_stops_the_machine_names_its_channel() {
+        let (mut f, module, rou) = interceptor_fixture(2, FAULT);
+        let chan = f.host.gsbl().terms().chan(1).expect("channel 1");
+        f.host.defer(chan, rou, vec![]);
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
+        assert!(matches!(cycles.ended, Ended::Stopped(_, Some(c)) if c == chan), "{:?}", cycles.ended);
+        assert!(f.host.deferred.is_empty(), "taken before it ran, not left to run again");
     }
 
     #[test]

@@ -86,7 +86,9 @@ fn outprf_core<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// `prfbuf` fresh, transmit, then call `clrprf_mem` -- but is not the same
 /// function: that one is not `pub` and takes a `Chan` its caller already
 /// resolved from `A::Cpu`, not a `Call<A>` it could read one off itself.
-fn outprf_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>, chan: Chan) -> Result<(), ShimError> {
+/// `pub(crate)` for [`crate::Host`]'s deferred-call drain, which owes a
+/// flush after each callback it makes.
+pub(crate) fn outprf_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>, chan: Chan) -> Result<(), ShimError> {
     let start = host
         .globals()
         .pointer_mem(mem, "prfbuf")

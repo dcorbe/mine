@@ -1,5 +1,5 @@
-//! One odd one out: an ASCII file lister that cannot honour its own
-//! completion callback.
+//! One odd one out: an ASCII file lister whose completion callback is a
+//! call back into the module.
 //!
 //! ```text
 //! listing  1
@@ -97,40 +97,33 @@ use crate::abi::{self, Abi, Call};
 /// `shims::screen::rstrxf`'s own doc comment already makes and defends for
 /// page mode generally.
 ///
-/// # What cannot be reproduced, and why this is not a "not implemented yet"
+/// # `whndun` is deferred, not called here
 ///
-/// `whndun` cannot be called, in either branch, by design rather than by
-/// gap: a `Shim<A>` is `fn(&mut Call<A>, &mut Host<A>) -> ...` -- it never
-/// receives `&A::Module`, and every mechanism this crate has for calling
-/// *into* module code needs one. `Host::run` (`lib.rs:2134`, `pub fn run`)
-/// takes `module: &A::Module` as an explicit parameter; its one shim-side
-/// caller with a comparable job, `crate::shims::fsd::fsdprc`'s callback
-/// into `fldvfy` (that file's own "The callback discipline" doc comment),
-/// is for exactly that reason **not** a `Shim<A>` -- it is `pub(crate) fn
-/// fsdprc(machine, host, module, chan)`, reached through the FSD's own
-/// native dispatch slot, which is handed a module reference by its caller
-/// that an ordinary import-table entry never is. `listing` is registered
-/// as an ordinary `MAJORBBS` import (this file's own module doc comment's
-/// registration table), so it has no route to one either. This is a
-/// signature-level fact, not a missing feature: adding one would mean
-/// changing what a `Shim<A>` is handed, which is outside this file's
-/// ownership and this task's scope.
+/// A `Shim<A>` is `fn(&mut Call<A>, &mut Host<A>) -> ...` -- it never
+/// receives the `&A::Module` that [`Host::run`] needs -- so this cannot
+/// call `whndun` itself. It records the call with [`Host::defer`] and
+/// `Host::cycle` makes it on its next pass, with this channel current and
+/// `prfbuf` flushed afterwards. That is also the real host's order of
+/// events: `listing` hands the file to the tagspec engine and returns, and
+/// `tshlst`'s `TSHFIN` calls `whndun` from a later pass of the main loop,
+/// after the module's own `sttrou` has returned. Until 2026-08-31 this
+/// routine refused instead, on the premise that no shim could arrange a
+/// call into module code -- `Host::kicks` (`rtkick`) had been exactly that
+/// for months, and MajorMUD's sysop menu `N` (release notes,
+/// `WCCMMUD.NOT`) stopped the module on the refusal.
 ///
-/// So this always ends in [`ShimError::Failed`] after doing the printable
-/// part, in both the found and not-found cases -- the real body calls
-/// `whndun` unconditionally either way, so there is no branch where this
-/// routine could complete successfully without the call this host cannot
-/// make.
+/// `whndun`'s argument is `(int)ftfscb->actfil` at `TSHFIN`: 1 when the
+/// file was listed, 0 when it could not be. A missing file is the latter;
+/// `ftgnew()` failing (no free transfer slot) is not modelled, so the
+/// synchronous `whndun(0)` branch never runs.
 ///
 /// # Errors
 ///
 /// If no channel is current, if `path` cannot be read as a string, or if a
-/// resolved file cannot be read -- and, unconditionally past that point,
-/// [`ShimError::Failed`] naming the `whndun` gap above.
+/// resolved file cannot be read.
 ///
 /// Generic: reads its two fixed pointer arguments (`path`, `whndun`),
-/// matching the prototype -- `whndun` is read as a pointer for arity's sake
-/// even though it is never called through.
+/// matching the prototype.
 pub fn listing<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let path = call.ptr();
     let whndun = call.ptr();
@@ -141,17 +134,20 @@ pub fn listing<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     .into_owned();
     let chan = host.current_channel_mem(call.mem())?;
 
-    if let Some(at) = host.find(&named) {
-        let bytes = std::fs::read(&at)
-            .map_err(|e| ShimError::Failed(format!("listing({named}): {}: {e}", at.display())))?;
-        host.gsbl_mut().transmit(chan, &bytes);
-    }
-
-    Err(ShimError::Failed(format!(
-        "listing({named}): the file half is done, but whndun at {whndun} cannot be called -- a \
-         Shim<A> is never handed &A::Module, which every callback-into-module-code mechanism \
-         this crate has needs; see shims::mudmisc::listing's own doc comment"
-    )))
+    let listed = match host.find(&named) {
+        Some(at) => {
+            let bytes = std::fs::read(&at)
+                .map_err(|e| ShimError::Failed(format!("listing({named}): {}: {e}", at.display())))?;
+            host.gsbl_mut().transmit(chan, &bytes);
+            1
+        }
+        None => {
+            host.note(format!("listing: {named} not found; whndun told 0"));
+            0
+        }
+    };
+    host.defer(chan, whndun, vec![abi::Arg::Int(A::Int::from(listed))]);
+    Ok(abi::Ret::Void)
 }
 
 #[cfg(test)]
@@ -169,34 +165,44 @@ mod tests {
 
     // ---- listing ------------------------------------------------------------
 
+    /// The one `whndun` call `listing` queued: `(channel, entry, ok)`.
+    fn queued(f: &Fixture) -> (crate::chan::Chan, mbbs_machine::m16::FarPtr, u32) {
+        let [call] = f.host.deferred.as_slice() else {
+            panic!("exactly one deferred call, got {}", f.host.deferred.len());
+        };
+        let [abi::Arg::Int(ok)] = call.args.as_slice() else {
+            panic!("whndun takes one int");
+        };
+        (call.chan, call.entry, (*ok).into())
+    }
+
     #[test]
-    fn listing_prints_the_file_then_refuses_the_whndun_call() {
+    fn listing_prints_the_file_and_defers_whndun_1_on_its_channel() {
         let root = crate::testing::scratch("mudmisc-listing-found");
         std::fs::write(root.join("NEWS.TXT"), b"stop the presses").expect("a file");
         let mut f = Fixture::rooted(root);
         let chan = current(&mut f);
         let path = f.text("NEWS.TXT");
 
-        let err = f
-            .invoke(listing, &[path.offset, path.selector, 0x1234, 0x5678])
-            .expect_err("listing always ends in the whndun refusal");
-        assert!(format!("{err}").contains("whndun"));
+        f.invoke(listing, &[path.offset, path.selector, 0x1234, 0x5678]).expect("listed");
 
         let out: Vec<u8> = f.host.gsbl().channel(chan).output.iter().copied().collect();
-        assert_eq!(out, b"stop the presses", "the file half still ran");
+        assert_eq!(out, b"stop the presses");
+        let whndun = mbbs_machine::m16::FarPtr { offset: 0x1234, selector: 0x5678 };
+        assert_eq!(queued(&f), (chan, whndun, 1), "whndun(1): the file was listed");
     }
 
     #[test]
-    fn listing_on_a_missing_file_still_refuses_but_prints_nothing() {
+    fn listing_on_a_missing_file_prints_nothing_and_defers_whndun_0() {
         let root = crate::testing::scratch("mudmisc-listing-missing");
         let mut f = Fixture::rooted(root);
         let chan = current(&mut f);
         let path = f.text("NOPE.TXT");
 
-        let err = f
-            .invoke(listing, &[path.offset, path.selector, 0, 0])
-            .expect_err("listing always ends in the whndun refusal");
-        assert!(format!("{err}").contains("whndun"));
+        f.invoke(listing, &[path.offset, path.selector, 0x1234, 0x5678]).expect("nothing to refuse");
+
         assert!(f.host.gsbl().channel(chan).output.is_empty());
+        let whndun = mbbs_machine::m16::FarPtr { offset: 0x1234, selector: 0x5678 };
+        assert_eq!(queued(&f), (chan, whndun, 0), "whndun(0): interrupted, nothing listed");
     }
 }
