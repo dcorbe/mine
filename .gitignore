@@ -104,3 +104,10 @@ re/tasrc/
 # wrappers Track B adds -- see that plan's Task 1. The oracle for those is
 # PLBTVSTF.C, which lives in archive/ and needs no extraction.
 re/btvsrc/
+
+# Evicted from history 2026-09-01: not ours to redistribute. Kept on disk for
+# the ignored oracle tests; a copy lives in ~/bbs-backups/evicted-2026-09-01.
+re/oracle/
+re/hse_files/
+re/wg/
+.scratch/
