@@ -323,6 +323,22 @@ pub struct Channel {
     /// [`Channel::transmit`]'s CSI scanner state. See [`CsiScan`] for why
     /// this lives on the channel rather than local to one call.
     pub(crate) csi: CsiScan,
+
+    /// The numeric parameter accumulating in the CSI [`Channel::csi`] is
+    /// scanning -- the `55` of `ESC[55D`. Reset when a CSI opens and on each
+    /// `;` separator, so it holds the last parameter when the final byte
+    /// arrives; that is what a cursor-movement final byte (`D`/`C`/`G`/`H`/`f`)
+    /// applies to [`Channel::column`]. Persists across calls for the same
+    /// reason `csi` does: a CSI can split across two `transmit` calls.
+    ///
+    /// **Why `column` must track cursor motion.** Word wrap keys off `column`,
+    /// and a module that redraws a line in place -- RCIROSE rewrites its
+    /// status line every combat tick with `ESC[nD ESC[K` -- moves the cursor
+    /// back without emitting the characters that would carry `column` back
+    /// with it. Counting those `ESC[nD`s as zero-width (as every other CSI
+    /// still is) left `column` climbing across each redraw until wrap fired
+    /// mid-word on the next real line. See `column_tracks_cursor_motion...`.
+    pub(crate) csi_param: u16,
 }
 
 impl Default for Channel {
@@ -365,6 +381,7 @@ impl Default for Channel {
             chi_seen_input: false,
             supplied_lf: false,
             csi: CsiScan::Text,
+            csi_param: 0,
         }
     }
 }
@@ -633,6 +650,19 @@ impl Gsbl {
             return Vec::new();
         }
         let out: Vec<u8> = c.output.drain(..).collect();
+        if std::env::var_os("MBBS_TRACE_WIRE").is_some() {
+            let shown: String = out
+                .iter()
+                .map(|&b| match b {
+                    b'\r' => "<CR>".to_owned(),
+                    b'\n' => "<LF>\n".to_owned(),
+                    0x1b => "<ESC>".to_owned(),
+                    0x20..=0x7e => (b as char).to_string(),
+                    other => format!("<{other:02x}>"),
+                })
+                .collect();
+            eprintln!("mbbs-wire chan={chan} [{} bytes]: {shown}", out.len());
+        }
         if c.oes {
             c.status.push_back(Self::OUTMT);
         }
@@ -753,6 +783,27 @@ impl Gsbl {
     /// worse failure than the wrap-artefact one the pre-translation copy
     /// point in [`Gsbl::monitor`] already guards against.
     pub fn transmit(&mut self, chan: Chan, bytes: &[u8]) {
+        if std::env::var_os("MBBS_TRACE_TX").is_some() {
+            let shown: String = bytes
+                .iter()
+                .map(|&b| match b {
+                    b'\r' => "<CR>".to_owned(),
+                    b'\n' => "<LF>".to_owned(),
+                    0x1b => "<ESC>".to_owned(),
+                    0x20..=0x7e => (b as char).to_string(),
+                    other => format!("<{other:02x}>"),
+                })
+                .collect();
+            let c = self.channel(chan);
+            eprintln!(
+                "mbbs-tx chan={chan} [{} bytes] width={} col={} softcr={} hardcr={:#x}: {shown}",
+                bytes.len(),
+                c.width,
+                c.column,
+                c.softcr,
+                c.hardcr
+            );
+        }
         self.try_transmit(chan, bytes);
     }
 
@@ -1216,6 +1267,7 @@ impl Channel {
         let mut column = self.column;
         let mut supplied_lf = self.supplied_lf;
         let mut csi = self.csi;
+        let mut csi_param = self.csi_param;
         let mut wrapped = self.wrapped;
 
         for &byte in bytes {
@@ -1238,6 +1290,7 @@ impl Channel {
                         out.push(0x1B);
                         out.push(byte);
                         csi = CsiScan::Csi;
+                        csi_param = 0;
                     } else {
                         // Not a CSI after all. The withheld ESC is an
                         // ordinary byte, counted exactly as it always was
@@ -1271,12 +1324,37 @@ impl Channel {
                 CsiScan::Csi => {
                     if (0x40..=0x7E).contains(&byte) {
                         // The final byte. Emitted uncounted, like everything
-                        // else in the sequence; the CSI is complete.
+                        // else in the sequence; the CSI is complete. A
+                        // cursor-movement final byte moves `column` the way the
+                        // client's real cursor moves, so wrap keeps counting
+                        // from where the module actually left off -- every
+                        // other final byte (colour `m`, erase `K`, ...) leaves
+                        // `column` alone, exactly as before.
+                        match byte {
+                            // Cursor back / forward: the parameter defaults to
+                            // 1 when omitted (`ESC[D`).
+                            b'D' => column = column.saturating_sub(csi_param.max(1)),
+                            b'C' => column = column.saturating_add(csi_param.max(1)),
+                            // Absolute column (`G`) and cursor position
+                            // (`H`/`f`, whose last parameter is the column) are
+                            // 1-based; column 1 is index 0, and an omitted
+                            // parameter means column 1.
+                            b'G' | b'H' | b'f' => column = csi_param.saturating_sub(1),
+                            _ => {}
+                        }
                         out.push(byte);
                         csi = CsiScan::Text;
                     } else if (0x20..=0x3F).contains(&byte) {
                         // A parameter or intermediate byte. Still inside a
-                        // well-formed CSI.
+                        // well-formed CSI. Accumulate the numeric parameter for
+                        // a cursor-movement final byte; `;` starts the next
+                        // one, so the column parameter of `ESC[row;colH` is
+                        // what survives to the final byte.
+                        if byte.is_ascii_digit() {
+                            csi_param = csi_param.saturating_mul(10).saturating_add(u16::from(byte - b'0'));
+                        } else if byte == b';' {
+                            csi_param = 0;
+                        }
                         out.push(byte);
                     } else {
                         // Malformed: this byte cannot appear in a CSI at all
@@ -1324,6 +1402,7 @@ impl Channel {
         self.column = column;
         self.supplied_lf = supplied_lf;
         self.csi = csi;
+        self.csi_param = csi_param;
         self.wrapped = wrapped;
         true
     }
@@ -1664,6 +1743,35 @@ mod tests {
             String::from_utf8_lossy(&drained),
             String::from_utf8_lossy(&undrained),
             "a drain between two btuxmt calls changed the bytes"
+        );
+    }
+
+    /// A module that redraws a line in place -- RCIROSE rewrites its status
+    /// line every combat tick with `ESC[nD ESC[K` -- moves the cursor back
+    /// without emitting the characters that would carry `column` back with it.
+    /// Word wrap keys off `column`, so a cursor-back must decrement it;
+    /// counting `ESC[nD` as zero-width (as colour codes rightly are) left
+    /// `column` climbing across each redraw until the next real line wrapped
+    /// mid-word. This is the mangled Rose combat output that fix cured.
+    #[test]
+    fn column_tracks_cursor_motion_so_a_redraw_does_not_wrap_the_next_line() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 80;
+        // 70 printable columns, no line break: `column` is now 70.
+        g.transmit(chan(), &[b'x'; 70]);
+        // Cursor back to column 15 and erase, as a status redraw does -- no
+        // printable characters, so without cursor tracking `column` stays 70.
+        g.transmit(chan(), b"\x1b[55D\x1b[K");
+        // 60 more columns. From column 15 that ends at 75, under the 80 wrap;
+        // from a stale 70 it would wrap after the 10th.
+        g.transmit(chan(), &[b'y'; 60]);
+
+        let out = g.drain_output(chan());
+        let after_erase = &out[out.iter().rposition(|&b| b == b'K').expect("the erase") + 1..];
+        assert_eq!(
+            after_erase,
+            &[b'y'; 60][..],
+            "the cursor-back reset the wrap column; the redrawn line must not break early"
         );
     }
 

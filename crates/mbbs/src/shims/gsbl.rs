@@ -348,6 +348,9 @@ pub fn btutsw<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let Some(width) = u16_arg::<A>(call.int()) else {
         return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
     };
+    if std::env::var_os("MBBS_TRACE_TERM").is_some() {
+        eprintln!("mbbs-term: btutsw chan={chan} width={width}");
+    }
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).width = width;
     }) {
@@ -527,6 +530,12 @@ pub(crate) fn apply_xnf(
     xoff: i16,
     page: Option<(u16, Vec<u8>)>,
 ) {
+    if std::env::var_os("MBBS_TRACE_TERM").is_some() {
+        eprintln!(
+            "mbbs-term: btuxnf chan={chan} xon={xon} xoff={xoff} page_lines={:?}",
+            page.as_ref().map(|(cnt, _)| *cnt)
+        );
+    }
     let c = g.channel_mut(chan);
     c.xon = xon;
     debug_assert!(
