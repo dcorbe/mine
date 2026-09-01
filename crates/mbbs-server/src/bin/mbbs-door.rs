@@ -27,18 +27,25 @@ const DEFAULT_SYSOP_LEVEL: u32 = 90;
 #[derive(Parser)]
 #[command(about = "Relay a BBS caller into a running mbbs-server")]
 struct Cli {
-    /// The DOOR32.SYS the BBS wrote for this caller (`%f` under Synchronet).
+    /// The DOOR32.SYS drop file the BBS wrote for this caller just before
+    /// launching this relay (`%f` under Synchronet). It carries the caller's
+    /// name, security level, node and ANSI capability.
     drop_file: PathBuf,
-    /// The server's door socket (`mbbs-server --listen-door PATH`).
+    /// The Unix socket of the server to relay into: the path that
+    /// `mbbs-server --listen-door` is listening on.
     #[arg(long)]
     socket: PathBuf,
-    /// Security level at or above which the caller is a sysop.
+    /// Security level at or above which the caller is presented to the
+    /// module as a sysop. The scale is the BBS's own: 90 is Synchronet's
+    /// SYSOP_LEVEL, Mystic and WWIV use 255.
     #[arg(long, default_value_t = DEFAULT_SYSOP_LEVEL)]
     sysop_level: u32,
-    /// Terminal rows (`%R` under Synchronet).
+    /// The caller's terminal height in rows (`%R` under Synchronet). The
+    /// module lays out full-screen forms against it.
     #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u8).range(1..))]
     rows: u8,
-    /// Terminal columns (`%W` under Synchronet).
+    /// The caller's terminal width in columns (`%W` under Synchronet). The
+    /// module word-wraps against it.
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..))]
     cols: u8,
 }

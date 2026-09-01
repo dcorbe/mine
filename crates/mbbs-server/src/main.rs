@@ -14,7 +14,6 @@ use mbbs_server::host::{Boot, ExtensionBuilder};
 use mbbs_server::msg::In;
 use mbbs_server::termcompat::Stack;
 
-const DEFAULT_MODULE: &str = "re/WCCMMUD.DLL";
 const DEFAULT_LISTEN: &str = "127.0.0.1:2323";
 const DEFAULT_TERMS: u16 = 2;
 
@@ -71,8 +70,10 @@ const DEFAULT_SYSCYC_HZ: u32 = 1;
 #[derive(Parser, Debug)]
 #[command(name = "mbbs-server", about = "a tokio edge in front of one MajorBBS-family machine")]
 struct Cli {
-    /// The board directory (holds the module's own data files). Always
-    /// required.
+    /// The board directory: where the module's own data files live (its
+    /// `.MSG`, `.DAT`, `.VIR` and whatever else it opens by bare name) and
+    /// where it writes. The host changes into it before the module runs, so
+    /// every relative path the module opens resolves here. Always required.
     #[arg(long)]
     root: Option<PathBuf>,
 
@@ -90,11 +91,9 @@ struct Cli {
     /// files, or a `Wg32` machine for PE files -- both repeatable, in the
     /// order given; mixing formats is a named `Err`.
     ///
-    /// Left empty, [`plan`] falls back to `DEFAULT_MODULE`, exactly this
-    /// binary's original single-module behaviour -- deliberate backward
-    /// compatibility, so `mbbs-server --root tmp` keeps booting MajorMUD
-    /// unchanged.
-    #[arg(long)]
+    /// At least one is required: this host ships no module of its own and
+    /// has no default to fall back on.
+    #[arg(long, required = true)]
     module: Vec<PathBuf>,
 
     /// Address to bind for a modern client: CP437 transcoded to UTF-8, and
@@ -119,11 +118,16 @@ struct Cli {
     #[arg(long)]
     listen_door: Option<PathBuf>,
 
-    /// Fixed channel count, must be at least 1
+    /// Channel count: how many callers can be connected at once. Fixed for
+    /// the life of the process, because the module's own per-channel tables
+    /// are sized from it at init. At least 1, at most 32767.
     #[arg(long, default_value_t = DEFAULT_TERMS, value_parser = parse_terms)]
     terms: u16,
 
-    /// Poll firings granted per elapsed second
+    /// How many times per second the host fires the module's background
+    /// poll routine while idle. That routine is where a module advances its
+    /// world between keystrokes; too low and the world runs slow, too high
+    /// and the process spins. 512 is what a period board delivered.
     #[arg(long, default_value_t = DEFAULT_POLLS_PER_SECOND)]
     polls_per_second: usize,
 
@@ -134,7 +138,12 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SYSCYC_HZ)]
     syscyc: u32,
 
-    /// Connection keys handed to a new player [default: DEMO,NORMAL,USER]
+    /// The keys every caller holds. A key is MajorBBS's unit of
+    /// entitlement: a module asks `haskey` before it lets a caller into a
+    /// game, a menu or a sysop command, and the sysop of a period board
+    /// granted keys per account. This host has no accounts, so one set is
+    /// handed to every connection. Comma-separated; a key may not be empty.
+    /// [default: DEMO,NORMAL,USER]
     #[arg(long, value_delimiter = ',', value_parser = parse_key)]
     keys: Vec<String>,
 
@@ -248,16 +257,6 @@ enum Plan {
     Wg32 { modules: Vec<PathBuf>, root: PathBuf },
 }
 
-/// `--module` as given, or [`DEFAULT_MODULE`] when none was -- so
-/// `mbbs-server --root tmp` keeps booting MajorMUD unchanged.
-fn requested_modules(cli: &Cli) -> Vec<PathBuf> {
-    if cli.module.is_empty() {
-        vec![PathBuf::from(DEFAULT_MODULE)]
-    } else {
-        cli.module.clone()
-    }
-}
-
 /// Read every requested module's header. A file that cannot be read or
 /// sniffed is a startup error naming the file.
 fn sniff_all(modules: &[PathBuf]) -> Result<Vec<Format>, String> {
@@ -271,10 +270,13 @@ fn sniff_all(modules: &[PathBuf]) -> Result<Vec<Format>, String> {
 }
 
 /// Decide the machine from the requested modules and their formats
-/// (`formats[i]` is `requested_modules(cli)[i]`'s). Every rejection is a
+/// (`formats[i]` is `cli.module[i]`'s). Every rejection is a
 /// named `Err`, never a panic and never a silent fallback.
 fn plan(cli: &Cli, formats: &[Format]) -> Result<Plan, String> {
-    let modules = requested_modules(cli);
+    let modules = cli.module.clone();
+    if modules.is_empty() {
+        return Err("--module is required".to_string());
+    }
     if formats.len() != modules.len() {
         return Err(format!("{} modules but {} formats", modules.len(), formats.len()));
     }
@@ -381,7 +383,7 @@ async fn main() -> ExitCode {
         );
     }
 
-    let modules = requested_modules(&cli);
+    let modules = cli.module.clone();
     let formats = match sniff_all(&modules) {
         Ok(formats) => formats,
         Err(msg) => {
@@ -536,8 +538,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Cli, DEFAULT_MODULE, DEFAULT_POLLS_PER_SECOND, Plan,
-        build_lua_extension, listeners, plan, requested_modules,
+        Cli, DEFAULT_POLLS_PER_SECOND, Plan,
+        build_lua_extension, listeners, plan,
     };
 
     fn args<'a>(v: &[&'a str]) -> Vec<&'a str> {
@@ -561,7 +563,7 @@ mod tests {
     /// before it existed, failed nothing at all.
     #[test]
     fn flags_map_to_their_own_stacks() {
-        let cli = Cli::try_parse_from(args(&[
+        let cli = Cli::try_parse_from(args(&["--module", "W.DLL", 
             "--root",
             "tmp",
             "--listen",
@@ -592,21 +594,19 @@ mod tests {
 
     #[test]
     fn listen_door_is_optional_and_takes_a_path() {
-        let cli = Cli::try_parse_from(["mbbs-server", "--listen-door", "/run/user/1000/mbbs-mmud.sock"])
+        let cli = Cli::try_parse_from(["mbbs-server", "--module", "W.DLL", "--listen-door", "/run/user/1000/mbbs-mmud.sock"])
             .expect("parses");
         assert_eq!(cli.listen_door.as_deref(), Some(std::path::Path::new("/run/user/1000/mbbs-mmud.sock")));
-        assert!(Cli::try_parse_from(["mbbs-server"]).expect("parses").listen_door.is_none());
+        assert!(Cli::try_parse_from(["mbbs-server", "--module", "W.DLL"]).expect("parses").listen_door.is_none());
     }
 
-    /// `--root` alone parses cleanly and everything else takes its documented
-    /// default; `--module` no longer carries a clap-level default (that
-    /// fallback moved into `plan`, see `no_module_flags_falls_back_to_the_default_module`
-    /// below), so it parses as empty here.
+    /// `--module` and `--root` alone parse cleanly and everything else takes
+    /// its documented default.
     #[test]
-    fn defaults_are_applied_when_only_root_is_given() {
-        let cli = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
+    fn defaults_are_applied_when_only_module_and_root_are_given() {
+        let cli = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp"])).expect("parses");
         assert_eq!(cli.root, Some(std::path::PathBuf::from("tmp")));
-        assert!(cli.module.is_empty(), "--module's default now lives in plan(), not clap");
+        assert_eq!(cli.module, vec![std::path::PathBuf::from("W.DLL")]);
         assert_eq!(cli.listen, vec!["127.0.0.1:2323".to_string()]);
         assert!(cli.listen_raw.is_empty(), "no default period port -- opt in with --listen-raw");
         assert_eq!(cli.terms, 2);
@@ -614,12 +614,11 @@ mod tests {
         assert!(cli.keys.is_empty(), "no --keys given, so main falls back to default_keys()");
     }
 
-
     /// `--listen` repeated binds more than one modern-stack address, in the
     /// order given.
     #[test]
     fn listen_is_repeatable() {
-        let cli = Cli::try_parse_from(args(&[
+        let cli = Cli::try_parse_from(args(&["--module", "W.DLL", 
             "--root",
             "tmp",
             "--listen",
@@ -634,7 +633,7 @@ mod tests {
     /// `--listen-raw` is repeatable too, independent of `--listen`.
     #[test]
     fn listen_raw_is_repeatable() {
-        let cli = Cli::try_parse_from(args(&[
+        let cli = Cli::try_parse_from(args(&["--module", "W.DLL", 
             "--root",
             "tmp",
             "--listen-raw",
@@ -660,7 +659,7 @@ mod tests {
     #[test]
     fn listen_raw_alone_still_defaults_listen() {
         let cli =
-            Cli::try_parse_from(args(&["--root", "tmp", "--listen-raw", "127.0.0.1:2325"]))
+            Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--listen-raw", "127.0.0.1:2325"]))
                 .expect("parses");
         assert_eq!(cli.listen, vec!["127.0.0.1:2323".to_string()]);
         assert_eq!(cli.listen_raw, vec!["127.0.0.1:2325".to_string()]);
@@ -680,7 +679,7 @@ mod tests {
     /// one testable home.
     #[test]
     fn root_is_optional_at_the_parse_layer() {
-        let cli = Cli::try_parse_from(args(&["--terms", "2"])).expect("parses");
+        let cli = Cli::try_parse_from(args(&["--module", "W.DLL", "--terms", "2"])).expect("parses");
         assert_eq!(cli.root, None);
     }
 
@@ -740,18 +739,12 @@ mod tests {
         );
     }
 
-    /// No `--module` at all -- `plan` falls back to `DEFAULT_MODULE`, the
-    /// same single-module behaviour this binary has always had. This is the
-    /// backward-compatibility case: `mbbs-server --root tmp` must keep
-    /// booting MajorMUD unchanged.
+    /// No `--module` at all is refused by the parser, naming the flag. There
+    /// is no built-in module to fall back on.
     #[test]
-    fn no_module_flags_falls_back_to_the_default_module() {
-        let cli = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
-        assert_eq!(requested_modules(&cli), vec![PathBuf::from(DEFAULT_MODULE)]);
-        assert_eq!(
-            plan(&cli, &[Format::Ne]),
-            Ok(Plan::Wg16 { modules: vec![PathBuf::from(DEFAULT_MODULE)], root: PathBuf::from("tmp") })
-        );
+    fn no_module_flag_is_refused_by_name() {
+        let err = Cli::try_parse_from(args(&["--root", "tmp"])).expect_err("--module is required");
+        assert!(err.to_string().contains("--module"), "the error names the flag: {err}");
     }
 
     /// A mix of NE and PE modules is refused by name -- the offending file,
@@ -784,14 +777,13 @@ mod tests {
         assert!(err.contains("--root"), "{err}");
     }
 
-    /// The same case as `missing_root_is_a_named_plan_error`, but reached
-    /// through the default-module fallback rather than an explicit
-    /// `--module` -- both paths through `requested_modules` must hit the
-    /// same check.
+    /// The same case as `missing_root_is_a_named_plan_error`, reached with
+    /// a 16-bit module: `--root` is optional at the clap layer and required
+    /// by `plan`.
     #[test]
     fn wg16_boot_without_root_is_a_named_plan_error() {
-        let cli = Cli::try_parse_from(args(&[])).expect("parses; --root is optional at the clap layer");
-        let err = plan(&cli, &[Format::Ne]).expect_err("the default module wants to boot Wg16, which needs --root");
+        let cli = Cli::try_parse_from(args(&["--module", "W.DLL"])).expect("parses; --root is optional at the clap layer");
+        let err = plan(&cli, &[Format::Ne]).expect_err("a Wg16 boot needs --root");
         assert!(err.contains("--root"), "error should name the missing flag: {err}");
     }
 
@@ -808,14 +800,14 @@ mod tests {
     #[test]
     fn module32_is_gone() {
         assert!(Cli::try_parse_from(args(&["--root", "tmp", "--module32", "X"])).is_err());
-        assert!(Cli::try_parse_from(args(&["--root", "tmp", "--root32", "X"])).is_err());
-        assert!(Cli::try_parse_from(args(&["--root", "tmp", "--bturno32", "1"])).is_err());
+        assert!(Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--root32", "X"])).is_err());
+        assert!(Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--bturno32", "1"])).is_err());
     }
 
     /// A flag this binary does not know about is refused, not ignored.
     #[test]
     fn unknown_argument_is_an_error() {
-        let err = Cli::try_parse_from(args(&["--root", "tmp", "--bogus", "x"])).unwrap_err();
+        let err = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--bogus", "x"])).unwrap_err();
         assert!(err.to_string().contains("--bogus"), "error should name the bad flag: {err}");
     }
 
@@ -823,7 +815,7 @@ mod tests {
     /// default.
     #[test]
     fn a_dangling_flag_is_an_error() {
-        let err = Cli::try_parse_from(args(&["--root", "tmp", "--terms"])).unwrap_err();
+        let err = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--terms"])).unwrap_err();
         assert!(
             err.to_string().contains("--terms"),
             "error should name the flag missing its value: {err}"
@@ -836,7 +828,7 @@ mod tests {
     /// `--scripts` had never been wired up as a real flag at all).
     #[test]
     fn scripts_without_a_directory_is_an_error() {
-        let err = Cli::try_parse_from(args(&["--root", "tmp", "--scripts"])).unwrap_err();
+        let err = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--scripts"])).unwrap_err();
         assert!(
             err.to_string().contains("--scripts"),
             "error should name the flag missing its value: {err}"
@@ -852,7 +844,7 @@ mod tests {
     /// `Terms::new(0)` panics; this must catch it first and report cleanly.
     #[test]
     fn terms_zero_is_rejected_before_it_reaches_terms_new() {
-        let err = Cli::try_parse_from(args(&["--root", "tmp", "--terms", "0"])).unwrap_err();
+        let err = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--terms", "0"])).unwrap_err();
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("--terms") && msg.contains("at least 1"),
@@ -864,7 +856,7 @@ mod tests {
     /// is refused the same way `Terms::new` would panic on it.
     #[test]
     fn terms_above_i16_max_is_rejected() {
-        let err = Cli::try_parse_from(args(&["--root", "tmp", "--terms", "40000"])).unwrap_err();
+        let err = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--terms", "40000"])).unwrap_err();
         assert!(err.to_string().contains("--terms"), "error should name the flag: {err}");
     }
 
@@ -872,7 +864,7 @@ mod tests {
     /// flag and the bad value, not just "invalid input".
     #[test]
     fn an_unparseable_number_is_a_clear_error() {
-        let err = Cli::try_parse_from(args(&["--root", "tmp", "--terms", "banana"])).unwrap_err();
+        let err = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--terms", "banana"])).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--terms"), "error should name the flag: {msg}");
         assert!(msg.contains("banana"), "error should echo the bad value: {msg}");
@@ -881,7 +873,7 @@ mod tests {
     /// `--keys` splits on commas.
     #[test]
     fn keys_split_on_commas() {
-        let cli = Cli::try_parse_from(args(&["--root", "tmp", "--keys", "A,B,C"])).expect("parses");
+        let cli = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--keys", "A,B,C"])).expect("parses");
         assert_eq!(cli.keys, vec!["A", "B", "C"]);
     }
 
@@ -889,7 +881,7 @@ mod tests {
     /// silently handed to a new connection.
     #[test]
     fn an_empty_key_segment_is_rejected() {
-        let err = Cli::try_parse_from(args(&["--root", "tmp", "--keys", "A,,C"])).unwrap_err();
+        let err = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp", "--keys", "A,,C"])).unwrap_err();
         assert!(err.to_string().contains("--keys"), "error should name the flag: {err}");
     }
 }
