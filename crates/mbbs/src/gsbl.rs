@@ -753,9 +753,32 @@ impl Gsbl {
     /// worse failure than the wrap-artefact one the pre-translation copy
     /// point in [`Gsbl::monitor`] already guards against.
     pub fn transmit(&mut self, chan: Chan, bytes: &[u8]) {
-        if self.channel_mut(chan).transmit(bytes) {
+        self.try_transmit(chan, bytes);
+    }
+
+    /// [`Gsbl::transmit`], answering whether the block went out: `false` is
+    /// the R6 refusal -- nothing was queued and `OVRFLW` is raised -- which a
+    /// caller that paces itself against [`Gsbl::room`] (the host's file
+    /// listing) treats as a bug rather than as lost text.
+    pub fn try_transmit(&mut self, chan: Chan, bytes: &[u8]) -> bool {
+        let sent = self.channel_mut(chan).transmit(bytes);
+        if sent {
             self.monitor(chan, bytes);
         }
+        sent
+    }
+
+    /// Bytes the channel's output ring can still take -- `btuoba`'s answer.
+    /// Bytes a screen pause is holding count against it, exactly as
+    /// [`Channel::transmit`]'s own capacity test counts them.
+    pub fn room(&self, chan: Chan) -> usize {
+        let c = self.channel(chan);
+        OUTSIZ.saturating_sub(c.output.len() + c.held.len())
+    }
+
+    /// Whether a screen pause is holding this channel's output.
+    pub fn is_paused(&self, chan: Chan) -> bool {
+        self.channel(chan).paused
     }
 
     /// `btuxct` -- binary output, exactly as given.

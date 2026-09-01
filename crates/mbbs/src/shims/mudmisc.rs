@@ -88,34 +88,35 @@ use crate::abi::{self, Abi, Call};
 /// prompt, permission checks. None of that is modelled here, and none of
 /// it is this routine's *observable contract* to a module -- the contract
 /// is "the file's text reaches the user's screen, then `whndun` is told
-/// how it went". This reproduces the visible half of that: `path` is
-/// resolved the same way `shims::msg::opnmsg` resolves a message file name
-/// (`Host::find`, matching MajorBBS's own case-insensitive, backslash- or
-/// forward-slash-separated DOS paths) and, if found, its bytes are sent to
-/// the current channel whole, with no pause-and-continue -- the same
-/// "headless, not a MajorBBS reproduction" trade-off
-/// `shims::screen::rstrxf`'s own doc comment already makes and defends for
-/// page mode generally.
+/// how it went". This reproduces that: `path` is resolved the same way
+/// `shims::msg::opnmsg` resolves a message file name (`Host::find`,
+/// matching MajorBBS's own case-insensitive, backslash- or forward-slash-
+/// separated DOS paths) and, if found, handed to [`Host::begin_listing`],
+/// which streams it line by line as the channel drains -- `WCCMMUD.NOT` is
+/// 126 KB against an 8 KB output ring, so "send it whole" was never an
+/// option -- under the user's own screen pause, and calls `whndun` when
+/// the last line has gone. The download-manager dressing (permission
+/// checks, the transfer prompt) is not reproduced.
 ///
 /// # `whndun` is deferred, not called here
 ///
 /// A `Shim<A>` is `fn(&mut Call<A>, &mut Host<A>) -> ...` -- it never
 /// receives the `&A::Module` that [`Host::run`] needs -- so this cannot
-/// call `whndun` itself. It records the call with [`Host::defer`] and
-/// `Host::cycle` makes it on its next pass, with this channel current and
-/// `prfbuf` flushed afterwards. That is also the real host's order of
-/// events: `listing` hands the file to the tagspec engine and returns, and
-/// `tshlst`'s `TSHFIN` calls `whndun` from a later pass of the main loop,
-/// after the module's own `sttrou` has returned. Until 2026-08-31 this
+/// call `whndun` itself. The listing records the call with [`Host::defer`]
+/// when it ends, and `Host::cycle` makes it on its next pass, with this
+/// channel current and `prfbuf` flushed afterwards. That is also the real
+/// host's order of events: `listing` hands the file to the tagspec engine
+/// and returns, and `tshlst`'s `TSHFIN` calls `whndun` from a later pass of
+/// the main loop, after the module's own `sttrou` has returned. Until 2026-08-31 this
 /// routine refused instead, on the premise that no shim could arrange a
 /// call into module code -- `Host::kicks` (`rtkick`) had been exactly that
 /// for months, and MajorMUD's sysop menu `N` (release notes,
 /// `WCCMMUD.NOT`) stopped the module on the refusal.
 ///
 /// `whndun`'s argument is `(int)ftfscb->actfil` at `TSHFIN`: 1 when the
-/// file was listed, 0 when it could not be. A missing file is the latter;
-/// `ftgnew()` failing (no free transfer slot) is not modelled, so the
-/// synchronous `whndun(0)` branch never runs.
+/// file was listed, 0 when it was not -- a missing file, or the user's
+/// abort key mid-listing. `ftgnew()` failing (no free transfer slot) is not
+/// modelled, so the synchronous `whndun(0)` branch never runs.
 ///
 /// # Errors
 ///
@@ -134,19 +135,17 @@ pub fn listing<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     .into_owned();
     let chan = host.current_channel_mem(call.mem())?;
 
-    let listed = match host.find(&named) {
+    match host.find(&named) {
         Some(at) => {
             let bytes = std::fs::read(&at)
                 .map_err(|e| ShimError::Failed(format!("listing({named}): {}: {e}", at.display())))?;
-            host.gsbl_mut().transmit(chan, &bytes);
-            1
+            host.begin_listing(chan, bytes, whndun);
         }
         None => {
             host.note(format!("listing: {named} not found; whndun told 0"));
-            0
+            host.defer(chan, whndun, vec![abi::Arg::Int(A::Int::from(0u16))]);
         }
-    };
-    host.defer(chan, whndun, vec![abi::Arg::Int(A::Int::from(listed))]);
+    }
     Ok(abi::Ret::Void)
 }
 
@@ -177,9 +176,9 @@ mod tests {
     }
 
     #[test]
-    fn listing_prints_the_file_and_defers_whndun_1_on_its_channel() {
+    fn listing_prints_a_small_file_whole_and_defers_whndun_1_on_its_channel() {
         let root = crate::testing::scratch("mudmisc-listing-found");
-        std::fs::write(root.join("NEWS.TXT"), b"stop the presses").expect("a file");
+        std::fs::write(root.join("NEWS.TXT"), b"stop the\r\npresses\r\n").expect("a file");
         let mut f = Fixture::rooted(root);
         let chan = current(&mut f);
         let path = f.text("NEWS.TXT");
@@ -187,9 +186,35 @@ mod tests {
         f.invoke(listing, &[path.offset, path.selector, 0x1234, 0x5678]).expect("listed");
 
         let out: Vec<u8> = f.host.gsbl().channel(chan).output.iter().copied().collect();
-        assert_eq!(out, b"stop the presses");
+        assert_eq!(out, b"stop the\r\npresses\r\n");
+        assert!(f.host.listings.is_empty(), "a file that fits is finished at once");
+        assert!(!f.host.gsbl().channel(chan).oes, "oes is put back the way it was");
         let whndun = mbbs_machine::m16::FarPtr { offset: 0x1234, selector: 0x5678 };
         assert_eq!(queued(&f), (chan, whndun, 1), "whndun(1): the file was listed");
+    }
+
+    /// `WCCMMUD.NOT` is 126 KB; the output ring is 8 KB. The first call
+    /// sends what fits and leaves the rest for the `OUTMT` feed -- not an
+    /// `OVRFLW` with nothing sent, which is what one whole-file transmit did.
+    #[test]
+    fn listing_a_file_bigger_than_the_ring_sends_the_first_lines_and_arms_oes() {
+        let root = crate::testing::scratch("mudmisc-listing-big");
+        let file: Vec<u8> = (0..3000).flat_map(|n| format!("line {n:04}\r\n").into_bytes()).collect();
+        std::fs::write(root.join("BIG.NOT"), &file).expect("a file");
+        let mut f = Fixture::rooted(root);
+        let chan = current(&mut f);
+        let path = f.text("BIG.NOT");
+
+        f.invoke(listing, &[path.offset, path.selector, 0x1234, 0x5678]).expect("listed");
+
+        let c = f.host.gsbl().channel(chan);
+        let sent = c.output.len();
+        assert!(sent > 0 && sent < file.len(), "part of the file went out: {sent} of {}", file.len());
+        assert!(!c.status.contains(&crate::gsbl::Gsbl::OVRFLW), "and nothing overflowed");
+        assert!(c.oes, "the ring draining will raise OUTMT");
+        let listing = &f.host.listings[&chan];
+        assert_eq!(listing.pos, sent, "what went out is exactly what was consumed");
+        assert!(f.host.deferred.is_empty(), "whndun waits for the last line");
     }
 
     #[test]

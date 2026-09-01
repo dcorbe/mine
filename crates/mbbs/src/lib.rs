@@ -926,6 +926,19 @@ pub(crate) struct Deferred<A: Abi> {
     pub(crate) args: Vec<crate::abi::Arg<A>>,
 }
 
+/// An ASCII file `listing` is streaming to one channel -- see
+/// [`Host::begin_listing`].
+pub(crate) struct Listing<A: Abi> {
+    /// The whole file.
+    pub(crate) bytes: Vec<u8>,
+    /// How much of it has been handed to the channel.
+    pub(crate) pos: usize,
+    /// Told `1` when the last byte has gone, `0` if the user aborted.
+    pub(crate) whndun: A::Ptr,
+    /// `Channel::oes` before the listing switched it on; put back at the end.
+    pub(crate) oes_was: bool,
+}
+
 pub struct Host<A: Abi> {
     exports: Exports,
 
@@ -1268,6 +1281,11 @@ pub struct Host<A: Abi> {
     /// in the order asked. [`Host::cycle`] runs them via [`Host::prcdfr`].
     /// See [`Host::defer`].
     pub(crate) deferred: Vec<Deferred<A>>,
+
+    /// The file each channel is being read, if any. Fed by
+    /// [`Host::feed_listing`] on every `OUTMT` the channel raises, the way
+    /// `FTFASCII.C`'s `asxctn` was.
+    pub(crate) listings: HashMap<Chan, Listing<A>>,
 
     /// Real-time interrupt routines a module installed with `rtihdlr`, in
     /// the order it installed them.
@@ -1991,6 +2009,7 @@ impl<A: Abi> Host<A> {
             noted: HashSet::new(),
             kicks: Vec::new(),
             deferred: Vec::new(),
+            listings: HashMap::new(),
             rtirs: Vec::new(),
             tasks: Vec::new(),
             chi: vec![None; chi_slots],
@@ -4293,6 +4312,109 @@ impl<A: Abi> Host<A> {
         Ok(None)
     }
 
+    /// Start listing `bytes` to `chan`, telling `whndun(1)` when the last
+    /// byte has gone -- `listing`'s file half.
+    ///
+    /// A file is bigger than the output ring (`WCCMMUD.NOT` is 126 KB against
+    /// 8 KB), so it goes out the way `FTFASCII.C`'s ASCII protocol sent it:
+    /// whole lines, as many as fit, then the rest as the channel drains.
+    /// `Channel::oes` is switched on so each drain raises `OUTMT`, which
+    /// [`Host::poll_with_chan`] answers with [`Host::feed_listing`] instead
+    /// of the module's `stsrou` -- the real host had the channel in the file
+    /// transfer module's own `state` for the duration, so the module never
+    /// saw those statuses either. The user's screen pause stays in force
+    /// (`FILEXFER.C:604`: the `"L"` protocol, unlike `"A"`, leaves `btuxnf`
+    /// alone), so feeding stops while the channel is paused.
+    ///
+    /// A listing already running on `chan` is dropped without its `whndun`:
+    /// nothing in the vendor tree starts a second one before the first is
+    /// done, so this is a module bug being noted, not a case being served.
+    pub(crate) fn begin_listing(&mut self, chan: Chan, bytes: Vec<u8>, whndun: A::Ptr) {
+        let oes_was = match self.listings.remove(&chan) {
+            Some(previous) => {
+                self.note(format!("listing: channel {chan} started a second listing over a running one"));
+                previous.oes_was
+            }
+            None => std::mem::replace(&mut self.gsbl.channel_mut(chan).oes, true),
+        };
+        self.listings.insert(chan, Listing { bytes, pos: 0, whndun, oes_was });
+        self.feed_listing(chan);
+    }
+
+    /// Hand `chan` the next lines of its listing that fit, and end the
+    /// listing when the file is spent.
+    ///
+    /// `FTFASCII.C:169-172`: up to `LCHUNK` (25) lines a call, each only
+    /// while `ftfoba() >= LINLEN+1` (257 bytes free). A line that trips the
+    /// screen pause ends the call early -- what the pause holds counts
+    /// against the ring, and the rest waits for the user's key.
+    pub(crate) fn feed_listing(&mut self, chan: Chan) {
+        const LINLEN: usize = 256;
+        const LCHUNK: usize = 25;
+        let Some(listing) = self.listings.get_mut(&chan) else {
+            return;
+        };
+        let mut refused = false;
+        let mut lines = 0;
+        while lines < LCHUNK
+            && listing.pos < listing.bytes.len()
+            && !self.gsbl.is_paused(chan)
+            && self.gsbl.room(chan) > LINLEN
+        {
+            let rest = &listing.bytes[listing.pos..];
+            let end = rest
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(rest.len(), |i| i + 1)
+                .min(LINLEN);
+            if !self.gsbl.try_transmit(chan, &rest[..end]) {
+                refused = true;
+                break;
+            }
+            listing.pos += end;
+            lines += 1;
+        }
+        let spent = listing.pos >= listing.bytes.len();
+        if refused {
+            // Paced against `room`, so a refusal is this host disagreeing
+            // with itself about the ring; the line stays queued for the
+            // next `OUTMT` rather than being lost.
+            self.note(format!("listing: channel {chan} refused a line that room said would fit"));
+        }
+        if spent {
+            self.end_listing(chan, 1);
+        }
+    }
+
+    /// A pass's look at every listing: one whose channel has nothing in
+    /// flight -- output and pause hold both empty, and not paused -- will
+    /// never raise the `OUTMT` that feeds it (a pause released with nothing
+    /// held drains nothing), so it is fed here instead.
+    fn nudge_listings(&mut self) {
+        let stalled: Vec<Chan> = self
+            .listings
+            .keys()
+            .copied()
+            .filter(|&chan| {
+                let c = self.gsbl.channel(chan);
+                !c.paused && c.output.is_empty() && c.held.is_empty()
+            })
+            .collect();
+        for chan in stalled {
+            self.feed_listing(chan);
+        }
+    }
+
+    /// Take `chan`'s listing down, put `oes` back, and defer `whndun(ok)`:
+    /// `tshlst`'s `TSHFIN`, `lstptr->whndun((int)ftfscb->actfil)`.
+    fn end_listing(&mut self, chan: Chan, ok: u16) {
+        let Some(listing) = self.listings.remove(&chan) else {
+            return;
+        };
+        self.gsbl.channel_mut(chan).oes = listing.oes_was;
+        self.defer(chan, listing.whndun, vec![crate::abi::Arg::Int(A::Int::from(ok))]);
+    }
+
     fn prcrtk(
         &mut self,
         machine: &mut A::Cpu,
@@ -4440,6 +4562,25 @@ impl<A: Abi> Host<A> {
             // module is re-prompted with an empty line, exactly as if the
             // user had pressed Return on nothing. (`ABOIP`/`INJOIP` are set
             // around it there; this host does not model those flag bits.)
+            // A channel mid-listing is, for these two statuses, the file
+            // transfer module's and not the module's -- see
+            // [`Host::begin_listing`]. `OUTMT` feeds the next lines; the
+            // abort key ends the listing with `whndun(0)` and, unlike the
+            // plain `ABOREQ` below, injects no empty line: the real host's
+            // `injacr` went to the file transfer state, which finished and
+            // called `whndun` -- the module never saw a line.
+            if self.listings.contains_key(&chan) {
+                if status == gsbl::Gsbl::OUTMT {
+                    self.feed_listing(chan);
+                    continue;
+                }
+                if status == gsbl::Gsbl::ABOREQ {
+                    self.gsbl_mut().channel_mut(chan).clear_output();
+                    self.end_listing(chan, 0);
+                    continue;
+                }
+            }
+
             let status = if status == gsbl::Gsbl::ABOREQ {
                 self.gsbl_mut().channel_mut(chan).clear_output();
                 gsbl::Gsbl::CRSTG
@@ -4874,6 +5015,7 @@ impl<A: Abi> Host<A> {
             // stays `None` when nothing was dispatched, which is the honest
             // answer: the time went to the kick sweep, not to a channel.
             let mut polled = None;
+            self.nudge_listings();
             match self.poll_with_chan(machine, module)? {
                 Some((Outcome::Stopped(poison), chan)) => {
                     return Ok(Cycles {
@@ -5908,6 +6050,8 @@ impl<A: Abi> Host<A> {
         chan: Chan,
         vector: Vector,
     ) -> io::Result<Option<Outcome<A>>> {
+        // A listing has no one to finish for; `tshlst` has no `TSHHUP` arm.
+        self.listings.remove(&chan);
         if let Err(e) = self.point_curusr(machine, chan) {
             return self.shim_stop(machine, "point_curusr", e).map(Some);
         }
@@ -9480,6 +9624,89 @@ mod tests {
         let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("ran");
         assert!(matches!(cycles.ended, Ended::Stopped(_, Some(c)) if c == chan), "{:?}", cycles.ended);
         assert!(f.host.deferred.is_empty(), "taken before it ran, not left to run again");
+    }
+
+    fn a_big_file() -> Vec<u8> {
+        (0..3000).flat_map(|n| format!("line {n:04}\r\n").into_bytes()).collect()
+    }
+
+    /// `FTFASCII.C`'s loop, end to end: each drain of the ring raises
+    /// `OUTMT`, the poll answers it with the next lines rather than with the
+    /// module's `stsrou`, and the last line ends the listing -- `oes` back
+    /// off, `whndun(1)` queued.
+    #[test]
+    fn a_listing_is_fed_on_each_outmt_until_spent_then_whndun_1_is_deferred() {
+        let (mut f, module, rou) = polling_fixture();
+        let chan = f.console();
+        let file = a_big_file();
+        f.host.begin_listing(chan, file.clone(), rou);
+
+        let mut got = f.host.gsbl_mut().drain_output(chan);
+        let mut rounds = 0;
+        while f.host.listings.contains_key(&chan) {
+            rounds += 1;
+            assert!(rounds < 200, "the feed is not advancing");
+            assert!(f.host.gsbl().pending(), "the drain raised OUTMT for the feed");
+            let served = f.host.poll_with_chan(&mut f.machine, &module).expect("polled");
+            assert!(served.is_none(), "OUTMT mid-listing is the host's, not the module's");
+            got.extend(f.host.gsbl_mut().drain_output(chan));
+        }
+        assert_eq!(got, file, "every byte, in order, once");
+        assert!(rounds > 1, "it took more than one ring: {rounds}");
+        assert!(!f.host.gsbl().channel(chan).oes, "oes is put back");
+        assert!(!f.host.gsbl().pending(), "and the last drain raised nothing");
+        let [call] = f.host.deferred.as_slice() else {
+            panic!("one whndun queued, got {}", f.host.deferred.len());
+        };
+        assert_eq!(call.chan, chan);
+        assert!(matches!(call.args.as_slice(), [crate::abi::Arg::Int(1)]), "whndun(1)");
+    }
+
+    #[test]
+    fn the_abort_key_ends_a_listing_with_whndun_0_and_no_line_for_the_module() {
+        let (mut f, module, rou) = polling_fixture();
+        let chan = f.console();
+        f.host.begin_listing(chan, a_big_file(), rou);
+        f.host.gsbl_mut().channel_mut(chan).status.push_back(gsbl::Gsbl::ABOREQ);
+
+        let served = f.host.poll_with_chan(&mut f.machine, &module).expect("polled");
+        assert!(served.is_none(), "nothing reached the module");
+        assert!(f.host.listings.is_empty(), "the listing is over");
+        assert_eq!(f.host.gsbl().output_len(chan), 0, "what was queued is thrown away");
+        assert!(!f.host.gsbl().pending(), "no CRSTG was injected");
+        let [call] = f.host.deferred.as_slice() else {
+            panic!("one whndun queued, got {}", f.host.deferred.len());
+        };
+        assert!(matches!(call.args.as_slice(), [crate::abi::Arg::Int(0)]), "whndun(0): interrupted");
+    }
+
+    /// A pause released with nothing held drains nothing, so no `OUTMT`
+    /// comes; the pass's nudge is what feeds the listing then.
+    #[test]
+    fn a_paused_channel_is_not_fed_and_the_next_pass_feeds_it_once_released() {
+        let (mut f, module, rou) = polling_fixture();
+        let chan = f.console();
+        f.host.gsbl_mut().channel_mut(chan).paused = true;
+        f.host.begin_listing(chan, a_big_file(), rou);
+        assert_eq!(f.host.gsbl().output_len(chan), 0, "nothing while paused");
+        assert_eq!(f.host.listings[&chan].pos, 0);
+
+        f.host.gsbl_mut().channel_mut(chan).paused = false;
+        let cycles = f.host.cycle(&mut f.machine, &module, &mut || false, &mut |_| {}).expect("cycled");
+        assert!(f.host.gsbl().output_len(chan) > 0, "the pass fed it");
+        assert_eq!(cycles.ended, Ended::Idle, "and parked: the ring's drain is the next signal");
+    }
+
+    #[test]
+    fn a_hangup_drops_the_listing_without_calling_whndun() {
+        let (mut f, module, rou) = polling_fixture();
+        let chan = f.console();
+        f.host.begin_listing(chan, a_big_file(), rou);
+        // The bare fixture registers no module, so `hangup` errs after the
+        // teardown this test is about; the error is not the subject.
+        let _ = f.host.hangup(&mut f.machine, &module, chan);
+        assert!(f.host.listings.is_empty());
+        assert!(f.host.deferred.is_empty(), "no one to finish for");
     }
 
     #[test]
