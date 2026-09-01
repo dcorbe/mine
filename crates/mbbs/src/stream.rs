@@ -713,6 +713,19 @@ impl<A: Abi> Streams<A> {
         Ok(&self.open[self.find(cookie)?].name)
     }
 
+    /// Whether a read has hit the end -- `_F_EOF`, asked of the host.
+    ///
+    /// Borland's `feof` is a macro over `FILE.flags` and never reaches here
+    /// (which is why the flag is mirrored into module memory at all); the
+    /// UCRT's `feof` is a real call, and this is what it asks.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream.
+    pub fn ended(&self, cookie: A::Ptr) -> Result<bool, String> {
+        Ok(self.open[self.find(cookie)?].ended)
+    }
+
     /// When the file behind `fd` was last written, in seconds since 1970.
     ///
     /// **Keyed by descriptor rather than by `FILE *`**, because the one caller

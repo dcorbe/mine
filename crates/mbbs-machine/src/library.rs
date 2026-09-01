@@ -144,9 +144,9 @@ pub static GALGSBL_WG3_16: OrdinalTable = OrdinalTable {
 
 /// Worldgroup NT, 32-bit. Named for the layout rather than a release because
 /// MBBS 10's own import library carries the identical numbering -- 88 shared
-/// ordinals, zero disagreements. Whether an MBBS 10 *module* binds by ordinal
-/// at all is unresolved; see the spec's caveat. The table is established for
-/// `wgnt` regardless.
+/// ordinals, zero disagreements. An MBBS 10 module *does* bind by ordinal
+/// (LunatiX 5.3H, 2025-11-30: seven GALGSBL ordinals, `_btuclo` @7 through
+/// `_bturno` @69), which is what [`GALGSBL_MBBS10`] exists to answer.
 pub static GALGSBL_LAYOUT_C: OrdinalTable = OrdinalTable {
     library: GALGSBL,
     generation: "layout-c",
@@ -154,6 +154,24 @@ pub static GALGSBL_LAYOUT_C: OrdinalTable = OrdinalTable {
     source_path: "re/wg33src/LIB/GALGSBL.DEF (#else branch)",
     source_kind: SourceKind::VendorDef,
     verified: "86 ordinals; the WG NT PE32 DLL exports these plus _btugri, _lanecb and a Borland __debuggerhookdata artifact.",
+};
+
+/// The Major BBS v10 (Project Phoenix, MSVC-built). Layout C plus the two
+/// names the WG NT binary exported but the DEF's `#else` branch never listed:
+/// `__lanecb` @82 and `_btugri` @83.
+///
+/// From an import library rather than the shipped `GALGSBL.DLL`: v10 ships as
+/// an Inno Setup 6.7 installer that neither `innoextract` nor a silent Wine
+/// run will open, and the SDK's `GALGSBL_LIB.LIB` is what a v10 module was
+/// actually linked against -- the stronger claim for a *module's* ordinal
+/// meaning, since it is the linker's own source of the number.
+pub static GALGSBL_MBBS10: OrdinalTable = OrdinalTable {
+    library: GALGSBL,
+    generation: "mbbs10",
+    tsv: include_str!("../data/galgsbl_mbbs10.tsv"),
+    source_path: "archive/modules/github-themajorbbs/MBBS-v10-module-SDK/lib/importlibs/GALGSBL_LIB.LIB (fa5c3a0)",
+    source_kind: SourceKind::ImportLibrary,
+    verified: "88 ordinals, every record ORDINAL-bound; agrees with layout-c on all 86 shared. re/implib_ordinals.py reproduces the file.",
 };
 
 /// MajorBBS 6.25's MAJORBBS numbering. **Shipped first among the MAJORBBS
@@ -424,6 +442,27 @@ pub static WGSERVER_WG33: OrdinalTable = OrdinalTable {
     verified: "1506 ordinals; a superset of the 3.12 binary's 1495, including _dfaStat @457 which no shipped binary exports.",
 };
 
+/// The Major BBS v10's `WGSERVER.EXE`, from the SDK's import library -- what
+/// an MSVC-built v10 module links its ordinals against. v10 kept Galacticomm's
+/// WG 3.3 numbering exactly: every one of these 1,354 ordinals is in
+/// [`WGSERVER_WG33`] under the same name, and 1,342 of them are in the 3.12
+/// binary. The 12 that are DEF-only there (`_dfaStat` @457, `_excpFilter`
+/// @538, `_isRunAsService` @816, `_prtPhase` @1062, `_isWinNT` @1379,
+/// `_getErrorText`/`_getLastErrorText` @1380-1381, `_gmktemp` @1599 and the
+/// four `pseudok2` routines @1600-1603) are exported by v10 for real.
+///
+/// A separate table rather than a pointer at `wg33` because a profile names
+/// what a *module* was linked against, and this is the only source that
+/// says so for v10. See [`GALGSBL_MBBS10`] for why an import library.
+pub static WGSERVER_MBBS10: OrdinalTable = OrdinalTable {
+    library: WGSERVER,
+    generation: "mbbs10",
+    tsv: include_str!("../data/wgserver_mbbs10.tsv"),
+    source_path: "archive/modules/github-themajorbbs/MBBS-v10-module-SDK/lib/importlibs/WGSERVER_LIB.LIB (fa5c3a0)",
+    source_kind: SourceKind::ImportLibrary,
+    verified: "1,354 ordinals, every record ORDINAL-bound; agrees with wg33 on all 1,354 and with wg312 on all 1,342 shared, zero disagreements.",
+};
+
 /// `DOSCALLS`, keyed to the extender release rather than the host release.
 ///
 /// No Worldgroup disk ships a `DOSCALLS.DLL`. The 286|DOS-Extender bound into
@@ -465,6 +504,7 @@ pub const GALGSBL_TABLES: &[&OrdinalTable] = &[
     &GALGSBL_WG2,
     &GALGSBL_WG3_16,
     &GALGSBL_LAYOUT_C,
+    &GALGSBL_MBBS10,
 ];
 
 pub const MAJORBBS_TABLES: &[&OrdinalTable] = &[&MAJORBBS_MBBS625, &MAJORBBS_WG101, &MAJORBBS_WG2];
@@ -475,7 +515,8 @@ pub const GALFIL_TABLES: &[&OrdinalTable] = &[&GALFIL_WG101];
 /// `_TL2LST` in one and `___TLCACT` in another -- so these must never be
 /// merged. A wrong ordinal map is worse than none.
 pub const GALETL_TABLES: &[&OrdinalTable] = &[&GALETL_NE5, &GALETL_WG101, &GALETL_WG300];
-pub const WGSERVER_TABLES: &[&OrdinalTable] = &[&WGSERVER_WG300, &WGSERVER_WG312, &WGSERVER_WG33];
+pub const WGSERVER_TABLES: &[&OrdinalTable] =
+    &[&WGSERVER_WG300, &WGSERVER_WG312, &WGSERVER_WG33, &WGSERVER_MBBS10];
 pub const DOSCALLS_TABLES: &[&OrdinalTable] = &[&DOSCALLS_PHARLAP31];
 
 /// How a library's symbols are named.
@@ -524,18 +565,29 @@ pub const GALME: &str = "GALME";
 pub const PHAPI: &str = "PHAPI";
 pub const DOSCALLS: &str = "DOSCALLS";
 pub const CW3220MT: &str = "CW3220MT";
+/// Microsoft's Universal C Runtime plus `VCRUNTIME140.dll`, as an MSVC-built
+/// module spells the C library. One library here, not seven: the
+/// `api-ms-win-crt-*` names are API-set forwarders onto a single
+/// `ucrtbase.dll`, and this host serves them all from the same C-library
+/// tables it serves `cw3220mt.DLL` from (`crates/mbbs`'s `shims::entry`).
+pub const UCRT: &str = "UCRT";
 pub const BTRIEVE: &str = "BTRIEVE";
 
 pub const LIBRARIES: &[Library] = &[
     Library {
         name: MAJORBBS,
-        // `WGSERVER.EXE` is the 32-bit host's own exports, under its 32-bit
-        // name -- measured: the PE32 LUNATIX.DLL imports 50 names from
-        // WGSERVER.EXE of which zero are dfa* and 49 are in the MAJORBBS
-        // table, and the two tables share 894 names. That alias is correct
-        // and stays. `cw3220mt.DLL` is Borland's C runtime, a genuinely
+        // `WGSERVER.EXE` used to be an alias here, on the measurement that
+        // the PE32 LUNATIX 5.3F imports 50 *names* from it, 49 of them in
+        // the MAJORBBS table. The routines are indeed one API under two
+        // names, and `crates/mbbs`'s `shims::entry` still folds `WGSERVER`
+        // onto `MAJORBBS` for the by-name lookup. The *ordinal spaces* are
+        // not one: LunatiX 5.3H (MBBS v10, MSVC) imports WGSERVER.EXE by
+        // ordinal, and 41 of its 53 ordinals name a different routine in
+        // the MAJORBBS tables (#229 is `alcmem` there, `fread` here). So the
+        // spelling now belongs to the `WGSERVER` library below, whose tables
+        // number it. `cw3220mt.DLL` is Borland's C runtime, a genuinely
         // different library, and has its own entry below.
-        aliases: &["WGSERVER.EXE"],
+        aliases: &[],
         naming: Naming::Ordinals(MAJORBBS_TABLES),
         authentic: Eligibility::NotLoadable(
             "MAJORBBS.EXE is NE plus a Phar Lap 286 extender; neither host can run it",
@@ -605,14 +657,36 @@ pub const LIBRARIES: &[Library] = &[
     },
     Library {
         name: WGSERVER,
-        // `canonical_dll` aliases `WGSERVER.EXE -> MAJORBBS` in `crates/mbbs`,
-        // so a `WGSERVER` library with this bare name does not collide with
-        // that alias. Do NOT give this library the alias `"WGSERVER.EXE"`:
-        // that spelling stays on `MAJORBBS`, where it resolves today, until
-        // Plan 3 splits it deliberately and re-measures what depends on it.
-        aliases: &[],
+        // The split MAJORBBS's own comment defers to: a PE32 module's
+        // `WGSERVER.EXE` is this library, so its ordinal demand lands on
+        // these tables and never on MAJORBBS's 16-bit numbering. By-name
+        // imports are unaffected -- `crates/mbbs`'s `shims::entry` folds
+        // `WGSERVER` onto `MAJORBBS` for routine lookup, which is where the
+        // one shared API is registered.
+        aliases: &["WGSERVER.EXE"],
         naming: Naming::Ordinals(WGSERVER_TABLES),
         authentic: Eligibility::Loadable,
+    },
+    Library {
+        name: UCRT,
+        // Every spelling LunatiX 5.3H's import directory uses for the C
+        // library. `VCRUNTIME140.dll` is where MSVC puts `memcpy`/`memset`/
+        // `strchr` and the SEH helpers; the API sets are the UCRT proper.
+        aliases: &[
+            "VCRUNTIME140.dll",
+            "api-ms-win-crt-convert-l1-1-0.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "api-ms-win-crt-stdio-l1-1-0.dll",
+            "api-ms-win-crt-string-l1-1-0.dll",
+            "api-ms-win-crt-time-l1-1-0.dll",
+            "api-ms-win-crt-utility-l1-1-0.dll",
+        ],
+        // MSVC's import libraries bind the C library by name; the ordinals
+        // `ucrtbase.dll` happens to export under are nothing a module carries.
+        naming: Naming::NamesOnly,
+        authentic: Eligibility::NotLoadable(
+            "the real UCRT is Microsoft's runtime, not a Galacticomm library this host models",
+        ),
     },
     Library {
         name: BTRIEVE,
@@ -715,6 +789,14 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "layout-c",
         tables: &[&GALGSBL_LAYOUT_C],
+    },
+    // The Major BBS v10. The only profile with a WGSERVER table, because a
+    // Borland-built PE32 module imports WGSERVER.EXE by name and so never
+    // evidences one; an MSVC-built v10 module imports it by ordinal, which
+    // is what selects this profile and nothing else.
+    Profile {
+        name: "mbbs10",
+        tables: &[&WGSERVER_MBBS10, &GALGSBL_MBBS10],
     },
 ];
 
@@ -1412,5 +1494,93 @@ mod tests {
             other => panic!("expected a wg101 shim, got {other:?}"),
         }
         assert!(galgsbl.render().contains("wg101"));
+    }
+
+    /// The v10 tables, spot-checked at the ordinals LunatiX 5.3H's boot
+    /// actually refused (`#717`) and the ones MAJORBBS's numbering would
+    /// have mis-named.
+    #[test]
+    fn the_mbbs10_tables_name_what_a_v10_module_demands() {
+        let wgs = WGSERVER_MBBS10.names();
+        assert_eq!(wgs.len(), 1354);
+        assert_eq!(wgs.get(&717).map(AsRef::as_ref), Some("gmdnam"));
+        assert_eq!(wgs.get(&229).map(AsRef::as_ref), Some("alcmem"), "MAJORBBS says fread here");
+        assert_eq!(wgs.get(&1047).map(AsRef::as_ref), Some("prf"));
+        assert_eq!(wgs.get(&1457).map(AsRef::as_ref), Some("instat"));
+        assert_eq!(wgs.get(&457).map(AsRef::as_ref), Some("dfastat"), "DEF-only in 3.12, real in v10");
+        let gsbl = GALGSBL_MBBS10.names();
+        assert_eq!(gsbl.len(), 88);
+        assert_eq!(gsbl.get(&69).map(AsRef::as_ref), Some("bturno"));
+        assert_eq!(gsbl.get(&83).map(AsRef::as_ref), Some("btugri"), "past layout-c's 86");
+    }
+
+    #[test]
+    fn mbbs10_agrees_with_wg33_on_every_shared_ordinal() {
+        let v10 = WGSERVER_MBBS10.names();
+        let wg33 = WGSERVER_WG33.names();
+        for (o, name) in &v10 {
+            assert_eq!(wg33.get(o), Some(name), "WGSERVER ordinal {o}");
+        }
+        let v10 = GALGSBL_MBBS10.names();
+        let c = GALGSBL_LAYOUT_C.names();
+        for (o, name) in &c {
+            assert_eq!(v10.get(o), Some(name), "GALGSBL ordinal {o}");
+        }
+    }
+
+    #[test]
+    fn the_pe32_spellings_reach_their_own_libraries() {
+        assert_eq!(library("WGSERVER.EXE").map(|l| l.name), Some(WGSERVER), "not MAJORBBS any more");
+        assert_eq!(library("wgserver.exe").map(|l| l.name), Some(WGSERVER));
+        assert_eq!(library("GALGSBL.DLL").map(|l| l.name), Some(GALGSBL));
+        assert_eq!(library("api-ms-win-crt-stdio-l1-1-0.dll").map(|l| l.name), Some(UCRT));
+        assert_eq!(library("VCRUNTIME140.dll").map(|l| l.name), Some(UCRT));
+        assert!(library("KERNEL32.dll").is_none(), "not a library this module names");
+    }
+
+    /// A v10 module's ordinal demand, as LunatiX 5.3H's import directory
+    /// spells it, selects `mbbs10` and nothing else.
+    #[test]
+    fn a_v10_modules_ordinal_demand_selects_mbbs10_uniquely() {
+        let mut demand = Demand::new();
+        for o in [229u16, 717, 1047, 1457] {
+            demand.add("WGSERVER.EXE", o);
+        }
+        for o in [7u16, 21, 69] {
+            demand.add("GALGSBL.DLL", o);
+        }
+        match detect(&demand) {
+            Outcome::Unique(p) => assert_eq!(p.name, "mbbs10"),
+            other => panic!("expected mbbs10 uniquely, got {other:?}"),
+        }
+    }
+
+    /// A 16-bit Worldgroup board's demand never evidences WGSERVER, so the
+    /// new profile is unevidenced for it and the outcome is what it was.
+    #[test]
+    fn a_16bit_boards_demand_does_not_see_mbbs10() {
+        let mut demand = Demand::new();
+        for o in [474u16, 1101, 1191] {
+            demand.add("MAJORBBS", o);
+        }
+        demand.add("GALGSBL", 72);
+        match detect(&demand) {
+            Outcome::Unique(p) => assert_ne!(p.name, "mbbs10"),
+            Outcome::Unobservable { chosen, agreeing } => {
+                assert_ne!(chosen.name, "mbbs10");
+                assert!(!agreeing.contains(&"mbbs10"), "{agreeing:?}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A Borland-built PE32 module imports everything by name: no demand at
+    /// all, and the anchor still answers -- `mbbs10` is not a default.
+    #[test]
+    fn no_demand_still_chooses_the_anchor() {
+        match detect(&Demand::new()) {
+            Outcome::Unobservable { chosen, .. } => assert_eq!(chosen.name, ANCHOR),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

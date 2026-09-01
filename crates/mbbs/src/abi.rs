@@ -1063,6 +1063,14 @@ pub enum Ret<A: Abi> {
     /// A C `long`: [`Abi::LONG_WIDTH`] bytes in every ABI met so far.
     Long(u32),
 
+    /// A 64-bit integer -- MSVC's `__int64`, which the UCRT's `_time64`
+    /// returns. **`Wg32` only**, in `EDX:EAX`
+    /// ([`mbbs_machine::m32::Ret::U64`]). Borland's 16-bit C has no 64-bit
+    /// integer at all, so no `Wg16`-bound routine can produce one; the
+    /// 16-bit conversion panics on it, the same shape as `F64`'s refusal
+    /// below rather than a silent truncation to `DX:AX`.
+    Long64(u64),
+
     /// A pointer, in this ABI's own representation.
     Ptr(A::Ptr),
 
@@ -1117,6 +1125,7 @@ where
             Self::Void => write!(f, "Void"),
             Self::Int(v) => f.debug_tuple("Int").field(v).finish(),
             Self::Long(v) => f.debug_tuple("Long").field(v).finish(),
+            Self::Long64(v) => f.debug_tuple("Long64").field(v).finish(),
             Self::Ptr(v) => f.debug_tuple("Ptr").field(v).finish(),
             Self::F64(v) => f.debug_tuple("F64").field(v).finish(),
         }

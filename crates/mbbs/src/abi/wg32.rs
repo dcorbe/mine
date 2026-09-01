@@ -663,6 +663,7 @@ impl From<Ret<Wg32>> for mbbs_machine::m32::Ret {
             Ret::Void => mbbs_machine::m32::Ret::Void,
             Ret::Int(v) => mbbs_machine::m32::Ret::U32(v),
             Ret::Long(v) => mbbs_machine::m32::Ret::U32(v),
+            Ret::Long64(v) => mbbs_machine::m32::Ret::U64(v),
             Ret::Ptr(p) => mbbs_machine::m32::Ret::U32(p.0),
             Ret::F64(v) => mbbs_machine::m32::Ret::F64(v),
         }

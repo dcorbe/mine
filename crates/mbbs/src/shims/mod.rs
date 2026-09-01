@@ -29,6 +29,7 @@ pub mod screen;
 pub mod stream;
 pub mod system;
 pub mod task;
+pub mod ucrt;
 pub mod vda;
 pub mod text;
 pub mod tfscan;
@@ -37,10 +38,10 @@ pub mod user;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
-use crate::exports::{DOSCALLS, GALGSBL, GALME, GALMSG, MAJORBBS, PHAPI};
+use crate::exports::{DOSCALLS, GALGSBL, GALME, GALMSG, MAJORBBS, PHAPI, WGSERVER};
 use crate::globals::GLOBALS;
 use evidence::Evidence;
-use mbbs_machine::library::CW3220MT;
+use mbbs_machine::library::{CW3220MT, UCRT};
 
 /// Whether `MBBS_TRACE_SHIMS` is set, for the shims that print an *argument*
 /// rather than just their own name.
@@ -1707,6 +1708,14 @@ const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans, Evidence)] =
     (MAJORBBS, "samepatu", user::samepatu, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "vtmsend", system::vtmsend, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "vtmsndok", system::vtmsndok, Cleans::Caller, Evidence::Unclassified),
+    // The UCRT's own vocabulary -- see `ucrt.rs`'s module doc for what an
+    // MSVC-built module imports under these names and why only these four
+    // need a body of their own. Registered names are post-`c_name`: the
+    // import directory says `_time64` and `__stdio_common_vsprintf`.
+    (UCRT, "feof", ucrt::feof, Cleans::Caller, Evidence::Standard),
+    (UCRT, "time64", ucrt::time64, Cleans::Caller, Evidence::Standard),
+    (UCRT, "_stdio_common_vsprintf", ucrt::stdio_common_vsprintf, Cleans::Caller, Evidence::Standard),
+    (UCRT, "_stdio_common_vfprintf", ucrt::stdio_common_vfprintf, Cleans::Caller, Evidence::Standard),
 ];
 
 /// [`Abi::native`]'s `Wg32` half. See [`wg16_native`], which this mirrors.
@@ -1990,6 +1999,27 @@ pub(crate) fn gbool_arg<A: Abi>(v: A::Int) -> bool {
 /// neither needs its own copy of the alias.
 pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
     let dll = canonical_dll(dll);
+    // `WGSERVER.EXE` is its own library to `mbbs_machine::library` -- with
+    // its own ordinal tables, since the MAJORBBS numbering names 41 of
+    // LunatiX 5.3H's 53 WGSERVER ordinals wrongly. The *routines* are one
+    // API under two names, registered once under MAJORBBS; fold here, at
+    // the one choke point, so no table needs a second copy.
+    let dll = if dll == WGSERVER { MAJORBBS } else { dll };
+    // An MSVC-built module spells the C library `api-ms-win-crt-*` /
+    // `VCRUNTIME140.dll` (`library::UCRT`). What only the UCRT has
+    // (`__stdio_common_vsprintf`, `_time64`, `feof` as a call rather than
+    // Borland's macro) is registered under `UCRT` itself and answered first;
+    // every other name it imports is the C library this host already serves
+    // `cw3220mt.DLL` from, so the spelling folds onto that and takes the
+    // `crt_home` path below like any Borland module's would.
+    let dll = if dll == UCRT {
+        if let Some((shim, cleans)) = A::native(UCRT, symbol) {
+            return Entry::Routine(shim, cleans);
+        }
+        CW3220MT
+    } else {
+        dll
+    };
     // A C runtime name both files export answers under whichever of the two
     // this host keyed it under, so rewrite to that one. Deliberately a
     // rewrite and not a lookup-then-fall-back: this function runs on every

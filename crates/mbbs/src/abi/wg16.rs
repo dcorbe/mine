@@ -440,6 +440,16 @@ impl From<Ret<Wg16>> for mbbs_machine::m16::Ret {
             Ret::Int(v) => mbbs_machine::m16::Ret::U16(v),
             Ret::Long(v) => mbbs_machine::m16::Ret::U32(v),
             Ret::Ptr(v) => mbbs_machine::m16::Ret::Far(v),
+            // Same shape as `F64` below: Borland's 16-bit C has no 64-bit
+            // integer, so no `Wg16`-bound routine can honestly produce one
+            // (the only producer, `shims::ucrt::time64`, is registered
+            // against `UCRT`, a `Wg32`-only library). Loud, not a silent
+            // truncation to `DX:AX`.
+            Ret::Long64(v) => panic!(
+                "Ret::Long64({v}) reached the 16-bit boundary: Borland's 16-bit C has no \
+                 64-bit integer and mbbs_machine::m16::Ret has no DX:AX:?:? to carry one. \
+                 See abi::Ret::Long64's own doc comment."
+            ),
             // Structural, not unfinished work -- the same refusal shape
             // `crt::setjmp` uses, stated here because `abi::Ret<A>`'s own
             // `F64` variant is generic over every `Abi` and this `From` is

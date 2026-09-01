@@ -3427,8 +3427,18 @@ impl<A: Abi> Host<A> {
         // get the same "refused before `cpu` is touched" guarantee
         // `Why::NotPlaced`/`Why::TooSmall` already had; see
         // `Why::NotExported`'s own doc comment for the case this exists for.
-        let precheck: HashSet<(String, Symbol)> =
-            image.as_ref().map(imported_symbols).unwrap_or_default();
+        //
+        // A PE's import directory answers the same question for `Wg32`.
+        // Until LunatiX 5.3H this arm was empty and nobody noticed, because
+        // every Borland-built PE32 module imports by name and so evidences
+        // no ordinal: detection fell to the anchor and no name was ever
+        // wrong. An MSVC-built v10 module imports `WGSERVER.EXE` by ordinal,
+        // and without its demand here the `mbbs10` profile is never chosen
+        // and every one of those ordinals resolves to a bare `#N`.
+        let precheck: HashSet<(String, Symbol)> = match image.as_ref() {
+            Some(image) => imported_symbols(image),
+            None => pe_imported_symbols(file),
+        };
 
         // The modules' own imports are the only evidence always present -- a
         // real board directory holds no vendor host binaries at all, so
@@ -6387,6 +6397,17 @@ fn addressed_as_data(image: &NeImage, file: &[u8]) -> HashMap<(String, Symbol), 
 /// which `addressed_as_data` never classifies as data at all -- still gets
 /// resolved, and any resulting [`Why::NotExported`] recorded, before
 /// `A::load` ever touches `cpu`. See that method's own doc comment.
+/// [`imported_symbols`] for a PE32 file: every `(library, symbol)` its import
+/// directory names, spelled as the file spells them (`WGSERVER.EXE`,
+/// `GALGSBL.DLL`, `api-ms-win-crt-stdio-l1-1-0.dll`). Empty for a file that
+/// is not a PE at all -- the caller has already failed to parse it as NE, so
+/// `A::load` is about to say why.
+fn pe_imported_symbols(file: &[u8]) -> HashSet<(String, Symbol)> {
+    mbbs_machine::m32::PeImage::parse(file)
+        .map(|pe| pe.imports.iter().map(|i| (i.library.clone(), i.symbol.clone())).collect())
+        .unwrap_or_default()
+}
+
 fn imported_symbols(image: &NeImage) -> HashSet<(String, Symbol)> {
     let mut symbols = HashSet::new();
     for segment in &image.segments {
@@ -6445,10 +6466,18 @@ fn registry_key(name: &str) -> String {
 fn symbol_name(exports: &Exports, from: &str, symbol: &Symbol) -> String {
     match symbol {
         Symbol::Name(name) => exports::c_name(name).into_string(),
-        Symbol::Ordinal(n) => exports
-            .name(from, *n)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("#{n}")),
+        // The tables are keyed by canonical library name (`WGSERVER`,
+        // `GALGSBL`); an NE segment already spells it that way, a PE import
+        // directory says `WGSERVER.EXE`/`GALGSBL.DLL`. Same fold `Demand::add`
+        // makes, so an ordinal that selected a profile is one the profile
+        // then names.
+        Symbol::Ordinal(n) => {
+            let library = mbbs_machine::library::library(from).map_or(from, |l| l.name);
+            exports
+                .name(library, *n)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("#{n}"))
+        }
     }
 }
 
