@@ -62,75 +62,23 @@
 //! call it from a genuine FSD-shaped site, and "the one call site we measured
 //! doesn't need it" is not the same claim as "correct."
 //!
-//! # How much of the pause-key/paging machinery this implements
+//! # The paging machinery this arms
 //!
-//! **None of it acts.** `btuxnf`, `btuhpk`, `btupbc` and `btucpc` all record
-//! state (`crate::gsbl::Channel::page_lines`/`page_message`/`pause_char`/
-//! `clear_pause_char`/`pause_handler_installed`) and none of it is ever read
-//! back to actually pause a channel's output. **This is reached, not
-//! hypothetical: long room descriptions, `look` output and `help` text will
-//! scroll straight past without pausing, on paths an ordinary player reaches
-//! every session.** An earlier draft of this comment claimed `btuxnf` "never
-//! once passes a negative `xoff`" and that page mode was unreached. That was
-//! wrong -- it also contradicted `btuxnf`'s own doc comment in
-//! `shims/gsbl.rs`, which already said "eight others (page mode)" before
-//! this file existed, while citing that comment as agreeing. Here is what is
-//! actually measured:
+//! Everything `rstrxf` sets is live: `crate::gsbl::Channel::release` counts
+//! lines against `page_lines`, drops the `btupbc`/`btucpc` characters, and
+//! pauses with `page_message` on the screen; `Channel::pause_key` is the
+//! host's `hpkrou` (`MAJORBBS.C:3796`) -- `N` nonstop, `Q` injects `ABOREQ`
+//! (which `Host::poll` answers with `btuclo` + an empty line, as the real
+//! host's `injacr` does), XON/XOFF ignored, anything else turns the page.
 //!
-//! * `re/ne_arity.py`'s `call_sites(data, 60, want_module='GALGSBL')` finds
-//!   all 14 of `WCCMMUD.DLL`'s `btuxnf` (GALGSBL ordinal 60) call sites and
-//!   splits them by the stack cleanup that follows: **6 sites clean 6
-//!   bytes** (3 words -- plain flow control, `xon`/`xoff` only) and **8
-//!   sites clean 12 bytes** (6 words -- the page-mode shape, because a
-//!   negative `xoff` pushes two more arguments, `cnt` and the far pointer
-//!   `stg`). **Eight of fourteen select page mode.**
-//! * Two of the eight are visible with full arguments in
-//!   `re/exports/WCCMMUD_named.c`: **line 37977** and **line 62401**, both
-//!   passing `0xffed` -- **-19** as a signed 16-bit value, the same -19
-//!   `rstrxf` itself passes. Their enclosing functions are verified: line
-//!   37977 is inside `_DISPLAY_LONG_TEXT` (declared line 37949), the
-//!   module's paginated-text primitive behind room/protected-room messages
-//!   and item/monster descriptions; line 62401 is inside `_CMD_SYSOP`
-//!   (declared line 61289), which is at least admin-gated.
-//! * Three more are traced to an enclosing function without that same
-//!   full-argument confirmation: line 35993 to `_DISPLAY_DESC_FROM_FILE`
-//!   (reached from `_DISPLAY_ROOM_DESC`, i.e. the `look` command), line
-//!   44741 to `_HELP_TEXT` (the player's `help` command), and line 12020 to
-//!   `_END_RELEASE_NOTE_LISTING` (rare/administrative). **Four of the eight
-//!   page-mode call sites were not identified at all** -- this is not a
-//!   complete map of where MajorMUD enters page mode, and it should not be
-//!   read as one.
-//! * `btuhpk`/`btupbc`/`btucpc` are still not `WCCMMUD.DLL` imports
-//!   themselves -- the module drives page mode through `btuxnf` alone, and
-//!   the only caller either of the other three could ever have in this host
-//!   is `rstrxf`, below. How a genuine board wires up the pause handler and
-//!   pause/clear-pause characters for a module that never imports the
-//!   routines that set them is not measured here -- presumably part of the
-//!   real host's own connection setup, upstream of anything `WCCMMUD.DLL`
-//!   calls.
-//! * MajorMUD has no "more" prompt of its own in
-//!   `re/exports/WCCMMUD_named.c` -- it delegates pause-and-continue
-//!   entirely to the host through `btuxnf`'s page-mode arguments, which is
-//!   what makes this host's non-implementation observable rather than inert.
-//!
-//! **Why the stub stands anyway.** The goal of this host is running a
-//! module headless, not reproducing MajorBBS, and scroll-without-pause
-//! degrades presentation without breaking play -- the text still arrives,
-//! in order, complete, to a client that has its own scrollback. Pagination
-//! means a driver loop that holds output, counts lines and waits for a
-//! keystroke across room entry, `look`, `help` and sysop text, for a return
-//! that is purely cosmetic against a modern client. That trade is approved
-//! and is not being reversed by this task -- what was wrong was calling
-//! those paths "unreached" instead of naming what a player actually sees.
-//!
-//! **What would show this is wrong:** nothing further needs to turn up --
-//! it already has. The concrete next step, if this is ever revisited, is
-//! finishing the map above: the four page-mode call sites `re/ne_arity.py`
-//! located but this pass did not identify. Until then, the state these four
-//! routines already record (`page_lines`, `page_message`, `pause_char`,
-//! `clear_pause_char`, `pause_handler_installed`) is what a real pagination
-//! implementation would start from -- recording it now is what makes that
-//! later work additive instead of a rewrite.
+//! `crate::Host::connect_state` calls [`restore_screen`] for every channel,
+//! as the real host's `figlang` does, then switches the line counter and
+//! pause character back off: a modern client has its own scrollback, and a
+//! module that paginates itself (T-LORD) would otherwise be double-prompted.
+//! So GSBL paging is on only for a channel whose module asked for it --
+//! through `btuxnf` with its own message (MajorMUD's `_DISPLAY_LONG_TEXT`,
+//! `look`, `help`: 8 of its 14 `btuxnf` sites pass `-19`), or through
+//! `rstrxf` itself, which is where [`PAUSE_MESSAGE`] is seen.
 
 use mbbs_machine::ptr::ModulePtr;
 
@@ -152,14 +100,13 @@ const CTNUOS: i16 = 2;
 
 /// `scnpaus[extptr->lingo]` -- the page-mode pause message, ordinarily loaded
 /// from the host's message catalog at startup (`MAJORBBS.C:630-637`,
-/// `scnpaus[clingo]=alcdup(rawmsg(SCNPAUS))`) and indexed by the connecting
-/// user's configured language. This host has no message catalog to load it
-/// from and no language table to index -- `extptr->lingo` is not modelled at
-/// all, only ever the implicit single language a host with one `scnpaus`
-/// entry would have. This is a literal placeholder, not data read from
-/// anywhere, and it is never shown to a user: see this module's own doc
-/// comment on why `page_message` is recorded and not acted on.
-const PAUSE_MESSAGE: &[u8] = b"Press any key to continue...";
+/// `scnpaus[clingo]=alcdup(rawmsg(SCNPAUS))`, ANSI stripped by `stpans`) and
+/// indexed by the connecting user's language. This host has no catalog to
+/// load it from and no language table (`extptr->lingo` is not modelled), so
+/// the one entry is a literal: the `SCNPAUS` text as a genuine host shows it,
+/// captured live. `\xd9` is CP437 for the box-drawing Return glyph,
+/// translated in the socket task like every other output byte.
+const PAUSE_MESSAGE: &[u8] = b"(N)on-Stop, (Q)uit, or (\xd9) to Continue";
 
 /// `usaptr->scnbrk`, as a signed byte -- `struct usracc`'s `char scnbrk` is
 /// genuinely signed in Borland's default, and `rstrxf` computes
@@ -182,16 +129,12 @@ fn account_scnbrk<A: Abi>(mem: &A::Mem, host: &Host<A>, chan: Chan) -> Result<i8
 ///
 /// # `scnbrk`'s default in this host
 ///
-/// [`AccountLayout::scnbrk`](crate::users::AccountLayout)'s own doc comment:
-/// `Host::connect_state`
-/// never writes this byte, so it reads whatever the account's memory already
-/// held -- ordinarily zero, since nothing else writes it either. `0-CTNUOS`
-/// is `-2`, and that negative `cnt` lands in `Channel::page_lines` as
-/// `0xfffe` the same way a real negative `int` argument would land in a
-/// 16-bit `cnt` parameter -- harmless, because `page_lines` is never acted
-/// on (see [`crate::shims::gsbl::apply_xnf`]'s doc comment). This is `rstrxf`
-/// computed faithfully against a host that does not model `scnbrk`, not a
-/// special case carved out for it.
+/// `Host::connect_state` writes `usaptr->scnbrk=24` before its own call to
+/// [`restore_screen`], as `figlang` does, so a module's `rstrxf` restores
+/// `24-CTNUOS` = 22 lines. An account whose byte was never written reads
+/// zero, and `0-CTNUOS` lands in `Channel::page_lines` as `0xfffe`, the same
+/// way a negative `int` lands in a 16-bit `cnt` -- a pause every 65532
+/// lines, which is to say never.
 ///
 /// Generic: reads no argument of its own. Reached **only** through module
 /// dispatch (its one `ROUTINES` entry, and its own module doc comment's "one
