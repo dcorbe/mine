@@ -306,6 +306,14 @@ pub enum Ended<A: Abi> {
     /// straight back.
     Bound { next_kick: Option<u32> },
 
+    /// Nothing is queued, but a module whose `syscyc` does per-call work has
+    /// asked (via `--syscyc`) to be stepped faster than the tick clock. The
+    /// driver sleeps `after` -- interruptible by input, exactly like
+    /// [`Ended::Waiting`] -- and calls straight back, so the module's world
+    /// advances at that cadence rather than at 1 Hz. See
+    /// [`Host::set_syscyc_hz`] for why only some modules want this.
+    Cycling { after: Duration },
+
     /// The module stopped, on the pass it stopped on.
     ///
     /// `Option<Chan>` names which channel was being serviced when it
@@ -322,6 +330,7 @@ impl<A: Abi> Clone for Ended<A> {
             Self::Idle => Self::Idle,
             Self::Waiting { next_kick } => Self::Waiting { next_kick: *next_kick },
             Self::Bound { next_kick } => Self::Bound { next_kick: *next_kick },
+            Self::Cycling { after } => Self::Cycling { after: *after },
             Self::Stopped(poison, chan) => Self::Stopped(poison.clone(), *chan),
         }
     }
@@ -333,6 +342,7 @@ impl<A: Abi> std::fmt::Debug for Ended<A> {
             Self::Idle => write!(f, "Idle"),
             Self::Waiting { next_kick } => f.debug_struct("Waiting").field("next_kick", next_kick).finish(),
             Self::Bound { next_kick } => f.debug_struct("Bound").field("next_kick", next_kick).finish(),
+            Self::Cycling { after } => f.debug_struct("Cycling").field("after", after).finish(),
             Self::Stopped(poison, chan) => f.debug_tuple("Stopped").field(poison).field(chan).finish(),
         }
     }
@@ -344,6 +354,7 @@ impl<A: Abi> PartialEq for Ended<A> {
             (Self::Idle, Self::Idle) => true,
             (Self::Waiting { next_kick }, Self::Waiting { next_kick: nk2 }) => next_kick == nk2,
             (Self::Bound { next_kick }, Self::Bound { next_kick: nk2 }) => next_kick == nk2,
+            (Self::Cycling { after }, Self::Cycling { after: a2 }) => after == a2,
             (Self::Stopped(poison, chan), Self::Stopped(poison2, chan2)) => poison == poison2 && chan == chan2,
             _ => false,
         }
@@ -473,6 +484,7 @@ impl<A: Abi> Ended<A> {
             Ended::Waiting { next_kick, .. } => {
                 Wait::Until(std::time::Duration::from_secs(u64::from(*next_kick)))
             }
+            Ended::Cycling { after } => Wait::Until(*after),
             Ended::Bound { .. } => Wait::Now,
             Ended::Stopped(..) => Wait::Stop,
         }
@@ -1342,6 +1354,20 @@ pub struct Host<A: Abi> {
     /// [`Host::set_polls_per_second`].
     polls_per_second: usize,
 
+    /// How often to fire the `syscyc` vector when a module has installed a
+    /// real handler and the pump is otherwise idle, or `None` for the default
+    /// one-per-elapsed-second (`MAJORBBS.C:419`'s edge, sufficient for a
+    /// handler whose whole body is an idempotent gate, e.g. MajorMUD's).
+    ///
+    /// `Some(period)` is for a handler that does per-call work -- RCIROSE
+    /// steps one entry of its timer ring per call, so parking to the next
+    /// whole second traverses the ring at 1 Hz and every real-time-gated
+    /// timer on it fires that much slower than its threshold, with no
+    /// catch-up. Set from `--syscyc <hz>` (`period = 1s / hz`), it makes
+    /// [`Host::cycle`] re-enter at that cadence instead. See
+    /// [`Host::set_syscyc_hz`].
+    syscyc_period: Option<Duration>,
+
     /// Where the next poll round starts, so the channels take turns.
     ///
     /// Polling used to ride the GSBL status queue, and `Gsbl::scan`'s own
@@ -1954,6 +1980,7 @@ impl<A: Abi> Host<A> {
             tfscan: shims::tfscan::TfScan::default(),
             polls_left: 0,
             polls_per_second: 0,
+            syscyc_period: None,
             poll_cursor: 0,
             census: PollCensus::default(),
             forms: HashMap::new(),
@@ -2453,6 +2480,20 @@ impl<A: Abi> Host<A> {
     /// pretend to know".
     pub fn set_polls_per_second(&mut self, n: usize) {
         self.polls_per_second = n;
+    }
+
+    /// Fire the `syscyc` vector `hz` times a second while a module with a real
+    /// handler is otherwise idle, instead of once per elapsed second.
+    ///
+    /// `hz <= 1` restores the default (one per elapsed second): a `syscyc`
+    /// whose body is an idempotent gate cannot tell the two apart (see
+    /// `docs/superpowers/specs/2026-08-20-cycle-interrupt-and-syscyc-design.md`),
+    /// so a MajorMUD board wants this off and keeps its idle cadence. `hz > 1`
+    /// is for a handler that steps a per-call queue -- RCIROSE -- whose world
+    /// otherwise advances at 1 Hz. The knob is per board because whether a
+    /// module's `syscyc` does per-call work is a property of that module.
+    pub fn set_syscyc_hz(&mut self, hz: u32) {
+        self.syscyc_period = (hz > 1).then(|| Duration::from_secs_f64(1.0 / f64::from(hz)));
     }
 
     /// Every client/server agent that has registered, in the order it did.
@@ -4966,6 +5007,47 @@ impl<A: Abi> Host<A> {
             // only advances when this host dispatches into it. Spinning here
             // was the whole of the old busy-wait.
             if !self.gsbl().pending() && self.polls_left == 0 {
+                // A module whose `syscyc` does per-call work (RCIROSE steps one
+                // entry of its timer ring per call) advances its world only as
+                // fast as this vector fires. Parked to the next whole second it
+                // runs at 1 Hz, far below the real-time thresholds on that ring
+                // and with no catch-up, which is the ~20x-slow combat the
+                // `--syscyc` knob exists to cure. When it is set and a module
+                // has chained a real handler, fire the vector now and ask the
+                // driver for a sub-second re-entry (`Ended::Cycling`) rather
+                // than parking -- yielding to input first, so a keystroke is
+                // never starved. Modules whose `syscyc` is an idempotent gate
+                // leave the knob off (see `Host::set_syscyc_hz`) and park as
+                // before.
+                if let Some(period) = self.syscyc_period {
+                    let vector = self.globals().pointer_mem(A::mem(machine), "syscyc")?;
+                    let real_syscyc =
+                        vector != A::null_ptr() && Some(vector) != self.syscyc_tail;
+                    if real_syscyc {
+                        if interrupted() {
+                            let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
+                            self.settle_bundles(false);
+                            return Ok(Cycles {
+                                iterations,
+                                dispatched,
+                                ended: Ended::Bound { next_kick },
+                            });
+                        }
+                        if let Some(poison) = self.syscyc(machine, module, &mut dispatched)? {
+                            return Ok(Cycles {
+                                iterations,
+                                dispatched,
+                                ended: Ended::Stopped(poison, None),
+                            });
+                        }
+                        self.settle_bundles(false);
+                        return Ok(Cycles {
+                            iterations,
+                            dispatched,
+                            ended: Ended::Cycling { after: period },
+                        });
+                    }
+                }
                 let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
                 let ended = match next_kick {
                     Some(next_kick) => Ended::Waiting { next_kick },
@@ -9005,6 +9087,58 @@ mod tests {
                  vector must not be called -- an idle scan is not a trigger"
             );
         }
+    }
+
+    /// A module whose `syscyc` steps a per-call queue (RCIROSE) crawls if it
+    /// is only re-entered once per whole second: its ring advances one step a
+    /// call, so the real-time timers on it fire that much slower than their
+    /// thresholds, with no catch-up. `--syscyc` ([`Host::set_syscyc_hz`])
+    /// makes an idle pass fire the vector and ask for a sub-second re-entry
+    /// (`Ended::Cycling`) instead of parking. Off by default, so a
+    /// gate-shaped handler still parks and keeps its idle cadence.
+    ///
+    /// The clock is pinned so no whole second elapses across the calls: that
+    /// is what makes the default pass's `Ended::Idle`, not the per-second
+    /// site's own firing, prove the knob is the only thing that fires the
+    /// vector here.
+    #[test]
+    fn syscyc_hz_re_enters_at_a_sub_second_cadence_instead_of_parking() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+
+        let mut bytes = [0u8; 4];
+        bytes[0..2].copy_from_slice(&rou.offset.to_le_bytes());
+        bytes[2..4].copy_from_slice(&rou.selector.to_le_bytes());
+        f.host
+            .globals()
+            .write(&mut f.machine, "syscyc", &bytes)
+            .expect("syscyc is a placed global");
+
+        // Default: the idle pass parks, and the pinned clock keeps the
+        // per-second site silent, so the vector never runs.
+        let cycles = f
+            .host
+            .cycle(&mut f.machine, &module, &mut || false, &mut |_| {})
+            .expect("ran");
+        assert_eq!(cycles.ended, Ended::Idle, "default parks the idle pass");
+        assert_eq!(cycles.dispatched, 0, "and never fires the vector");
+
+        // Knob on: the same idle pass fires the vector and asks for a
+        // sub-second re-entry rather than parking.
+        f.host.set_syscyc_hz(100);
+        let cycles = f
+            .host
+            .cycle(&mut f.machine, &module, &mut || false, &mut |_| {})
+            .expect("ran");
+        match cycles.ended {
+            Ended::Cycling { after } => assert!(
+                after >= std::time::Duration::from_millis(9)
+                    && after <= std::time::Duration::from_millis(11),
+                "~1/100 s re-entry, got {after:?}"
+            ),
+            other => panic!("expected Cycling, got {other:?}"),
+        }
+        assert_eq!(cycles.dispatched, 1, "and fired the syscyc vector once");
     }
 
     /// A registered task runs on every cycle, and keeps running -- that is

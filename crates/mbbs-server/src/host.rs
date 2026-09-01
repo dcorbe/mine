@@ -190,6 +190,11 @@ pub struct Boot<A: Abi> {
     /// which is why this is no longer a per-wake re-arm: there is no
     /// `refill_polls` to call any more.
     pub polls_per_second: usize,
+    /// How often to fire the module's `syscyc` vector while idle, in Hz. `1`
+    /// (the default) is the tick-clock cadence every board had before the knob
+    /// existed; higher is for a module whose `syscyc` steps a per-call queue
+    /// (RCIROSE). Applied at boot via [`mbbs::Host::set_syscyc_hz`].
+    pub syscyc_hz: u32,
     // This struct used to carry `passes: usize` here too, `Host::cycle`'s
     // pass-count bound. Retired 2026-08-20 alongside `--passes`: a count is
     // a proxy for "has input arrived?", and a bad one -- see
@@ -990,6 +995,7 @@ fn life<A: Abi>(
     // pump's wake pattern is a property of socket traffic; the module's
     // world rate must not be.
     host.set_polls_per_second(boot.polls_per_second);
+    host.set_syscyc_hz(boot.syscyc_hz);
     let census_every = census_interval();
     // The poll grant's floor is a property of the MODULE's config, and this
     // host does not read another program's config and pretend to understand

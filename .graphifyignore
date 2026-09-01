@@ -1,0 +1,6 @@
+# Vendored third-party skill documentation, not part of this project.
+.superpowers/
+# Scratch experiments and disposable working files.
+.scratch/
+# Recovered vendor archives (binaries + extracted SDK trees), not our source.
+archive/

@@ -55,6 +55,11 @@ const DEFAULT_WG32_ARENA_BYTES: usize = 0x0100_0000;
 /// host may not pretend to know".
 const DEFAULT_POLLS_PER_SECOND: usize = 512;
 
+/// The `syscyc` vector fires once per elapsed second by default -- the edge a
+/// gate-shaped handler needs, and the cadence every board ran at before
+/// `--syscyc` existed. See [`mbbs::Host::set_syscyc_hz`].
+const DEFAULT_SYSCYC_HZ: u32 = 1;
+
 // Every rejection (an unknown flag, a missing required one, a number that
 // does not parse) is a clear message to stderr and a non-zero exit, never a
 // fallback to a default the operator did not ask for -- that would be
@@ -121,6 +126,13 @@ struct Cli {
     /// Poll firings granted per elapsed second
     #[arg(long, default_value_t = DEFAULT_POLLS_PER_SECOND)]
     polls_per_second: usize,
+
+    /// Times per second to fire the `syscyc` vector while idle. The default 1
+    /// suits a module whose `syscyc` is an idempotent gate (MajorMUD). Set it
+    /// higher for a module that steps a per-call queue every fire (RCIROSE,
+    /// `--syscyc 100`), whose world otherwise advances at 1 Hz.
+    #[arg(long, default_value_t = DEFAULT_SYSCYC_HZ)]
+    syscyc: u32,
 
     /// Connection keys handed to a new player [default: DEMO,NORMAL,USER]
     #[arg(long, value_delimiter = ',', value_parser = parse_key)]
@@ -396,6 +408,7 @@ async fn main() -> ExitCode {
             terms,
             bturno: cli.bturno.clone(),
             polls_per_second: cli.polls_per_second,
+            syscyc_hz: cli.syscyc,
             clock_reads: None,
             wake_age_ms: None,
             dispatched_total: None,
@@ -410,6 +423,7 @@ async fn main() -> ExitCode {
             terms,
             bturno: cli.bturno.clone(),
             polls_per_second: cli.polls_per_second,
+            syscyc_hz: cli.syscyc,
             clock_reads: None,
             wake_age_ms: None,
             dispatched_total: None,
