@@ -889,7 +889,10 @@ fn life<A: Abi>(
             .load(&mut machine, &file)
             .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))?;
         let entry = A::init_entry(&module).ok_or_else(|| {
-            io::Error::other(format!("{}: module has no ordinal 1 (the init routine)", path.display()))
+            io::Error::other(format!(
+                "{}: module has no initialization routine (no export named _INIT__*)",
+                path.display()
+            ))
         })?;
         match host.run(&mut machine, &module, entry, &[], None)? {
             Outcome::Returned { .. } => {}

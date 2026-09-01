@@ -1029,15 +1029,19 @@ fn init_resolves_by_name_even_when_ordinal_one_is_something_else() {
     );
 }
 
-/// The other half of the fix: when no `_INIT__<name>` export exists at all
-/// (every NE module this host loaded before `RCIROSE.DLL` -- `WCCMMUD.DLL`
-/// included, whose init routine only happens to also carry that name),
-/// `init()` must still fall back to ordinal 1 rather than returning `None`.
+/// The init routine's name need not contain the module's own name at all.
+/// `MAJORBBS.EXE` 6.25's `initdlls` (`seg 22:0x233`) walks every exported
+/// name with `DosEnumProc` and takes the first one `sameto("_INIT__", ..)`
+/// accepts -- a prefix test, nothing more. `TSGARN.DLL` (Tele-Arena 5.6d) is
+/// the measured shape: its own name is `TSGARN`, ordinal 1 is `_DELARN`, and
+/// the init routine is `_INIT__TA` at ordinal 251. Matching `_INIT__TSGARN`
+/// found nothing and the ordinal-1 guess ran `delarn` as init.
 #[test]
-fn init_falls_back_to_ordinal_one_when_no_named_init_export_exists() {
+fn init_is_the_first_export_whose_name_starts_with_init_prefix() {
     let ne = Ne {
-        segments: vec![Seg::code(vec![0xcbu8; 4]), Seg::data(vec![0; 4])],
-        entries: vec![Some((1, 0x02))],
+        segments: vec![Seg::code(vec![0u8; 0x20]), Seg::data(vec![0; 16])],
+        entries: vec![Some((1, 0x04)), Some((1, 0x08)), Some((1, 0x10))],
+        resident: vec![("_DELARN".into(), 1), ("_CLSARN".into(), 2), ("_INIT__TA".into(), 3)],
         autodata: 2,
         ..Ne::default()
     };
@@ -1047,24 +1051,63 @@ fn init_falls_back_to_ordinal_one_when_no_named_init_export_exists() {
 
     assert_eq!(
         module.init(),
-        module.entry(1),
-        "no _INIT__TESTMOD export exists, so init() must fall back to ordinal 1"
+        module.entry(3),
+        "init() must be _INIT__TA, whose suffix is not the module's own name"
     );
+    assert_ne!(module.init(), module.entry(1), "ordinal 1 (_DELARN) is not init");
 }
 
-/// The ordinal-1 fallback must not hand back a pointer into a *data*
-/// segment. `entry(1)` still resolves it -- that call has no way to know
-/// the caller means to execute it -- but `init()`'s fallback does, and a
-/// far jump into a non-executable descriptor is a fault the sandbox
-/// cannot recover from (`m16::fault`'s claim test reads the *interrupted*
-/// `CS`, which a jump that never completed never changed). Measured
-/// against `CXO-LORD.DLL`, whose ordinal 1 sits in a segment its own NE
-/// header marks `SEG_DATA`.
+/// `sameto` upper-cases both strings before comparing (`MAJORBBS.EXE` seg
+/// 35:0x1ec4), so a lower-case `_init__` export is the same routine.
 #[test]
-fn init_refuses_ordinal_one_when_its_segment_is_data() {
+fn init_prefix_match_is_case_insensitive() {
+    let ne = Ne {
+        segments: vec![Seg::code(vec![0u8; 0x20]), Seg::data(vec![0; 16])],
+        entries: vec![Some((1, 0x04)), Some((1, 0x08))],
+        resident: vec![("_delarn".into(), 1), ("_init__ta".into(), 2)],
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    let mut machine = Machine::new().expect("16-bit machine");
+    let module = machine.load_ne(&ne.finish(), &nothing).expect("loaded");
+
+    assert_eq!(module.init(), module.entry(2));
+}
+
+/// Two `_INIT__` exports: the first in name-table order wins, resident table
+/// before non-resident, which is the order `DosEnumProc` hands names out
+/// in. No module in the corpus has two, so this pins determinism rather
+/// than a measured vendor choice.
+#[test]
+fn init_prefers_the_resident_table_and_then_table_order() {
+    let ne = Ne {
+        segments: vec![Seg::code(vec![0u8; 0x20]), Seg::data(vec![0; 16])],
+        entries: vec![Some((1, 0x04)), Some((1, 0x08)), Some((1, 0x10))],
+        resident: vec![("_INIT__SECOND".into(), 2), ("_INIT__THIRD".into(), 3)],
+        nonresident: vec![("_INIT__FIRST".into(), 1)],
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    let mut machine = Machine::new().expect("16-bit machine");
+    let module = machine.load_ne(&ne.finish(), &nothing).expect("loaded");
+
+    assert_eq!(module.init(), module.entry(2));
+}
+
+/// No `_INIT__` export means no init routine -- the vendor host's
+/// `catastro("%s.DLL has no initialization routine!")`. Ordinal 1 is not a
+/// fallback: in every measured module where no `_INIT__` name exists it is
+/// something else (`GALGSBL.DLL`'s `_BTUBSE`, `FW_MSG.DLL`'s
+/// `_FW_MSG_GET_VERSION`, a `WEP`), and where an `_INIT__` name does exist
+/// ordinal 1 is a crt0 stub or gameplay code as often as it is init.
+#[test]
+fn init_is_none_when_no_export_starts_with_init_prefix() {
     let ne = Ne {
         segments: vec![Seg::code(vec![0xcbu8; 4]), Seg::data(vec![0; 4])],
-        entries: vec![Some((2, 0x00))],
+        entries: vec![Some((1, 0x02))],
+        resident: vec![("_BTUBSE".into(), 1)],
         autodata: 2,
         ..Ne::default()
     };
@@ -1073,11 +1116,7 @@ fn init_refuses_ordinal_one_when_its_segment_is_data() {
     let module = machine.load_ne(&ne.finish(), &nothing).expect("loaded");
 
     assert!(module.entry(1).is_some(), "ordinal 1 is exported and resolves fine on its own");
-    assert_eq!(
-        module.init(),
-        None,
-        "no _INIT__TESTMOD export exists and ordinal 1 names a data segment, so init() must refuse rather than guess"
-    );
+    assert_eq!(module.init(), None, "no _INIT__ export, so there is no init routine to guess at");
 }
 
 #[test]

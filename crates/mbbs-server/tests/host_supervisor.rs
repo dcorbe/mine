@@ -496,7 +496,11 @@ mod builder {
             }
         }
 
+        // The own name, then the one export by name: a module's init routine
+        // is the first export named `_INIT__*` (see `m16::ne::Module::init`),
+        // and this builder's single entry point is exactly that.
         let mut restab = pstring("TESTMOD", 0);
+        restab.extend_from_slice(&pstring("_INIT__TESTMOD", 1));
         restab.push(0);
         let mut nrtab = pstring("a test module", 0);
         nrtab.push(0);
@@ -834,9 +838,12 @@ async fn an_extension_that_fails_to_build_is_a_boot_failure_not_restarted() {
 /// `None`, and the builder would report "NOT resolved" instead.
 #[tokio::test]
 async fn the_extension_builder_receives_modules_whose_export_table_is_already_populated() {
+    // Booting runs the module's init routine -- the export named `_INIT__*`
+    // -- so the module needs one before the builder is ever reached; `PING`
+    // is the export the builder then looks up.
     let module = module_file(
         "mbbs-server-host-supervisor-extension-sees-populated-exports",
-        &mbbs::testing::module_bytes_exporting("PING", &[0xcb]), // retf
+        &mbbs::testing::module_bytes_exporting_many(&[("_INIT__TESTMOD", &[0xcb]), ("PING", &[0xcb])]), // retf, retf
     );
     let mut b = boot(
         module,

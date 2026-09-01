@@ -407,6 +407,11 @@ pub struct NeImage {
     pub own_name: String,
     /// Exported names from both name tables, mapped to their ordinals.
     pub names: HashMap<String, u16>,
+    /// The ordinal of the first exported name, in name-table order, that
+    /// starts with `_INIT__` (ASCII case-insensitive) -- the module's init
+    /// routine by the vendor host's own rule; see [`Module::init`]. `None`
+    /// when no export is named that way.
+    pub init: Option<u16>,
 }
 
 impl NeImage {
@@ -487,8 +492,9 @@ impl NeImage {
         let own_name = r.pstring("resident name table", restab)?.0;
 
         let mut names = HashMap::new();
-        collect_names(&r, restab, &mut names)?;
-        collect_names(&r, nrtab, &mut names)?;
+        let mut init = None;
+        collect_names(&r, restab, &mut names, &mut init)?;
+        collect_names(&r, nrtab, &mut names, &mut init)?;
 
         Ok(Self {
             flags,
@@ -500,6 +506,7 @@ impl NeImage {
             entries,
             own_name,
             names,
+            init,
         })
     }
 
@@ -757,10 +764,16 @@ fn parse_entry_table(r: &Reader<'_>, at: usize) -> Result<Vec<Option<EntryPoint>
 /// Both name tables lead with a string that is not an export -- the module name
 /// in the resident table, the module description in the non-resident one -- and
 /// whose ordinal field is meaningless.
+///
+/// `init` is filled with the first `_INIT__`-prefixed export met, in table
+/// order, and left alone once set -- the table order is what
+/// `MAJORBBS.EXE`'s `DosEnumProc` walk hands out, and it is lost once the
+/// names are in a `HashMap`, so the choice has to be made here.
 fn collect_names(
     r: &Reader<'_>,
     at: usize,
     names: &mut HashMap<String, u16>,
+    init: &mut Option<u16>,
 ) -> Result<(), NeError> {
     let mut at = at;
     let mut first = true;
@@ -776,9 +789,20 @@ fn collect_names(
         if first {
             first = false;
         } else {
+            if init.is_none() && is_init_name(&name) {
+                *init = Some(ordinal);
+            }
             names.insert(name, ordinal);
         }
     }
+}
+
+/// Whether an exported name is an init routine's: it starts with `_INIT__`,
+/// compared the way GCOMM's `sameto` does -- ASCII case-insensitively.
+fn is_init_name(name: &str) -> bool {
+    const PREFIX: &str = "_INIT__";
+    name.get(..PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
 }
 
 /// What an imported symbol resolves to, in this format's own pointer type.
@@ -812,10 +836,6 @@ pub use crate::module::ImportResolver;
 pub struct Module {
     /// Selector per NE segment number, indexed from zero for segment 1.
     selectors: Vec<u16>,
-    /// Whether each segment (indexed the same way as `selectors`) is code
-    /// rather than data, straight from the NE header's own `SEG_DATA` bit
-    /// -- see [`Module::init`]'s ordinal-1 fallback, the only reader.
-    is_code: Vec<bool>,
     autodata: u16,
     entries: Vec<Option<EntryPoint>>,
     /// This module's own declared name -- see [`NeImage::own_name`]. What a
@@ -824,6 +844,8 @@ pub struct Module {
     /// list of names *this* module imports from.
     own_name: String,
     names: HashMap<String, u16>,
+    /// The init routine's ordinal -- see [`NeImage::init`] and [`Module::init`].
+    init: Option<u16>,
     /// Where this module's own slice of the machine-wide thunk index space
     /// begins -- [`Machine::next_thunk`](crate::m16::Machine) when this
     /// module's [`Thunks`] started counting. `imports[0]`, if it exists, is
@@ -890,73 +912,37 @@ impl Module {
         self.entry(*self.names.get(name)?)
     }
 
-    /// The same lookup as [`Module::entry_by_name`], ASCII case-insensitive.
+    /// The module's init routine -- `register_module`'s caller -- by the
+    /// vendor host's own rule: **the first exported name that starts with
+    /// `_INIT__`**, compared case-insensitively.
     ///
-    /// A linear scan, unlike the exact-case lookup's `HashMap` hit --
-    /// [`Module::init`] is the only caller, it runs once per load, and a
-    /// second case-folded index would be a second table to keep in step
-    /// with `names`.
-    fn entry_by_name_ignore_ascii_case(&self, name: &str) -> Option<FarPtr> {
-        let ordinal = self
-            .names
-            .iter()
-            .find_map(|(n, &ordinal)| n.eq_ignore_ascii_case(name).then_some(ordinal))?;
-        self.entry(ordinal)
-    }
-
-    /// The module's real init routine -- `register_module`'s caller --
-    /// resolved by **name** first, exported ordinal 1 only as a fallback.
+    /// That is what `MAJORBBS.EXE` 6.25 does (`initdlls`, seg 22:0x233 of
+    /// `re/hosts/MAJORBBS.EXE`): it walks every exported name with
+    /// `DosEnumProc`, tests each with `sameto("_INIT__", name)` -- GCOMM's
+    /// case-insensitive prefix compare -- and calls the first hit through
+    /// `DosGetProcAddr`; no hit is `catastro("%s.DLL has no initialization
+    /// routine!")`. The suffix is whatever the module's author named it in
+    /// the source and is **not** the DLL's name: `TSGARN.DLL` (Tele-Arena
+    /// 5.6d) exports `_INIT__TA`, `CXO-LORD.DLL` `_INIT__IGM`, `LOGCAS.DLL`
+    /// `_INIT__CASINO`, `DIALCC.DLL` `_INIT__CHATTER` -- 10 of the 33 NE
+    /// modules in the archive corpus differ from their file name. (Worldgroup
+    /// 3's `CALLINIT.C` does look up `_init__<dllname>` exactly, which is why
+    /// the modules that differ are all MajorBBS 6.x era; the prefix scan
+    /// finds both kinds.)
     ///
-    /// **Not "exported ordinal 1."** That was believed to be Galacticomm's
-    /// own convention on the strength of one module: `WCCMMUD.DLL`'s
-    /// ordinal 1 is `_INIT__WCCMMUD`, its real init routine. Measured
-    /// against a second module, `RCIROSE.DLL` (NE), that agreement turned
-    /// out to be coincidence: its ordinal 1 is `BCC286_EXE` -- Borland C++
-    /// 286's crt0 startup stub, not an entry point at all -- while its real
-    /// init routine, `_INIT__RCIROSE`, sits at ordinal 403. A crt0-looking
-    /// name at ordinal 1 is itself a signal that ordinal 1 is not an entry
-    /// point; the name lookup below runs first for exactly that reason, and
-    /// ordinal 1 is never preferred once a name resolves, even when both
-    /// exist.
+    /// Ordinal 1 is not consulted. Two earlier rules were: "ordinal 1 is
+    /// init" (true of `WCCMMUD.DLL`, false of `RCIROSE.DLL`, whose ordinal 1
+    /// is Borland's `BCC286_EXE` crt0 stub) and then "`_INIT__<own name>`,
+    /// else ordinal 1" -- which booted `TSGARN.DLL` by running `_DELARN`,
+    /// its ordinal 1, as init. In every corpus module with no `_INIT__`
+    /// export at all, ordinal 1 is something else (`GALGSBL.DLL`'s
+    /// `_BTUBSE`, `FW_MSG.DLL`'s `_FW_MSG_GET_VERSION`, a Windows `WEP`), so
+    /// the fallback never once guessed right.
     ///
-    /// The candidate name is `_INIT__` followed by [`Module::name`]
-    /// (`WCCMMUD` -> `_INIT__WCCMMUD`, `RCIROSE` -> `_INIT__RCIROSE`, both
-    /// measured) and matched case-insensitively -- both measured NE exports
-    /// happen to upper-case the whole name, matching [`Module::name`]'s own
-    /// case exactly, but nothing about the format guarantees that, and the
-    /// PE side of this same convention (`m32::PeImage::init_rva`) lower-cases
-    /// it instead.
-    ///
-    /// `None` when neither the name lookup nor ordinal 1 resolves -- the
-    /// module has no export by that name and no ordinal 1 either. Mirrors
-    /// `m32::PeImage::init_rva`'s own `None` case.
+    /// `None` when no export is named that way -- the vendor's catastro.
+    /// Mirrors `m32::PeImage::init_rva`'s own `None` case.
     pub fn init(&self) -> Option<FarPtr> {
-        let candidate = format!("_INIT__{}", self.own_name);
-        self.entry_by_name_ignore_ascii_case(&candidate)
-            .or_else(|| self.ordinal_one_if_code())
-    }
-
-    /// Ordinal 1, but only once its segment is confirmed to be code.
-    ///
-    /// [`Module::init`]'s own doc comment already distrusts ordinal 1 as a
-    /// rule; this closes the one way trusting it as a *fallback* is unsafe
-    /// rather than merely wrong. Measured against `CXO-LORD.DLL`: ordinal 1
-    /// resolves to offset `0x5b` in segment 4, which that file's own NE
-    /// header marks `SEG_DATA` -- so `map_ne` mapped it non-executable, and
-    /// a far jump into a non-executable descriptor is refused by the CPU
-    /// before `CS` ever loads the new selector. `m16::fault`'s recovery
-    /// claims a fault by reading the *interrupted* `CS`, which in that case
-    /// is still the host's own -- so nobody claims it, and the module
-    /// crashes the whole process instead of the process seeing an ordinary
-    /// [`crate::m16::Poison`]. Refusing here, like the name lookup running
-    /// first above, turns a guess this codebase does not trust into an
-    /// honest `None`.
-    fn ordinal_one_if_code(&self) -> Option<FarPtr> {
-        let entry = (*self.entries.first()?)?;
-        if !*self.is_code.get(usize::from(entry.segment).wrapping_sub(1))? {
-            return None;
-        }
-        self.entry(1)
+        self.entry(self.init?)
     }
 
     /// What thunk `index` stands for, as [`Exit::Call`](crate::m16::Exit::Call)
@@ -1102,7 +1088,6 @@ impl Machine {
         // tail is BSS, and leaving it as whatever was there before would be a
         // module reading uninitialised globals that looked initialised.
         let mut selectors = Vec::with_capacity(image.segments.len());
-        let mut is_code = Vec::with_capacity(image.segments.len());
         let first = self.mem.segments.len();
         for (i, entry) in image.segments.iter().enumerate() {
             let mut segment =
@@ -1114,7 +1099,6 @@ impl Machine {
                 .write(0, &file[entry.file.clone()])
                 .expect("the segment is at least as large as its file data");
             selectors.push(segment.selector());
-            is_code.push(!entry.is_data());
             self.mem.segments.push(segment);
         }
 
@@ -1198,11 +1182,11 @@ impl Machine {
 
         Ok(Module {
             selectors,
-            is_code,
             autodata,
             entries: image.entries.clone(),
             own_name: image.own_name.clone(),
             names: image.names.clone(),
+            init: image.init,
             base: thunks.base,
             imports: thunks.sites,
             relocations: applied,

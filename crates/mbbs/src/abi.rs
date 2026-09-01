@@ -788,7 +788,10 @@ pub trait Abi {
     /// comments for the full measurement.
     ///
     /// `None` if this ABI's module has no such entry -- an NE module with
-    /// neither a named `_INIT__<dll>` export nor ordinal 1 (`Wg16`), or a
+    /// no export named `_INIT__*` at all (`Wg16`: the first such name is
+    /// init, whatever its suffix -- `TSGARN.DLL`'s is `_INIT__TA` -- and
+    /// ordinal 1 is never a fallback; the vendor's `MAJORBBS.EXE` catastros
+    /// instead), or a
     /// PE with no export directory and neither a named nor an ordinal-1
     /// export (`Wg32`; `mbbs_machine::m32::Module::init`, distinct from
     /// `Module::entry` -- see that method's own doc comment). Both ABIs'
