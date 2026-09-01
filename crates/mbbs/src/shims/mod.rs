@@ -508,7 +508,6 @@ pub(crate) fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cl
         (MAJORBBS, "condex", credit::condex, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "sscanf", credit::sscanf, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "memset", credit::memset, Cleans::Caller, Evidence::Unclassified),
-        (MAJORBBS, "intdos", credit::intdos, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "getbtv", btrieve::getbtv, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "obtbtv", btrieve::obtbtv, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "anpbtv", btrieve::anpbtv, Cleans::Caller, Evidence::Unclassified),
@@ -1586,6 +1585,9 @@ const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans, Evidence)] = &[
     // `impl From<mbbs_machine::m16::Ret> for abi::Ret<Wg16>` supplies.
     (MAJORBBS, "alctile", memory::alctile, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "ptrtile", memory::ptrtile, Cleans::Caller, Evidence::Unclassified),
+    // Borland's `INT 21h` wrapper, routed to the `dos` kernel through the
+    // 16-bit memory seam (`crate::dosint`); a PE module has no such import.
+    (MAJORBBS, "intdos", credit::intdos, Cleans::Caller, Evidence::Unclassified),
     // The compiler's own runtime, which this host exports because the real
     // one did. Same adapter shape as the tiling pair above. These four pop
     // their own arguments -- see `runtime`.

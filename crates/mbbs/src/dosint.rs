@@ -107,6 +107,65 @@ impl Guest for Guest16<'_> {
     }
 }
 
+/// A guest whose register file is the caller's, not the machine's.
+///
+/// For Borland's `intdos(inregs, outregs)`: the C runtime loads the
+/// registers from `*inregs`, fires `INT 21h`, and stores them into
+/// `*outregs` -- the CPU's own registers at the shim crossing are never the
+/// interrupt's operands. Memory still goes through [`Guest16`]'s selector
+/// check; only the register file and the carry flag are held here, to be
+/// read back with [`Regfile::regs`] and [`Regfile::carry`].
+pub struct Regfile<'a> {
+    mem: Guest16<'a>,
+    regs: Regs,
+    carry: bool,
+}
+
+impl<'a> Regfile<'a> {
+    pub fn new(cpu: &'a mut Machine, regs: Regs) -> Self {
+        Self { mem: Guest16::new(cpu), regs, carry: false }
+    }
+
+    /// The register file as the service left it.
+    pub fn regs(&self) -> Regs {
+        self.regs
+    }
+
+    /// Whether the service set CF -- DOS's "this call failed".
+    pub fn carry(&self) -> bool {
+        self.carry
+    }
+}
+
+impl Guest for Regfile<'_> {
+    fn read(&self, at: Ptr, len: usize) -> Result<&[u8], Fault> {
+        self.mem.read(at, len)
+    }
+
+    fn read_until(&self, at: Ptr, term: u8, max: usize) -> Result<&[u8], Fault> {
+        self.mem.read_until(at, term, max)
+    }
+
+    fn write(&mut self, at: Ptr, bytes: &[u8]) -> Result<(), Fault> {
+        self.mem.write(at, bytes)
+    }
+
+    fn regs(&self) -> Regs {
+        self.regs
+    }
+
+    fn set_regs(&mut self, regs: Regs) {
+        self.regs = regs;
+    }
+
+    fn set_flag(&mut self, flag: Flag, on: bool) {
+        match flag {
+            Flag::Carry => self.carry = on,
+            Flag::Zero => panic!("no int 21h service answers through ZF; a guest asked for it"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

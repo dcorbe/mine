@@ -13,9 +13,10 @@
 //! The oracle for this file is Tele-Arena instead:
 //! `/home/daniel/bbs/re/tasrc/tsgarn-2.c:385-386,440` calls `tstcrd`, `dedcrd`
 //! and `condex` as a real shipping module, and is cited as a module call site
-//! throughout, never as host source. `sscanf`, `memset` and `intdos` have no
-//! call site anywhere in `re/tasrc` either; those three are implemented from
-//! the vendor's own definition, and say so at each one.
+//! throughout, never as host source. `sscanf` and `memset` have no call site
+//! anywhere in `re/tasrc` either and are implemented from the vendor's own
+//! definition; `intdos` is called from the precompiled `TSGARN-1.LIB` half
+//! of the same module, which is not in `re/tasrc` -- see that routine.
 //!
 //! Vendor citations are the **wg1** archive tree
 //! (`archive/galacticomm/extract/wg1/GALDSRC/SRC`), never wg20 -- the same
@@ -47,7 +48,7 @@
 use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
-use crate::abi::{self, Abi, Call};
+use crate::abi::{self, Abi, Call, Wg16};
 use crate::shims::ShimError;
 
 /// The answer [`dedcrd`] and [`tstcrd`] both give: yes.
@@ -563,40 +564,97 @@ pub fn memset<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// clock -- real vendor code built on exactly this mechanism, cited to prove
 /// it is a real one and not a speculative prototype.
 ///
-/// # This host has no DOS interrupt path, and this refuses rather than fake one
+/// # Routed to the `dos` kernel, the same one a raw `INT 21h` reaches
 ///
-/// `intdos`'s entire contract is "run whatever DOS function `AH` in `*inregs`
-/// names" -- file I/O, memory allocation, the DOS version, dozens of others,
-/// selected by a byte this routine does not get to see in advance. This
-/// crate's module execution is `mbbs_machine::m16::Machine`, an x86 interpreter with
-/// no DOS kernel or BIOS beneath it: there is no `int21`/`int86`/`intdos`
-/// dispatcher anywhere in this crate (checked -- zero matches for any of
-/// those names, or for "interrupt", outside this comment), because nothing
-/// this host does needs one; every file, timer and console operation a
-/// module can reach goes through a Galacticomm-shaped host routine instead of
-/// a raw DOS call.
+/// The DOS services live in one place, `dos_kernel::kernel::dispatch` --
+/// what `Wg16::interrupt` hands a module's own `INT 21h` instruction to
+/// (`abi/wg16.rs`) and what `runexe` runs real-mode programs on. This shim
+/// is Borland's wrapper and nothing more: it loads a register file from
+/// `*inregs`, runs the interrupt on that file through
+/// [`crate::dosint::Regfile`] (module memory through the machine's selector
+/// check, registers from the struct, the CPU's own registers untouched), and
+/// stores the file into `*outregs`. Which functions exist, and what they
+/// answer, is the kernel's business -- `is_implemented` is asked first so an
+/// unserved function is refused by name here rather than answered with CF.
 ///
-/// Answering this would not be one shim's worth of work: it would mean
-/// choosing, function by function, which of DOS's INT 21h services this host
-/// pretends to be able to run, and there is no oracle for that decision --
-/// neither `WCCMMUD.DLL` nor Tele-Arena calls `intdos` at all (this file's
-/// own module doc comment), so there is no real `AH` value to start from.
-/// Per this crate's own standing rule (`crate::shims`'s "what to do when
-/// nothing does"), a host that cannot answer truthfully stops the module
-/// rather than fabricating a plausible `outregs`.
+/// The measured caller is Tele-Arena 5.6d's random seeder, in the
+/// precompiled `TSGARN-1.LIB` half of the module (`TSGARN.DLL` seg 6:0x1aa8,
+/// reached from `init__ta`): on its first call it sets `AH=0x2C` (Get System
+/// Time), calls `intdos`, and seeds from `outregs.x.cx + outregs.x.dx`.
+///
+/// `union REGS` (Borland `DOS.H`): `x.ax, bx, cx, dx, si, di, cflag, flags`
+/// as eight words; `h.al/ah` are the two bytes of `ax`, and so on. `DS` is
+/// the caller's -- `intdos` has no `SREGS`, that is `intdosx` -- so a
+/// `DS:DX` path argument resolves against the module's own data segment.
+/// `cflag` is CF as a word, `flags` carries the same bit. The return value
+/// is `AX`.
+///
+/// Wg16 only: `intdos` is 16-bit Borland C runtime, and a PE module has no
+/// such import to resolve.
 ///
 /// # Errors
 ///
-/// Always. There is no answer this can give that is not a lie.
-pub fn intdos<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let _inregs = call.ptr();
-    let _outregs = call.ptr();
-    Err(ShimError::Failed(
-        "intdos: this host has no DOS interrupt path -- INT 21h is not \
-         emulated, and no call site in the measured corpus names which \
-         function it would need; see this routine's own doc comment"
-            .into(),
-    ))
+/// A function the kernel does not implement, named. A service that asked to
+/// terminate or stay resident, or faulted on memory -- none of which a module
+/// calling a library routine can mean. The kernel not being openable on the
+/// board root.
+pub fn intdos(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    use dos_kernel::guest::Regs;
+    use dos_kernel::kernel::{Outcome, dispatch, is_implemented};
+
+    const REGS: usize = 16;
+    let inregs = call.ptr();
+    let outregs = call.ptr();
+    let raw: [u8; REGS] = inregs
+        .resolve(call.mem(), REGS)
+        .map_err(|e| ShimError::Failed(format!("intdos: inregs: {e}")))?
+        .try_into()
+        .expect("resolve answers exactly the length asked for");
+    let word = |i: usize| u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+    let regs = Regs {
+        ax: word(0),
+        bx: word(1),
+        cx: word(2),
+        dx: word(3),
+        si: word(4),
+        di: word(5),
+        ds: call.cpu.regs().ds,
+        es: 0,
+    };
+
+    let ah = regs.ah();
+    if !is_implemented(ah) {
+        return Err(ShimError::Failed(format!(
+            "intdos: INT 21h function {ah:#04x} is not implemented by the dos kernel"
+        )));
+    }
+    let dos = host.dos().map_err(|e| ShimError::Failed(format!("intdos: {e}")))?;
+    let mut guest = crate::dosint::Regfile::new(call.cpu, regs);
+    match dispatch(&mut guest, &mut dos.state) {
+        Outcome::Continue => {}
+        Outcome::Terminate(code) => {
+            return Err(ShimError::Failed(format!(
+                "intdos: INT 21h function {ah:#04x} asked to terminate with {code}"
+            )));
+        }
+        Outcome::StayResident { .. } => {
+            return Err(ShimError::Failed("intdos: INT 21h function 0x31 asked to stay resident".into()));
+        }
+        Outcome::Fault(f) => {
+            return Err(ShimError::Failed(format!("intdos: INT 21h function {ah:#04x}: {f}")));
+        }
+    }
+    let (out, carry) = (guest.regs(), guest.carry());
+
+    let cf = u16::from(carry);
+    let mut bytes = [0u8; REGS];
+    for (i, w) in [out.ax, out.bx, out.cx, out.dx, out.si, out.di, cf, cf].into_iter().enumerate() {
+        bytes[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+    }
+    outregs
+        .write(call.mem(), &bytes)
+        .map_err(|e| ShimError::Failed(format!("intdos: outregs: {e}")))?;
+    Ok(abi::Ret::Int(out.ax))
 }
 
 #[cfg(test)]
@@ -821,12 +879,67 @@ mod tests {
         assert!(e.to_string().contains('f'), "{e}");
     }
 
+    /// `union REGS` as Tele-Arena's seeder fills it: `AH=2Ch`, the rest as
+    /// given. `inregs` and `outregs` are distinct, as the C runtime allows.
+    fn intdos_call(f: &mut Fixture, inregs: [u8; 16]) -> (Result<Ret, ShimError>, [u8; 16], [u8; 16]) {
+        let inp = f.bytes(&inregs, false);
+        let out = f.bytes(&[0xeeu8; 16], false);
+        let mut args = Fixture::far(inp).to_vec();
+        args.extend(Fixture::far(out));
+        let ret = f.invoke(intdos, &args);
+        let read = |f: &Fixture, at| -> [u8; 16] {
+            f.machine.resolve(at, 16).expect("REGS").try_into().expect("16 bytes")
+        };
+        (ret, read(f, inp), read(f, out))
+    }
+
+    /// Tele-Arena's seeder: `AH=2Ch`, then `cx + dx`. The answer comes from
+    /// the `dos` kernel (`CH:CL` hour:minute, `DH:DL` second:hundredths), the
+    /// registers 2Ch does not touch pass through, CF is clear, and the
+    /// return value is `AX`.
     #[test]
-    fn intdos_always_refuses() {
+    fn intdos_routes_2ch_through_the_dos_kernel_into_outregs() {
         let mut f = Fixture::new();
-        let regs = f.bytes(&[0u8; 16], false);
-        let mut args = Fixture::far(regs).to_vec();
-        args.extend(Fixture::far(regs));
-        assert!(f.invoke(intdos, &args).is_err());
+        let mut inregs = [0u8; 16];
+        inregs[0..2].copy_from_slice(&0x2c11u16.to_le_bytes()); // AH=2Ch, AL=11h
+        inregs[2..4].copy_from_slice(&0x1234u16.to_le_bytes()); // BX passes through
+        inregs[12..14].copy_from_slice(&1u16.to_le_bytes()); // a stale cflag, to be overwritten
+
+        let (ret, inp, out) = intdos_call(&mut f, inregs);
+        assert_eq!(ret.expect("2Ch is served"), Ret::U16(0x2c11), "intdos returns AX");
+        assert_eq!(inp, inregs, "inregs is read, never written");
+
+        let word = |i: usize| u16::from_le_bytes([out[2 * i], out[2 * i + 1]]);
+        assert_eq!(word(0), 0x2c11, "AX");
+        assert_eq!(word(1), 0x1234, "BX passes through");
+        let (hour, minute) = (word(2) >> 8, word(2) & 0xff);
+        let (second, hund) = (word(3) >> 8, word(3) & 0xff);
+        assert!(hour < 24 && minute < 60 && second < 60 && hund < 100, "CX={:#06x} DX={:#06x}", word(2), word(3));
+        assert_eq!((word(6), word(7)), (0, 0), "cflag and flags: 2Ch cannot fail");
+    }
+
+    /// A function the kernel has no service for is refused by name, before
+    /// anything is written.
+    #[test]
+    fn intdos_refuses_a_function_the_kernel_does_not_implement() {
+        let mut f = Fixture::new();
+        let mut inregs = [0u8; 16];
+        inregs[1] = 0x99;
+        let (ret, _, out) = intdos_call(&mut f, inregs);
+        let e = ret.expect_err("0x99 is nothing");
+        assert!(e.to_string().contains("0x99"), "{e}");
+        assert_eq!(out, [0xee; 16], "outregs untouched on refusal");
+    }
+
+    /// `AH=4Ch` is "terminate the program" -- a real kernel service, and one
+    /// no library call can mean; the shim refuses instead of ending anything.
+    #[test]
+    fn intdos_refuses_a_function_that_would_terminate() {
+        let mut f = Fixture::new();
+        let mut inregs = [0u8; 16];
+        inregs[0..2].copy_from_slice(&0x4c07u16.to_le_bytes());
+        let (ret, _, _) = intdos_call(&mut f, inregs);
+        let e = ret.expect_err("4Ch terminates");
+        assert!(e.to_string().contains("terminate") && e.to_string().contains('7'), "{e}");
     }
 }
