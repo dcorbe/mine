@@ -70,10 +70,6 @@ wccmdact.ini
 
 
 
-# Build artifact of tools/btrieve-oracle/crtprobe.c -- built by hand, see
-# that file's own header comment.
-tools/btrieve-oracle/crtprobe.exe
-
 # Tele-Arena 5.6d source, extracted from Ta56dSrc.ZIP in archive/ for reference
 # (9,104 lines across TSGARN-2..5.C). Third-party source read as an oracle for
 # how a REAL module calls the host API -- prfmlt takes a message number, pmlt
