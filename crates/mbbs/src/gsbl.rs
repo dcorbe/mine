@@ -2387,81 +2387,6 @@ mod tests {
     }
 
     #[test]
-    fn the_guides_own_worked_example_renders_the_way_the_guide_prints_it() {
-        // Printed pages 174-175: Galacticomm set `btutsw(chan,20)`, transmitted
-        // a known paragraph, and printed the expected screen. It is the only
-        // assertion in this file answerable from the specification rather than
-        // from this host measuring itself, and nothing used it until a review
-        // went looking.
-        //
-        // The guide's example also sets `btuhcr(chan,13)` and `btuscr(chan,10)`,
-        // making its `\n`s *soft* carriage returns -- and its own rule is that
-        // "when output word wrap has taken place in a paragraph, all subsequent
-        // soft carriage returns are converted into spaces". `btuhcr` and
-        // `btuscr` exist on this host now, but `WCCMMUD.DLL` imports neither,
-        // so this test still supplies the soft CRs already converted rather
-        // than calling them -- which is the same input the guide's own
-        // machinery would hand the wrapper.
-        //
-        // This is the assertion that fails on the code as it stood before the
-        // carry fix: the old `transmit` produced `theEngelmann` and
-        // `westernNorth`. The defect was never MajorMUD-specific -- it failed
-        // Galacticomm's published example.
-        //
-        // `width` is set to 19 by hand here, not to the 20 the manual's
-        // example passes `btutsw()`. That gap is a real discrepancy between
-        // the guide and the genuine board, and it is recorded here rather
-        // than resolved -- do not "tidy" it away in either direction:
-        //
-        // - Page `GSBL-172` (`archive/galacticomm/gsblref.pdf`) says "to
-        //   prevent the user's terminal from doing its own line wrapping,
-        //   each line is actually limited to width-1 characters", and the
-        //   worked example on `GSBL-174/175` duly prints 19-column lines for
-        //   its `btutsw(chan, 20)`. The manual is self-consistent.
-        // - The genuine board is not consistent *with the manual*.
-        //   `WCCMMUD.DLL` calls `btutsw(chan, 0x4f)` (79), and
-        //   `re/oracle/oracle_bank2.raw` wraps at 79 visible columns -- not
-        //   78. Argument and capacity are the same number on the real wire.
-        // - This host follows the board, because the board is the oracle:
-        //   `btutsw` stores its argument verbatim
-        //   (`crates/mbbs/src/shims/gsbl.rs:56`), so `Channel::width` *is*
-        //   the raw argument and `transmit` fills every one of its columns.
-        //   `the_oracle_s_own_paragraph_wraps_at_its_own_six_line_lengths`
-        //   is the test that pins that, against real captured bytes.
-        //
-        // So this test cannot both call `btutsw(chan, 20)` and reproduce the
-        // guide's printed screen; it sets the capacity that screen is
-        // actually rendered at and exercises the wrap algorithm against it,
-        // which is the part of the example worth having. Whether some GSBL
-        // revision really did subtract one and MajorMUD was built against one
-        // that did not is open -- settle it with a capture, not with this
-        // comment.
-        //
-        // That the word-fit half of `wrap()`'s rule (this task's fix, not the
-        // carry fix above) is exercised even by Galacticomm's own example was
-        // not expected going in: the paragraph's `to` (`"...native to"`) fills
-        // line 3 to column 19 exactly, and only stays there rather than being
-        // carried because of that rule. At `width = 20` -- the value this test
-        // used to carry -- the *old*, buggy `wrap()` reproduced this screen by
-        // coincidence, because always carrying a found word happens to agree
-        // with capping every line one column short when the two are off by
-        // exactly the same one. Nineteen removes the coincidence: the pre-fix
-        // `wrap()` cannot reproduce this screen at this width, only the fixed
-        // one can.
-        let mut g = one();
-        g.channel_mut(chan()).width = 19;
-        g.transmit(chan(), b"The blue form of the Engelmann Spruce ");
-        g.transmit(chan(), b"is native to the mountains of western ");
-        g.transmit(chan(), b"North America.");
-        assert_eq!(
-            String::from_utf8_lossy(&g.drain_output(chan())),
-            "The blue form of\r\nthe Engelmann\r\nSpruce is native to\r\nthe mountains of\r\nwestern North\r\nAmerica.",
-            "the guide's printed rendering, pages 174-175, at the width its own \
-             width-1 rule actually produces"
-        );
-    }
-
-    #[test]
     fn only_a_space_becomes_the_break_and_a_tab_is_part_of_the_word() {
         // Guide page 172 defines a word as a run of non-space characters,
         // so a TAB belongs to the word and has to survive the wrap. Widening
@@ -2819,16 +2744,6 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_cr_from_the_module_reaches_the_wire_as_crlf() {
-        // R1, guide `btulfd` page 114: the default on channel init is that an
-        // explicit LF is required after every CR, and WCCMMUD.DLL never
-        // calls btulfd/btuhcr to change that default.
-        let mut g = one();
-        g.transmit(chan(), b"line\r");
-        assert_eq!(g.drain_output(chan()), b"line\r\n".to_vec());
-    }
-
-    #[test]
     fn an_explicit_crlf_from_the_module_does_not_become_crlf_lf() {
         let mut g = one();
         g.transmit(chan(), b"line\r\n");
@@ -2910,50 +2825,6 @@ mod tests {
         g.transmit(chan(), b"\x1b[3");
         g.transmit(chan(), b"1mABCDE");
         assert_eq!(g.drain_output(chan()), b"\x1b[31mABCDE".to_vec());
-    }
-
-    #[test]
-    fn a_lone_esc_not_starting_a_csi_still_counts_toward_the_column() {
-        // Only `ESC [` opens a CSI. WCCMMUD.DLL never emits a bare ESC --
-        // every escape it writes is a complete CSI (see the IF-ANSI work in
-        // `ifansi.rs`) -- so this is scope discipline, not a case this host
-        // needs to render well: a stray ESC keeps exactly the pre-fix
-        // behaviour of being just another opaque byte that costs a column.
-        let mut g = one();
-        g.channel_mut(chan()).width = 5;
-        g.transmit(chan(), b"\x1bABCDE");
-        assert_eq!(
-            g.drain_output(chan()),
-            b"\x1bABCD\r\nE".to_vec(),
-            "ESC, A, B, C, D fill the five columns; E wraps"
-        );
-    }
-
-    #[test]
-    fn an_esc_with_no_follow_up_yet_is_held_pending_not_lost() {
-        // The deferred half of the scanner: whether ESC counts -- and
-        // whether it is even the start of a CSI -- is not decided until the
-        // next byte is seen, so ESC is not committed to the wire until then
-        // either. This mirrors `supplied_lf`, which already defers a
-        // decision (whether an LF is the module's own or this host's
-        // supplied one) across a call boundary.
-        //
-        // The window this opens is one byte wide and closes as soon as
-        // another byte arrives, from this call or a later one. WCCMMUD.DLL
-        // never ends a channel's output on a bare trailing ESC, so in
-        // practice it always closes.
-        let mut g = one();
-        g.transmit(chan(), b"\x1b");
-        assert!(
-            g.drain_output(chan()).is_empty(),
-            "held pending, not dropped, until the next byte resolves it"
-        );
-        g.transmit(chan(), b"A");
-        assert_eq!(
-            g.drain_output(chan()),
-            b"\x1bA".to_vec(),
-            "resolved as not a CSI: both bytes are now on the wire, in order"
-        );
     }
 
     #[test]

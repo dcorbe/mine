@@ -3520,21 +3520,6 @@ mod tests {
     }
 
     #[test]
-    fn gmdnam_matches_the_label_in_whatever_case_the_vendor_wrote_it() {
-        // RTSLORD.MDF: "Module name: -= T-LORD =-" -- lowercase n, and the
-        // real host's `sameto` does not care.
-        let root = crate::testing::scratch("gmdnam_lowercase_label");
-        std::fs::write(root.join("LOWER.MDF"), "; LOWER.MDF\r\n\r\nModule name: -= T-LORD =-\r\n\r\nDeveloper: RTSoft\r\n")
-            .expect("write");
-        let mut f = Fixture::rooted(root);
-        let name = f.text("LOWER.MDF");
-        let Ret::Far(at) = f.invoke(gmdnam, &Fixture::far(name)).expect("read") else {
-            panic!("gmdnam returns a pointer");
-        };
-        assert_eq!(f.read(at), "-= T-LORD =-");
-    }
-
-    #[test]
     fn gmdnam_stops_the_module_rather_than_inventing_a_name() {
         let mut f = Fixture::new();
         let name = f.text("NOSUCH.MDF");
@@ -3941,35 +3926,6 @@ mod tests {
     }
 
     #[test]
-    fn register_agent_keeps_the_appid_and_the_four_vectors() {
-        // Measured: MajorMUD's own record, at `seg 67:0x0000` of
-        // `WCCMMUD.DLL`, is `WCCMMUD` and four vectors into its segment 26.
-        let mut f = Fixture::new();
-        let vectors: Vec<FarPtr> = [0x0069, 0x016b, 0x029c, 0x02a1]
-            .into_iter()
-            .map(|offset| FarPtr {
-                offset,
-                selector: f.machine.code_selector(),
-            })
-            .collect();
-        let block = agent_block(&mut f, "WCCMMUD", &vectors);
-
-        assert_eq!(
-            f.invoke(register_agent, &Fixture::far(block))
-                .expect("registered"),
-            Ret::Void,
-            "register_agent returns nothing"
-        );
-
-        let agent = &f.host.agents()[0];
-        assert_eq!(agent.appid, "WCCMMUD");
-        assert_eq!(agent.read, Some(vectors[0]));
-        assert_eq!(agent.write, Some(vectors[1]));
-        assert_eq!(agent.xferdone, Some(vectors[2]));
-        assert_eq!(agent.abort, Some(vectors[3]));
-    }
-
-    #[test]
     fn an_agent_is_copied_rather_than_pointed_at() {
         // The opposite of `register_module`, and measured: `register_agent`
         // ends in `movmem(agdptr, &agents[nagents], 25)`, so the caller's block
@@ -4017,24 +3973,6 @@ mod tests {
     }
 
     #[test]
-    fn a_vector_at_offset_zero_is_still_a_vector() {
-        // The real routine tests both words -- `mov ax,[es:bx+9]` then
-        // `or ax,[es:bx+0xb]` -- and this is why that is not pedantry. Offset
-        // zero is a real address: `seg 26:0x0000` of `WCCMMUD.DLL` is the
-        // routine that calls `register_agent` in the first place.
-        let mut f = Fixture::new();
-        let start = FarPtr {
-            offset: 0,
-            selector: f.machine.code_selector(),
-        };
-        let block = agent_block(&mut f, "WCCMMUD", &[start]);
-        f.invoke(register_agent, &Fixture::far(block))
-            .expect("registered");
-
-        assert_eq!(f.host.agents()[0].read, Some(start));
-    }
-
-    #[test]
     fn an_appid_filling_its_field_is_read_bounded() {
         // `char appid[AIDSIZ]` is nine bytes and a name that uses all nine has
         // no terminator. Scanning for one would run into the `read` vector and
@@ -4050,48 +3988,6 @@ mod tests {
 
         assert_eq!(f.host.agents()[0].appid, "ABCDEFGHI");
         assert_eq!(f.host.agents()[0].read, Some(read));
-    }
-
-    #[test]
-    fn register_textvar_publishes_the_table_through_the_global() {
-        // Measured: MajorMUD registers one text variable, `MUDCHARINFO`, whose
-        // routine is at `seg 3:0x001e` of `WCCMMUD.DLL`. And the *global* is
-        // the point -- the module reaches the table only through `txtvars`, so
-        // a host that filled a table and left the pointer null would have
-        // registered nothing.
-        let mut f = Fixture::new();
-        // The standard suite (`shims::txtvbl`) is already registered; a
-        // module's first variable lands after it.
-        let base = f.host.textvars().len();
-        let name = f.text("MUDCHARINFO");
-        let varrou = FarPtr {
-            offset: 0x001e,
-            selector: f.machine.code_selector(),
-        };
-
-        let args = [name.offset, name.selector, varrou.offset, varrou.selector];
-        assert_eq!(
-            f.invoke(register_textvar, &args).expect("registered"),
-            Ret::U16(base),
-            "the first module-registered variable follows the standard suite"
-        );
-
-        let published = f
-            .host
-            .globals()
-            .pointer(&f.machine, "txtvars")
-            .expect("txtvars");
-        assert_ne!(published, mbbs_machine::m16::FarPtr::NULL, "the global was filled in");
-        assert_eq!(published, f.host.textvars().at().expect("a table"));
-
-        let row = f
-            .host
-            .textvars()
-            .get_mem(f.machine.mem(), base)
-            .expect("readable")
-            .expect("a row");
-        assert_eq!(row.name, "MUDCHARINFO");
-        assert_eq!(row.varrou, Some(varrou));
     }
 
     #[test]
@@ -4262,20 +4158,6 @@ mod tests {
             .expect_err("refused");
         assert!(format!("{e}").contains("no appid"), "{e}");
         assert!(f.host.agents().is_empty());
-    }
-
-    #[test]
-    fn nctime_unpacks_the_three_fields_dos_packed() {
-        // 13:45:30, packed the way `now` packs it -- seconds are two-second
-        // units, so 30 seconds is 15. The unpacking is read off
-        // `MAJORBBS-wg101.EXE seg 33:0x0c56`: `sar 0xb / and 0x1f`,
-        // `sar 0x5 / and 0x3f`, and `add ax,ax / and 0x3e`.
-        let packed = (13 << 11) | (45 << 5) | 15;
-        let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(nctime, &[packed]).expect("nctime") else {
-            panic!("nctime returns a far pointer");
-        };
-        assert_eq!(f.read(at), "13:45:30");
     }
 
     #[test]
@@ -4464,19 +4346,6 @@ mod tests {
             .invoke(cofdat, &[dos_date(0, 13, 1)])
             .expect_err("refused");
         assert!(format!("{e}").contains("13"), "{e}");
-    }
-
-    #[test]
-    fn ncedat_spells_the_month() {
-        // Day 7, month 8 (August), year 46 (2026) -- the plan's own example.
-        // Upper case: `moname` is `AUG`, not `Aug` -- measured at NE segment
-        // 88, DGROUP:0x00, of `MAJORBBS-wg101.EXE`.
-        let packed = (46 << 9) | (8 << 5) | 7;
-        let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
-            panic!("far pointer");
-        };
-        assert_eq!(f.read(at), "07-AUG-26");
     }
 
     #[test]

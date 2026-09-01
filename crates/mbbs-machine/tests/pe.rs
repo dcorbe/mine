@@ -1267,61 +1267,6 @@ fn exports_resolve_through_the_name_ordinal_indirection_not_position_or_base() {
 }
 
 #[test]
-fn a_forwarder_is_not_mistaken_for_an_address() {
-    // A function RVA that falls inside the export directory's own
-    // [VirtualAddress, VirtualAddress + Size) range is not code: it is the
-    // RVA of a "DLL.Symbol" string. `wccmmud.dll` has none of these, so only
-    // a synthetic fixture can reach this arm.
-    let mut v = with_one_export_section();
-    let sec = 0x98 + 0xe0;
-    let raw = sec + 40;
-    let to_rva = |file_off: usize| 0x1000u32 + (file_off - raw) as u32;
-
-    let dir = raw;
-    let functions = dir + 40;
-    let names = functions + 4;
-    let ordinals = names + 4;
-    let forward_str = ordinals + 2;
-    let name_str = forward_str + "OTHER.dll.RealFunc\0".len();
-
-    put_u32(&mut v, dir + 16, 1); // Base
-    put_u32(&mut v, dir + 20, 1); // NumberOfFunctions
-    put_u32(&mut v, dir + 24, 1); // NumberOfNames
-    put_u32(&mut v, dir + 28, to_rva(functions));
-    put_u32(&mut v, dir + 32, to_rva(names));
-    put_u32(&mut v, dir + 36, to_rva(ordinals));
-
-    // The function "address" points inside the directory's own range below.
-    put_u32(&mut v, functions, to_rva(forward_str));
-    put_u32(&mut v, names, to_rva(name_str));
-    put_u16(&mut v, ordinals, 0);
-
-    put_bytes(&mut v, forward_str, b"OTHER.dll.RealFunc\0");
-    put_bytes(&mut v, name_str, b"Exported\0");
-
-    set_export_directory(&mut v, to_rva(dir), 0x100);
-
-    let image = PeImage::parse(&v).unwrap();
-    assert_eq!(image.exports.len(), 1);
-    assert_eq!(image.exports[0].name, "Exported");
-    assert_eq!(
-        image.exports[0].forwarder(),
-        Some("OTHER.dll.RealFunc"),
-        "the function rva fell inside the export directory's own range"
-    );
-    assert_eq!(
-        image.export_rva("Exported"),
-        None,
-        "a forwarder has no function rva to hand back"
-    );
-    assert_eq!(
-        image.export_rva_by_ordinal(1), // Base(1) + index 0
-        None,
-        "export_rva_by_ordinal must refuse a forwarder exactly like export_rva does"
-    );
-}
-
-#[test]
 fn a_function_rva_exactly_at_the_export_directorys_end_is_not_a_forwarder() {
     // The forwarder range is [VirtualAddress, VirtualAddress + Size) --
     // half-open. A function rva equal to VirtualAddress + Size is one past

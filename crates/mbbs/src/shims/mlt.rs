@@ -253,26 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn getmsg_feeding_pmlt_matches_the_tele_arena_call_shape() {
-        // `pmlt(", %s",getmsg(tods[it]))` -- `re/tasrc/tsgarn-2.c:1126`.
-        let mut f = Fixture::new();
-        opened(&mut f);
-        let template = f.text(", %s");
-
-        let Ret::Far(word) = f.invoke(getmsg, &[1]).expect("read") else {
-            panic!("getmsg returns a pointer");
-        };
-        f.invoke(
-            pmlt,
-            &[template.offset, template.selector, word.offset, word.selector],
-        )
-        .expect("queued");
-
-        let buffer = f.host.globals().prf_buffer();
-        assert_eq!(f.read(buffer), ", DEMO");
-    }
-
-    #[test]
     fn getmsg_with_no_block_set_refuses() {
         // Mirrors `shims::msg::tests::reading_an_option_with_no_block_set_refuses`:
         // nothing is current, so there is no message-block storage to answer

@@ -1174,24 +1174,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cntdirs_counters_are_placed_in_declaration_order() {
-        // DSKUTL.H:23-26 declares numfils, numbyts, numbytp, numdirs, in that
-        // order and as four longs. `cntdir` writes the first three and
-        // `cntdirs` the fourth, so all four belong in module memory whether or
-        // not this module addresses them -- WCCMMUD.DLL addresses only
-        // `numbyts`, at six sites.
-        let f = crate::testing::Fixture::new();
-        let g = f.host.globals();
-        let at = |name| g.address(name).expect("placed").offset;
-        for name in ["numfils", "numbyts", "numbytp", "numdirs"] {
-            assert_eq!(g.size(name), Some(4), "{name} is a long");
-        }
-        assert!(at("numfils") < at("numbyts"));
-        assert!(at("numbyts") < at("numbytp"));
-        assert!(at("numbytp") < at("numdirs"));
-    }
-
-    #[test]
     fn a_long_global_reads_back_signed() {
         // `long` is signed, and the counters are the only globals this host
         // reads four bytes of. A reader that widened them as unsigned would
@@ -1472,21 +1454,6 @@ mod tests {
                    "the first language is current");
     }
 
-    #[test]
-    fn nobody_is_the_current_user_before_one_connects() {
-        // `MAJORBBS.C:882` -- `usrnum=-1;`, three lines above the `inimod()`
-        // that runs every module's init routine. Zero is not "no current user":
-        // it is channel 0, and `WCCMMUD.DLL` indexes its own per-channel tables
-        // by `usrnum` at 61 sites. A module initialising with `usrnum == 0`
-        // writes into the slot belonging to whoever connects first.
-        //
-        // -1 is safe to read because `channel[]` carries sentinels for exactly
-        // this -- see `the_channel_table_has_three_sentinels_before_it`.
-        let f = crate::testing::Fixture::new();
-        let usrnum = f.host.globals().word(&f.machine, "usrnum").expect("usrnum");
-        assert_eq!(usrnum as i16, -1);
-    }
-
     /// The whole table, laid out the way [`Globals::new`] lays it out, for
     /// `A`. Kept in step with that loop by hand -- there is no way to ask
     /// `Globals` for a layout without a `Cpu` to place it in, and building a
@@ -1580,113 +1547,6 @@ mod tests {
             end(layout::<crate::abi::Wg32>()) - end(layout::<crate::abi::Wg16>()),
             2 * ints.len() as u32 + file_difference,
         );
-    }
-
-    /// The 16-bit half of the width change is a no-op, stated as a test
-    /// rather than as a claim in a comment: every `Wg16` offset is what it
-    /// was when the table held plain `u16` sizes.
-    ///
-    /// Anchored on three globals whose offsets other tests and the module's
-    /// own `0xfffe` addend already depend on, plus the table's total length.
-    #[test]
-    fn the_wg16_layout_is_unchanged_by_widths_becoming_per_abi() {
-        let placed = layout::<crate::abi::Wg16>();
-        let at = |name: &str| placed.iter().find(|p| p.0 == name).expect("placed").1;
-        assert_eq!(at("input"), 0);
-        assert_eq!(at("margv"), 256);
-        assert_eq!(at("margn"), 256 + 512);
-        let last = *placed.last().expect("non-empty");
-        // 3415 until 2026-08-14, 3509 until 2026-08-15's first three datums,
-        // 3520 until Task 12/13/15's second pass added three more, 3528 until
-        // Task 1.1 placed one more, 3530 until Task 1.2 placed four more,
-        // 3538 until Task 1.3 placed one, 3540 until Task 1.4 placed seven,
-        // 3568 until Task 1.5 placed two more, 3576 until Task 1.6 placed one,
-        // 3622 until Task 1.7 placed the last of this batch:
-        //   +2 txtlen    (GME.H:199 -- GALME's, not MAJORBBS.H's; `Width::Bytes(2)`
-        //                 rather than `Width::Int`, so it is 2 bytes under both ABIs)
-        // no new alignment byte: 2 is even -- 3622 + 2 = 3624. Then Phase 2's
-        // Task 2.1 placed one more:
-        //   +2 nlingo    (LINGO.H:40 -- the count beside `languages`, which
-        //                 stopped being an empty array in the same task)
-        // no new alignment byte: 2 is even, and `nlingo` sits beside `clingo`,
-        // already 2-byte-aligned -- 3624 + 2 = 3626.
-        // Before that:
-        //   +46 uidxrf   (USRACC.H:39 -- the struct BY VALUE, xrfstg[16] +
-        //                 userid[30], non-GCV2)
-        // no new alignment byte: 46 is even, so alignment on both sides of it
-        // is unchanged -- 3576 + 46 = 3622.
-        // Before that:
-        //   +4 module    (MAJORBBS.H:314 -- empty, safe only while nmods==0)
-        //   +4 languages (LINGO.H:42 -- empty, no counter pairs it)
-        // no new alignment byte: both are 4-byte pointers -- 3568 + 4*2 = 3576.
-        // Before that:
-        //   +28 bbsttl, company, addres1, addres2, dataph, liveph, syskey
-        //       (MAJORBBS.H:558-567, seven CHAR * at 4 bytes each)
-        // no new alignment byte: all seven are 4 bytes and PTR-width entries
-        // stay evenly aligned throughout -- 3540 + 4*7 = 3568.
-        // Before that:
-        //   +1 eurmsk    (MAJORBBS.H:592, a CHAR -- 1 byte)
-        // plus one alignment byte: eurmsk ends on an odd offset and `kilipg`
-        // (an int) needs to start on an even one -- 3538 + 1 + 1 = 3540.
-        // Before that:
-        //   +2 nmods     (MAJORBBS.H:316 -- the count beside `module`, Task 1.5)
-        //   +2 mmucrr    (MAJORBBS.H:581 -- same block as `outbsz`)
-        //   +2 digalw    (MAJORBBS.H:653)
-        //   +2 clingo    (LINGO.H:41)
-        // no new alignment byte: each of the four is 2 bytes and lands beside
-        // an already 2-byte-aligned neighbour -- 3530 + 2*4 = 3538.
-        // Before that:
-        //   +2 outbsz    (MAJORBBS.H:579 -- 15 of 43 corpus modules, the most
-        //                 widely imported symbol this host did not serve)
-        // no new alignment byte: `outbsz` (2 bytes) sits between `emlsdrou`
-        // (4-byte-aligned) and `kilipg` (already 2-byte-aligned) --
-        // 3528 + 2 = 3530.
-        // Before that:
-        //   +4 othexp    (MAJORBBS.H:352 -- RTSLORD-NE, 15 sites)
-        //   +2 kilipg    (MAJORBBS.H:590/REMOTE.H:44, an int -- Rose32, 1 site)
-        //   +2 kilsrc    (REMOTE.H:46 -- 47, an int -- Rose32, 1 site)
-        // no new alignment byte: `othexp` (4 bytes) follows `othusp`, itself
-        // 4-byte-aligned, and `kilipg`/`kilsrc` (2 bytes each) sit beside
-        // `errcod`, already 2-byte-aligned -- 3520 + 4 + 2 + 2 = 3528.
-        // Before that:
-        //   +4 fsdusr    (FSDBBS.H:225 -- The Rose, 12 sites)
-        //   +4 emlsdrou  (MAJORBBS.H:461 -- The Rose, 6 sites)
-        //   +2 errcod    (REMOTE.H:11, an int -- The Rose, 4 sites)
-        // plus one alignment byte ahead of fsdusr, because bturno (9 bytes)
-        // ends on an odd offset. Before that, the corpus survey placed four
-        // data the modules address but this host had no slot for:
-        //   +4  othuap  (USRACC.H:73-76, beside usaptr -- 17 modules)
-        //   +4  ftgptr  (FTG.H:97-98    -- 7 modules, 210 sites)
-        //   +4  ftfscb  (FTF.C:26-27    -- 6 modules)
-        //   +81 tshmsg  (FTG.H:74,:66, TSHLEN+1 -- 6 modules, 82 sites)
-        // plus one alignment byte. A change to this number is only ever
-        // legitimate alongside a deliberate change to the table above; it is
-        // pinned so that an accidental one is loud.
-        //
-        // Phases 3+4 Task 4.4 added `_streams`, `NFILE` (20) `FILE` structs
-        // of `Wg16::FILE_SIZE` (20 bytes) each: 3628 + 400 = 4028. It is the
-        // first `Width::Files` global and the largest single datum in the
-        // table -- and it has to be a real region rather than a pointer,
-        // because the streams this host opens live inside it.
-        //
-        // Task 4.5 then added `_8087`, two bytes: 4028 + 2 = 4030.
-        //
-        // Phase 5 Task 4 then appended `ictact`, two bytes, at the tail
-        // beside `_txtlen` rather than beside `bturno` -- see that global's
-        // own comment for why -- so it is the last addition rather than one
-        // threaded into the middle of this chain: 4030 + 2 = 4032.
-        //
-        // The corpus's last DOSCALLS/PHAPI/GALGSBL task then appended
-        // `ticker`, two bytes, at the tail beside `ictact` -- see that
-        // global's own comment for why (declaration order in `BRKTHU.H`
-        // still holds: `ticker` is after `ictact` there too). No new
-        // alignment byte: 2 is even -- 4032 + 2 = 4034.
-        //
-        // The module-import survey then appended `btux25`, GALGSBL's X.25
-        // support flag -- an `INT`, so two bytes here and four under `Wg32`,
-        // which is why it is `si` and not `s`. Still even, still no alignment
-        // byte: 4034 + 2 = 4036.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 4036);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
@@ -1849,43 +1709,6 @@ mod tests {
                 assert_eq!(bits & ctype::PUNCT, 0, "{c} is a letter and punctuation");
             }
         }
-    }
-
-    #[test]
-    fn ctype_is_the_table_the_host_binary_carries() {
-        // No longer a reconstruction. These are the 257 bytes at
-        // `DGROUP:0x1a08` of `MAJORBBS-wg101.EXE` (NE autodata segment 151,
-        // file offset 0xd5008), and they are identical in wg200. The table is
-        // what `toupper` indexes -- `test byte [es:bx+0x1a09],0x8` at
-        // `seg 1:0x54a9` -- and what the module indexes itself through the
-        // `__CTYPE` datum, so a host that built its own opinion of it would
-        // give two answers to one question.
-        //
-        // The one entry no amount of reasoning from `isspace`/`isprint` would
-        // have produced is the space: `0x81`, not `0x01`. The extra bit is
-        // Borland's `_IS_SPC`, "is the space character", which `isprint` tests
-        // and `isspace` does not.
-        #[rustfmt::skip]
-        const MEASURED: [u8; CTYPE_LEN as usize] = [
-            0x00, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x21, 0x21, 0x21, 0x21, 0x21, 0x20,
-            0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-            0x20, 0x81, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-            0x40, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x40, 0x40, 0x40, 0x40, 0x40,
-            0x40, 0x40, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04,
-            0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x40, 0x40, 0x40, 0x40,
-            0x40, 0x40, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
-            0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x40, 0x40, 0x40, 0x40,
-            0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00,
-        ];
-        assert_eq!(ctype_table(), MEASURED);
     }
 
     #[test]

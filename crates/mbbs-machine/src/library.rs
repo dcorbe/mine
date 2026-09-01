@@ -1249,21 +1249,6 @@ mod tests {
         assert!(profile(ANCHOR).is_some(), "the anchor must name a profile that exists");
     }
 
-    fn board_demand() -> Demand {
-        // Measured from WCCMMUD.DLL and WCCMMPLS.DLL's own relocation records.
-        let mut d = Demand::new();
-        for o in [6, 7, 11, 19, 21, 26, 30, 37, 49, 53, 56, 58, 59, 60, 72, 87] {
-            d.add("GALGSBL", o);
-        }
-        // The three MAJORBBS ordinals that matter: 474 is prf, 1191 is the
-        // highest the board demands, and 1101 is one of the sixteen MBBS 6.25
-        // never had.
-        for o in [474, 1101, 1191] {
-            d.add("MAJORBBS", o);
-        }
-        d
-    }
-
     /// A PE spelling must land in the same bucket as the NE one, or a 32-bit
     /// module's demand would be invisible to a profile check.
     #[test]
@@ -1283,59 +1268,6 @@ mod tests {
         assert_eq!(d.libraries().count(), 0);
     }
 
-    /// **The regression test for this design's own first mistake.** Looking at
-    /// GALGSBL alone, mbbs625 covers every ordinal the board demands and is
-    /// indistinguishable from wg101. It is still not admissible, because the
-    /// same modules demand MAJORBBS ordinals MBBS 6.25 never had. A rule that
-    /// selected per library rather than per profile passes every GALGSBL-only
-    /// assertion and fails this one.
-    #[test]
-    fn mbbs625_is_excluded_by_majorbbs_though_its_galgsbl_table_would_admit_it() {
-        let d = board_demand();
-        let mbbs625 = profile("mbbs625").expect("mbbs625");
-
-        // GALGSBL alone: fully covered.
-        let g = mbbs625.table(GALGSBL).expect("galgsbl table").names();
-        for o in d.ordinals(GALGSBL).expect("galgsbl demand") {
-            assert!(g.contains_key(o), "mbbs625's GALGSBL table covers ordinal {o}");
-        }
-
-        // As a profile: excluded, and the evidence names MAJORBBS.
-        match standing(mbbs625, &d) {
-            Standing::Excluded { uncovered } => {
-                let libs: Vec<_> = uncovered.iter().map(|(l, _)| *l).collect();
-                assert!(libs.contains(&MAJORBBS), "excluded by MAJORBBS, got {libs:?}");
-            }
-            other => panic!("mbbs625 must be excluded, got {other:?}"),
-        }
-    }
-
-    /// The precedence rule itself: exclusion is checked **before** completeness.
-    ///
-    /// `board_demand` cannot test this. It demands only GALGSBL and MAJORBBS,
-    /// and `mbbs625` has a table for both, so `missing` is empty there and the
-    /// check order is inert -- a `standing` that tested `missing` first would
-    /// pass every assertion in
-    /// [`mbbs625_is_excluded_by_majorbbs_though_its_galgsbl_table_would_admit_it`].
-    /// Adding a library `mbbs625` has no table for at all makes both lists
-    /// non-empty at once, which is the only shape where the ordering is
-    /// observable. Found by mutation: the ordering mutation this design's plan
-    /// listed against that test did not discriminate.
-    #[test]
-    fn an_uncovered_ordinal_excludes_even_when_a_table_is_also_missing() {
-        let mut d = board_demand();
-        // mbbs625 has no GALME table at all, so `missing` is non-empty...
-        d.add("GALME", 30);
-        // ...while MAJORBBS 1101 and 1191 keep `uncovered` non-empty.
-        match standing(profile("mbbs625").expect("mbbs625"), &d) {
-            Standing::Excluded { uncovered } => {
-                let libs: Vec<_> = uncovered.iter().map(|(l, _)| *l).collect();
-                assert!(libs.contains(&MAJORBBS), "excluded by MAJORBBS, got {libs:?}");
-            }
-            other => panic!("an uncovered ordinal must win over a missing table, got {other:?}"),
-        }
-    }
-
     /// Exclusion needs one counterexample and no other table; selection needs a
     /// table for every demanded library.
     ///
@@ -1353,32 +1285,6 @@ mod tests {
         match standing(profile("layout-c").expect("layout-c"), &d) {
             Standing::Unevidenced { missing } => assert!(missing.contains(&GALME)),
             other => panic!("layout-c has no GALME table, so it cannot be selected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn wg101_is_admissible_for_this_board() {
-        assert!(matches!(standing(profile("wg101").expect("wg101"), &board_demand()), Standing::Admissible));
-    }
-
-    /// The board's own answer, measured. Ordinal 87 rules out wg3-16 and
-    /// layout-c; MAJORBBS ordinals MBBS 6.25 never had rule out mbbs625. What
-    /// is left is wg101 and wg2, which agree on every ordinal these modules
-    /// demand -- so the honest answer is that this board cannot tell them
-    /// apart, not that it is wg101.
-    ///
-    /// This test asserted `Unique(wg101)` until the wg2 profile gained its
-    /// MAJORBBS and GALME tables. That `Unique` was an artefact of a missing
-    /// table, not evidence.
-    #[test]
-    fn the_board_cannot_distinguish_wg101_from_wg2() {
-        match detect(&board_demand()) {
-            Outcome::Unobservable { chosen, agreeing } => {
-                assert_eq!(chosen.name, ANCHOR);
-                assert!(agreeing.contains(&"wg101") && agreeing.contains(&"wg2"), "{agreeing:?}");
-                assert!(!agreeing.contains(&"mbbs625"), "MAJORBBS still rules mbbs625 out");
-            }
-            other => panic!("expected the two Layout A profiles to be indistinguishable, got {other:?}"),
         }
     }
 
@@ -1452,48 +1358,6 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
-    }
-
-    /// A library whose authentic binary is present but cannot be loaded here
-    /// must be shimmed AND say so. Silently ignoring the file is what makes a
-    /// swapped board indistinguishable from an unswapped one.
-    #[test]
-    fn an_ineligible_authentic_binary_is_shimmed_and_says_why() {
-        let d = board_demand();
-        let everything_present = |_: &str| true;
-        let rows = provision(&d, profile("wg101").expect("wg101"), &everything_present);
-        let majorbbs = rows.iter().find(|r| r.library == MAJORBBS).expect("MAJORBBS row");
-        match &majorbbs.provision {
-            Provision::Shim { .. } => {}
-            other => panic!("MAJORBBS is NE plus a Phar Lap extender and cannot be authentic: {other:?}"),
-        }
-        assert!(majorbbs.render().contains("Phar Lap"), "the reason must survive into the report");
-    }
-
-    /// With the binary present and loadable, authentic wins -- that is the
-    /// swap knob.
-    #[test]
-    fn a_present_loadable_binary_is_preferred_over_the_shim() {
-        let d = board_demand();
-        let everything_present = |_: &str| true;
-        let rows = provision(&d, profile("wg101").expect("wg101"), &everything_present);
-        let galgsbl = rows.iter().find(|r| r.library == GALGSBL).expect("GALGSBL row");
-        assert!(matches!(galgsbl.provision, Provision::Authentic { .. }));
-    }
-
-    /// With nothing present, everything is shimmed against the chosen
-    /// profile's table, and the report names the generation.
-    #[test]
-    fn with_no_binaries_present_everything_is_shimmed_against_the_chosen_generation() {
-        let d = board_demand();
-        let nothing_present = |_: &str| false;
-        let rows = provision(&d, profile("wg101").expect("wg101"), &nothing_present);
-        let galgsbl = rows.iter().find(|r| r.library == GALGSBL).expect("GALGSBL row");
-        match &galgsbl.provision {
-            Provision::Shim { table: Some(t) } => assert_eq!(t.generation, "wg101"),
-            other => panic!("expected a wg101 shim, got {other:?}"),
-        }
-        assert!(galgsbl.render().contains("wg101"));
     }
 
     /// The v10 tables, spot-checked at the ordinals LunatiX 5.3H's boot

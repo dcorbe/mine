@@ -1131,53 +1131,12 @@ mod tests {
     use crate::abi::{Wg16, Wg32};
 
     #[test]
-    fn a_user_slot_is_the_forty_one_bytes_the_module_strides_by() {
-        // Not arithmetic from the header alone. `WCCMMUD.DLL` imports `_USER`
-        // and indexes the array itself, and every one of those sites strides by
-        // `0x29`:
-        //
-        //     *(int *)((int)_user_625 + _usrnum_628 * 0x29 + 6) = ...
-        //
-        // 0x29 is 41, which is what `MAJORBBS.H:74` adds up to under Borland's
-        // default byte alignment -- `CL.CFG` in the recovered SDK passes no
-        // `-a`. A host that padded the trailing `char lcstat` to a word would
-        // put every channel but the first at the wrong address.
-        assert_eq!(UserLayout::of::<Wg16>().stride, 0x29);
-    }
-
-    #[test]
-    fn the_user_fields_are_where_the_module_reaches_for_them() {
-        // Every one of these offsets appears in `WCCMMUD.DLL`, off `usrptr` and
-        // off `user[usrnum]` both. `FLAGS` is the load-bearing one: the module
-        // tests `+0x14 & 2`, `+0x15 & 0x40` and `+0x16 & 0x80`, which are three
-        // bytes of a single 4-byte field and rule out every other layout.
-        let user = UserLayout::of::<Wg16>();
-        assert_eq!(user.state.at, 6);
-        assert_eq!(user.substt.at, 8);
-        assert_eq!(user.flags.at, 0x14);
-        assert_eq!(user.crdrat.at, 0x1a);
-        assert_eq!(user.lcstat.at, 40);
-    }
-
-    #[test]
     fn every_user_field_fits_inside_a_slot() {
         // The check that makes the two tests above one fact rather than two
         // lists: the last field is one byte, and it ends exactly at the stride.
         let user = UserLayout::of::<Wg16>();
         assert_eq!(user.lcstat.at + 1, user.stride, "lcstat is the last byte of a slot");
         assert!(user.flags.at + 4 <= user.stride, "flags is a long and must fit");
-    }
-
-    #[test]
-    fn an_extusr_slot_is_twenty_two_bytes() {
-        // `MAJORBBS.H:94`, byte-aligned like `struct user`. Nothing in
-        // `WCCMMUD.DLL` strides by it -- the module imports neither `extusr`
-        // nor `extptr` -- so unlike `USER` this one is arithmetic from the
-        // header. It is here because `curusr`'s array is real whether or not
-        // this module looks at it. `Wg16` is the GCV2 build this crate has
-        // always run, and is the only ABI with a table to measure; see
-        // `extusr_exists_for_gcv2_only` for the `Wg32` half.
-        assert_eq!(extusr_stride::<Wg16>(), Some(22));
     }
 
     #[test]

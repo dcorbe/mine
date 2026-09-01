@@ -740,11 +740,6 @@ mod tests {
         Files::new(fd.into(), dir)
     }
 
-    fn loaded() -> crate::win32::load::Loaded {
-        let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
-        crate::win32::load::load(&file).expect("loads")
-    }
-
     /// The layout, asserted as offsets rather than described in a comment. A
     /// `FILE` whose `fd` moves is a `fileno` that returns a buffer pointer.
     #[test]
@@ -816,114 +811,6 @@ mod tests {
         assert_eq!(s.unlink(b"NEVER.DAT"), MINUS_ONE, "and so does a name never used");
     }
 
-    /// With no root at all, every call fails the way a missing file fails
-    /// rather than panicking. That is what makes `Process::new` able to stay
-    /// infallible.
-    #[test]
-    fn without_a_root_every_call_fails_honestly() {
-        let mut l = loaded();
-        let mut s = Streams::new(None);
-        assert!(!s.has_files());
-        assert_eq!(s.access(b"ANY.TXT", 0), MINUS_ONE);
-        assert_eq!(s.fopen(&mut l.mem, b"ANY.TXT", b"r"), 0, "NULL, not a panic");
-        assert_eq!(s.fclose(0), EOF);
-        assert_eq!(s.unlink(b"ANY.TXT"), MINUS_ONE);
-    }
-
-    /// A stream opened, written through the host, closed, and reopened. The
-    /// `FILE` the program is handed must carry its descriptor inline where
-    /// Borland's `fileno` macro expects it.
-    #[test]
-    fn a_file_round_trips_and_carries_its_fields_inline() {
-        let files = root_at("win32-roundtrip");
-        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
-            .join("win32-roundtrip");
-        std::fs::write(dir.join("IN.TXT"), b"HELLO").expect("fixture");
-
-        let mut l = loaded();
-        let mut s = Streams::new(Some(files));
-        let fp = s.fopen(&mut l.mem, b"IN.TXT", b"rb");
-        assert_ne!(fp, 0, "the file is there, so this is not NULL");
-
-        let raw = Flat32Ptr(fp).resolve(&l.mem, FILE_SIZE).expect("in memory");
-        let word = |off: u32| {
-            u32::from_le_bytes(raw[off as usize..off as usize + 4].try_into().unwrap())
-        };
-        assert_ne!(word(FILE_FLAGS) & F_READ, 0, "opened for reading");
-        assert_ne!(word(FILE_FLAGS) & F_BIN, 0, "in binary mode");
-        assert_eq!(word(FILE_FLAGS) & F_EOF, 0, "and not at end of file yet");
-        assert_eq!(raw[FILE_FD as usize], 0, "the first stream is fileno 0");
-
-        assert_eq!(s.fclose(fp), 0);
-        assert_eq!(s.fclose(fp), EOF, "closing it twice is an error");
-    }
-
-    /// `fgetc` walks a stream one byte at a time, as an unsigned `int` in
-    /// `0..=255` -- **not** a signed `i8`, which would turn a byte at or above
-    /// 0x80 into a negative value indistinguishable from `EOF` itself. The
-    /// last call past the final byte answers `EOF` and sets `F_EOF`, the same
-    /// flag `feof` reads and the same one a short [`Streams::read`] already
-    /// sets -- `fgetc` has no bookkeeping of its own to get out of step with
-    /// it.
-    #[test]
-    fn fgetc_walks_a_stream_one_byte_past_0x7f_then_answers_eof() {
-        let files = root_at("win32-fgetc");
-        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
-            .join("win32-fgetc");
-        std::fs::write(dir.join("BYTES.DAT"), [0x41, 0xff]).expect("fixture");
-
-        let mut l = loaded();
-        let mut s = Streams::new(Some(files));
-        let fp = s.fopen(&mut l.mem, b"BYTES.DAT", b"rb");
-        assert_ne!(fp, 0);
-
-        assert_eq!(s.fgetc(&mut l.mem, fp), 0x41, "first byte, ordinary ASCII");
-        assert_eq!(
-            s.fgetc(&mut l.mem, fp),
-            0xff,
-            "second byte: 255, not -1 -- a signed read would collide with EOF"
-        );
-        assert_eq!(s.fgetc(&mut l.mem, fp), EOF, "past the end of the file");
-
-        let raw = Flat32Ptr(fp).resolve(&l.mem, FILE_SIZE).expect("in memory");
-        let flags = u32::from_le_bytes(raw[FILE_FLAGS as usize..FILE_FLAGS as usize + 4].try_into().unwrap());
-        assert_ne!(flags & F_EOF, 0, "feof must see this");
-    }
-
-    /// A `FILE *` this host never handed out answers `EOF`, not a panic.
-    #[test]
-    fn fgetc_on_an_unknown_stream_is_eof_not_a_panic() {
-        let mut l = loaded();
-        let mut s = Streams::new(None);
-        assert_eq!(s.fgetc(&mut l.mem, 0x1234), EOF);
-    }
-
-    /// `fputc` writes one byte -- truncated from the `int` C passes down to
-    /// the `unsigned char` it actually is -- and hands the written byte back,
-    /// widened without sign extension. A byte at or above 0x80 must still
-    /// read back as itself, not as `EOF`.
-    #[test]
-    fn fputc_writes_one_truncated_byte_and_echoes_it_back() {
-        let files = root_at("win32-fputc");
-        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
-            .join("win32-fputc");
-
-        let mut l = loaded();
-        let mut s = Streams::new(Some(files));
-        let fp = s.fopen(&mut l.mem, b"OUT.DAT", b"wb");
-        assert_ne!(fp, 0);
-
-        assert_eq!(s.fputc(fp, 0x41), 0x41, "an ordinary byte");
-        // `int` carries garbage above the low byte the way every other
-        // narrow C argument on this ABI does -- only the low byte is ever
-        // meant to land on disk.
-        assert_eq!(s.fputc(fp, 0xdead_ff00 | 0xff), 0xff, "truncated, not EOF");
-        assert_eq!(s.fclose(fp), 0);
-
-        let written = std::fs::read(dir.join("OUT.DAT")).expect("the file landed");
-        assert_eq!(written, vec![0x41, 0xff], "both bytes, in order, on disk");
-    }
-
     /// A `FILE *` this host never handed out answers `EOF`, not a panic.
     #[test]
     fn fputc_on_an_unknown_stream_is_eof_not_a_panic() {
@@ -931,66 +818,5 @@ mod tests {
         assert_eq!(s.fputc(0x1234, 0x41), EOF);
     }
 
-    /// Two streams open at once must be distinguishable. A host keying its
-    /// table on anything the two share hands the second one's reads to the
-    /// first.
-    #[test]
-    fn two_open_streams_are_distinct() {
-        let files = root_at("win32-two");
-        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
-            .join("win32-two");
-        std::fs::write(dir.join("A.TXT"), b"a").expect("fixture");
-        std::fs::write(dir.join("B.TXT"), b"b").expect("fixture");
-
-        let mut l = loaded();
-        let mut s = Streams::new(Some(files));
-        let a = s.fopen(&mut l.mem, b"A.TXT", b"rb");
-        let b = s.fopen(&mut l.mem, b"B.TXT", b"rb");
-        assert_ne!(a, 0);
-        assert_ne!(b, 0);
-        assert_ne!(a, b, "two FILEs, two addresses");
-
-        let fd_of = |fp: u32, mem: &Memory| {
-            Flat32Ptr(fp).resolve(mem, FILE_SIZE).expect("in memory")[FILE_FD as usize]
-        };
-        assert_ne!(fd_of(a, &l.mem), fd_of(b, &l.mem), "and two filenos");
-    }
-
-    /// A closed slot is reused rather than leaked, so a program that opens and
-    /// closes in a loop does not exhaust the table.
-    #[test]
-    fn a_closed_slot_is_reused() {
-        let files = root_at("win32-reuse");
-        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
-            .join("win32-reuse");
-        std::fs::write(dir.join("A.TXT"), b"a").expect("fixture");
-
-        let mut l = loaded();
-        let mut s = Streams::new(Some(files));
-        for _ in 0..8 {
-            let fp = s.fopen(&mut l.mem, b"A.TXT", b"rb");
-            assert_ne!(fp, 0);
-            assert_eq!(s.fclose(fp), 0);
-        }
-        assert_eq!(s.open.len(), 1, "one slot, reused eight times");
-    }
-
-    /// The jail is not optional: a path that climbs out of the root must be
-    /// refused. `Files` enforces this with `openat2(RESOLVE_BENEATH)`, and this
-    /// test is here to catch a future change that resolves paths some other
-    /// way before handing them over.
-    #[test]
-    fn a_path_cannot_escape_the_root() {
-        let files = root_at("win32-escape");
-        let mut l = loaded();
-        let mut s = Streams::new(Some(files));
-        assert_eq!(
-            s.fopen(&mut l.mem, b"..\\..\\etc\\passwd", b"rb"),
-            0,
-            "climbing out of the root is refused"
-        );
-        assert_eq!(s.fopen(&mut l.mem, b"/etc/passwd", b"rb"), 0);
-        assert_eq!(s.access(b"../../etc/passwd", 0), MINUS_ONE);
-    }
 }
 

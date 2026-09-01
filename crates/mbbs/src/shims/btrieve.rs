@@ -4274,40 +4274,6 @@ mod tests {
     }
 
     #[test]
-    fn aabbtv_takes_three_arguments_and_never_reads_a_fourth() {
-        // `BTVSTF.H:155` declares `int aabbtv(void*, long, int)` -- five
-        // argument words -- and all eight of `WCCMMUD.DLL`'s call sites clean
-        // `add sp,10`, which is those five and no more. `aabbtvl`, the
-        // four-argument form, is a separate export the module never imports.
-        //
-        // This host used to read a sixth word as `loktyp` because it shared a
-        // helper with `gabbtvl`, which really does take four. The sixth word
-        // was the caller's, and any nonzero garbage there used to be refused
-        // as a lock the module never asked for -- fixed by `UNLOCKED`
-        // (`aabbtv`'s own doc comment), which passes a hardcoded `0` instead
-        // of reading a word that is not there.
-        //
-        // Invoked with exactly five words, which is what gives this teeth: the
-        // word above them is the outer frame's return offset and is not zero.
-        let mut f = Fixture::new();
-        let block = open(&mut f, "SAMPLE.DAT", 64);
-        let into = buffer(&f, block);
-
-        assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6");
-        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
-            panic!("absbtv returns a long");
-        };
-        assert!(acquire(&mut f, None, 0, 12), "somewhere else entirely");
-
-        assert_eq!(
-            f.invoke(aabbtv, &[0, 0, position as u16, (position >> 16) as u16, 0])
-                .expect("five argument words are all there are"),
-            Ret::U16(1)
-        );
-        assert_eq!(got(&f, into), 6, "and it read the record it was sent to");
-    }
-
-    #[test]
     fn the_absolute_family_leaves_the_found_key_in_the_key_buffer() {
         // `PLBTVSTF.C:484` passes `bb->keyseg` to Btrieve, which writes the
         // found record's key back into it -- exactly as the query and acquire

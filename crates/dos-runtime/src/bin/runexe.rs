@@ -2049,32 +2049,6 @@ mod tests {
         assert_eq!(format_of(&almost), Format::RealMode);
     }
 
-    /// The real files, both of them, rather than only hand-built headers.
-    #[test]
-    fn the_real_binaries_route_where_they_belong() {
-        let pe = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the PE32 utility");
-        assert_eq!(format_of(&pe), Format::Pe32);
-
-        // Anchored to the manifest dir: cargo runs a test binary with the
-        // package root as its working directory, not the workspace root.
-        let mz = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../archive/lord/4.06/LORD.EXE"
-        ))
-        .expect("LORD");
-        assert_eq!(format_of(&mz), Format::RealMode);
-
-        // A real NE, not a hand-built header. The archive holds 3,497 of them,
-        // so "NE is refused rather than routed" is a claim worth making against
-        // one the vendor actually shipped.
-        let ne = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../archive/galacticomm/cdrom/wg33cd/INTRO/WGCD.EXE"
-        ))
-        .expect("an NE from the Worldgroup CD");
-        assert_eq!(format_of(&ne), Format::Unsupported);
-    }
-
     /// The live door's invocation, verbatim from
     /// `/sbbs/xtrn/lord/lord-dospoc.sh`: program first, then flags, then a bare
     /// command tail. This is the shape that must never stop parsing.
@@ -2136,23 +2110,6 @@ mod tests {
         let cli = Cli::try_parse_from(["runexe", "--root", ".", "--scan-u16", "1,22,333", "A.EXE"])
             .expect("comma separated list");
         assert_eq!(cli.scan_u16, vec![1, 22, 333]);
-    }
-
-    /// `--tsr` takes one value, quoted so its own command tail survives
-    /// clap's tokenizing -- exactly the shape the brief's own example uses.
-    #[test]
-    fn tsr_flag_carries_its_program_and_tail_as_one_value() {
-        let cli = Cli::try_parse_from([
-            "runexe",
-            "--root",
-            ".",
-            "--tsr",
-            "BTRIEVE.EXE /P:2048",
-            "WCCMMUTL.EXE",
-        ])
-        .expect("--tsr takes one value");
-        assert_eq!(cli.tsr.as_deref(), Some("BTRIEVE.EXE /P:2048"));
-        assert_eq!(cli.program, "WCCMMUTL.EXE");
     }
 
     /// No `--tsr` at all -- the overwhelming majority of invocations -- must

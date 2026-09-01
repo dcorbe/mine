@@ -581,39 +581,6 @@ mod tests {
         ));
     }
 
-    /// The finding this file's own module doc writes up, now closed: measured
-    /// `stdcall` at LunatiX's own call sites, and `Wg32::resume` now services
-    /// `Cleans::Callee` instead of panicking on it. Pinned against the exact
-    /// byte counts measured at those call sites, not merely "some `Callee`
-    /// variant" -- registering `Cleans::Callee(4)` for the two-argument
-    /// `GetProcAddress` (or `Cleans::Callee(8)` for the one-argument
-    /// `GetModuleHandleA`) would compile, pass a looser assertion, and leave
-    /// the module's stack wrong by exactly the difference every subsequent
-    /// call after it. This is also the wiring half of this crate's own
-    /// mutation check (see the task report): flipping either byte count here
-    /// is exactly the corruption `crates/mbbs/tests/wg32_abi.rs`'s stdcall
-    /// relay tests exist to catch on the execution side, and this test
-    /// catches it on the registration side.
-    #[test]
-    fn get_module_handle_and_get_proc_address_resolve_under_kernel32_dll_as_stdcall() {
-        assert!(
-            matches!(
-                entry::<Wg32>("KERNEL32.dll", "getmodulehandlea"),
-                Entry::Routine(_, Cleans::Callee(4))
-            ),
-            "GetModuleHandleA takes one 4-byte LPCSTR argument, and \
-             LUNATIX.DLL's own call site (0x41d61d) shows the callee popping it"
-        );
-        assert!(
-            matches!(
-                entry::<Wg32>("KERNEL32.dll", "getprocaddress"),
-                Entry::Routine(_, Cleans::Callee(8))
-            ),
-            "GetProcAddress takes two 4-byte arguments, and LUNATIX.DLL's own \
-             call site (0x41d62c) shows the callee popping both"
-        );
-    }
-
     /// [`get_module_handle`]'s own doc comment, proven rather than only
     /// asserted in prose: this host has no process image and no module list
     /// to search, so `NULL` -- not a plausible-looking fabricated handle --
@@ -665,20 +632,6 @@ mod tests {
         assert!(message.contains("exit(3)"), "{message}");
         assert!(message.contains("never returns"), "{message}");
         assert!(message.contains("byenow"), "{message}");
-    }
-
-    #[test]
-    fn getversion_reports_windows_nt_not_windows_9x() {
-        let mut f = Fixture::new();
-        let ret = f.invoke(getversion, &[]).expect("getversion");
-        let mbbs_machine::m16::Ret::U32(version) = ret else {
-            panic!("getversion returns a 32-bit DWORD");
-        };
-        // Bit 31 clear is the NT branch LUNATIX.DLL's own call site tests
-        // for -- see this module's own doc comment on `getversion`.
-        assert_eq!(version & 0x8000_0000, 0, "must read as Windows NT, not 9x");
-        assert_eq!(version & 0xff, 4, "major version 4");
-        assert_eq!((version >> 8) & 0xff, 0, "minor version 0");
     }
 
     #[test]

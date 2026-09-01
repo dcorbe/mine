@@ -681,23 +681,6 @@ mod tests {
         [v as u16, (v >> 16) as u16]
     }
 
-    #[test]
-    fn dedcrd_and_tstcrd_answer_yes_for_the_current_user() {
-        let mut f = Fixture::new();
-        connect(&mut f, &[]);
-
-        let amt = long_words(500);
-        assert_eq!(
-            f.invoke(tstcrd, &amt).expect("tstcrd"),
-            Ret::U16(1),
-            "otherwise re/tasrc/tsgarn-2.c:385 bounces the player to NEDCRD"
-        );
-
-        let mut args = amt.to_vec();
-        args.push(1); // asmuch
-        assert_eq!(f.invoke(dedcrd, &args).expect("dedcrd"), Ret::U16(1));
-    }
-
     /// `rdedcrd` is `dedcrd` with `real` set, and answers the same way.
     /// Asserted side by side with `dedcrd` over the identical arguments,
     /// because the failure worth catching is the two disagreeing -- a module

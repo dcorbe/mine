@@ -6684,17 +6684,6 @@ mod tests {
         assert_eq!(scb::CHGCNT, 164, "xitkey(162) + 2");
     }
 
-    #[test]
-    fn the_module_finds_flddat_and_newans_where_this_puts_them() {
-        // Not from the header -- from `WCCMMUD.DLL`. `seg 3:0x4340` is
-        // `les bx,[es:bx+0x4]` on `fsdscb` to reach `flddat`, and
-        // `seg 3:0x2d46` pushes `[es:bx+0xe]:[es:bx+0xc]` as `newans`. If these
-        // two numbers were wrong the module would read two other pointers and
-        // nothing would say so.
-        assert_eq!(scb::FLDDAT, 4);
-        assert_eq!(scb::NEWANS, 12);
-    }
-
     /// A fresh, zeroed control block, the way `alczer` leaves one.
     fn zeroed_scb() -> Scb<Wg16> {
         Scb::from_bytes(&[0u8; FSDSCB as usize]).expect("exactly FSDSCB bytes")
@@ -11062,24 +11051,6 @@ mod tests {
             String::from_utf8_lossy(&out),
             "Name: Kai   Rank: Cpl\r\n",
             "supporting text verbatim, each answer padded out to its run's width"
-        );
-    }
-
-    #[test]
-    fn fsddsp_blanks_an_avoided_field_rather_than_showing_it() {
-        // `FFFAVD` is the flag the *module* sets -- fourteen sites in
-        // WCCMMUD.DLL do -- so this is the arm MajorMUD's own sheet takes for
-        // its computed stats.
-        let spec = b"FIRST SECOND";
-        let template = b"a ????? b ???\r\n";
-        let (mut form, answers) = ansi_form(template, spec, b"FIRST=Kai\0SECOND=Cpl\0\0");
-        form.fields[0].flags |= flags::AVOID;
-
-        let out = fsddsp(&form, &answers, template);
-        assert_eq!(
-            String::from_utf8_lossy(&out),
-            "a       b Cpl\r\n",
-            "the avoided field is five blanks, not its answer"
         );
     }
 

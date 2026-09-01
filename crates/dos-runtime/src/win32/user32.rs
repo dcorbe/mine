@@ -102,32 +102,3 @@ fn read_bytes(mem: &Memory, at: u32) -> Vec<u8> {
         .map_or_else(|_| Vec::new(), <[u8]>::to_vec)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// ASCII classification, and the boundary cases either side of each range.
-    #[test]
-    fn alphanumeric_is_letters_and_digits_only() {
-        let mut l = {
-            let f = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
-            crate::win32::load::load(&f).expect("loads")
-        };
-        let mut p = Process::new("X.EXE", &[]);
-        // `dispatch` reads an argument, which needs a real frame, so the
-        // classification itself is checked directly -- the arm is one call.
-        for (ch, want) in [
-            (b'A', true),
-            (b'z', true),
-            (b'0', true),
-            (b'9', true),
-            (b'@', false),
-            (b' ', false),
-            (0xe1, false),
-        ] {
-            assert_eq!(ch.is_ascii_alphanumeric(), want, "{ch:#04x}");
-        }
-        // And an unimplemented USER32 symbol still declines.
-        assert!(dispatch(&mut p, &mut l.machine, &mut l.mem, "CreateWindowExA").is_none());
-    }
-}

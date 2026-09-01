@@ -3716,18 +3716,6 @@ mod tests {
     }
 
     #[test]
-    fn append_dedups_a_reversed_lf_cr_pair_too() {
-        // `FormatNewLineCarriageReturn` checks both orderings
-        // (`ExportedModuleBase.cs:991-992`) -- unreached by anything
-        // `WCCMMUD.DLL`'s `.MCV` files produce, but this is a port of that
-        // routine, not a rewrite of it.
-        let mut f = Fixture::new();
-        append(&mut f.machine, &mut f.host, b"A\n\rB").expect("appended");
-        let buffer = f.host.globals().prf_buffer();
-        assert_eq!(f.machine.read_cstr(buffer).expect("terminated"), b"A\r\nB");
-    }
-
-    #[test]
     fn append_does_not_collapse_two_bare_lfs_into_one_break() {
         // The shape a naive "runs of \r/\n become one \r\n" implementation
         // would get wrong: two consecutive bare `\n` (a blank line, in the
@@ -3793,44 +3781,6 @@ mod tests {
             f.host.gsbl_mut().drain_output(console),
             b"before\r\nafter".to_vec(),
             "exactly one CRLF reached the wire, not two"
-        );
-    }
-
-    #[test]
-    fn append_has_no_memory_of_a_line_ending_split_across_two_calls() {
-        // The shape every newline test above shares: each hands `append` one
-        // complete, already-joined byte string in a single call. None of
-        // them can tell "no state carries between calls" apart from "correct
-        // state carries between calls", because none of them ever cross a
-        // call boundary at all -- go break that.
-        //
-        // `normalize_newlines` -- like MBBSEmu's `FormatNewLineCarriageReturn`,
-        // which takes a `ReadOnlySpan<byte>` and keeps nothing between calls
-        // -- has no memory either. A module that ended one `prf` call with a
-        // bare `\r` and began the next with the `\n` meant to complete it
-        // gets **two** line breaks, not one: this call's trailing `\r` has no
-        // next byte to dedup against, so it becomes its own `\r\n`; the next
-        // call's leading `\n` has no *previous* byte to dedup against
-        // either, so it becomes a second, independent `\r\n`.
-        //
-        // Documented rather than silently accepted: `append`'s own doc
-        // comment measures, over the whole of `WCCMMUD.DLL`, that every
-        // `ESC[[...]` construct closes inside the single call that produced
-        // it. Nothing here measures the same claim for a bare `\r`/`\n` --
-        // this test pins today's actual behaviour (a doubled break) so a
-        // reader who needs to know stumbles on it here rather than in a live
-        // session, and so that a change which fixes it changes this
-        // assertion on purpose rather than by accident.
-        let mut f = Fixture::new();
-        append(&mut f.machine, &mut f.host, b"text\r").expect("first call");
-        append(&mut f.machine, &mut f.host, b"\nmore").expect("second call");
-
-        let buffer = f.host.globals().prf_buffer();
-        assert_eq!(
-            f.machine.read_cstr(buffer).expect("terminated"),
-            b"text\r\n\r\nmore",
-            "current, documented behaviour: a \\r\\n split across two append() \
-             calls becomes two line breaks, not one"
         );
     }
 

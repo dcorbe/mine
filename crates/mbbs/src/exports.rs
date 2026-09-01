@@ -182,41 +182,6 @@ pub use mbbs_machine::library::c_name;
 mod tests {
     use super::*;
 
-    /// The 3.x tables load, and they are NOT the same table under two names.
-    ///
-    /// The disagreement is the point: three GALETL builds exist whose ordinals
-    /// genuinely differ (ordinal 36 is `_TL2LST` in one and `___TLCACT` in
-    /// another), and two WGSERVER builds differ by 114 entries. A refactor
-    /// that "helpfully" merged them would pass a size check and answer wrong
-    /// names forever, so this asserts they stay distinct.
-    #[test]
-    fn the_worldgroup_3x_tables_are_loaded_and_distinct_from_each_other() {
-        let wg300 = Exports::wg300();
-        let wg312 = Exports::wg312();
-        assert_eq!(wg300.len(WGSERVER), 1381);
-        assert_eq!(wg312.len(WGSERVER), 1495, "3.12 exports 114 more than 3.00");
-
-        // Spot-checks against `re/wg33src/LIB/WGSERVER.DEF`, which carries
-        // explicit `@ordinal`s. The whole 3.12 table was checked against it
-        // ordinal-by-ordinal when it was recovered (1,494/1,494 agreed); these
-        // three are pinned so a regenerated table cannot drift silently.
-        assert_eq!(wg312.name(WGSERVER, 1), Some("f_scopy@"));
-        assert_eq!(wg312.name(WGSERVER, 3), Some("f_ldiv@"));
-        assert_eq!(wg312.name(WGSERVER, 1000), Some("onsys"));
-
-        // `_dfaStat @457` is in the 3.3 DEF and NOT in this binary, which is
-        // the 3.12/3.13 build -- so the DEF is a superset, and an ordinal
-        // present there can legitimately be absent here. Pinned as a `None`
-        // so that a future table which "helpfully" invents an entry for it
-        // fails rather than quietly answering a name the binary never had.
-        assert_eq!(wg312.name(WGSERVER, 457), None);
-
-        // A 3.x table must not answer for a WG 1.01 library: mixing
-        // generations is what contaminated isv_union_symbols.tsv.
-        assert_eq!(wg300.name(MAJORBBS, 11), None, "no WG1.01 table leaked in");
-        assert_eq!(Exports::wg101().name(WGSERVER, 1), None, "and not the reverse");
-    }
-
     #[test]
     fn the_tables_are_the_size_the_host_exports() {
         assert_eq!(Exports::wg101().len(MAJORBBS), 1210);

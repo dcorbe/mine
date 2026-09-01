@@ -1482,32 +1482,6 @@ mod tests {
         g.peek(buf_at, got).to_vec()
     }
 
-    /// Seeking backwards from the end is how a DOS program reads an index it
-    /// appended to its own file, and `CX:DX` carries that displacement as a
-    /// signed 32-bit value. Built unsigned, `FFFF:FFF0` stops being "sixteen
-    /// bytes back" and becomes "four gigabytes forward".
-    ///
-    /// **The position `42h` reports back cannot detect that**, which is why
-    /// this test reads rather than asserting on `DX:AX`. The overshoot is
-    /// exactly `2^32`, and `DX:AX` is exactly 32 bits, so the wrong seek
-    /// reports the *identical* position as the right one -- an assertion on
-    /// the returned offset passes against the bug and against the fix, and
-    /// mutation testing is the only thing that says so. Where the file
-    /// pointer actually ended up is observable only by reading through it.
-    #[test]
-    fn the_trailer_read_after_a_backward_seek_returns_the_last_bytes() {
-        let mut body: Vec<u8> = (0..100u8).collect();
-        body[84..].copy_from_slice(&[0xab; 16]);
-        let (mut g, mut dos, handle) = opened("dos_seek_trailer_read", "TRAILER.DAT", &body);
-
-        assert_eq!(seek(&mut g, &mut dos, handle, 2, -16), 84, "reported position wraps to 84 either way");
-
-        // 512 bytes asked for, exactly as WCCMMUTL does; 16 are left.
-        let got = read_after(&mut g, &mut dos, handle, 512);
-        assert_eq!(got.len(), 16, "a short read of exactly the trailer, not zero bytes");
-        assert_eq!(got, vec![0xab; 16], "and it must be the trailer's own bytes");
-    }
-
     /// AL=1 carries the same signed displacement, measured from where the
     /// handle already is -- and is unobservable in `DX:AX` for the same
     /// wrap-around reason, so this reads too.

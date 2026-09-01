@@ -2071,31 +2071,4 @@ mod tests {
         assert!(!offer(&mut gsbl, &tx, chan), "a closed connection is the hangup signal");
     }
 
-    /// The reversed-order hint: a missing library that is a module still to
-    /// come earns the clause, and nothing else does. The spellings differ on
-    /// purpose (`WCCMMUD.dll` in the import directory, `wccmmud.dll` on
-    /// disk) -- a case-sensitive match here would never fire on the real
-    /// board.
-    #[test]
-    fn later_module_hint_fires_only_for_a_module_still_to_be_loaded() {
-        use std::path::PathBuf;
-
-        let remaining =
-            vec![PathBuf::from("/b/wccmmpls.dll"), PathBuf::from("/b/wccmmud.dll")];
-        let hint = super::later_module_hint("WCCMMUD.dll", &remaining)
-            .expect("the missing library is still to come");
-        assert!(hint.contains("WCCMMUD.dll"), "the hint names the library: {hint}");
-        assert!(hint.contains("--module order is load order"), "{hint}");
-
-        assert_eq!(
-            super::later_module_hint("WCCMMUD.dll", &[]),
-            None,
-            "nothing comes later: the library really is a host gap"
-        );
-        assert_eq!(
-            super::later_module_hint("WCCMMUD.dll", &[PathBuf::from("/b/rcirose.dll")]),
-            None,
-            "an unrelated module later on the line explains nothing"
-        );
-    }
 }

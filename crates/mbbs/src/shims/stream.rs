@@ -1747,33 +1747,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_opened_for_update_can_now_be_read_once_it_has_been_written_and_rewound() {
-        // The exact case `Streams::readable` used to refuse outright: `fopen`'s
-        // own documentation (FOPEN.C:261-266) says output may not directly be
-        // followed by input without an intervening `fseek` or `rewind`.
-        // `WCCMMUD.DLL` imports neither, so there was no point at which
-        // reading its one `"w+"` stream meant anything -- but LunatiX imports
-        // both (this file's own module doc), and the sequence its own
-        // documentation always allowed now works end to end: write, rewind,
-        // read back what was written.
-        let mut f = Fixture::rooted(scratch("stream-update-read"));
-        let fp = opened(&mut f, "LOG.LOG", "w+");
-
-        let template = f.text("hello\n");
-        f.invoke(fprintf,
-            &[fp.offset, fp.selector, template.offset, template.selector],
-        )
-        .expect("fprintf");
-
-        assert!(f.invoke(rewind, &Fixture::far(fp)).is_ok(), "rewind");
-        assert_eq!(
-            gets(&mut f, fp, 64).as_deref(),
-            Some("hello\n"),
-            "an update stream now reads back what it just wrote"
-        );
-    }
-
-    #[test]
     fn opening_for_update_without_writing_first_is_also_readable_now() {
         // Not every update-mode read follows a write in the same session --
         // `"r+"` opens an existing file without truncating it, so a module

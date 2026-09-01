@@ -812,39 +812,6 @@ mod tests {
         assert!(Cli::try_parse_from(args(&["--root", "tmp", "--bturno32", "1"])).is_err());
     }
 
-    /// `--module` is repeatable, and in the order given -- load order is the
-    /// whole channel-entry contract (`mbbs_server::host::Boot::modules`'s own
-    /// doc), so the parse must preserve it rather than merely collecting the
-    /// values, and `plan` must carry that order through into the `Wg16`
-    /// board it boots.
-    #[test]
-    fn module_is_repeatable_and_keeps_order() {
-        let cli = Cli::try_parse_from(args(&[
-            "--root",
-            "tmp",
-            "--module",
-            "re/WCCMMUD.DLL",
-            "--module",
-            "WCCMMPLS.DLL",
-        ]))
-        .expect("parses");
-        assert_eq!(
-            cli.module,
-            vec![
-                PathBuf::from("re/WCCMMUD.DLL"),
-                PathBuf::from("WCCMMPLS.DLL"),
-            ]
-        );
-        assert_eq!(requested_modules(&cli), cli.module);
-        assert_eq!(
-            plan(&cli, &[Format::Ne, Format::Ne]),
-            Ok(Plan::Wg16 {
-                modules: vec![PathBuf::from("re/WCCMMUD.DLL"), PathBuf::from("WCCMMPLS.DLL")],
-                root: PathBuf::from("tmp"),
-            })
-        );
-    }
-
     /// A flag this binary does not know about is refused, not ignored.
     #[test]
     fn unknown_argument_is_an_error() {

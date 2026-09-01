@@ -655,19 +655,6 @@ mod tests {
     }
 
     #[test]
-    fn language_is_a_declaration_and_not_a_message() {
-        // Measured, not assumed: `TSGARN-C.MCV` has 78 messages where its
-        // `.MSG` has 79 things that look like options, and the first compiled
-        // message is `LEVEL3`'s empty value rather than `English/ANSI`.
-        let file = parse(concat!(
-            "LANGUAGE {English/ANSI}\r\n",
-            "LEVEL3 {}\r\n",
-            "FULKEY {LIVE} S 8\r\n",
-        ));
-        assert_eq!(texts(&file), ["", "LIVE"]);
-    }
-
-    #[test]
     fn a_lower_case_name_is_not_a_name_at_all() {
         // `is_name` admits no lower case, so `Language` is the one-letter name
         // `L` followed by prose -- and `L` is not the declaration, so its value

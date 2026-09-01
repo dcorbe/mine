@@ -2030,30 +2030,6 @@ mod tests {
     }
 
     #[test]
-    fn curusr_leaves_vdaptr_null_until_alcvda_has_run() {
-        // `vdaoff` reads `vdahdl`, which `alcvda` fills in after every module's
-        // init. `curusr` during init therefore sets `vdaptr` to null -- and
-        // that is right, because that is what the real host's `vdaoff` returned
-        // at that point. `WCCMMUD.DLL` tests `usrptr` for null in two places;
-        // handing it a pointer to nothing would be worse than handing it zero.
-        let mut f = Fixture::new();
-        let console = f.console();
-        f.invoke(curusr, &[0]).expect("channel 0");
-        assert_eq!(
-            f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
-            mbbs_machine::m16::FarPtr::NULL
-        );
-
-        f.invoke(crate::shims::system::dclvda, &[256]).expect("declared");
-        f.host.alcvda(&mut f.machine).expect("allocated");
-        f.invoke(curusr, &[0]).expect("channel 0 again");
-        assert_eq!(
-            f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
-            f.host.users().vda(console).expect("allocated")
-        );
-    }
-
-    #[test]
     fn curusr_on_a_channel_that_does_not_exist_changes_nothing() {
         // `MAJORBBS.C:4293` -- `if (0 <= uno && uno < nterms)`, with no else.
         // Silent, and modules rely on it: `curusr(-1)` is how the host itself

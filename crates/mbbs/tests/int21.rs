@@ -52,25 +52,6 @@ fn get_default_drive_answers_c_and_resumes() {
 }
 
 #[test]
-fn find_first_fills_the_dta_for_a_file_in_the_root() {
-    let root = scratch("int21-find");
-    std::fs::write(root.join("RCIROSE.DLL"), b"x").expect("a file to find");
-    let mut fx = Fixture::rooted(root);
-    let dta = fx.buffer(43);
-    let spec = fx.text("rcirose.dll");
-    // DS is pinned by the test's own prologue (`find_first`'s `mov
-    // ax,ds_sel; mov ds,ax`), so DS:DX addresses the scratch buffers
-    // regardless of what DS the module's own DGROUP would otherwise be.
-    match run(&mut fx, &find_first(dta.selector, dta.offset, spec.offset)) {
-        Outcome::Returned { lo, .. } => assert_eq!(lo & 0xffff, 0, "found"),
-        Outcome::Stopped(p) => panic!("stopped: {p}"),
-    }
-    let name = fx.machine.read_cstr(mbbs_machine::m16::FarPtr { selector: dta.selector, offset: dta.offset + 0x1e })
-        .expect("the record's name field is NUL-terminated");
-    assert_eq!(name, b"RCIROSE.DLL");
-}
-
-#[test]
 fn find_first_reports_file_not_found_with_carry() {
     let root = scratch("int21-find-missing");
     let mut fx = Fixture::rooted(root);

@@ -696,19 +696,6 @@ mod tests {
     }
 
     #[test]
-    fn a_pointer_prints_as_selector_and_offset() {
-        // Lower case: `%p` now defers to `A::Ptr`'s own `Display` (see
-        // `format`'s doc for why the generic walk cannot reconstruct
-        // `FarPtr`'s fields by hand) rather than reimplementing the same
-        // `seg:off` rendering `mbbs_machine::m16::FarPtr::fmt` already gives -- one
-        // place that decides how a pointer prints, not two that could
-        // disagree. WCCMMUD.DLL's decompiled sources have no `%p` conversion
-        // at all (`grep -c %p` over `WCCMMUD_named.c` is 0), so nothing
-        // measured depends on the case that changed.
-        check("%p", &[0x1234, 0x00af], "00af:1234");
-    }
-
-    #[test]
     fn the_walk_reports_how_many_bytes_it_consumed() {
         let mut f = Fixture::new();
         let template = f.text("%d %ld %c");

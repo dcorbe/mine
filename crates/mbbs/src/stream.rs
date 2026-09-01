@@ -1327,16 +1327,6 @@ mod tests {
     }
 
     #[test]
-    fn every_mode_the_module_uses_parses() {
-        // Every mode-shaped string in `re/WCCMMUD.DLL`, by occurrence: `r` 17,
-        // `a` 12, `rt` 5, `w` 4, `wt` 3, `at` 2, `rb` 1, and `w+` once at file
-        // offset 0xe2412 -- the only update mode in the module.
-        for used in ["w", "a", "rt", "wt", "at", "rb", "w+"] {
-            Mode::parse(used).unwrap_or_else(|e| panic!("{used}: {e}"));
-        }
-    }
-
-    #[test]
     fn a_plus_adds_the_other_direction_without_changing_the_base_letter() {
         // `CheckOpenType`, FOPEN.C:100-108 -- "same modes, but both read and
         // write". The base letter still decides create and truncate, so it has

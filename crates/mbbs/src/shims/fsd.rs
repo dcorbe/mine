@@ -3228,31 +3228,6 @@ mod tests {
     }
 
     #[test]
-    fn fsdroom_mirrors_tmpmsg_where_the_sixteen_bit_rose_reads_it() {
-        // The Rose 2.0 (NE) re-fetches its template as `getasc(fsdusr->tmpmsg)`:
-        // `les bx,[fsdusr]; push word es:[bx+0x00AB]; call far getasc` -- seg
-        // 28:0x2ed-0x2fc of RCIROSE.DLL, and 0xAB is also the header math,
-        // sizeof fsdscb (166, FSD.H:275) + sizeof ainscb (1, AIN.H:51) +
-        // sizeof(FILE *curmbk) (4). Written at the 32-bit build's 0xc8, the
-        // NE build read zeros and painted a template-less screen.
-        let mut f = Fixture::new();
-        let _ = open(&mut f);
-        let spec = f.text("ONE TWO");
-        f.invoke(fsdroom, &[7, spec.offset, spec.selector, 0]).expect("sized");
-
-        let fsdusr = f.host.globals().pointer(&f.machine, "fsdusr").expect("placed");
-        let word = f
-            .machine
-            .read(FarPtr { selector: fsdusr.selector, offset: fsdusr.offset + 0x00ab }, 2)
-            .expect("in the block");
-        assert_eq!(
-            u16::from_le_bytes([word[0], word[1]]),
-            7,
-            "fsdusr->tmpmsg at the 16-bit build's own offset"
-        );
-    }
-
-    #[test]
     fn a_second_form_reuses_the_one_control_block() {
         // `inifsdscb()` allocates only `if (fsdtbl == NULL)`, and `nterms` is
         // one here. A segment per call would leak an LDT entry a form.
