@@ -93,3 +93,11 @@ tools/oracle/
 
 # Never any binaries. tools/btrieve-oracle/*.c build with build.sh.
 *.exe
+
+# Personal tooling config: stays on disk, never tracked.
+.graphifyignore
+.review-pages-head.rs
+.worktreecopy
+.worktreeignore
+.superpowers/
+.worktrees/
