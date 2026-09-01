@@ -288,6 +288,17 @@ pub struct Channel {
     /// past the point a pause fired. Released through the same counting on
     /// resume, so one long block can pause more than once.
     pub(crate) held: VecDeque<u8>,
+
+    /// `btuxmt` output postponed because the user has a line in progress --
+    /// the "output-suspended-while-inputting" feature (guide `btuxmt`, page
+    /// 189): "If the user is typing an input line when btuxmt() is called,
+    /// output is postponed until he clears the line by pressing ENTER or by
+    /// backspacing to the beginning of the line." Held here, transformed, so
+    /// the user's echoed input line is not garbled by the module writing over
+    /// it; [`Channel::cooked`] releases it the moment `line` goes empty.
+    /// `btuxct` ([`Gsbl::transmit_raw`]) never fills this -- the guide's own
+    /// escape hatch from the feature.
+    pub(crate) postponed: VecDeque<u8>,
     /// Lines out since the counter was last cleared: by a page turn, the
     /// clear-pause character, or a Return from the user. `btucpc`'s
     /// "internal line counter".
@@ -372,6 +383,7 @@ impl Default for Channel {
             chi_notify_on_idle: false,
             paused: false,
             held: VecDeque::new(),
+            postponed: VecDeque::new(),
             lines_out: 0,
             nonstop: false,
             printable_since_return: false,
@@ -1153,9 +1165,21 @@ impl Channel {
     /// Resets `column` to zero -- the cursor is back at the left margin of a
     /// blank line -- and `wrapped` along with it (`Channel::wrapped`'s own
     /// doc comment: "Reset wherever `column` is reset to zero").
+    /// Let output postponed while a line was being entered go out, now that
+    /// the line has cleared -- through [`Channel::release`], so the screen
+    /// pause still counts it. A no-op when nothing was postponed.
+    fn flush_postponed(&mut self) {
+        if self.postponed.is_empty() {
+            return;
+        }
+        let out: Vec<u8> = self.postponed.drain(..).collect();
+        self.release(&out);
+    }
+
     pub(crate) fn clear_output(&mut self) {
         self.output.clear();
         self.held.clear();
+        self.postponed.clear();
         self.paused = false;
         self.message_shown = false;
         self.lines_out = 0;
@@ -1173,8 +1197,16 @@ impl Channel {
             //    nothing to echo -- the guide's default is to leave the
             //    terminal alone rather than move its cursor off the line.
             0x08 => {
-                if self.line.pop().is_some() && self.echo {
-                    self.output.extend(b"\x08 \x08");
+                if self.line.pop().is_some() {
+                    if self.echo {
+                        self.output.extend(b"\x08 \x08");
+                    }
+                    // Backspacing to the beginning of the line clears it, the
+                    // other release point for postponed output (guide `btuxmt`
+                    // page 189).
+                    if self.line.is_empty() {
+                        self.flush_postponed();
+                    }
                 }
             }
 
@@ -1191,6 +1223,9 @@ impl Channel {
                 self.lines_out = 0;
                 self.printable_since_return = false;
                 self.nonstop = false;
+                // The line is clear: let any output the module postponed while
+                // it was being entered go out now, behind the echoed CRLF.
+                self.flush_postponed();
             }
 
             _ => {
@@ -1394,11 +1429,22 @@ impl Channel {
         // reached the wire. `wrapped` joins that guarantee for the same
         // reason: a block that never reached the wire must not be able to
         // arm or disarm the *next* accepted block's soft-CR behaviour.
-        if self.output.len() + self.held.len() + out.len() > OUTSIZ {
+        if self.output.len() + self.held.len() + self.postponed.len() + out.len() > OUTSIZ {
             self.status.push_back(Gsbl::OVRFLW);
             return false;
         }
-        self.release(&out);
+        if self.line.is_empty() {
+            self.release(&out);
+        } else {
+            // Output-suspended-while-inputting (guide `btuxmt`, page 189): the
+            // user has a line in progress, so this block waits in `postponed`
+            // rather than writing over the echoed input line. `cooked` flushes
+            // it when the line clears. The transformation is done here all the
+            // same, so consecutive postponed blocks wrap against one shared
+            // `column` and the flush is a straight copy. `btuxct` does not
+            // reach here (see `transmit_raw`), so it is never postponed.
+            self.postponed.extend(out.iter().copied());
+        }
         self.column = column;
         self.supplied_lf = supplied_lf;
         self.csi = csi;
@@ -1772,6 +1818,64 @@ mod tests {
             after_erase,
             &[b'y'; 60][..],
             "the cursor-back reset the wrap column; the redrawn line must not break early"
+        );
+    }
+
+    /// Output-suspended-while-inputting (guide `btuxmt`, page 189): a module
+    /// that writes while the user has a line in progress must not garble the
+    /// echoed input -- the output waits until the line clears. RCIROSE redraws
+    /// its status line constantly, which shredded whatever the user was typing
+    /// until this held it back.
+    #[test]
+    fn btuxmt_output_waits_while_a_line_is_being_entered_and_goes_on_enter() {
+        let mut g = one();
+        // A line in progress; drop the echo of it so the buffer holds only
+        // what the module produces.
+        g.push_input(chan(), b"lo");
+        let _ = g.drain_output(chan());
+
+        g.transmit(chan(), b"<status redraw>");
+        assert!(
+            g.drain_output(chan()).is_empty(),
+            "module output must be postponed while a line is in progress"
+        );
+
+        // Enter clears the line -> the postponed block goes out behind the CRLF.
+        g.push_input(chan(), b"\r");
+        let out = g.drain_output(chan());
+        assert!(
+            out.windows(15).any(|w| w == b"<status redraw>"),
+            "postponed output must flush once the line clears: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// Backspacing to the beginning of the line is the other release point,
+    /// and `btuxct` (binary output) is the guide's own exemption -- it is
+    /// never postponed.
+    #[test]
+    fn postponement_releases_on_backspace_to_empty_and_btuxct_is_exempt() {
+        let mut g = one();
+        g.push_input(chan(), b"x");
+        let _ = g.drain_output(chan());
+
+        // btuxct is never held, even mid-line.
+        g.transmit_raw(chan(), b"BIN");
+        assert_eq!(
+            g.drain_output(chan()),
+            b"BIN".to_vec(),
+            "btuxct must not be postponed"
+        );
+
+        // A postponed btuxmt block, released by backspacing the line empty.
+        g.transmit(chan(), b"MSG");
+        assert!(g.drain_output(chan()).is_empty(), "held while the line stands");
+        g.push_input(chan(), b"\x08");
+        let out = g.drain_output(chan());
+        assert!(
+            out.windows(3).any(|w| w == b"MSG"),
+            "backspace-to-empty must release the postponed block: {:?}",
+            String::from_utf8_lossy(&out)
         );
     }
 
