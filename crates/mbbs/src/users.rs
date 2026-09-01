@@ -581,33 +581,25 @@ impl<A: Abi> Users<A> {
     /// restated once per table. It lives in [`Terms::chan`] now, and a [`Chan`]
     /// is what is left of having asked it.
     ///
-    /// The final add -- base plus `each * unum` -- goes through
-    /// [`Abi::ptr_offset`] rather than a hand-built `FarPtr`, which is what
-    /// makes this method, and every accessor built on it, real for any `A`
-    /// rather than only `Wg16`. The `checked_mul` above it stays: it is what
-    /// turns an out-of-range `unum` into the named panic below rather than a
-    /// wrapped offset, and [`Abi::ptr_offset`] carries no such check of its
-    /// own. A second overflow check on the add itself (`base`'s own offset
-    /// plus that product) was dropped rather than pushed through the trait:
-    /// [`Users::new`] already proved `each * terms.count()` bytes fit in one
-    /// region before handing out `base`, so for any `unum` this `Chan` can
-    /// name, the add cannot leave that region either.
+    /// The add -- base plus `each * unum` -- goes through
+    /// [`Abi::ptr_checked_add`], not [`Abi::ptr_offset`]: a table
+    /// [`Users::table`] placed through `Heap::reserve_large` is larger than
+    /// one segment, so the product no longer fits `ptr_offset`'s `u16`. The
+    /// check is what turns an out-of-range `unum` into the named panic below
+    /// rather than a wrapped offset.
     ///
     /// # Panics
     ///
-    /// If the slot does not fit in the segment. Unreachable for a `Chan` of
-    /// this `Users`' own [`Terms`]: [`Users::new`] allocated `each * terms`
-    /// bytes at `base` and that allocation succeeded, so every offset below it
-    /// is addressable. A panic here means `unum` came from a larger `Terms`
-    /// than the one that sized these tables.
+    /// If the slot is past what this ABI's pointer can name. Unreachable for
+    /// a `Chan` of this `Users`' own [`Terms`]: [`Users::table`] allocated
+    /// `each * terms` bytes at `base` and that allocation succeeded, so every
+    /// offset below it is addressable. A panic here means `unum` came from a
+    /// larger `Terms` than the one that sized these tables.
     fn nth(&self, base: A::Ptr, each: u16, unum: Chan) -> A::Ptr {
-        let offset = u16::try_from(unum.index())
-            .ok()
-            .and_then(|unum| each.checked_mul(unum))
-            .unwrap_or_else(|| {
-                panic!("channel {unum} is past the end of a table of {each}-byte slots")
-            });
-        A::ptr_offset(base, offset)
+        let by = usize::from(each) * unum.index();
+        A::ptr_checked_add(base, by).unwrap_or_else(|| {
+            panic!("channel {unum} is past the end of a table of {each}-byte slots")
+        })
     }
 
     /// `&user[unum].state`.
@@ -978,31 +970,69 @@ impl<A: Abi> Users<A> {
     /// Allocate `size` bytes of volatile data area per channel, against
     /// memory directly rather than a whole `Machine`.
     ///
+    /// `MAJORBBS.C:1373`, `vdahdl=alcblok(nterms,vdasiz)` -- one table, laid
+    /// out by [`Users::table`].
+    ///
     /// The generic core [`Users::alcvda`]'s `Wg16` facade delegates into --
     /// see the struct's own doc comment for why the two need different names.
     ///
     /// # Errors
     ///
-    /// If the heap has no room.
+    /// If the heap has no room, or the table is larger than this ABI's pointer
+    /// can span -- see [`Users::table`].
     pub fn alcvda_mem(
         &mut self,
         mem: &mut A::Mem,
         heap: &mut crate::Heap<A>,
         size: u16,
     ) -> io::Result<()> {
-        let count = self.terms.count();
-        let bytes = size
-            .checked_mul(count)
-            .ok_or_else(|| io::Error::other(format!("{count} channels of {size} bytes")))?;
-        let at = heap
-            .reserve(mem, bytes)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let at = Self::table(mem, heap, size, self.terms.count())?;
         self.vda = Some((at, size));
         Ok(())
     }
 }
 
 impl<A: Abi> Users<A> {
+    /// One per-channel table: `count` slots of `each` bytes, zeroed.
+    ///
+    /// The vendor made these with `alcblok(nterms, size)` (`MAJORBBS.C:1021`,
+    /// `:1373`; `ACCOUNT.C:110`), whose flat branch is one `alczer` of the
+    /// whole product with no ceiling. This is that: the byte count is sized
+    /// at full width and branches on the *value*, exactly as `shims::memory`'s
+    /// `alcmem`/`alczer` do -- fits `u16`, and it packs into a shared region
+    /// through [`Heap::reserve`](crate::Heap::reserve); does not, and it takes
+    /// a region of its own through
+    /// [`Heap::reserve_large`](crate::Heap::reserve_large). 128 channels of
+    /// MajorMUD-NT's 1961-byte VDA is 251,008 bytes, and until this branch
+    /// existed `mbbs-server --terms 128` stopped at "128 channels of 1961
+    /// bytes".
+    ///
+    /// Under `Wg16` the large branch refuses: no far pointer addresses across
+    /// a segment, and the vendor's own 16-bit `alcblok` split such a table
+    /// into globs (`shims::memory::alcblok`) that this host's tables do not
+    /// build. That is a clean refusal naming the table, not a gap this
+    /// function papers over.
+    ///
+    /// # Errors
+    ///
+    /// If the heap has no room, or the table does not fit this ABI's pointer.
+    fn table(
+        mem: &mut A::Mem,
+        heap: &mut crate::Heap<A>,
+        each: u16,
+        count: u16,
+    ) -> io::Result<A::Ptr> {
+        let bytes = usize::from(each) * usize::from(count);
+        let at = match u16::try_from(bytes) {
+            Ok(small) => heap.reserve(mem, small),
+            Err(_) => heap.reserve_large(mem, bytes),
+        }
+        .map_err(|e| io::Error::other(format!("{count} channels of {each} bytes: {e}")))?;
+        at.write(mem, &vec![0u8; bytes])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(at)
+    }
+
     /// Allocate `terms` channels' worth of everything, zeroed.
     ///
     /// `alczer` and not `alcmem`, at `MAJORBBS.C:735-736`, and `ACCOUNT.C:112`
@@ -1026,26 +1056,15 @@ impl<A: Abi> Users<A> {
         let user = UserLayout::of::<A>();
         let usracc = AccountLayout::of::<A>();
         let count = terms.count();
-        let mut block = |each: u16| -> io::Result<A::Ptr> {
-            let bytes = each
-                .checked_mul(count)
-                .ok_or_else(|| io::Error::other(format!("{count} channels of {each} bytes")))?;
-            let at = heap
-                .reserve(mem, bytes)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            at.write(mem, &vec![0u8; usize::from(bytes)])
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            Ok(at)
-        };
-        let users = block(user.stride)?;
+        let users = Self::table(mem, heap, user.stride, count)?;
         // Allocated only for an ABI that has the struct. A non-GCV2 host never
         // made this table, and reserving heap for it here would be inventing
         // storage the module has no name for.
         let extra = match extusr_stride::<A>() {
-            Some(each) => Some(block(each)?),
+            Some(each) => Some(Self::table(mem, heap, each, count)?),
             None => None,
         };
-        let accounts = block(usracc.stride)?;
+        let accounts = Self::table(mem, heap, usracc.stride, count)?;
 
         // `MAJORBBS.C:740-743`, which is three statements doing one thing:
         //
@@ -1109,7 +1128,7 @@ impl<A: Abi> Users<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::Wg16;
+    use crate::abi::{Wg16, Wg32};
 
     #[test]
     fn a_user_slot_is_the_forty_one_bytes_the_module_strides_by() {
@@ -1204,6 +1223,50 @@ mod tests {
             users.account(ch(1)).offset - users.account(ch(0)).offset,
             AccountLayout::of::<Wg16>().stride
         );
+    }
+
+    #[test]
+    fn a_per_channel_table_may_exceed_one_segment_under_wg32() {
+        // 128 channels of MajorMUD-NT's 1961-byte VDA is 251,008 bytes. The
+        // vendor's flat `alcblok` (`ALCBLOK.C`, non-`GCDOS`) took that in one
+        // `alczer` with no ceiling; this host answered `mbbs-server --terms
+        // 128` with "128 channels of 1961 bytes" because every table's byte
+        // count was a `u16`.
+        let mut mem = mbbs_machine::m32::Memory::new(4 * 1024 * 1024).expect("arena");
+        let mut heap = crate::Heap::new(crate::Config::default());
+        let terms = Terms::new(128);
+        let mut users: Users<Wg32> =
+            Users::new(&mut mem, &mut heap, terms).expect("128 channels");
+        users
+            .alcvda_mem(&mut mem, &mut heap, 1961)
+            .expect("128 areas of 1961 bytes");
+        let ch = |n| terms.chan(n).expect("one of the 128");
+        let first = users.vda(ch(0)).expect("allocated");
+        let last = users.vda(ch(127)).expect("allocated");
+        assert_eq!(last.0 - first.0, 127 * 1961);
+        // The last slot is memory, not an address past the block.
+        last.write(&mut mem, &[0xa5; 1961]).expect("writable");
+        assert_eq!(
+            users.account(ch(127)).0 - users.account(ch(0)).0,
+            127 * u32::from(AccountLayout::of::<Wg32>().stride)
+        );
+    }
+
+    #[test]
+    fn a_per_channel_table_past_one_segment_is_refused_under_wg16() {
+        // No far pointer addresses across a segment, and the vendor's own
+        // 16-bit `alcblok` split such a table into globs this host does not
+        // build -- so the answer is a refusal naming the table, not a panic
+        // and not a wrapped offset.
+        let mut machine = mbbs_machine::m16::Machine::new().expect("machine");
+        let mut heap = crate::Heap::new(crate::Config::default());
+        let terms = Terms::new(128);
+        let mut users: Users<Wg16> =
+            Users::new(machine.mem_mut(), &mut heap, terms).expect("128 channels");
+        let err = users
+            .alcvda_mem(machine.mem_mut(), &mut heap, 1961)
+            .expect_err("251,008 bytes in one 16-bit segment");
+        assert!(err.to_string().contains("128 channels of 1961 bytes"), "{err}");
     }
 
     #[test]
