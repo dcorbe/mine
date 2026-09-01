@@ -53,18 +53,18 @@ Developed against Linux 6.18.
 ## Status
 
 Early. A handful of 16-bit and 32-bit modules from different vendors boot and
-are playable end to end. The host API is not complete; a module that imports a
-routine this host does not serve stops with the routine named.
+are playable end to end. The host API is not complete: a module that imports a
+routine this host does not serve stops at startup with the routine named.
 
 | area | state |
 |---|---|
-| Module load | 16-bit NE and 32-bit PE. Several modules can boot on one machine, in dependency order. |
-| Telnet | Multiple channels. CP437 to UTF-8 for modern clients, raw CP437/ANSI for period ones. |
-| Full-screen data entry | Line mode and ANSI full-screen forms. |
-| Btrieve | Fixed and variable-length records, duplicate-key chains, v5 and v6 files. Verified against genuine Pervasive Btrieve. |
-| BBS doors | A Unix socket and a relay binary, so a real BBS can present a module as a door. |
-| Scripting | Lua scripts can add commands above a module. |
-| Host API | Partial. Coverage grows module by module. |
+| Module loading | Works for both 16-bit NE and 32-bit PE modules. Add-on modules load alongside the main one. |
+| Terminals | Works. Modern clients get UTF-8; period clients get the original CP437 and ANSI bytes. |
+| Full-screen forms | Works, in both line mode and ANSI full-screen mode. |
+| Btrieve | Works. Modules read and write their data files through a complete record manager. |
+| BBS doors | Works. A real BBS can hang a module as a door through the relay binary. |
+| Scripting | Works. Lua scripts can add commands a module never had. |
+| Host API | Partial. Each new module tends to import something not yet implemented. |
 
 ## Quickstart
 
