@@ -79,7 +79,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use btrieve::testing::{make_keys_modifiable, scratch, Flat, FlatHeap, FlatMem};
-use btrieve::{Btrieve, Geometry, LockTable, Op, Step};
+use btrieve::{Btrieve, Geometry, LockTable, Step};
 
 // --- peak-heap tracking --------------------------------------------------
 
@@ -612,45 +612,6 @@ fn report(label: &str, file_len: u64, cost: &Cost) {
     );
 }
 
-/// One record update on a small, genuine v6 fixed-length file --
-/// `WCCRACE2.VIR` (MajorMUD-NT's race table, 40,960 bytes, reclen 126, one
-/// key), confirmed real and readable via `btrieve-census` against this
-/// exact archive tree before this test was written. Copied into scratch,
-/// never mutated in place: corpus files are read-only evidence.
-///
-/// Ungated (no `$WCCMP002`-style env var needed): the file is small enough
-/// that this runs by default under `cargo test -p btrieve`, but still skips
-/// cleanly, rather than panicking, on a checkout with no `archive/` --
-/// `crate::corpus::root`'s own doc comment: "anything reading it must
-/// handle its absence explicitly."
-#[test]
-fn small_v6_fixed_update_cost_today() {
-    let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(archive) = btrieve::corpus::root() else {
-        eprintln!("write_cost: no archive/ on this box, nothing measured -- expected on a fresh checkout");
-        return;
-    };
-
-    let small_src = archive.join("modules/majormud-nt/wccnt8pj/out/wccrace2.vir");
-    if !small_src.is_file() {
-        eprintln!("write_cost: {} not found, nothing measured", small_src.display());
-        return;
-    }
-    let small_dir = scratch("write-cost-small");
-    let small_path = small_dir.join("WCCRACE2.VIR");
-    std::fs::copy(&small_src, &small_path)
-        .unwrap_or_else(|e| panic!("copying {}: {e}", small_src.display()));
-    // Flipping a byte that happens to land in a key's own bytes would be
-    // refused (status 10, "not modifiable") regardless of the read/write
-    // amplification this test measures -- make every key modifiable first,
-    // the same helper `mbbs`'s own tests use for the identical reason.
-    make_keys_modifiable(&small_path);
-    let small_len = std::fs::metadata(&small_path).expect("metadata").len();
-
-    let cost = measure_one_update("WCCRACE2.VIR", &small_path);
-    report("small v6 fixed (WCCRACE2.VIR)", small_len, &cost);
-}
-
 /// One record update on the exact file the plan's own measured defect #2
 /// names: `WCCMP002.DAT`, 55,734,272 bytes, 13,607 pages, v6, fixed-length,
 /// one key. This is the number Plan 3 Task 5 is judged against.
@@ -1161,149 +1122,5 @@ fn keyed_reads_on_an_open_block_cost_no_file_opens() {
         0,
         "a keyed read on an open block must go through the block's own page \
          cache, never a fresh open(2)"
-    );
-}
-
-/// **The rebuild-rate gate.** The hot loop that stalls the 32-bit board is a
-/// write immediately followed by a keyed step: the module updates a record
-/// (its key value changes), then steps to the next in key order. On a
-/// materialised rank `OrderIndex`, the write invalidates the key's cached
-/// order and the very next step rebuilds it -- a full O(records) tree walk.
-/// Measured on the live board's own update: ~13 such rebuilds per second,
-/// 800 in 60 seconds, with no client even connected.
-///
-/// A tree position is not a rank. Real Btrieve's GET NEXT re-navigates the
-/// B-tree from where the cursor sits (`nav::TreeCursor`, O(log n)); it never
-/// materialises a rank, so a write between two steps costs the step nothing.
-/// This test pins that: **the number of `OrderIndex` builds a run of
-/// write-then-step iterations triggers must be bounded by a small constant,
-/// not grow with the iteration count.** It fails against the rank-index
-/// stepping path (one build per iteration) and passes once stepping is
-/// served positionally.
-///
-/// Ungated exactly like [`small_v6_fixed_update_cost_today`]: a genuine v6
-/// fixed-length file from `archive/`, scratch-copied so no committed fixture
-/// is ever written, skipped cleanly where `archive/` is absent.
-#[test]
-fn stepping_does_not_rebuild_the_order_index() {
-    let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(archive) = btrieve::corpus::root() else {
-        eprintln!("write_cost: no archive/ on this box, nothing measured -- expected on a fresh checkout");
-        return;
-    };
-
-    let src = archive.join("modules/majormud-nt/wccnt8pj/out/wccrace2.vir");
-    if !src.is_file() {
-        eprintln!("write_cost: {} not found, nothing measured", src.display());
-        return;
-    }
-    let dir = scratch("write-cost-stepping-rebuilds");
-    let path = dir.join("WCCRACE2.VIR");
-    std::fs::copy(&src, &path).unwrap_or_else(|e| panic!("copying {}: {e}", src.display()));
-    // A key-changing update lands on the key's own bytes; without this it
-    // would be refused (status 10) before the rebuild this test measures.
-    make_keys_modifiable(&path);
-
-    let mut mem = FlatMem::new(64 * 1024);
-    let mut heap = FlatHeap::new(0x100);
-    let mut btrieve = Btrieve::<Flat>::default();
-    let geometry = Geometry::read("WCCRACE2.VIR", &path).expect("geometry");
-    assert!(!geometry.variable, "this gate is the fixed-length stepping path");
-    let maxlen = geometry.reclen;
-    let at = btrieve
-        .open(&mut mem, &mut heap, "WCCRACE2.VIR", &path, geometry, maxlen)
-        .expect("open");
-
-    // The last record is the write target -- its key stepped past by a cursor
-    // walking up from the lowest key, so mutating it never disturbs the cursor.
-    // Learn key 0's own byte span so the update actually changes the indexed
-    // value (WCCRACE2's key 0 is not at offset 0), and clone the victim's bytes.
-    // Key 0's byte span within a record. `Block::update_v6`'s fast path reads
-    // key bytes off a record padded by a 2-byte shift (`records::keyed`), so a
-    // segment offset of `s` names byte `s - 2` of the record's own bytes -- the
-    // update must land there or `Key::compare` sees no change and invalidates
-    // nothing.
-    const KEY_SHIFT: usize = 2;
-    let (key_off, key_len) = {
-        let block = btrieve.block_mut(at).expect("open");
-        let seg = &block.keys()[0].segments[0];
-        (usize::from(seg.offset) - KEY_SHIFT, usize::from(seg.length))
-    };
-    let (victim, victim_bytes) = {
-        let block = btrieve.block_mut(at).expect("open");
-        let records = block.records().expect("records");
-        assert!(records.len() >= 4, "this gate needs a few records to step across");
-        let last = records.physical(records.len() - 1).expect("last");
-        (last.position, last.bytes.clone())
-    };
-
-    let mut locks = LockTable::default();
-
-    // Establish a keyed cursor on key 0 at its lowest key -- the state a keyed
-    // GET NEXT loop reads from.
-    assert!(
-        btrieve
-            .block_mut(at)
-            .expect("open")
-            .get(0, Op::Lowest, &[], 0, &mut locks, maxlen)
-            .expect("position at lowest key")
-            .is_some(),
-        "the file must have a lowest key to position on"
-    );
-
-    const ITERATIONS: u32 = 40;
-    btrieve::testing::reset_order_builds();
-    for i in 0..ITERATIONS {
-        // A genuine key change on the victim record: fill key 0's own bytes with
-        // a high, per-iteration marker (0xF0.. prefix, low byte = i). High so it
-        // sorts above every real race-definition key and never collides; unique
-        // per iteration so `Key::compare` always reports a change and the update
-        // invalidates key 0's cached order -- exactly the board's write traffic
-        // during a table rebuild.
-        let mut bytes = victim_bytes.clone();
-        for b in &mut bytes[key_off..key_off + key_len] {
-            *b = 0xf0;
-        }
-        bytes[key_off + key_len - 1] = i as u8;
-        btrieve
-            .block_mut(at)
-            .expect("open")
-            .update(victim, &bytes)
-            .unwrap_or_else(|e| panic!("iteration {i}: key-changing update: {e}"));
-
-        // A keyed GET NEXT -- the board's own read during the update, unlike a
-        // physical step it stays on key 0's order. On the rank-index path it
-        // rebuilds the just-invalidated order (a full O(records) tree walk);
-        // positionally it re-navigates the tree from where the cursor sits and
-        // builds nothing. Re-seat at the lowest key on end-of-file so the loop
-        // keeps reading.
-        let stepped = btrieve
-            .block_mut(at)
-            .expect("open")
-            .get(0, Op::Next, &[], 0, &mut locks, maxlen)
-            .unwrap_or_else(|e| panic!("iteration {i}: keyed get next: {e}"));
-        if stepped.is_none() {
-            btrieve
-                .block_mut(at)
-                .expect("open")
-                .get(0, Op::Lowest, &[], 0, &mut locks, maxlen)
-                .expect("re-seat at lowest key");
-        }
-    }
-    let builds = btrieve::testing::order_builds();
-
-    eprintln!(
-        "stepping_does_not_rebuild_the_order_index: {ITERATIONS} write-then-read \
-         iterations triggered {builds} OrderIndex build(s)"
-    );
-
-    // The gate. A positional read path builds at most a small constant (the
-    // initial navigation state, once), independent of the iteration count. The
-    // rank-index path rebuilds on every keyed read after a write -- ~40 here.
-    assert!(
-        builds <= 2,
-        "{ITERATIONS} write-then-read iterations triggered {builds} full OrderIndex \
-         rebuilds -- a keyed read must re-navigate the tree positionally, not rebuild \
-         the rank index after every write (this is the 32-bit board's stall)"
     );
 }

@@ -136,12 +136,11 @@ mod tests {
     use crate::testing::{Flat, FlatHeap, FlatMem, FlatPtr};
     use crate::{Btrieve, Geometry, Version};
 
-    /// Every v6 file this repository's own corpus (plus a handful of named
-    /// fixtures) has -- the same list [`super::super::nav::tests::
+    /// Every committed v6 fixture -- the same list [`super::super::nav::tests::
     /// v6_candidate_paths`] walks, duplicated rather than shared across a
     /// `mod tests` boundary neither file's own privacy already crosses.
     fn v6_candidate_paths() -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = crate::corpus::walk().into_iter().map(|e| e.path).collect();
+        let mut paths: Vec<PathBuf> = Vec::new();
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         for extra in [
             "tests/data/variable/V6DUP.DAT",

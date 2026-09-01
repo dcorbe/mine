@@ -930,14 +930,13 @@ mod tests {
     use crate::testing::{Flat, FlatHeap, FlatMem, FlatPtr};
     use crate::{Btrieve, Geometry, Version};
 
-    /// Every v6 file worth differentially testing: whatever `corpus::walk`
-    /// finds under `archive/` (absent in a fresh checkout) plus a fixed list
-    /// of small, committed fixtures this repository keeps under version
-    /// control -- present regardless, and the only guaranteed source of a
-    /// duplicate-permitting key with more than one record sharing a value
-    /// (`DUPKEY30.DAT`'s ten groups of three, `pages.rs`'s own module doc).
+    /// Every v6 file worth differentially testing: the small, committed
+    /// fixtures this repository keeps under version control, the only
+    /// guaranteed source of a duplicate-permitting key with more than one
+    /// record sharing a value (`DUPKEY30.DAT`'s ten groups of three,
+    /// `pages.rs`'s own module doc).
     fn v6_candidate_paths() -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = crate::corpus::walk().into_iter().map(|e| e.path).collect();
+        let mut paths: Vec<PathBuf> = Vec::new();
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         for extra in [
             "tests/data/variable/V6DUP.DAT",

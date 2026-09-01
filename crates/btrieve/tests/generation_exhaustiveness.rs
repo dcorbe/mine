@@ -88,7 +88,6 @@ fn scoped_files() -> Vec<PathBuf> {
         src.join("read.rs"),
         src.join("emit.rs"),
         src.join("canvas.rs"),
-        src.join("corpus.rs"),
     ];
     let format_dir = src.join("format");
     let mut format_files: Vec<PathBuf> = fs::read_dir(&format_dir)

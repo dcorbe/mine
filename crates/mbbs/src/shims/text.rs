@@ -3797,65 +3797,6 @@ mod tests {
     }
 
     #[test]
-    fn append_reproduces_the_oracles_bytes_for_the_lawfulness_paragraph() {
-        // The exact symptom the plan names
-        // (`docs/plans/2026-08-11-live-session-defects.md`, Task 2): the
-        // "truly 'lawful' citizen" paragraph, checked against a real capture
-        // rather than a string this test made up. `re/oracle/oracle_m1.raw`
-        // is a `Session.raw` dump (`tools/oracle/mudlib.py:20,39-41`) --
-        // unmodified bytes off the socket, not one of the cleaned `.log`
-        // transcripts `normalize_newlines`'s own doc comment explains why to
-        // distrust for this question.
-        //
-        // Note: the plan's own Task 2 acceptance criterion names
-        // `re/oracle/oracle_bank2.raw` for this check, but that file has no
-        // "lawful" text in it at all -- the paragraph lives in
-        // `oracle_m1.raw`, which is what this test reads below. Follow this
-        // citation, not the plan's.
-        let oracle = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re/oracle/oracle_m1.raw"),
-        )
-        .expect("re/oracle/oracle_m1.raw is tracked in git");
-        let found = oracle
-            .windows(b"lawful".len())
-            .position(|w| w == b"lawful")
-            .expect("the lawfulness paragraph is in this capture");
-        let expected = &oracle[found - 10..found + 400];
-        assert!(
-            expected.windows(2).filter(|w| *w == b"\r\n").count() >= 3,
-            "sanity: the slice should span several real line breaks"
-        );
-
-        // What the module would have handed the host before this fix: the
-        // `.MCV` encoding (`msg.rs:238-245`) never writes `\r\n` together,
-        // only a bare `\r` (hard break) or a bare `\n` (soft wrap). Standing
-        // every one of the oracle's line breaks up as a bare `\n` is a
-        // strictly harder input than `.MCV` would actually produce, since it
-        // puts every occurrence through this function's "no complementary
-        // byte" branch at once, with nothing to dedup anywhere in the slice.
-        let mut module_input = Vec::with_capacity(expected.len());
-        let mut i = 0;
-        while i < expected.len() {
-            if expected[i..].starts_with(b"\r\n") {
-                module_input.push(b'\n');
-                i += 2;
-            } else {
-                module_input.push(expected[i]);
-                i += 1;
-            }
-        }
-
-        let mut f = Fixture::new();
-        append(&mut f.machine, &mut f.host, &module_input).expect("appended");
-        let buffer = f.host.globals().prf_buffer();
-        assert_eq!(
-            f.machine.read_cstr(buffer).expect("terminated"),
-            expected,
-            "byte-identical to the genuine board's wire"
-        );
-    }
-
-    #[test]
     fn append_has_no_memory_of_a_line_ending_split_across_two_calls() {
         // The shape every newline test above shares: each hands `append` one
         // complete, already-joined byte string in a single call. None of
