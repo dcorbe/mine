@@ -12,34 +12,6 @@ docs/mirrors/
 mudbins/
 tmp/
 
-# Period MAJORBBS.EXE host binaries, extracted from archive/ for disassembly.
-# The 16-bit host is an NE *executable* that exports the API modules import --
-# there is no MAJORBBS.DLL -- so this is the primary source for every routine
-# whose C never survived. Re-extractable; see docs/MIRRORS.md.
-re/hosts/
-
-# Reverse-engineering derived artifacts (regenerable / derivative of the binary)
-re/ghidra_proj/
-re/wg_nt_ghidra/
-re/wccmmpls_ghidra/
-re/wg_nt_ref/
-# Worldgroup 3.3 host source, 4,868 files / 73 MB. Re-extract with
-# `unzip archive/galacticomm/source33.zip -d re/wg33src` -- a plain zip, unlike
-# the activation-encrypted developer kits in archive/galacticomm/wg32sdk.zip.
-re/wg33src/
-# Pervasive Btrieve 6.15 engine: staged binaries, Ghidra project and the 1.6 MB
-# of decompiled C. Regenerable -- re-run tools/btrieve-oracle/ and the
-# analyzeHeadless invocation recorded in docs/plans/2026-08-08-btrieve-real-oracle.md.
-re/btrieve_ghidra/
-re/exports/*
-!re/exports/gang_house_description_files.txt
-re/__pycache__/
-re/mmud_wgnt.sqlite
-
-# Third-party reference repositories (vendored, not ours)
-re/Nightmare-Redux/
-re/MMUD-Explorer/
-
 # Recovered Galacticomm archive: vendor SDKs, host binaries, scanned manuals,
 # and cloned third-party module/tooling repos. Hundreds of MB, all of it
 # re-downloadable from software.bbsdocumentary.com and GitHub, and none of it
@@ -64,30 +36,6 @@ state.sqlite-wal
 __pycache__/
 wccmdact.ini
 
-
-
-
-
-
-
-# Tele-Arena 5.6d source, extracted from Ta56dSrc.ZIP in archive/ for reference
-# (9,104 lines across TSGARN-2..5.C). Third-party source read as an oracle for
-# how a REAL module calls the host API -- prfmlt takes a message number, pmlt
-# takes a format string, and so on -- which headers alone do not settle. Not
-# ours to commit; the zip it came from is already in archive/.
-re/tasrc/
-
-# `unzip -j archive/galacticomm/mbbs511s.zip 'BTVSTF.*' 'ECBTVSTF.C' -d re/btvsrc`
-# MajorBBS 5.11's Btrieve wrapper layer. Note it does NOT contain the twelve
-# wrappers Track B adds -- see that plan's Task 1. The oracle for those is
-# PLBTVSTF.C, which lives in archive/ and needs no extraction.
-re/btvsrc/
-
-# Evicted from history 2026-09-01: not ours to redistribute. Kept on disk for
-# the ignored oracle tests; a copy lives in ~/bbs-backups/evicted-2026-09-01.
-re/oracle/
-re/hse_files/
-re/wg/
 .scratch/
 tools/oracle/
 
@@ -101,3 +49,6 @@ tools/oracle/
 .worktreeignore
 .superpowers/
 .worktrees/
+
+# Reverse-engineering workspace: vendor extracts, disassembly, notes. Never tracked.
+re/
