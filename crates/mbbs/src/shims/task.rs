@@ -3,10 +3,8 @@
 //! A *task* is a system-wide routine the host runs once per system cycle,
 //! registered by a module at init. `GCOMM.H:493`:
 //!
-//!
 //! **Why this matters, and why it went missing.** `MAJORBBS.C:323` is the
 //! whole story in one line:
-//!
 //!
 //! The `syscyc` vector's *initial value is the task runner*. A module that
 //! chains onto that vector saves the previous value and calls it at its own

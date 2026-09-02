@@ -567,7 +567,6 @@ pub fn fsdnan<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// (Worldgroup, generation wg1) is the whole body -- the same tree, not a
 /// second guess from a different one:
 ///
-///
 /// Two things this settles beyond doubt, not just beyond a header comment:
 ///
 /// - **Zero-based.** `0 <= fldi && fldi < fsdscb->numfld` is the bound check
@@ -697,7 +696,6 @@ fn fsdfxt_answer<A: Abi>(mem: &A::Mem, host: &Host<A>, field: u16) -> Result<Vec
 ///
 /// `archive/galacticomm/extract/wg1/GALDSRC/SRC/FSDBBS.C:242-251` is the
 /// whole of it:
-///
 ///
 /// `isripu()` asks whether the connected terminal speaks RIPscrip, the
 /// graphical BBS protocol -- and this host has no notion of a RIP terminal
@@ -883,7 +881,6 @@ pub fn fsdord<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `VOID fsdouc(CHAR c)` -- `FSDBBS.C:393-400` -- display one character of a
 /// full-screen form.
 ///
-///
 /// **The `prf` branch is the live one**, and unlike the usual version of this
 /// claim it is checkable rather than assumed. `qikout` is `CHAR qikout=0`
 /// (`FSDBBS.C:50`) and the *only* code in the vendor that ever sets it is
@@ -1043,7 +1040,6 @@ fn ascii_template<A: Abi>(
 
 /// `void fsdbkg(char *templt)` -- paint the full-screen background.
 /// `FSDBBS.C:185-194`.
-///
 ///
 /// Module-callable, and the module does call it: `fsdbkg(fsdrft())`
 /// (`FSDBBS.C:87`), before `fsdego`. Nothing inside the FSD calls it --
@@ -1236,7 +1232,6 @@ const ENTERING: u16 = 1;
 
 /// The template text an FSD form is compiled and driven against, for one
 /// `amode`. `FSDBBS.C:137`.
-///
 ///
 /// Every place this crate needs the template goes through here, and that is
 /// the point rather than tidiness: a field's `tmpoff` is an offset *into this
@@ -1708,7 +1703,6 @@ pub(crate) fn fsdprc<A: Abi>(
 /// (`MAJORBBS.C:1791-1795`, `"power" outprf() - cut through input`), which
 /// says outright what it stands in for:
 ///
-///
 /// `powprf` is `outprf` plus one more call, `btucli` -- flushing input --
 /// which is exactly the "power" the name claims and the reason this is not
 /// simply `powprf` without it. Transmit whatever `prf`/`append` have queued
@@ -2165,7 +2159,6 @@ pub(crate) fn fsd_cycle<A: Abi>(
 ///
 /// `fsdsts`'s real first line is not just "call `fsdqoe`" -- it is
 /// `FSDBBS.C:263-267` in full:
-///
 ///
 /// and `fsdqoe` is reached a completely different way in the original: from
 /// `fsdchi`'s own `c == -1` sentinel (`FSDBBS.C:345-347`), the interrupt-level

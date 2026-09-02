@@ -42,7 +42,6 @@ use crate::gsbl::Gsbl;
 ///
 /// `ACCOUNT.C:126`:
 ///
-///
 /// `uablok` is never null in this host -- the block is allocated in
 /// [`Host::new`] and never released -- so the null return is unreachable. An
 /// out-of-range `unum` is not. `ptrblok` had no bound and would have handed
@@ -116,7 +115,6 @@ pub fn curusr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3368`:
 ///
-///
 /// **Returns `char *margv[0]`, not `void`** -- a shim answering `Ret::Void`
 /// here would hand the module a null pointer it dereferences unguarded.
 ///
@@ -159,7 +157,6 @@ pub fn getin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 /// `int haskey(char *lock)` -- does the current user hold the key to this lock?
 ///
 /// `LOCKNKEY.C:254`, which is one line:
-///
 ///
 /// The current user is taken from `usrnum` rather than from anything this host
 /// remembers, because that is what the original read: a module that moved
@@ -226,7 +223,6 @@ pub fn haskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `LOCKNKEY.H:193-194` (wg33src) declares it; `LOCKNKEY.C:239-243` (wg1) is
 /// the whole body:
-///
 ///
 /// `re/ne_arity.py 335 <WCCMMPLS.DLL>` measures 18/18 call sites cleaning one
 /// word, matching this one-`int` prototype -- `335` is `_HASMKEY`'s ordinal in
@@ -429,7 +425,6 @@ fn scan_for<A: Abi>(
 ///
 /// `MAJORBBS.C:3730`:
 ///
-///
 /// The `othusn`/`othusp`/`othuap` side effect is [`scan_for`]'s -- see its own
 /// doc comment for what a caller sees on both a match and a miss.
 ///
@@ -474,7 +469,6 @@ const SUPIPG: u16 = 3;
 /// past signup, not merely signing up)?
 ///
 /// `MAJORBBS.C:3689`:
-///
 ///
 /// Same `othusn`/`othusp`/`othuap` side effect as [`instat`]; see
 /// [`scan_for`]. `invis` (`TRUE` skips the `INVISB` gate outright) is
@@ -538,7 +532,6 @@ pub(crate) fn onsysn_for<A: Abi>(
 /// `LOCKNKEY.H:165` (recovered with `re/wgproto.py`; the declaration is
 /// Galacticomm's K&R multi-line style, so a single-line grep does not find
 /// it). `LOCKNKEY.C:216-231`:
-///
 ///
 /// **Fully implemented, by exposing what this host already had.** This is the
 /// general form of [`haskey`], and [`crate::KeySet::evaluate`] is already that
@@ -606,7 +599,6 @@ pub fn gen_haskey_shim<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result
 /// `INT uhskey(const CHAR *uid, const CHAR *lock)` -- `LOCKNKEY.H:197`.
 /// `LOCKNKEY.C:317-322`:
 ///
-///
 /// **Fully implemented as the branch it is**, and its two arms are not equally
 /// answerable here. Online, it is [`othkey`] -- and `onsysn`'s own scan is
 /// what leaves `othusn` pointing at the channel it found, which is exactly
@@ -673,7 +665,6 @@ fn othkey_for<A: Abi>(
 /// only a *comment*, which is why the plan names that tool as the authority).
 /// `LOCKNKEY.C:339-371`:
 ///
-///
 /// **The empty lock is answered; anything else refuses.**
 ///
 /// `lock[0] == '\0'` returns 1 before the routine touches a disk, so that
@@ -736,7 +727,6 @@ fn uidkey_for<A: Abi>(
 
 /// `VOID nkyrec(const CHAR *uid)` -- `LOCKNKEY.H:149`. `LOCKNKEY.C:117-132`:
 ///
-///
 /// **Refuses.** Every line of the body is a write to the keys Btrieve file,
 /// and this host has no such file: keys are a per-channel
 /// [`crate::KeySet`] built at connect and thrown away at disconnect, with
@@ -772,7 +762,6 @@ pub fn nkyrec<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 /// `INT keynam(const CHAR *keyname)` -- `LOCKNKEY.H:250`. `LOCKNKEY.C:594`
 /// is one line into `valkorl` (`:607-636`), which is `static` and so is
 /// reproduced here rather than registered:
-///
 ///
 /// **Fully implemented.** A key name is 3 to `KEYSIZ-1` = 15 characters of
 /// [`crate::strings::is_text_var_char`], plus `#` and `=` which the switch
@@ -836,7 +825,6 @@ pub fn istxvc<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 }
 
 /// `INT usridx(INT chan)` -- `MAJORBBS.H:752`. `MAJORBBS.C:1587-1598`:
-///
 ///
 /// **Fully implemented.** The inverse of the `channel` table: `channel[unum]`
 /// is the hardware channel number a user number sits on, and this searches it
@@ -921,7 +909,6 @@ pub fn rstchn<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
 
 /// `VOID clrxrf(VOID)` -- `MAJORBBS.H:793`. `MAJORBBS.C:3437-3443`:
 ///
-///
 /// **Does nothing, and that is the vendor's own `numxrf == 0` branch rather
 /// than a stub.**
 ///
@@ -929,7 +916,6 @@ pub fn rstchn<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
 /// carry, read at `MAJORBBS.C:992` as `numopt(NUMXRF,0,MAXXRF)` -- **minimum
 /// zero** -- and the very next line only allocates `xrfpos` at all when it
 /// came back non-zero:
-///
 ///
 /// So a board that did not configure the cross-reference had `numxrf == 0`
 /// and `xrfpos == NULL`, and this routine did nothing there either. This host
@@ -994,7 +980,6 @@ pub fn hdluid<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 /// `INT nliniu(VOID)` -- how many of this host's channels are in use?
 /// `ACCOUNT.C:1086-1097`:
 ///
-///
 /// **Fully implemented**, and it answers `0` today for every channel,
 /// including connected ones.
 ///
@@ -1029,7 +1014,6 @@ pub fn nliniu<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// hold this key?
 ///
 /// `LOCKNKEY.C:332`, one line:
-///
 ///
 /// [`haskey`]'s own doc comment already explains `gen_haskey`/`low_haskey` --
 /// [`crate::KeySet::evaluate`] now -- and the `usrcls == BBSPRV` fallback for
@@ -1074,7 +1058,6 @@ fn null_ptr<A: Abi>() -> A::Ptr {
 /// C's.
 ///
 /// `GCOMM.H:360` / `re/wg33src/SRC/api/gcommlib/MDFGETS.C`:
-///
 ///
 /// Three ways this differs from plain `fgets`
 /// ([`crate::shims::stream::fgets`]), all in the C source above and all
@@ -1183,7 +1166,6 @@ const CYCLE: i16 = 240;
 ///
 /// `MAJORBBS.C:5202`:
 ///
-///
 /// # The `default:` branch cannot fire on this host, and that is checked here rather than assumed
 ///
 /// `module00` is the built-in "Menuing System" module -- `MAJORBBS.C:39` puts
@@ -1237,7 +1219,6 @@ pub fn dfsthn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `void begin_polling(int unum, void (*rouptr)())` -- start calling `rouptr`
 /// for channel `unum` every time the host comes round. `MAJORBBS.C:1183`:
-///
 ///
 /// The `inpolr` half of that guard is vendor-faithful -- `MAJORBBS.C`'s own
 /// `polrou == NULL && unum != inpolr` -- and stops a status being queued for a
@@ -1346,7 +1327,6 @@ pub fn stop_polling<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
 /// `struct usrmnu *mnuoff(INT unum)` -- `MENUING.C:867-873` -- a pointer to
 /// one user's menuing state.
 ///
-///
 /// **Refused, because `muusrs` does not exist here and cannot be invented.**
 /// It is `static VOID *muusrs` (`MENUING.C:32`), the menuing subsystem's own
 /// per-user block array, allocated by a subsystem this host does not run.
@@ -1426,7 +1406,6 @@ const BBSPRV: u16 = 2;
 /// secret-character-echo session `echsec` started.
 ///
 /// `MAJORBBS.C:4548`:
-///
 ///
 /// (`echon()`, `MAJORBBS.C:4544`, is `echonu(usrnum)` against the current
 /// channel; it is not itself imported, only `echonu` and `echsec` are.)
@@ -1533,7 +1512,6 @@ fn turn_echo_on<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, chan: crate::Cha
 ///
 /// `MAJORBBS.C:4541`:
 ///
-///
 /// One line in the original, and this shim is not much more: [`echonu`]'s
 /// own doc comment already covers everything the body does (why `echtyp[
 /// grpnum[usrnum]]` is always `1` here, where `wid` lives for a GCV2 ABI,
@@ -1566,7 +1544,6 @@ pub fn echon<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 /// prompt is built on.
 ///
 /// `MAJORBBS.C:4558`:
-///
 ///
 /// Like [`echon`], this takes no channel argument -- `usrnum` names it, read
 /// the same way [`getin`]/[`haskey`]/`echon` already do.
@@ -1821,7 +1798,6 @@ pub fn swtcls<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 ///
 /// `archive/galacticomm/extract/wg1/GALDSRC/SRC/MAJORBBS.C:4304-4309` (wg1):
 ///
-///
 /// [`crate::users::Users::extra`] already is this: the same `nterms`-slots
 /// `extusr` table [`curusr`]'s own doc comment names as one of the two
 /// globals it deliberately does not set (`WCCMMUD.DLL` addresses neither
@@ -1873,7 +1849,6 @@ pub fn extoff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `re/wg33src/SRC/server/wgserver/MAJORBBS.C:3996-4003` (Worldgroup 3.3,
 /// 1997):
-///
 ///
 /// Two halves, both gated on machinery this host does not have, for two
 /// different reasons.
@@ -1928,7 +1903,6 @@ pub fn paccit<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
 ///
 /// `re/wg33src/INC/GCSP.H:536` declares it; `re/wg33src/INC/GCSPSRV.H:124-125`
 /// gives its only two callers, both macros:
-///
 ///
 /// # No surviving body -- semantics from the macros and their call sites, not a guess
 ///

@@ -17,7 +17,6 @@
 //! deliberately wg1 and not wg20, whose line numbers differ and would cite
 //! the wrong function -- declared `MAJORBBS.H:727`:
 //!
-//!
 //! # Where the one call site actually leads
 //!
 //! The plan that scheduled this task worried about a specific shape --
@@ -239,7 +238,6 @@ pub fn explode<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
 /// the local console screen directly.
 ///
 /// `re/wg33src/SRC/api/gcommlib/INISCN.C:18-40` (Worldgroup 3.3, 1997):
-///
 ///
 /// # What this host reproduces, and why
 ///

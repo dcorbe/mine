@@ -9,7 +9,6 @@
 //! there and a wg20 citation would silently point at the wrong line)
 //! declares the whole family together:
 //!
-//!
 //! It is Worldgroup's answer to serving more than one language from one
 //! module: a *pool* of print buffers, one per active language, picked by
 //! `mltflg`/`linuse`, so `prfmlt`/`pmlt` format into whichever buffer the
@@ -59,7 +58,6 @@
 //! the body. The body survives in
 //! `archive/galacticomm/extract/wg1/GALDSRC/SRC/MAJORBBS.C:4517-4522`:
 //!
-//!
 //! `rawmsg(int msgnum)` (`GCOMM.H:265`, in the "MSGUTL.C prototypes" block
 //! next to `opnmsg`/`clsmsg`) is the message-block text lookup -- the same
 //! job [`crate::shims::msg::message_mem`] already does for `prfmsg`/`stgopt`.
@@ -67,7 +65,6 @@
 //! `MENUING.C:1134-1155`) walks the raw text in place, expanding any
 //! embedded text-variable marker (byte value `1`, `SOH`) via `grbtxv`, and
 //! returns the same buffer it was given:
-//!
 //!
 //! `mxmssz` (`GCOMM.H:270`) sizes the one shared buffer `rawmsg` reads
 //! messages into -- the real host's `getmsg` mutates and returns *that*
@@ -108,7 +105,6 @@
 //! # `othuap` -- a datum, not a routine, and not implemented in this file
 //!
 //! `USRACC.H:73-76` (`archive/galacticomm/extract/wg1/GALDSRC/SRC/USRACC.H`):
-//!
 //!
 //! One `extern` statement, three declarators -- and only the first two carry
 //! their own `*`. `acctmp` has none, so it is a plain `struct usracc` value

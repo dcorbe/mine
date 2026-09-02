@@ -50,7 +50,6 @@ use crate::gsbl::Gsbl;
 
 /// `void injacr(void)` -- `MAJORBBS.C:2559-2567`:
 ///
-///
 /// **Implemented as an approximation, not a synchronous re-entry** -- see
 /// this file's module doc comment for why a shim cannot call `hdlcri`
 /// (which is what `hdlinp` ultimately reaches) at all, only defer it. The
@@ -117,7 +116,6 @@ pub fn injacr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `void hdlinp(void)` -- `MAJORBBS.C:2657-2664`:
 ///
-///
 /// **Not implementable with a faithful approximation -- implemented as a
 /// documented no-op.** This file's module doc comment covers why no shim
 /// can reach `hdlcri` at all; [`injacr`]'s own doc comment covers why
@@ -125,7 +123,6 @@ pub fn injacr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// that routine*. Neither escape applies here, for reasons specific to how
 /// the wg1 tree actually calls `hdlinp` directly (as opposed to through
 /// `injacr`):
-///
 ///
 /// (`EMULATE.C:388-395`'s `entcht` -- "enter sysop chat mode now" -- is the
 /// same five lines verbatim.) Both real callers:

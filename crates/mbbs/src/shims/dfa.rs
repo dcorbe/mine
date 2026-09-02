@@ -808,7 +808,6 @@ pub fn dfaAcqAbsLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<a
 ///
 /// `DFAAPI.C:459-470`:
 ///
-///
 /// A two-line wrapper: [`dfa_acq_abs`] is the whole body, and this refuses
 /// when it answers `false` instead of returning it -- the same `gabbtvl`
 /// relationship to `aabbtv` has, restated for a family whose worker refuses
@@ -1034,7 +1033,6 @@ pub fn dfaUpdateDup<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
 ///
 /// `DFAAPI.C:645-652`:
 ///
-///
 /// No arguments -- the record is whichever one the dfa file is positioned
 /// on, exactly [`btv::delbtv`]'s own shape, except this host actually
 /// writes: [`crate::btrieve::Block::delete`] exists in the engine already
@@ -1184,7 +1182,6 @@ pub fn dfaRecLen<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
 ///
 /// `DFAAPI.C:810-818`:
 ///
-///
 /// The wire reply this writes is [`crate::btrieve::Block::stat`]'s own
 /// [`crate::btrieve::Stat::wire`] -- measured against genuine Pervasive
 /// Btrieve 6.15 (`crate::btrieve::stat`'s own module doc comment,
@@ -1232,7 +1229,6 @@ pub fn dfaStat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// `VOID dfaUnlock(LONG abspos, SHORT keynum)` -- release a lock.
 ///
 /// `DFAAPI.C:836-850`:
-///
 ///
 /// `DFAAPI.H:211-214`'s four macros produce three distinct `keynum`s:
 /// `dfaUnlockOne()` (`0`: release the single lock this session holds at the
@@ -1606,7 +1602,6 @@ fn decode_create_buffer(bytes: &[u8]) -> Result<crate::btrieve::FileSpec, ShimEr
 /// # Reading `struct dfaKeySpec`/`struct dfaSegSpec` out of module memory
 ///
 /// `DFAAPI.H:60-92`:
-///
 ///
 /// Every `size_t`/`INT`/pointer field is read at `A`'s own width
 /// ([`Abi::INT_WIDTH`]/[`Abi::PTR_WIDTH`]) -- realistically always `Wg32`,

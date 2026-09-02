@@ -7317,7 +7317,6 @@ impl<M: Mem> Btrieve<M> {
     ///
     /// `PLBTVSTF.C:227`, and every word of it is load-bearing:
     ///
-    ///
     /// A **shifting** stack ten deep, not an indexed one. So an eleventh nested
     /// `setbtv` does not overflow -- it silently drops the *oldest* entry, and
     /// the module never finds out. That is reproduced here rather than refused,
@@ -7347,7 +7346,6 @@ impl<M: Mem> Btrieve<M> {
     /// What was current before the last `setbtv`, as `rstbtv` restores it.
     ///
     /// `PLBTVSTF.C:236`:
-    ///
     ///
     /// **An empty stack is not an error.** It restores `bbstk[0]`, which starts
     /// null, and every routine in `PLBTVSTF.C` opens by checking `bb == NULL`
@@ -7463,7 +7461,6 @@ impl<M: Mem> Btrieve<M> {
     /// `dfaSetBlk` -- `DFAAPI.C:186-192`, quoted in full because the one
     /// line that matters is easy to misread:
     ///
-    ///
     /// # Not [`Self::set`], and not an oversight
     ///
     /// `setbtv`'s equivalent line is `*bbstk=bb;` -- it reads `bb`'s value
@@ -7511,7 +7508,6 @@ impl<M: Mem> Btrieve<M> {
 
     /// `dfaRstBlk` -- `DFAAPI.C:194-199`, and this one *is* the same shape
     /// as [`Self::restore`]:
-    ///
     ///
     /// An empty stack is not an error, for the same reason [`Self::restore`]'s
     /// is not: `dfastk` starts as ten null pointers, and every `dfa*`
@@ -7867,7 +7863,6 @@ impl<M: Mem> Btrieve<M> {
     }
 
     /// Close `at`, as everything in `PLBTVSTF.C:632` *after* `bb=bbp` does.
-    ///
     ///
     /// `bb=bbp` is `mbbs`'s `shims::btrieve::clsbtv`'s
     /// job, not this one's -- `bb` is a module global this type does not
@@ -8286,7 +8281,6 @@ mod tests {
     /// `DFAAPI.H:119-129`, the `GCWINNT` branch -- the layout MajorMUD-NT is
     /// compiled against, and the one this host got wrong until the boot
     /// described below.
-    ///
     ///
     /// `reclen` is `USHORT`, so a 32-bit compiler pads two bytes before
     /// `key` to put the pointer back on a four-byte boundary. **Every offset
@@ -9858,80 +9852,6 @@ mod tests {
         for position in [first, second, third] {
             assert!(reread.find_physical(position).is_some());
         }
-    }
-
-    /// I2: variable-length files must refuse `insert`, not truncate into it.
-    /// `normalized` (below) exists for the fixed-length case -- see
-    /// [`insert_normalizes_to_the_files_own_reclen_not_the_callers_buffer`] --
-    /// where `reclen` really is every record's length and padding or cutting
-    /// to it is correct. On a variable-length file `reclen` is not that; it
-    /// is the same number `Block::update` already refuses to write over for
-    /// exactly this reason (see its doc comment). Before this fix,
-    /// `dinsbtv` on `WCCTEXT.DAT` would silently cut a 2,022-byte buffer down
-    /// to a 22-byte `reclen` and answer 1, success -- the next task writes
-    /// `WCCTEXT`, and that is not a plausible answer to give it.
-    /// A key's index root is the low **24** bits of its root field, not the
-    /// low 31.
-    ///
-    /// `WGSGEN2.VIR` is the file that found this: genuine Worldgroup's own
-    /// generic user database, two keys, and the second one's root reads
-    /// `0x81000003`. Masking with `0x7fffffff` leaves the key number in the
-    /// top byte and turns logical page 3 into 16,777,219, which
-    /// `v6::Map::relocate` then refuses as not fitting a `u16` -- the error
-    /// that stopped MajorMUD's boot once duplicate keys worked.
-    ///
-    /// **A single-key file cannot catch this**, because its only root has a
-    /// top byte of exactly `0x80` and the two masks agree. Every other
-    /// fixture here is single-key, which is why this test needs a file of its
-    /// own rather than an assertion added to an existing one.
-    #[test]
-    fn a_keys_root_is_its_low_twenty_four_bits_even_on_a_second_key() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/variable/WGSGEN2.VIR");
-        let geometry = Geometry::read("WGSGEN2.VIR", &path).expect("a genuine v6 file");
-        assert_eq!(geometry.keys, 2, "the point of this fixture is its second key");
-
-        let whole = std::fs::read(&path).expect("the file reads");
-        let page = usize::from(geometry.page);
-        let generation = |at: usize| u16::from_le_bytes([whole[at + 4], whole[at + 5]]);
-        let live = if generation(0) > generation(page) { 0 } else { page };
-        let fcr = &whole[live..live + FCR];
-        let tables = acs_tables(&path, &geometry, fcr).expect("its collating tables load");
-        let keys = keys::parse("WGSGEN2.VIR", fcr, geometry.keys, &tables).expect("its keys parse");
-
-        let root_of = |key: &Key| {
-            let at = pages::fcr::KEYS
-                + usize::from(key.definition) * pages::fcr::KEY_WIDTH
-                + pages::fcr::KEY_ROOT;
-            pages::long(&fcr[at..at + 4])
-        };
-
-        let first = root_of(&keys[0]);
-        let second = root_of(&keys[1]);
-        assert_eq!(first, 0x8000_0002, "key 0's root, as the vendor shipped it");
-        assert_eq!(second, 0x8100_0003, "key 1's root carries its own number too");
-
-        // Both must resolve to a page the file actually has.
-        let map = v6::Map::read(&mut v6::Store::from_bytes(&whole, geometry.page).expect("test fixture"), geometry.page).expect("its allocation table reads");
-        for (key, raw) in [(&keys[0], first), (&keys[1], second)] {
-            let logical = raw & pages::fcr::ROOT_PAGE;
-            assert!(
-                logical < geometry.pages,
-                "key {}: root {raw:#010x} masks to logical {logical}, and the file has \
-                 {} pages",
-                key.number,
-                geometry.pages
-            );
-            assert!(
-                map.physical(logical).is_some(),
-                "key {}: logical {logical} is claimed in the allocation table",
-                key.number
-            );
-        }
-
-        // The mask this replaced agreed on the first key and not the second.
-        assert_eq!(first & 0x7fff_ffff, first & pages::fcr::ROOT_PAGE);
-        assert_ne!(second & 0x7fff_ffff, second & pages::fcr::ROOT_PAGE);
     }
 
     /// A `Block` over a real file, with the geometry and keys the file itself
@@ -11981,173 +11901,6 @@ mod tests {
                     key.number
                 );
             }
-        }
-    }
-
-    /// Key **1**'s index pages are tagged `0x8100`, not key 0's `0x8000`.
-    ///
-    /// A v6 index page's type tag carries the key's own number in its high
-    /// byte -- `0x8000` for key 0, `0x8100` for key 1 -- exactly as the file
-    /// control record's `KEY_ROOT` field does
-    /// ([`pages::fcr::ROOT_PAGE`]'s doc comment). Measured against genuine
-    /// Btrieve 6.15 (`crtprobe.exe`, 2026-08-17): a two-key v6 file built and
-    /// filled with 120 records by the engine gives key 1 a root page opening
-    /// `00 81`, with every child pointer in it reading `0x81......`, against
-    /// key 0's `00 80` and `0x80......`.
-    ///
-    /// `WGSGEN2.VIR` is the same shape and says the same thing before anything
-    /// has been written to it: key 0's root is logical 2 on a page tagged
-    /// `0x8000`, key 1's is logical 3 on a page tagged `0x8100`.
-    ///
-    /// This host wrote `0x8000` for both. The mistake survived because
-    /// [`v6::Map::relocate`] rewrites only the page-number half of an
-    /// allocation-table entry and leaves the marker untouched, so the table
-    /// went on saying `0x8100` while the page it pointed at said `0x8000` --
-    /// a disagreement no reader in this crate consults and every one of its
-    /// tests was blind to.
-    #[test]
-    fn each_keys_index_pages_are_tagged_with_that_keys_own_number() {
-        let dir = crate::testing::scratch("wgsgen2-index-page-tags");
-        let path = dir.join("WGSGEN2.DAT");
-        std::fs::copy(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/variable/WGSGEN2.VIR"),
-            &path,
-        )
-        .expect("the virgin fixture copies into a scratch directory");
-
-        let mut block = block_from_file(path.clone(), "WGSGEN2.DAT");
-        let reclen = usize::from(block.geometry.reclen);
-        let mut record = vec![0u8; reclen];
-        record[..4].copy_from_slice(&1u32.to_le_bytes());
-        record.extend_from_slice(&[0xa5u8; 7]);
-        block.insert(&record).expect("one record goes in");
-
-        // Read the roots back off the file exactly as `v6_reindex` found them.
-        let whole = std::fs::read(&path).expect("the file reads");
-        let page = usize::from(block.geometry.page);
-        let mut store = v6::Store::from_bytes(&whole, block.geometry.page).expect("test fixture");
-        let live = block.v6_live_fcr(&mut store).expect("a live control record");
-        let map = v6::Map::read(&mut store, block.geometry.page).expect("resolves");
-
-        for key in &block.keys {
-            let definition =
-                pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
-            let raw = pages::long(&live[definition..definition + 4]);
-            let logical = raw & pages::fcr::ROOT_PAGE;
-            let physical = map.physical(logical).expect("the root is claimed") as usize;
-            let tag = u16::from_le_bytes([whole[physical * page], whole[physical * page + 1]]);
-
-            let want = 0x8000u16 | (key.number << 8);
-            assert_eq!(
-                tag, want,
-                "key {}'s index root (logical {logical}, physical {physical}) is tagged \
-                 {tag:#06x}, and this key's pages are {want:#06x}",
-                key.number
-            );
-            assert_eq!(
-                (raw >> 24) as u16,
-                0x80 | key.number,
-                "and the control record's own root field agrees"
-            );
-        }
-    }
-
-    /// The wall MajorMUD-NT's boot used to hit: three successive
-    /// variable-length inserts into `WGSGEN2.DAT` left the header's record
-    /// count and the page walk disagreeing.
-    ///
-    /// ```text
-    /// WGSERVER.EXE.dfaacqlock refused: WGSGEN2.DAT: the header says 3
-    /// records and walking the pages found 2
-    /// ```
-    ///
-    /// The module inserts one demo-clock record per boot and re-reads the
-    /// file afterwards, so this was not an exotic path -- it was the second
-    /// and third time anything was written to a file this host created.
-    ///
-    /// # The cause, and why it took three inserts to show
-    ///
-    /// `WGSGEN2.DAT`'s key 0 is a **segmented duplicate key**, and `keys.rs`
-    /// read every key's in-record chain offset off its *last* definition. A
-    /// segmented key carries that offset in its *first* one, so key 0's chain
-    /// offset came back as 0 -- not a chain at all, but the front of the slot.
-    /// [`Self::v6_reindex`] then wrote each duplicate pair at `slot + 0`, and
-    /// because [`pages::to_long`] stores a long word-swapped, a `prev` of
-    /// position 16390 (`0x4006`) laid down `00 00 06 40`, clearing the
-    /// two-byte marker of the very slot it was describing.
-    ///
-    /// Three inserts, because a chain pair is only non-`NOWHERE` once a record
-    /// has a neighbour on both sides. The first two inserts wrote
-    /// `ff ff ff ff` over their markers, which reads as occupied and so did no
-    /// visible harm; the third gave the middle record a real `prev`, whose
-    /// swapped high word is zero, and the marker read free. The slot markers
-    /// after each insert:
-    ///
-    /// ```text
-    /// insert 0   [ffff,    0,    0]
-    /// insert 1   [ffff, ffff,    0]
-    /// insert 2   [ffff,    0, ffff]     <- slot 1 now reads free
-    /// ```
-    ///
-    /// See `keys.rs`'s
-    /// `a_segmented_duplicate_key_reads_its_chain_offset_from_its_first_segment`
-    /// for the fixture's own key descriptors and the fix.
-    ///
-    /// # Two things an earlier reading recorded as suspects, both wrong
-    ///
-    /// Kept because they cost a session and would cost another. Neither is a
-    /// divergence from genuine 6.15:
-    ///
-    /// 1. **"Physical pages 7 and 10 both carry logical id 4, and this host
-    ///    never advances their generation word."** They are logical 4's shadow
-    ///    *twin pair*, which is exactly what [`v6::Map::relocate`] measured the
-    ///    engine doing -- a page alternates between two physical homes on
-    ///    successive writes. Nothing needs to distinguish them by a stamp of
-    ///    their own: the allocation table says which one is live, and a data
-    ///    page's `[0x04]` is a modification stamp, not the generation counter
-    ///    an allocation-table or control-record page carries.
-    /// 2. **"The two allocation-table copies disagree about pages already
-    ///    claimed, so a claim is being lost."** Traced entry by entry across
-    ///    all three inserts, the live table is correct at every step and never
-    ///    loses a claim. What alternates is which *physical* page each logical
-    ///    id resolves to -- twin flipping again -- and which of physical 2 and
-    ///    3 is live, which is what copy-on-write means.
-    ///
-    /// Both readings were taken from snapshots of the file between inserts.
-    /// The defect was never in the allocation table; it was eight bytes
-    /// written at the wrong offset inside a record.
-    #[test]
-    fn repeated_variable_inserts_keep_the_header_count_and_the_walk_agreeing() {
-        let dir = crate::testing::scratch("wgsgen2-repeated-variable-insert");
-        let path = dir.join("WGSGEN2.DAT");
-        std::fs::copy(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/variable/WGSGEN2.VIR"),
-            &path,
-        )
-        .expect("the virgin fixture copies into a scratch directory");
-
-        let mut block = block_from_file(path.clone(), "WGSGEN2.DAT");
-        assert!(block.geometry.variable);
-        let reclen = usize::from(block.geometry.reclen);
-
-        for n in 0..3u32 {
-            let mut record = vec![0u8; reclen];
-            record[..4].copy_from_slice(&(n + 1).to_le_bytes());
-            // The module's own record runs past `reclen` -- 62 bytes over a
-            // 55-byte fixed part -- which is what makes it variable at all.
-            record.extend_from_slice(&[0xa5u8; 7]);
-            block.insert(&record).unwrap_or_else(|e| panic!("insert {n}: {e:?}"));
-
-            block.records = None;
-            let seen = block
-                .records()
-                .unwrap_or_else(|e| panic!("re-read after insert {n}: {e:?}"))
-                .len();
-            assert_eq!(
-                seen,
-                n as usize + 1,
-                "after insert {n} the walk must find every record the header counts"
-            );
         }
     }
 

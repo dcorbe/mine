@@ -129,7 +129,6 @@ pub fn clrmlt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// The one call site with its arguments visible, `PLSTUFF.C:219`:
 ///
-///
 /// -- `prat(x, y, fmt, ...)`: position, then a `prf`-style format, onto the
 /// **local console screen**. The comment on the line above is Galacticomm's
 /// own: "this is only good for WGSERVER.EXE", i.e. a video display attached
@@ -142,7 +141,6 @@ pub fn clrmlt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `_PRAT`/`_LOCATE`/`_CURCURX`/`_CURCURY` symbol at all, only raw
 /// `Ordinal_147`/`Ordinal_148`/`Ordinal_392`/`Ordinal_471` thunks):
 /// `re/exports/WCCMMUD_named.c:14246-14288`, `FUN_1010_aa00`:
-///
 ///
 /// Save cursor, print a rotating "still working" indicator and a status
 /// line at fixed console coordinates, restore the cursor -- the textbook
@@ -160,7 +158,6 @@ pub fn clrmlt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `GCOMM.H:314`'s `void prat();` is an old K&R declaration with no
 /// parameters listed, which makes the routine look argument-less. The one
 /// surviving vendor call site says otherwise:
-///
 ///
 /// So `prat` is *print at*: `prat(x, y, ctlstg, ...)`, a `printf` whose
 /// output lands at a fixed console coordinate. The coordinate is the part

@@ -206,7 +206,6 @@ pub fn clock<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>,
 
 /// `void getdate(struct date *d)` -- today, in Borland's own struct.
 ///
-///
 /// **`da_year` is the full year, not an offset**, and it comes first -- the
 /// two `char`s follow it, day before month. Getting the last pair the wrong
 /// way round is invisible for the first twelve days of any month, which is
@@ -238,7 +237,6 @@ pub fn getdate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
 /// `int getftime(int handle, struct ftime *ft)` -- when the file behind a
 /// handle was last written.
-///
 ///
 /// **Those six bitfields are exactly DOS's two packed words**, in order: the
 /// first three fill a 16-bit time word and the last three a 16-bit date
@@ -287,7 +285,6 @@ pub fn getftime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::R
 
 /// `long dostounix(struct date *d, struct time *t)` -- a DOS date and time,
 /// as seconds since 1970.
-///
 ///
 /// **`struct time`'s field order is not chronological**: minutes come first,
 /// then hours, then *hundredths*, then seconds. Reading it as
@@ -339,7 +336,6 @@ pub fn dostounix<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
 }
 
 /// `VOID dsairp(VOID)` -- `IRPS.C:14-21` -- mask the CPU interrupt flag.
-///
 ///
 /// **The empty body is the vendor's own**, not a stub this host wrote. On
 /// every build that is not bare-metal DOS the preprocessor removes the only
@@ -414,7 +410,6 @@ pub fn memcata<A: Abi>(_: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, 
 /// The vendor's own uses are in `MAJORBBS.C`'s `updclk`, reading and setting
 /// the CMOS/DOS clock, and only inside `#ifdef GCDOS` (`MAJORBBS.C:3846`
 /// opens the block; DOS-only, never compiled for `GCWINNT`/UNIX builds):
-///
 ///
 /// Galacticomm's own library code (`re/wg33src/SRC/api/gcommlib`) uses it
 /// for still more interrupts this comment does not enumerate exhaustively:
@@ -504,7 +499,6 @@ pub fn sstatr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `VOID setwin(CHAR *scn, INT xul, INT yul, INT xlr, INT ylr, INT sen)` --
 /// `wnt/VIDAPI.C:375-390` -- set the window, saving the previous one.
 ///
-///
 /// `CR` is `#define CR curatr` (`wnt/VIDAPI.C:26`). Pure state: it reads
 /// nothing, writes nothing outside the struct, and touches no screen.
 ///
@@ -543,7 +537,6 @@ pub fn setwin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `VOID rstwin(VOID)` -- `wnt/VIDAPI.C:398-406` -- put back the window
 /// [`setwin`] saved.
 ///
-///
 /// **One save slot, not a stack.** `struct curatr` holds exactly one `o*`
 /// copy of each field, so two `setwin`s followed by two `rstwin`s restore the
 /// *second* saved state both times and the first window is gone. Nesting does
@@ -564,7 +557,6 @@ pub fn rstwin<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// `CHAR *scblank(CHAR *buf, CHAR attrib)` -- `dos/VIDAPI.C:160-178` -- clear
 /// a screen to blanks.
-///
 ///
 /// **That early return is the whole reachable body here, and it is a complete
 /// implementation of it.** `vidmem` is `static CHAR *vidmem=NULL`
@@ -590,7 +582,6 @@ pub fn scblank<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 /// `INT baudat(ULONG baud, INT blink)` -- `OPRLOW.C:502-521` -- the display
 /// attribute for a channel running at `baud`.
 ///
-///
 /// **The walk is downward**, so the answer is the colour of the *highest*
 /// threshold the rate reaches, not the lowest. `bauds[0]` is `0`, so the loop
 /// always breaks and `i` is never `-1`.
@@ -598,7 +589,6 @@ pub fn scblank<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 /// # `baud` is a `UINT`, one word -- and the vendor's own body disagrees
 ///
 /// `MAJORBBS.H:950-955` declares this routine **twice**:
-///
 ///
 /// and the body quoted above -- `OPRLOW.C:502`, from the 32-bit Worldgroup
 /// 3.3 tree -- is the `ULONG` one. Taking the body's word for it would have
@@ -667,7 +657,6 @@ const UIDISP_SIZE: usize = 2 + LGNSIZ;
 /// -- record the operator console's legend for the calling channel.
 ///
 /// The body has two halves and this host can serve one of them:
-///
 ///
 /// **The three `uidarr[chan]` writes are real state and are performed.** The
 /// video poke below them, the `shochl_hook` and the trailing `usrchl()` are
@@ -778,7 +767,6 @@ const DAYS_1970_TO_1980: i64 = 3652;
 /// `USHORT datofc(USHORT count)` -- `DNTAPI.C:466-478` -- a count of days
 /// since 1/1/1980, packed back into a DOS date.
 ///
-///
 /// The vendor's `addDaysToDate` (`DNTAPI.C:407-456`) walks whole years and
 /// then whole months off the count, one iteration at a time, over its own
 /// `isLeapYear`. This host reaches the same calendar through
@@ -835,7 +823,6 @@ pub fn daytoday<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 /// `USHORT dctime(const CHAR *timstr)` -- `DNTAPI.C:299-310` -- decode a DOS
 /// time from `"HH:MM[:SS]"`.
 ///
-///
 /// [`GCINVALIDDOT`] is the answer for anything that does not decode, and it
 /// is a *value*: a module tests the result against `0xFFFF`, so a
 /// `ShimError` here would break the very callers this serves. A valid time
@@ -880,7 +867,6 @@ pub fn dctime<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// range.
 ///
 /// The vendor is two `sscanf`s in one condition:
-///
 ///
 /// One scan answers both, because the two formats differ only in how many
 /// fields they ask for: scanning up to three colon-separated integers gives
@@ -1499,7 +1485,6 @@ pub fn access<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// the non-`GCWINNT` half (the `GCWINNT`/`FindFirstFile` half is the same
 /// answer, through Win32 instead of `stat`):
 ///
-///
 /// **The vendor tolerates a missing file -- so does this.** `*ddat=*dtim=0`
 /// runs unconditionally before `stat` is even attempted, and a failed `stat`
 /// returns with those zeros left in place -- the routine's own caller
@@ -1806,7 +1791,6 @@ pub fn rtkick<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `VOID rtihdlr(VOID (*rouptr)(VOID))` -- `MAJORBBS.H:750` -- install an
 /// 18 Hz real-time interrupt routine. `MAJORBBS.C:1533-1542`:
 ///
-///
 /// **The handler is remembered and nothing runs it**, which is
 /// [`rtkick`]'s answer to the same question and reached the same way -- see
 /// [`Host::rtirs`], which is [`Host::kicks`]'s shape deliberately rather
@@ -1870,7 +1854,6 @@ pub fn rtihdlr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
 /// `INT oldbgnedt(INT siz, CHAR *buf, INT tsiz, CHAR *topic,
 /// SHORT (*whndun)(SHORT), INT flags)` -- `MAJORBBS.C:5413-5424`:
-///
 ///
 /// **Refuses**, and its arity is worth stating because the declaration hides
 /// it. `GALPNQH.H:494` -- *not* `MAJORBBS.H` -- declares it
@@ -1956,7 +1939,6 @@ pub fn dclvda<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `void globalcmd(int (*rouptr)())` -- install a global command handler.
 ///
 /// `MAJORBBS.C:1114`, transcribed:
-///
 ///
 /// A global command is one the host offers on every channel regardless of
 /// which module has it -- the real host walks `globs[]` before handing a

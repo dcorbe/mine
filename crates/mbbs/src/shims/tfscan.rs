@@ -6,7 +6,6 @@
 //! see the memory note "cite wg1, not wg20", the same file in wg20 has
 //! different line numbers and produces silently wrong citations), whole:
 //!
-//!
 //! `tfsdpr` (TFSCAN.H:31) is not one of the four this file implements -- it is
 //! not among the symbols the task named, and no call site found below ever
 //! reaches it (every one of them tests `tfspfx`'s return, never chains a

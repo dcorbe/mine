@@ -279,7 +279,6 @@ pub(crate) fn ushort_arg<A: Abi>(v: A::Int) -> u16 {
 
 /// The five modes `BTVSTF.H:41-45` defines for `omdbtv`.
 ///
-///
 /// All five describe how Btrieve should treat *writes*, which is why nothing
 /// here does anything with the mode yet beyond keeping it. What it is kept for
 /// is the step that writes: opening a file read-only and then updating it is a
@@ -315,7 +314,6 @@ pub fn omdbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// # It pushes itself, and that is not a typo
 ///
 /// `PLBTVSTF.C:145`:
-///
 ///
 /// The allocation writes the global `bb` directly, so by the time `setbtv` runs
 /// there is nothing left of what was current: `opnbtv` pushes the block it just
@@ -488,7 +486,6 @@ pub fn cntrbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// difference is load-bearing. `PLBTVSTF.C:584` opens with the same guard the
 /// six reads have:
 ///
-///
 /// With no file current the real host inserted nothing and returned, so
 /// answering nothing is reproducing it rather than pretending. **That is all
 /// initialisation needs**, and it needs it without this host having written a
@@ -554,7 +551,6 @@ pub fn delbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `int dinsbtv(void *recptr)` -- insert a new record into the current file.
 ///
 /// `PLBTVSTF.C:598`:
-///
 ///
 /// # No `bb == NULL` guard
 ///
@@ -688,7 +684,6 @@ pub fn dupdbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// `void clsbtv(struct btvblk *bbp)` -- close a Btrieve file.
 ///
 /// `PLBTVSTF.C:632`, quoted in full because every line of it does something:
-///
 ///
 /// # `bb=bbp` happens first, and it is unconditional
 ///
@@ -1193,7 +1188,6 @@ pub fn obtbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// Eleven routines in `PLBTVSTF.C` open with `if (bb == NULL) return 0;` and
 /// this is not one of them. `:509` goes straight to work:
 ///
-///
 /// Two dereferences before anything is checked. A real board that stepped with
 /// no file current took the fault there, so there is no answer to reproduce and
 /// refusing is the honest translation of what happened.
@@ -1618,7 +1612,6 @@ pub(crate) fn locate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Reques
     if value != Btrieve::<AbiMem<A>>::null() {
         // **The original measured this copy with the key number as passed**,
         // before `:268` resolved a negative one to `bb->lastkn`:
-        //
         //
         // `keylns` is at offset 144 of the block and `lastkn` at 142, so
         // `keylns[-1]` *is* `lastkn` -- the real host copied a key-number's
@@ -2245,7 +2238,6 @@ fn set_current<A: Abi>(call: &mut Call<A>, host: &Host<A>, block: A::Ptr) -> Res
 ///
 /// `PLBTVSTF.C:300-308` is a pure tail call fixing `loktyp` at 0:
 ///
-///
 /// `getbtvl` (`:310-337`) is not implemented elsewhere in this file -- see
 /// the module doc comment's "remaining five guards" list, which already
 /// named it (`:318`) as one of the routines this host does not build. This
@@ -2261,7 +2253,6 @@ fn set_current<A: Abi>(call: &mut Call<A>, host: &Host<A>, block: A::Ptr) -> Res
 /// (`(*btvuptr)(getopt+loktyp,...)` vs `(*btvuptr)(obtopt+loktyp,...)`,
 /// same opcode range 5-13). **They diverge in exactly one place**, and nowhere
 /// else:
-///
 ///
 /// `obtbtvl` treats "no such key" (status 4), "end of file" (status 9) and a
 /// lock conflict (`wslbtv()`) as legitimate answers and returns 0 without
@@ -2331,7 +2322,6 @@ pub fn getbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `PLBTVSTF.C:339-347`:
 ///
-///
 /// A pure tail call fixing `loktyp` at 0 -- four words rather than
 /// [`obtbtvl`]'s five, the same shape [`aabbtv`] is to [`gabbtvl`]. Every
 /// other line of this function is [`obtbtvl`]'s own body, because `:357-379`
@@ -2382,7 +2372,6 @@ pub fn obtbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `PLBTVSTF.C:382-388`:
 ///
-///
 /// A pure tail call fixing `chkcas` at 1 (case-sensitive) and `loktyp` at 0.
 /// `anpbtvl`/`anpbtvlk` -- the routines that let either vary -- are neither
 /// asked for by this task nor implemented separately in this file (the
@@ -2390,7 +2379,6 @@ pub fn obtbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `anpbtvlk` at `:406`); this is `anpbtvlk`'s body with both fixed.
 ///
 /// # What `anpbtvlk` does, per `PLBTVSTF.C:399-415`
-///
 ///
 /// It saves the *current* key value into `bb->data` -- borrowing the record
 /// buffer as scratch, before the step below can touch it -- then steps with
@@ -2525,7 +2513,6 @@ pub(crate) fn strcmp_eq(a: &[u8], b: &[u8]) -> bool {
 ///
 /// `PLBTVSTF.C:436-443`:
 ///
-///
 /// A pure tail call fixing `loktyp` at 0 -- three words, not [`gabbtvl`]'s
 /// four, the same shape [`aabbtv`] is to `gabbtvl` itself (see that
 /// routine's own doc comment for why a four-word cursor cannot be shared
@@ -2572,7 +2559,6 @@ pub fn gabbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// pages hold it, or stop.
 ///
 /// `PLBTVSTF.C:495-501`:
-///
 ///
 /// A pure tail call fixing `loktyp` at 0 -- two words rather than
 /// [`stpbtvl`]'s three. Duplicated rather than shared through a common
@@ -2648,7 +2634,6 @@ pub fn stpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `PLBTVSTF.C:524-529`:
 ///
-///
 /// # No guard of its own, and it reads `bb` before `upvbtv` ever checks it
 ///
 /// `:528` is `bb->reclen` -- a dereference of `bb`, evaluated to build
@@ -2687,7 +2672,6 @@ pub fn updbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// positioned on, at a module-supplied length.
 ///
 /// `PLBTVSTF.C:531-547`, quoted in full:
-///
 ///
 /// # `bb == NULL` is the quiet no-op, same as `invbtv`/`delbtv`
 ///
@@ -2860,7 +2844,6 @@ pub(crate) fn update_variable<A: Abi>(
 ///
 /// `PLBTVSTF.C:572-577`:
 ///
-///
 /// # No guard of its own, and it reads `bb` before `invbtv` ever checks it
 ///
 /// `:576` is `bb->reclen`, a dereference of `bb` evaluated to build
@@ -2914,7 +2897,6 @@ pub fn insbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `PLBTVSTF.C:239-246` (Worldgroup 1.0 only; not declared in MajorBBS
 /// 6.25's `BTVSTF.H` at all), quoted in full:
 ///
-///
 /// Op 19 plus `loktyp` -- `WAITBV` (0) or `NOWTBV` (200), `BTVSTF.H:48-49`
 /// -- exactly matches `dfaBegTrans`'s own `19+loktyp` (`shims/dfa.rs`,
 /// citing `DFAAPI.C:201-209`), and both reach the identical
@@ -2946,7 +2928,6 @@ pub fn bxabtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `PLBTVSTF.C:248-254` (Worldgroup 1.0 only; same generation gap as
 /// [`bxabtv`]), quoted in full:
-///
 ///
 /// Op 20, no arguments -- exactly `dfaEndTrans` (`shims/dfa.rs`, citing
 /// `DFAAPI.C:219-225`) -- and both reach the identical
@@ -3048,7 +3029,6 @@ pub fn getbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// `anpbtvlk` split at all -- its own `anpbtvl` is the routine [`anpbtv`]'s
 /// doc comment already quotes in full, calling `obtbtv` rather than
 /// `obtbtvl` because 6.25 has neither locking variant), quoted in full:
-///
 ///
 /// A pure tail call fixing `loktyp` at 0. [`anpbtvlk`] is this routine's own
 /// body, with `loktyp` read as a fourth argument instead of fixed.
@@ -3258,10 +3238,8 @@ pub fn aabbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// `PLBTVSTF.C:713-728` (Worldgroup 1.0 only -- not in MajorBBS 6.25),
 /// quoted in full:
 ///
-///
 /// Op 27, "Unlock", flavoured entirely by `keynum`. `BTVSTF.H:125-128`
 /// names the only three flavours a module can reach this with:
-///
 ///
 /// The C body itself only branches on `keynum == -1` versus everything
 /// else -- `0` and `-2` both fall into the same `else` arm and are told
@@ -3359,7 +3337,6 @@ pub fn sttbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `PLBTVSTF.C:696-710` (MajorBBS 6.25; identical body in Worldgroup 1.0/2.0
 /// modulo line numbers), quoted in full:
 ///
-///
 /// The identical shape [`cntrbtv`] already has for `fs.numofr` -- same
 /// Btrieve `STAT` call (op 15), same reply struct, a different field. See
 /// [`cntrbtv`]'s own doc comment for the full account of why this has no
@@ -3402,7 +3379,6 @@ pub fn rlenbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// lock-conflict statuses to report because it has no locking variants at
 /// all), quoted in full:
 ///
-///
 /// "Was status Locked" -- checked against the module-static `status` every
 /// `btvu()` call leaves behind, the same variable [`llnbtv`]'s own
 /// `lastlen` sits beside in `PLBTVSTF.C`'s file scope. [`obtbtvl`]/
@@ -3435,7 +3411,6 @@ pub fn wslbtv<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
 /// `PLBTVSTF.C:352-356` (MajorBBS 6.25; identical body in Worldgroup 1.0/2.0
 /// modulo line numbers), quoted in full:
 ///
-///
 /// `lastlen` is `PLBTVSTF.C`'s own file-scope static, set inside `btvu()`
 /// (`:687` in 6.25's own numbering) after *every* low-level call -- see the
 /// engine's own `lastlen` field doc comment ([`crate::btrieve::Btrieve`])
@@ -3467,7 +3442,6 @@ pub fn llnbtv<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// does not have -- the same textual difference every other routine this
 /// file cites from both generations shows, and no difference in what either
 /// generation actually does), quoted in full:
-///
 ///
 /// Op 14, Create -- the same opcode [`crate::btrieve::create`] (this
 /// crate's own engine half) already writes a v5 file for. This routine's

@@ -1,0 +1,112 @@
+# One routine, two names: the MajorBBS/Worldgroup API renames.
+#
+# `GALPORT.C` rows are the authority and need no inference. Galacticomm shipped
+# a porting tool for exactly this -- SRC/devutils/galport/GALPORT.C, "help
+# developers port their add-on source code from Worldgroup v2.x to v3.x" --
+# whose `changes[]` array literally maps each old name to its new one. 67 of its
+# 91 entries are btv*->dfa* API renames; the other 24 are C type spellings
+# (int->INT and friends) and are not reproduced here.
+#
+# The `ordinals:` rows are inferred by comparing two ordinal tables that share
+# one numbering, and they exist to catch pairs GALPORT.C does not name -- the
+# MAJORBBS-generation renames like free/galfree and malloc/galmalloc. They are
+# weaker evidence and labelled as such.
+#
+# The `ordinal` column is the export slot where some table names one of the two.
+# `-` means neither table does, which is normal for a GALPORT.C pair: many of
+# those names are macros over the ordinal-exported primitives rather than
+# exports of their own, which is exactly why an ordinal comparison alone found
+# only 30 of the 67.
+#
+# Regenerate: parse GALPORT.C's `changes[]` for pairs whose target starts with
+# "dfa", then diff crates/mbbs-machine/data/majorbbs_*.tsv against
+# re/wg33src/LIB/wg2/WGSERVER.DEF and against each other by ordinal. Committed
+# because re/wg33src is gitignored.
+#
+# TRAP: the committed wgserver_wg300/wg312/wg33 tables are a DIFFERENT ordinal
+# space -- @48 is _FFLUSH there against __WRITE, @326 is _CHOOWD against
+# _GETMSG -- and must never be diffed against the MAJORBBS ones. Same trap
+# library.rs documents for GALETL's @36.
+library	name_a	name_b	ordinal	source
+MAJORBBS	aabbtv	dfaacqabs	51	GALPORT.C
+MAJORBBS	aabbtvl	dfaacqabslock	1100	GALPORT.C
+MAJORBBS	absbtv	dfaabs	53	GALPORT.C
+MAJORBBS	acqbtv	dfaacqeq	-	GALPORT.C
+MAJORBBS	agebtv	dfaacqge	-	GALPORT.C
+MAJORBBS	agtbtv	dfaacqgt	-	GALPORT.C
+MAJORBBS	ahibtv	dfaacqhi	-	GALPORT.C
+MAJORBBS	alebtv	dfaacqle	-	GALPORT.C
+MAJORBBS	alobtv	dfaacqlo	-	GALPORT.C
+MAJORBBS	altbtv	dfaacqlt	-	GALPORT.C
+MAJORBBS	anibtv	dfaacqnxi	-	GALPORT.C
+MAJORBBS	anpbtvlk	dfaacqnplock	998	GALPORT.C
+MAJORBBS	apibtv	dfaacqpri	-	GALPORT.C
+MAJORBBS	aqnbtv	dfaacqnx	-	GALPORT.C
+MAJORBBS	aqpbtv	dfaacqpr	-	GALPORT.C
+MAJORBBS	clsbtv	dfaclose	117	GALPORT.C
+MAJORBBS	cntrbtv	dfacountrec	133	GALPORT.C
+MAJORBBS	crtbtv	dfacreate	144	GALPORT.C
+MAJORBBS	delbtv	dfadelete	162	GALPORT.C
+MAJORBBS	dinsbtv	dfainsertdup	170	GALPORT.C
+MAJORBBS	dupdbtv	dfaupdatedup	180	GALPORT.C
+MAJORBBS	gabbtv	dfagetabs	313	GALPORT.C
+MAJORBBS	gabbtvl	dfagetabslock	999	GALPORT.C
+MAJORBBS	gcrbtv	dfaabsrec	-	GALPORT.C
+MAJORBBS	geqbtv	dfageteq	-	GALPORT.C
+MAJORBBS	getbtvl	dfagetlock	996	GALPORT.C
+MAJORBBS	ggebtv	dfagetge	-	GALPORT.C
+MAJORBBS	ggtbtv	dfagetgt	-	GALPORT.C
+MAJORBBS	ghibtv	dfagethi	-	GALPORT.C
+MAJORBBS	glebtv	dfagetle	-	GALPORT.C
+MAJORBBS	globtv	dfagetlo	-	GALPORT.C
+MAJORBBS	gltbtv	dfagetlt	-	GALPORT.C
+MAJORBBS	gnxbtv	dfagetnx	-	GALPORT.C
+MAJORBBS	gprbtv	dfagetpr	-	GALPORT.C
+MAJORBBS	insbtv	dfainsert	351	GALPORT.C
+MAJORBBS	invbtv	dfainsertv	357	GALPORT.C
+MAJORBBS	llnbtv	dfalastlen	388	GALPORT.C
+MAJORBBS	obtbtvl	dfaacqlock	997	GALPORT.C
+MAJORBBS	omdbtv	dfamode	447	GALPORT.C
+MAJORBBS	qeqbtv	dfaqueryeq	-	GALPORT.C
+MAJORBBS	qgebtv	dfaqueryge	-	GALPORT.C
+MAJORBBS	qgtbtv	dfaquerygt	-	GALPORT.C
+MAJORBBS	qhibtv	dfaqueryhi	-	GALPORT.C
+MAJORBBS	qlebtv	dfaqueryle	-	GALPORT.C
+MAJORBBS	qlobtv	dfaquerylo	-	GALPORT.C
+MAJORBBS	qltbtv	dfaquerylt	-	GALPORT.C
+MAJORBBS	qnpbtv	dfaquerynp	484	GALPORT.C
+MAJORBBS	qnxbtv	dfaquerynx	-	GALPORT.C
+MAJORBBS	qprbtv	dfaquerypr	-	GALPORT.C
+MAJORBBS	qrybtv	dfaquery	485	GALPORT.C
+MAJORBBS	rlenbtv	dfareclen	904	GALPORT.C
+MAJORBBS	rstbtv	dfarstblk	505	GALPORT.C
+MAJORBBS	setbtv	dfasetblk	534	GALPORT.C
+MAJORBBS	shibtv	dfastephi	-	GALPORT.C
+MAJORBBS	slobtv	dfasteplo	-	GALPORT.C
+MAJORBBS	snxbtv	dfastepnx	-	GALPORT.C
+MAJORBBS	sprbtv	dfasteppr	-	GALPORT.C
+MAJORBBS	stpbtvl	dfasteplock	1101	GALPORT.C
+MAJORBBS	sttbtv	dfastat	588	GALPORT.C
+MAJORBBS	ulabtv	dfaunlockall	-	GALPORT.C
+MAJORBBS	ulmbtv	dfaunlockcur	-	GALPORT.C
+MAJORBBS	ulobtv	dfaunlocksel	-	GALPORT.C
+MAJORBBS	ulsbtv	dfaunlockone	-	GALPORT.C
+MAJORBBS	unlbtv	dfaunlock	1102	GALPORT.C
+MAJORBBS	updbtv	dfaupdate	621	GALPORT.C
+MAJORBBS	upvbtv	dfaupdatev	622	GALPORT.C
+MAJORBBS	wslbtv	dfawaslocked	1103	GALPORT.C
+MAJORBBS	bgnedt	oldbgnedt	88	ordinals:majorbbs_mbbs625-vs-wg101
+MAJORBBS	edtimr	oldedtimr	184	ordinals:majorbbs_mbbs625-vs-wg101
+MAJORBBS	free	galfree	230	ordinals:majorbbs_mbbs625-vs-wg101
+MAJORBBS	galmalloc	malloc	400	ordinals:majorbbs_mbbs625-vs-wg101
+MAJORBBS	inedit	oldinedit	739	ordinals:majorbbs_mbbs625-vs-wg101
+MAJORBBS	dftpfn	setpfn	965	ordinals:majorbbs_wg101-vs-wg2
+MAJORBBS	clreol	cleareol	111	ordinals:majorbbs_wg2-vs-wgserver_wg2
+MAJORBBS	fll1st	fil1stlst	217	ordinals:majorbbs_wg2-vs-wgserver_wg2
+MAJORBBS	fllnxt	filnxtlst	218	ordinals:majorbbs_wg2-vs-wgserver_wg2
+MAJORBBS	fllspc	filspclst	219	ordinals:majorbbs_wg2-vs-wgserver_wg2
+MAJORBBS	getmsg	getmsgblk	326	ordinals:majorbbs_wg2-vs-wgserver_wg2
+MAJORBBS	opnbtv	dfaopen	455	ordinals:majorbbs_wg2-vs-wgserver_wg2
+MAJORBBS	setdtd	setfiletm	538	ordinals:majorbbs_wg2-vs-wgserver_wg2
+MAJORBBS	settnd	setfilegmt	546	ordinals:majorbbs_wg2-vs-wgserver_wg2
+MAJORBBS	sstatr	setatr	563	ordinals:majorbbs_wg2-vs-wgserver_wg2

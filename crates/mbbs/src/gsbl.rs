@@ -502,7 +502,6 @@ impl Gsbl {
     /// What a module injects at itself to be called back on the next pass.
     /// `fsdnfy()` (`FSDBBS.C:368`) is its whole body:
     ///
-    ///
     /// It reaches `stsrou`, not `sttrou`: `susing()` (`MAJORBBS.C:2478`) names
     /// `POLSTS`, the hangup statuses, `CRSTG`, `OBFCLR`, `ABOREQ` and `OUTMT`
     /// as cases and lets everything else fall to
@@ -2901,18 +2900,17 @@ mod tests {
     }
 
     #[test]
-    fn the_oracle_s_town_square_line_fits_at_width_79_once_the_csi_prefix_is_excluded() {
+    fn a_measured_line_fits_at_width_79_once_the_csi_prefix_is_excluded() {
         let mut g = one();
         g.channel_mut(chan()).width = 79;
         let line = b"\x1b[79D\x1b[K\x1b[0;37;40m    The market is crowded this morning and every stall along the square is busy";
-        assert_eq!(line.len(), 97, "the oracle's own raw byte count for this line");
+        assert_eq!(line.len(), 97, "18 bytes of CSI prefix and 79 visible columns");
         g.transmit(chan(), line);
         assert_eq!(
             g.drain_output(chan()),
             line.to_vec(),
             "97 raw bytes, 79 of them visible, and no wrap triggered within \
-             them -- matching the oracle, where this line runs the full 79 \
-             columns before the break"
+             them -- a line that runs the full 79 columns before the break"
         );
     }
 

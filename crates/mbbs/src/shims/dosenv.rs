@@ -576,7 +576,6 @@ pub fn oldsend<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
 /// `simpsnd` returns a GME status code, and the vendor's own body opens by
 /// answering precisely our case:
 ///
-///
 /// A host that never initialised a messaging engine has `gmeinit` false, in
 /// perpetuity. `GMEERR` is therefore not a plausible zero invented to fill a
 /// gap -- it is the documented answer for the exact state this host is in,

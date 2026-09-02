@@ -252,7 +252,6 @@ pub fn rsp2write<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret
 /// telnet one. `MAJORBBS.C:4728-4732`'s `byenow` is the clearest surviving
 /// example, and it is explicit about the gate:
 ///
-///
 /// `WCCMMUD.DLL`'s own output path reproduces exactly this shape.
 /// `_TELL_USER` (`WCCMMUD_named.c:65778`) opens by testing `ISGCSU`
 /// (see this module's own doc comment for the bit-offset arithmetic); the
@@ -299,9 +298,7 @@ pub fn senddpk<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 /// `BBSMAINM.C:209-236` (real host source, `mmuread`, the main menu's own
 /// read vector):
 ///
-///
 /// and `GCSASYS.C:499-529` (`sysread`, also real host source):
-///
 ///
 /// `WCCMMUD.DLL`'s own agent does the same thing with the same shape:
 /// `Ordinal_974(0x1290,param_2,param_3)` (`WCCMMUD_named.c:68344` in the read

@@ -943,7 +943,6 @@ mod tests {
             "tests/data/variable/V6SHRINK.DAT",
             "tests/data/variable/V6VAR.DAT",
             "tests/data/variable/IDXPROBE.DAT",
-            "tests/data/variable/WGSGEN2.VIR",
             "../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT",
             "../../tools/btrieve-oracle/fixtures/DUPKEY30SWAPPED.DAT",
             "../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT",

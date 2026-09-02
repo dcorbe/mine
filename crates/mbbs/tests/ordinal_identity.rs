@@ -16,7 +16,7 @@
 //!
 //! # The ordinal space, and the trap in it
 //!
-//! `re/api-renames.tsv` holds two comparisons, both **within a single
+//! `tests/data/api-renames.tsv` holds two comparisons, both **within a single
 //! numbering**. First, the MAJORBBS space as numbered by MAJORBBS (wg2) against
 //! the same space as numbered by the wg2-era `WGSERVER` import library: those
 //! two really are one numbering -- `__WRITE` is `@48` in both -- and 38 slots
@@ -67,7 +67,7 @@ use mbbs::shims::{Entry, entry};
 
 /// Ordinal slots the host serves from two different bodies today.
 ///
-/// The name pair, as `re/api-renames.tsv` spells it. **May only shrink.** Each entry is one export the
+/// The name pair, as `tests/data/api-renames.tsv` spells it. **May only shrink.** Each entry is one export the
 /// vendor numbered once and this host answers twice, so the two answers can
 /// drift -- and `ce64fbbe` is the drift already found, at `@162`.
 ///
@@ -118,7 +118,7 @@ fn repo_root() -> PathBuf {
 /// primitives -- so keying this on an ordinal would drop the majority of the
 /// vendor's own map.
 fn renames() -> Vec<(String, String, String)> {
-    let path = repo_root().join("re/api-renames.tsv");
+    let path = repo_root().join("crates/mbbs/tests/data/api-renames.tsv");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} is committed: {e}", path.display()));
     let mut out = Vec::new();
@@ -136,7 +136,7 @@ fn renames() -> Vec<(String, String, String)> {
     }
     assert!(
         out.len() > 60,
-        "re/api-renames.tsv parsed to {} rows, too few to be the vendor's own \
+        "tests/data/api-renames.tsv parsed to {} rows, too few to be the vendor's own \
          map (67 GALPORT.C pairs alone) -- did its format change?",
         out.len()
     );
@@ -217,7 +217,7 @@ fn the_getmsg_rename_is_one_body() {
         renames()
             .iter()
             .any(|(_, a, b)| a == "getmsg" && b == "getmsgblk"),
-        "re/api-renames.tsv carries the getmsg/getmsgblk pair"
+        "tests/data/api-renames.tsv carries the getmsg/getmsgblk pair"
     );
 
     let (Entry::Routine(a, _), Entry::Routine(b, _)) = (

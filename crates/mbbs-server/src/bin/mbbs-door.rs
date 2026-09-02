@@ -173,7 +173,7 @@ fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!("mbbs-door: {}: {e}", cli.socket.display());
-            tell("MajorMUD is not available right now.");
+            tell("The game is not available right now.");
             return ExitCode::from(1);
         }
     };
@@ -188,7 +188,7 @@ fn main() -> ExitCode {
 
     if let Err(e) = sock.write_all(header(&door32, cli.sysop_level, cli.rows, cli.cols).as_bytes()) {
         drop(raw);
-        tell(&format!("MajorMUD hung up before the session started: {e}"));
+        tell(&format!("The game hung up before the session started: {e}"));
         return ExitCode::from(1);
     }
 

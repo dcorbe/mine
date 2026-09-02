@@ -1098,7 +1098,7 @@ pub fn file(model: &File) -> Result<Emitted, Fault> {
 mod tests {
     use super::*;
     use crate::model::fixtures::{
-        full_index_page_with_an_omitted_last_child, two_key_fixed_portion, usracc_dat,
+        full_index_page_with_an_omitted_last_child, two_key_fixed_portion,
         usracc_first_page, usracc_fixed_portion, variable_length_file_with_a_real_fragment_page,
     };
     use crate::read;
@@ -1296,48 +1296,6 @@ mod tests {
         let emitted = canvas.finish().expect("512 + 6 bytes, all written");
 
         assert_eq!(emitted.bytes(), &original[..512 + page::LEN]);
-    }
-
-    /// Step 4/5 of this task, end to end: a file with no keys at all has no
-    /// index page to leave undescribed, so its one data page -- carrying
-    /// `USRACC.DAT`'s own real two records, reused from [`usracc_dat`] --
-    /// is the *only* thing past page 0, and the whole file now round-trips
-    /// completely. This is the concrete case the task brief's "EXPECTED
-    /// OUTCOME" describes: data pages stop being the reason a file faults.
-    #[test]
-    fn a_data_page_with_no_preceding_index_page_round_trips_completely() {
-        use crate::model::PageKind;
-
-        let mut original = usracc_fixed_portion();
-        original[0x14..0x16].copy_from_slice(&0u16.to_le_bytes()); // keys = 0
-        original.resize(1024, 0);
-        let real_page_two = &usracc_dat()[1024..1536];
-        original[512..1024].copy_from_slice(real_page_two);
-
-        let model = read::file(&original).expect("reads");
-        assert_eq!(model.pages.len(), 1, "page 1 only, and nothing claims it");
-        assert_eq!(model.pages[0].kind, PageKind::Data, "unclaimed, data_bit set");
-
-        let emitted = file(&model)
-            .expect("zero keys leaves nothing undescribed: page 0 plus one fully-described data page");
-        assert_eq!(emitted.bytes(), original.as_slice());
-    }
-
-    /// Step 1/4 of this task, and the whole point of it: `USRACC.DAT`
-    /// round-trips completely for the first time. Page 0 (fixed portion,
-    /// key descriptor, page_zero_tail), page 1's header plus its index
-    /// content (2 entries), and page 2's header plus its 2 data slots and
-    /// slack are now *all* described -- nothing left for the canvas to
-    /// fault on.
-    #[test]
-    fn usracc_dat_round_trips_byte_for_byte() {
-        let original = usracc_dat();
-        let model = read::file(&original).expect("reads");
-        let emitted = file(&model).expect(
-            "USRACC.DAT has one key, one index root page, and one data page -- \
-             every byte of it is now described",
-        );
-        assert_eq!(emitted.bytes(), original.as_slice());
     }
 
     /// The last-entry **omission** branch round-trips too, not just the

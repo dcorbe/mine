@@ -516,7 +516,6 @@ impl Chain {
     ///
     /// `W32MKDE_decompiled.c:19045`:
     ///
-    ///
     /// For v5, whether a fragment carries a leading pointer is the entry's
     /// own `0x8000` bit ([`Entry::continued`]), and a fragment that does not
     /// carry one is the end of the chain, full stop -- `fragment` reports
@@ -1461,7 +1460,6 @@ const ROOM_DIVISOR: u32 = 20;
 ///
 /// **Derived, never stored.** `W32MKDE_decompiled.c:19930-19934`
 /// (`FUN_00421ba0`):
-///
 ///
 /// `param_1 + 10` is [`FRAGMENT_COUNT`], which is how that routine's offsets
 /// are known to be a page's rather than the in-memory file block's -- the

@@ -475,7 +475,6 @@ pub fn oldsend<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 /// lock name recognised by its own logic rather than by a Btrieve keyring
 /// entry (`_FORUMOP`, `_PORT#`, `_LANG=`, ...). `LOCKNKEY.C:51-68`:
 ///
-///
 /// Every measured call site (`AAEFU.C:98`, `GALFIL.C:331`,
 /// `MAJORBBS.C:1236-1240`, five calls in a row registering `_PORT#`,
 /// `_GROUP#`, `_LANG=`, `_PROT=` and `_ISGCSU`) is a bare statement -- the
@@ -552,7 +551,6 @@ pub fn alldgs<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// `CHAR *unpad(CHAR *cp)` -- `GCOMM.H:527-529` -- strip trailing whitespace
 /// in place, and hand the same pointer back. `VCPROJ/GCOMMLIB/UNPAD.C:19-24`:
 ///
-///
 /// `strpln` walks backward over the same whitespace set `depad` truncates
 /// against -- [`crate::strings::depad`]'s own doc comment names it as the
 /// unexported routine that function is folded from, and this is the second
@@ -581,7 +579,6 @@ pub fn unpad<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>,
 
 /// `INT findmod(CHAR *name)` -- `MAJORBBS.H:770` -- a module's registration
 /// number, by the name it gave `register_module`. `MAJORBBS.C:1779-1789`:
-///
 ///
 /// Starts at **one**, not zero: `module[0]` is the BBS's own menuing system
 /// (`inimod()` registers it before any DLL gets a turn), which is exactly
@@ -659,7 +656,6 @@ fn unpack_dos_time(time: u16) -> Civil {
 /// `const CHAR *prntim(INT mode, USHORT time)` -- `DNTAPI.H:310-312` -- a
 /// DOS-packed time, rendered per `mode` (`DNTAPI.H:141-159`). Two vendor
 /// bodies compose to build it, both `SRC/api/gcommlib/DNTAPI.C`:
-///
 ///
 /// # `Civil` is the unpacker, and the validity check, both
 ///
@@ -771,7 +767,6 @@ const MONTHS: [&str; 12] = [
 /// `const CHAR *prndat(INT mode, USHORT date, CHAR sep)` -- `DNTAPI.H:315-317`
 /// -- a DOS-packed date, rendered per `mode` (`DNTAPI.H:161-178`).
 /// `SRC/api/gcommlib/DNTAPI.C`:
-///
 ///
 /// `date` is unpacked by [`unpack_dos_date`] into a [`Civil`] (hour/minute/
 /// second left zero), and `validDate` (`DNTAPI.C:635-644`: month in 1..=12,
@@ -976,7 +971,6 @@ const INVISB: u32 = 0x0000_4000;
 /// user-id logged onto *any* channel right now, even one still mid-login?
 /// `MAJORBBS.C:3712-3724`:
 ///
-///
 /// **Not `instat`/`onsysn`'s shared loop.** Those two ([`crate::shims::user`]'s
 /// `scan_for`) never exclude the calling channel; `onbbs` explicitly skips
 /// `uisusn == usrnum` in its own match test (though it still *counts* through
@@ -1056,7 +1050,6 @@ pub fn onbbs<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 
 /// `struct clstab *fndcls(const CHAR *clsname)` -- `USRACC.H:69` -- this
 /// user's class table entry, by name. `SRC/server/wgserver/ACCOUNT.C:209-223`:
-///
 ///
 /// `clshead` (`USRACC.H:44`) is the head of an in-memory linked list this
 /// host's own boot would build from the **class database**

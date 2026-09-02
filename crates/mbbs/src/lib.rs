@@ -2098,8 +2098,8 @@ impl<A: Abi> Host<A> {
     ///
     /// `WGSGEN2.DAT` is the *host's* file, not a module's, so no module
     /// distribution ships it and [`Host::btrieve_file`]'s usual `.VIR` install
-    /// has nothing to install from. This crate therefore carries its own virgin
-    /// copy (`data/WGSGEN2.VIR`) and lays it down when a board has neither.
+    /// has nothing to install from. The board supplies it, as a Worldgroup
+    /// install does; this host carries no copy of its own.
     ///
     /// Those bytes were not invented here. They were built by genuine Pervasive
     /// Btrieve 6.15 (`B_CREATE` through `tools/btrieve-oracle`, under Wine) from
@@ -2146,30 +2146,15 @@ impl<A: Abi> Host<A> {
         /// user dbase rec".
         const GENSIZ: u16 = 8192;
         const NAME: &str = "WGSGEN2.DAT";
-        static TEMPLATE: &[u8] = include_bytes!("../data/WGSGEN2.VIR");
 
-        // Written as the `.DAT` itself rather than as a `.VIR` for
-        // [`Host::btrieve_file`] to install: that convention belongs to the
-        // fifteen files a *module* distribution ships virgin, and a real
-        // Worldgroup install has no `WGSGEN2.VIR` at all. One file, under the
-        // name the host actually opens.
-        if self.find(NAME).is_none() {
-            let to = self.root.join(NAME);
-            if let Err(e) =
-                std::fs::create_dir_all(&self.root).and_then(|()| std::fs::write(&to, TEMPLATE))
-            {
-                self.note(format!(
-                    "genbb stays null: {} could not be written ({e}), so the host has no \
-                     generic data file and any module that does dfaSetBlk(genbb) will be \
-                     handed a null one",
-                    to.display()
-                ));
-                return;
-            }
-        }
-
+        // The board supplies this file, as it supplies every other data file:
+        // a Worldgroup install has one, and this host ships none of its own.
         let Some(path) = self.find(NAME) else {
-            self.note(format!("genbb stays null: no {NAME} under {}", self.root.display()));
+            self.note(format!(
+                "genbb stays null: no {NAME} under {}; copy one from a Worldgroup install \
+                 (the host ships no generic data file of its own)",
+                self.root.display()
+            ));
             return;
         };
         let geometry = match btrieve::Geometry::read(NAME, &path) {
@@ -3913,7 +3898,6 @@ impl<A: Abi> Host<A> {
     ///
     /// `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3368`:
     ///
-    ///
     /// `paccin` is `inplen=btuinp(usrnum,input)` followed by `paccit()` --
     /// the modem monitor and the profanity check, both BBS-shaped and out of
     /// scope. This host's `paccin` is `btuinp` and nothing else: take the
@@ -4048,7 +4032,6 @@ impl<A: Abi> Host<A> {
     }
 
     /// `prcrtk()` -- one second's worth of the kicktable. `RTKICK.C:59`:
-    ///
     ///
     /// Called once per elapsed second, never once per pass -- see
     /// [`Host::cycle`].
@@ -5654,7 +5637,6 @@ impl<A: Abi> Host<A> {
 
     /// Completely reset a channel: `rstchn`, via its default handler `dftrst`.
     ///
-    ///
     /// `MAJORBBS.C:3487-3500`. Everything after those five lines is hardware:
     /// `rcdbaud`, `lincst`, `bturst` and the `switch` over its return code
     /// exist to bring a *modem* channel back up, and this host has no channel
@@ -5908,7 +5890,6 @@ impl<A: Abi> Host<A> {
     /// `aschup` found a routine to call.
     ///
     /// `mjrfin`'s module sweep -- `MAJORBBS.C:4818-4831`:
-    ///
     ///
     /// **The caller does `hupall` first.** This is the second half only, so
     /// that a driver can hang its channels up through whatever path it
@@ -6187,7 +6168,6 @@ impl<A: Abi> Host<A> {
     /// still being called until then. Not part of [`Host::new`] for that
     /// reason: a host that allocated at construction would size the area off a
     /// `vdasiz` of zero and every `vdaptr` the module read would be null.
-    ///
     ///
     /// `vdaptr` is left pointing at channel 0, matching `vdarea=vdaoff(0)` at
     /// `:1374`; `curusr` is what re-points it per channel afterwards. `vdatmp`
@@ -6713,59 +6693,27 @@ mod tests {
     };
     use mbbs_machine::m16::{FarPtr, Machine, Poison, Ret};
 
-    /// `genbb` is a *host* global. `MAJORBBS.C:999` fills it in with
-    /// `dfaOpen("wgsgen2.dat",GENSIZ,NULL)` and modules dereference it without
-    /// ever assigning it -- so a null one is not a quiet gap but the thing that
-    /// stopped `WCCMMUD.DLL`'s init at `dfaInsertV`, which `DFAAPI.C` does not
-    /// guard.
-    ///
-    /// This asserts the whole chain rather than just "the global is non-zero":
-    /// a pointer that does not resolve to an open file, or resolves to a file
-    /// of the wrong shape, would satisfy a null check and still hand the module
-    /// something useless. The 55-byte record length is the assertion that
-    /// actually discriminates -- it is `WGSGEN2.BCR`'s own `record=55`, and it
-    /// is *not* `GENSIZ`. Conflating the two is a real failure mode with real
-    /// artefacts: the `WGSGEN2.DAT` files this repo produced before this
-    /// existed carry `reclen 8192`, the open-time buffer size written into the
-    /// file as its record length.
+    /// The board supplies `WGSGEN2.DAT`; the host lays down no file of its
+    /// own. Without one, `genbb` stays null and the note says which file is
+    /// missing and where the board would have to get it.
     #[test]
-    fn a_board_opens_its_own_generic_data_file_and_publishes_genbb() {
-        let root = testing::scratch("genbb-published");
+    fn a_board_without_a_generic_data_file_keeps_genbb_null_and_says_so() {
+        let root = testing::scratch("genbb-absent");
         let mut machine = Machine::new().expect("16-bit machine");
         let mut host = Host::<Wg16>::new(&mut machine, root.clone(), Terms::new(1)).expect("host");
 
-        // Not the constructor's job -- see `Host::open_genbb`. Before the board
-        // takes its startup step there is no file and no pointer.
-        assert!(
-            !root.join("WGSGEN2.DAT").exists(),
-            "Host::new must not lay a file down in a module's own directory"
-        );
-
         host.open_genbb(&mut machine);
 
-        assert!(
-            root.join("WGSGEN2.DAT").is_file(),
-            "the board seeds its own generic data file: {:?}",
-            host.notes()
-        );
+        assert!(!root.join("WGSGEN2.DAT").exists(), "the host must not invent a data file");
         let genbb = host
             .globals()
             .pointer_mem(Wg16::mem_ref(&machine), "genbb")
             .expect("genbb is placed");
-        assert_ne!(
-            genbb,
-            crate::btrieve::Btrieve::<crate::btrieve::AbiMem<Wg16>>::null(),
-            "the module reads this pointer and passes its value straight to \
-             dfaSetBlk: {:?}",
+        assert_eq!(genbb, crate::btrieve::Btrieve::<crate::btrieve::AbiMem<Wg16>>::null());
+        assert!(
+            host.notes().iter().any(|n| n.contains("genbb stays null: no WGSGEN2.DAT") && n.contains("Worldgroup install")),
+            "the note names the file and where it comes from: {:?}",
             host.notes()
-        );
-
-        let file = host.btrieve.block(genbb).expect("genbb names an open file");
-        assert_eq!(
-            file.geometry().reclen,
-            55,
-            "WGSGEN2.BCR says record=55; GENSIZ (8192) is the open-time buffer, \
-             not the file's record length"
         );
     }
 
@@ -8580,7 +8528,6 @@ mod tests {
     /// and go to the menu" (`:4089`). But with one module that loop body never
     /// executes -- `:4076` skips `i == lofstt` and `lofstt` is the only module
     /// there is -- so the operative line is the self-call at `:4100`:
-    ///
     ///
     /// Against that test `0`, `-1` and `42` are the same answer: finished, go
     /// to the menu. Only `1` says "hold the channel, I am not done", and only

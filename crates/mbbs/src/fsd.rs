@@ -2416,7 +2416,6 @@ pub fn fsdlin<A: Abi>(form: &Form, spec: &[u8], template: &[u8], scb: &mut Scb<A
 ///
 /// Six lines, the ANSI counterpart of [`fsdlin`]:
 ///
-///
 /// # `flags = FSDANS` is an assignment, not an or
 ///
 /// And nothing ever clears it afterwards. `FSDANS` is not a mode that gets
@@ -2815,7 +2814,6 @@ pub fn bgnter<A: Abi>(form: &Form, scb: &mut Scb<A>) -> Vec<u8> {
 /// field -- the original's whole body is one `if`, and there is no `else`.
 ///
 /// # It writes *at* the cursor, and only grows the answer when it has to
-///
 ///
 /// So a character typed into the middle of a field **overwrites** the one
 /// already there and leaves the answer the same length; only a character
@@ -5514,7 +5512,6 @@ fn xitfsd<A: Abi>(scb: &mut Scb<A>, exit_state: u8) -> Vec<u8> {
 /// this path, the way `fsd_statics.rs` calls real statics by address.
 ///
 /// # The ANSI tail (Stage 5's Task 11), `FSD.C:1200-1209`
-///
 ///
 /// `fldptr` here is `flddat+entfld`, unchanged since `FSD.C:1143` -- nothing
 /// in the `switch(vc)` above reassigns it, only `fldi` (this function's own

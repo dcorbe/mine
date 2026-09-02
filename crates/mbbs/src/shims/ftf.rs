@@ -14,9 +14,7 @@
 //!
 //! `FTG.H:97-98` declares `ftgptr` as data:
 //!
-//!
 //! `FTF.C:26-27` (wg1) declares `ftfscb` the same way:
-//!
 //!
 //! (wg1's `FTF.C` never defines `struct ftfscb`'s fields anywhere in this
 //! archive -- the type is used only as a pointer, which C allows for an
@@ -26,7 +24,6 @@
 //! And `FTG.H:74` declares `tshmsg` as a fixed buffer, not a function --
 //! confirmed by seven `strcpy`/`sprintf`/`stlcpy` writes into it at
 //! `AAEFU.C:1775-1820` alone, never a call:
-//!
 //!
 //! Every call site across all three is a `->field` dereference or a direct
 //! read/write, never `ftgptr(...)`/`ftfscb(...)`/`tshmsg(...)` -- so a shim
@@ -71,10 +68,8 @@ use crate::shims::{NO, ShimError};
 
 /// `int ftgnew(void)` -- `FILEXFER.C:651-664` -- issue a new tagspec pointer.
 ///
-///
 /// Every line after `setftu()` reads state this host has never had. `setftu`
 /// itself (`FILEXFER.C:344-359`) is worse than `ftgnew` alone lets on:
-///
 ///
 /// `ftuser` is a per-user `struct ftuser` array (`FILEXFER.H:18-37`,
 /// `FILEXFER.H:51`) sized `nterms`, holding the whole file-transfer state
@@ -106,7 +101,6 @@ pub fn ftgnew<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
 /// `int ftgsbm(char *prot)` -- `FILEXFER.C:791-887` -- submit the tagspec
 /// [`ftgnew`] just issued, for tagging, immediate download, or a download-
 /// options prompt.
-///
 ///
 /// A strict superset of [`ftgnew`]'s gap, not a milder version of it: this
 /// needs everything `ftgnew` needed (`setftu()`'s whole chain), plus
@@ -152,7 +146,6 @@ pub fn ftgsbm<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 ///
 /// Zero on success, `-1` on any failure -- Borland's own contract, and the
 /// one `valpath()` (`GALFIL.C:2143`) leans on directly:
-///
 ///
 /// -- `mkdir()` called purely to test a path, its failure read as an
 /// ordinary answer and not a fault. That is the contract honoured here:
@@ -218,7 +211,6 @@ pub fn mkdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 /// `STPANS.C` is not among wg1's `GALDSRC/SRC` files). The body below is
 /// ported from `re/wg33src/SRC/api/gcommlib/STPANS.C:17-83`, cited per file
 /// because wg1 has none to prefer:
-///
 ///
 /// `ESC` is 27 (`GCOMM.H:181`, also `KBDAPI.H:54` in wg33).
 ///
@@ -418,9 +410,7 @@ pub fn farmalloc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
 /// module doc already cites for `now`/`today`/`time`'s correction. `dcdate`
 /// itself (`DNTAPI.C:287-297`):
 ///
-///
 /// `dateDecode` (`DNTAPI.C:225-253`):
-///
 ///
 /// `validDate` (`DNTAPI.C:636-641`) is `1<=year<=9999 && 1<=month<=12 &&
 /// 1<=day<=lastDayOfMonth(month,year)`; `lastDayOfMonth` (`DNTAPI.C:672-686`)

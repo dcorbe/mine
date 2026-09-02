@@ -2,10 +2,8 @@
 //!
 //! Borland's, re-exported by `MAJORBBS.DLL`:
 //!
-//!
 //! And two of Galacticomm's own, which ask about a file rather than holding
 //! one open:
-//!
 //!
 //! `getdtd` takes a descriptor this crate handed out; `cntdir` takes a path and
 //! never opens anything, and leaves its whole answer in three host globals.
@@ -237,7 +235,6 @@ pub fn fclose<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// counts the terminator, so at most `n - 1` bytes come back, and the newline is
 /// kept -- `FGETS.C` is one line and says all of that:
 ///
-///
 /// **`NULL` at end of file is an answer.** It is how the module finds the end,
 /// since it imports no `feof`.
 ///
@@ -286,7 +283,6 @@ pub fn fgets<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 ///
 /// **A short count is an answer**, and the module depends on it. `FUN_10f8_09ca`
 /// reads `WCCMMUD.INI` whole and terminates it at whatever came back:
-///
 ///
 /// So the count is what bounds a string the module then parses. Note it is bytes
 /// **delivered**, not bytes on the disk: in text mode the `\r` squeeze makes
@@ -855,7 +851,6 @@ impl FndblkLayout {
     /// 32-bit Worldgroup does **not** widen that record. It uses Borland's
     /// *32-bit* `struct ffblk`, which is a different shape entirely:
     ///
-    ///
     /// Size comes *before* the attribute, the attribute is a `long`, the
     /// times stay 16 bits, and the name starts at 16 rather than 30.
     ///
@@ -1021,7 +1016,6 @@ fn write_fndblk<A: Abi>(mem: &mut A::Mem, fbptr: A::Ptr, found: &FoundEntry) -> 
 ///
 /// `struct fndblk` -- `DOSFACE.H:52-59` (this file's own module doc quotes
 /// the whole header):
-///
 ///
 /// # The struct's layout is ABI-dependent, and half of it is inferred
 ///

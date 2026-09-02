@@ -123,7 +123,6 @@ pub fn l2as<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A
 /// `char *ul2as(unsigned long ulongin)` -- [`l2as`] for a value that has no
 /// sign.
 ///
-///
 /// `%lu`, not `%ld`: `0xFFFFFFFF` prints as `4294967295`, where [`l2as`]
 /// prints `-1`. That is the entire difference between the two, and
 /// `L2AS.C`'s own header comment states the ranges -- `l2as` answers
@@ -462,7 +461,6 @@ pub(crate) fn ansi_of_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, chan: crate::cha
 
 /// `VOID stansi(VOID)` -- `MAJORBBS.H:843`. `MAJORBBS.C:4536-4540`:
 ///
-///
 /// **Fully implemented, and it has nothing to do** -- which is a statement
 /// about this host's design rather than a gap, and is the reason it is not a
 /// refusal.
@@ -567,7 +565,6 @@ pub fn stzcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// `char *stlcpy(char *dst, const char *src, unsigned num)` -- copy,
 /// bounded, always terminated, and **nothing more**.
 ///
-///
 /// `num` is the size of the destination and counts the terminator, so at most
 /// `num - 1` characters are copied -- the same contract as [`stzcpy`], which
 /// sits beside it in `GCOMM.H` and differs in exactly one way: `stzcpy`'s
@@ -603,7 +600,6 @@ pub fn stlcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// `char *stzcat(char *dst, const char *src, unsigned num)` -- append, within
 /// a budget that counts what is already there.
-///
 ///
 /// `num` is the size of the whole destination, not the room remaining, so the
 /// append gets `num - dstlen` bytes and the result is at most `num - 1`
@@ -756,7 +752,6 @@ const UIDSIZ: u16 = 30;
 
 /// `void stripb(char *stg)` -- `SIGNUP.C:826-834`:
 ///
-///
 /// **Fully implemented.** [`depad`] with one extra step: when the caller
 /// passed `input` *itself*, `inplen` is brought back into agreement with it.
 ///
@@ -805,7 +800,6 @@ fn stripb_mem<A: Abi>(mem: &mut A::Mem, host: &Host<A>, stg: A::Ptr) -> Result<(
 
 /// `int isuplo(char *stg)` -- `SIGNUP.C:871-893`:
 ///
-///
 /// **Fully implemented.** "Is uniformly cased": 1 when the string's letters
 /// are all lower **or** all upper, 0 when they are mixed. A string with no
 /// letters at all answers 1, both loops having run to the terminator.
@@ -840,7 +834,6 @@ fn is_uniform_case(text: &[u8]) -> bool {
 }
 
 /// `void zonkhl(char *stg)` -- `SIGNUP.C:844-868`:
-///
 ///
 /// **Fully implemented.** Title-cases a uniformly-cased name -- first letter
 /// of each blank-delimited word up, the rest down -- and leaves a mixed-case
@@ -910,7 +903,6 @@ fn zonkhl_mem<A: Abi>(mem: &mut A::Mem, _host: &Host<A>, stg: A::Ptr) -> Result<
 
 /// `void makhdl(char *stg)` -- `SIGNUP.C:836-842`:
 ///
-///
 /// **Fully implemented**, and the most demanded routine in Phase 2 -- six of
 /// the corpus's modules import it.
 ///
@@ -937,7 +929,6 @@ pub fn makhdl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `int issupc(int c)` -- `SIGNUP.C:1147-1167`:
-///
 ///
 /// **Fully implemented.** The signup-time tightening of
 /// [`crate::strings::is_uid_char`]: the same alphabet, minus whatever the
@@ -981,7 +972,6 @@ pub fn issupc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `VOID clrinp(VOID)` -- `MAJORBBS.H:788`. `MAJORBBS.C:3204-3210`:
 ///
-///
 /// **Fully implemented.** Four writes to four placed globals, and all four
 /// matter: `margv[0]=input` is the one a plausible implementation drops.
 /// Clearing the buffer without re-pointing `margv[0]` at it leaves the first
@@ -1020,7 +1010,6 @@ pub fn clrinp<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `VOID xltctls(CHAR *txtbuf)` -- `MAJORBBS.H:751`. `MAJORBBS.C:1564-1584`:
-///
 ///
 /// **Fully implemented**, in place and shrinking: `^A` becomes the single
 /// byte `0x01`, and `^^` becomes a literal `^`.
@@ -1088,7 +1077,6 @@ pub fn xltctls<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 /// parsing inline; the routine `WCCMMUD.DLL` imports is Worldgroup's own,
 /// split out at
 /// `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3376`:
-///
 ///
 /// Four things this does that a from-scratch splitter would not, and each is
 /// load-bearing:

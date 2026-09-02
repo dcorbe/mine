@@ -217,7 +217,6 @@ pub fn profan<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 /// convention `crates/mbbs/src/btrieve`'s own `CHAR` fields already use for
 /// Btrieve records: no terminator, padded to the declared width).
 ///
-///
 /// Faithful. `length` is read at `A::Int`'s own width and widened into a
 /// `usize` (`Into::<u32>::into(call.int()) as usize`) rather than narrowed
 /// to `u16` -- the same widening `shims::text::strncpy`/`strncat` already
@@ -248,7 +247,6 @@ pub fn c2bcpy<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 /// (wg1) / `re/wg33src/SRC/api/gcommlib/B2CCPY.C:20-42` -- the other
 /// direction from [`c2bcpy`]: trim a fixed-width, space-padded field down to
 /// a NUL-terminated C string.
-///
 ///
 /// Faithful, including two details easy to miss on a re-read:
 ///
@@ -319,7 +317,6 @@ pub fn b2ccpy<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 /// `int findtvar(char *name)` -- `MAJORBBS.H:660` (wg1) /
 /// `MAJORBBS.C:1296-1307` (wg1):
 ///
-///
 /// Faithful, and reuses rather than reimplements: [`crate::textvar::TextVars`]
 /// is this host's own `txtvars`/`ntvars` (its own doc comment: "the module is
 /// what says so" -- ten `WCCMMUD.DLL` sites address the table directly), so
@@ -372,7 +369,6 @@ const TXV_HEADROOM: usize = 80;
 
 /// `CHAR *xlttxv(CHAR *buffer, INT size)` -- `MENUING.C:1120-1141` -- expand
 /// the text variables in a buffer, in place.
-///
 ///
 /// Byte `0x01` opens a reference; the sequence is
 /// `\x01 <justify> <width+32> <name> \x01` (read off `grbtxv`,

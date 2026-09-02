@@ -78,7 +78,6 @@ use crate::abi::{self, Abi, Call};
 /// the user's screen"; `whndun`'s "optional argument": "1=list completed
 /// 0=interrupted". `FILEXFER.H:78` (wg1); body `FILEXFER.C:937-955` (wg1):
 ///
-///
 /// # What is reproduced
 ///
 /// The real body's own machinery -- `ftgnew`/`ftgptr`/`tshlst`/`ftgsbm`, the

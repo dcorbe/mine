@@ -130,7 +130,6 @@ See `crates/mbbs-server`.
 | `textscreen` | Codepage, cell grid and painter behind the full-screen work. |
 | `cnf` | An editor for a module's sysop-configurable options. |
 | `bropey` | A byte-first persistent rope. |
-| `mud-core`, `mud-server`, `mud-client`, `mud-oracle` | A game-specific side track that predates MINE. Not part of the host; slated to leave this repository. |
 
 
 ## What this is not

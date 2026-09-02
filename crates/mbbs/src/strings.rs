@@ -60,7 +60,6 @@ pub fn is_white(c: u8) -> bool {
 /// Whether a character may appear in a user-ID --
 /// `SRC/api/gcommlib/ISUIDC.C:18-30`'s whole body, as a byte test.
 ///
-///
 /// Here rather than in a shim because two registered routines answer with
 /// it -- `crate::shims::cnc::isuidc`, which *is* this predicate, and
 /// `crate::shims::text::issupc`, whose `default:` arm calls it
@@ -85,7 +84,6 @@ pub fn is_uid_char(c: u8) -> bool {
 
 /// Whether a character may appear in a text-variable name --
 /// `SRC/api/gcommlib/ISTXVC.C:19-30`'s whole body, as a byte test.
-///
 ///
 /// [`is_uid_char`]'s sibling, written by the same author on the same day, with
 /// the same two CP437 ranges and a **different** punctuation set: `_` and `?`

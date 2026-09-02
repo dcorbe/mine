@@ -89,7 +89,7 @@ fn no_server_tells_the_caller_and_exits_1() {
         .expect("run mbbs-door");
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("MajorMUD is not available right now."),
+        String::from_utf8_lossy(&out.stdout).contains("The game is not available right now."),
         "stdout: {:?}",
         String::from_utf8_lossy(&out.stdout)
     );

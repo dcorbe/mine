@@ -394,7 +394,6 @@ pub fn itoa<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, 
 /// `int samend(char *longs, char *ends)` -- does `longs` end with `ends`,
 /// ignoring case. `re/wg33src/SRC/api/gcommlib/SAMEND.C`, in full:
 ///
-///
 /// `sameas(ends, longs+nl-ne)` is `ends` compared against the last
 /// `strlen(ends)` bytes of `longs`, case-folded, reached only once `ends` is
 /// no longer than `longs` -- exactly this crate's own
@@ -560,7 +559,6 @@ pub fn localeconvention<A: Abi>(
 /// `strcmp`.
 ///
 /// `SOURCE/RTL/SOURCE/CSTRINGS/COMMON32/STRICMP.C`, in full:
-///
 ///
 /// Upper-case both strings (the 16-bit `.CAS` assembly folds the identical
 /// `'a'..='z'` range, `cx = 0x617a`, into upper case rather than the other
@@ -904,7 +902,6 @@ pub fn gettime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 ///
 /// `SOURCE/RTL/SOURCE/IO/COMMON16/IOERROR.CAS`, in full for the return value:
 ///
-///
 /// `__IOerror` (same file) is what actually does the work: `_doserrno =
 /// dosErr` (clamped to `e_parameter` if `dosErr` is out of the table's
 /// range), then `errno = _dosErrorToSV[dosErr]` -- a fixed 51-entry DOS-code
@@ -944,7 +941,6 @@ pub fn doserror<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
 ///
 /// `SOURCE/RTL/SOURCE/MISC/COMMON32/ERRNO.C`, in full for the `_MT` (the
 /// variant these builds link, per this file's own module doc) case:
-///
 ///
 /// A genuine routine, not data: `INCLUDE/ERRNO.H`'s `#define errno
 /// (*__errno())` is what turns the *macro* `errno` a module's C source writes
@@ -1036,7 +1032,6 @@ pub fn lrand<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>,
 /// `char *searchpath(const char *file)` -- find `file`, or answer `NULL`.
 ///
 /// `SOURCE/RTL/SOURCE/PROCESS/COMMON16/SRCHPATH.C`, in full:
-///
 ///
 /// Real `searchpath` walks the current directory, then every directory named
 /// in the `PATH` environment variable, and answers a pointer into a static
@@ -2044,7 +2039,6 @@ pub fn _read<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `SOURCE/RTL/SOURCE/CSTRINGS/COMMON16/STRRCHR.C`, in full for the body:
 ///
-///
 /// # The terminator is scanned too, same as `strchr`
 ///
 /// "The null-terminator is considered to be part of the string" (the same
@@ -2253,7 +2247,6 @@ pub fn setvbuf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// three-byte drive prefix, then the working directory, then the length
 /// check against `n`):
 ///
-///
 /// # This host's current directory is always [`Host::root`] itself
 ///
 /// `crate::shims::tfscan`'s own module doc already establishes the reading
@@ -2329,7 +2322,6 @@ pub fn getcwd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `INCLUDE/TIME.H:52-63`, the field order this writes, all plain `int`s (so
 /// `A::INT_WIDTH` bytes each, not a fixed two):
-///
 ///
 /// # Built on [`crate::clock::Civil`], the same conversion `gettime`/`now`/
 /// `today`/`time` already share
@@ -2470,7 +2462,6 @@ pub fn localtime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
 /// # The in/out buffer contract is measured off three real call sites, not guessed
 ///
 /// `re/wg33src/SRC/api/galmhs/GALMHS.C:516-521`:
-///
 ///
 /// `outnam` holds a **directory**, with its own trailing separator already
 /// appended by the caller, when `creattemp` is called. Immediately after, the

@@ -57,7 +57,6 @@
 //! `MAJORBBS.H` -- the recovered WG 1.0, WG 2.0 and MBBS 6.25 kits carry
 //! identical code. Both are one-line wrappers around a low-level form:
 //!
-//!
 //! Both return `int`, and in both the low-level form starts `retval=0` and only
 //! ever sets it to 1 -- `ltstcrd` (`:624`) when the balance covers `amt`,
 //! `ldedcrd` (`:473`) as `retval=(uptr->creds >= -tabptr->dbtlmt)` after
@@ -151,7 +150,6 @@ pub fn odedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// (`archive/galacticomm/extract/wg1/GALDSRC/SRC/ACCOUNT.C`); the identical
 /// body is also in `re/wg33src/SRC/server/wgserver/ACCOUNT.C:572-577`:
 ///
-///
 /// **[`crate::shims::credit::tstcrd`] with `real` set, and the same answer
 /// for the same reason** -- exactly the relationship
 /// [`crate::shims::credit::rdedcrd`] has to `dedcrd`, which is the precedent
@@ -241,7 +239,6 @@ pub fn crdusr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `int addcrd(char *keyuid, const char *tckstg, int real)` -- post credits
 /// and announce it on the console. `ACCOUNT.C:691-708`:
 ///
-///
 /// **[`crdusr`] plus the console announcement, which this host really does
 /// emit** -- `shocst` is implemented (`crate::shims::system::shocst`), so the
 /// sysop console gets the same two lines the original wrote, with the same
@@ -319,7 +316,6 @@ fn read_string<A: Abi>(call: &mut Call<A>, at: A::Ptr) -> Result<String, ShimErr
 
 /// `void howbuy(void)` -- emit the "how to buy credits" message.
 /// `ACCOUNT.C:1383-1391`:
-///
 ///
 /// **Does nothing, because `pester` is off, and the vendor's own body does
 /// nothing when it is.** This is a real branch of the real routine rather

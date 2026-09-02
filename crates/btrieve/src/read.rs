@@ -2613,7 +2613,7 @@ mod tests {
     use crate::format::generation::Generation;
 
     use crate::model::fixtures::{
-        full_index_page_with_an_omitted_last_child, two_key_fixed_portion, usracc_dat,
+        full_index_page_with_an_omitted_last_child, two_key_fixed_portion,
         usracc_first_page, usracc_fixed_portion, variable_length_file_with_a_real_fragment_page,
     };
     use crate::model::FragmentSlot;
@@ -3935,98 +3935,6 @@ mod tests {
         assert!(e.why.contains("key_descriptor[8]"), "names the overrunning definition: {}", e.why);
         assert!(e.why.contains("key_descriptor[0]"), "names the key it continues: {}", e.why);
         assert!(e.why.contains("512-byte control record"), "{}", e.why);
-    }
-
-    /// `USRACC.DAT`'s three page headers, the exact case this task was
-    /// dispatched to make pass: page 0's own header bytes are the control
-    /// record's always-zero `lead` (already checked by
-    /// `usracc_dat_fixed_portion_reads_its_measured_values` above -- nothing
-    /// new to assert there), page 1 is the index page its one key's root
-    /// names, and page 2 is everything else -- a data page.
-    #[test]
-    fn usracc_dats_three_page_headers_are_measured_correctly() {
-        let buf = usracc_dat();
-        let file = file(&buf).expect("a valid three-page v5 file");
-        assert_eq!(file.pages.len(), 2, "physical pages 1 and 2");
-
-        let page1 = &file.pages[0];
-        assert_eq!(page1.number, 1, "page 1's own header number");
-        assert_eq!(page1.stamp, 3, "page 1's stamp");
-        assert!(!page1.data_bit, "page 1 holds a B-tree node, not records");
-        assert_eq!(page1.kind, PageKind::Index, "named by key_descriptor[0]'s root");
-
-        let page2 = &file.pages[1];
-        assert_eq!(page2.number, 2, "page 2's own header number");
-        assert_eq!(page2.stamp, 6, "page 2's stamp");
-        assert!(page2.data_bit, "page 2 holds USRACC.DAT's two records");
-        assert_eq!(page2.kind, PageKind::Data, "claimed by no root, ACS, or free chain");
-    }
-
-    /// Step 1 of this task: `USRACC.DAT` page 2 holds exactly two records at
-    /// the measured offsets (`0x06` and `0x102`, `physical` 252 bytes
-    /// apart), and the page's trailing 2 bytes (`512 - 6 - 2*252`, the same
-    /// arithmetic `PAGE_USABLE` corroborates) are described rather than
-    /// silently dropped -- they are zero in this real file, but the model
-    /// must carry them explicitly, not assume it.
-    #[test]
-    fn usracc_dats_page_two_holds_exactly_two_records_at_the_measured_offsets() {
-        let buf = usracc_dat();
-        let file = file(&buf).expect("a valid three-page v5 file");
-        let page2 = &file.pages[1];
-        assert_eq!(page2.kind, PageKind::Data, "page 2 holds USRACC.DAT's two records");
-
-        let content = page2.content.as_ref().expect("a data page's content is described");
-        assert_eq!(content.slots.len(), 2, "two 252-byte slots fit in a 512-byte page");
-        let RecordSlot::Live(slot0) = &content.slots[0] else {
-            panic!("USRACC.DAT has no deletions -- slot 0 must be live")
-        };
-        let RecordSlot::Live(slot1) = &content.slots[1] else {
-            panic!("USRACC.DAT has no deletions -- slot 1 must be live")
-        };
-        assert_eq!(slot0.len(), 252);
-        assert_eq!(slot1.len(), 252);
-        assert!(slot0.starts_with(b"Sysop"), "slot 0 at page offset 0x06 is the Sysop record");
-        assert!(slot1.starts_with(b"Test"), "slot 1 at page offset 0x102 is the Test record");
-        assert_eq!(content.slack, vec![0u8, 0], "the trailing 2 bytes, described and zero here");
-    }
-
-    /// This task's own anchor case: `USRACC.DAT` page 1's index content,
-    /// decoded byte by byte against the raw bytes the controller measured
-    /// when this task was dispatched. `count` 2, `rightmost`/`leftmost`
-    /// both `NOWHERE` (a leaf with no children). Entry 0's key is `Sysop`
-    /// (NUL-padded to 10 bytes), `head` `0x406` (file byte 1030 -- page 2
-    /// starts at 1024, and the `Sysop` slot sits at page offset `0x06`),
-    /// no `tail` (this key permits no duplicates), `child` `Some(NOWHERE)`
-    /// -- a leaf, not the last entry. Entry 1's key is `Test`, `head`
-    /// `0x502` (file byte 1282 -- page offset `0x102`), `child`
-    /// `Some(0)` -- the last entry's literal-zero placeholder, not
-    /// `NOWHERE`, exactly as harvest 4 SS4 describes. The 460 bytes after
-    /// the last entry (`512 - 0x34`) are zero in this real file.
-    #[test]
-    fn usracc_dats_index_page_decodes_its_two_entries() {
-        let buf = usracc_dat();
-        let file = file(&buf).expect("a valid three-page v5 file");
-        let page1 = &file.pages[0];
-        assert_eq!(page1.kind, PageKind::Index);
-
-        let idx = page1.index.as_ref().expect("an Index page's content is described");
-        assert_eq!(idx.rightmost, 0xffff_ffff, "a leaf: no rightmost child");
-        assert_eq!(idx.leftmost, 0xffff_ffff, "a leaf: no leftmost child");
-        assert_eq!(idx.entries.len(), 2, "USRACC.DAT has exactly 2 records");
-
-        let sysop = &idx.entries[0];
-        assert_eq!(sysop.key, b"Sysop\0\0\0\0\0");
-        assert_eq!(sysop.head, 0x0406, "file byte 1030 -- page 2 offset 0x06");
-        assert_eq!(sysop.tail, None, "this key permits no duplicates");
-        assert_eq!(sysop.child, Some(0xffff_ffff), "not the last entry: a leaf's NOWHERE");
-
-        let test = &idx.entries[1];
-        assert_eq!(test.key, b"Test\0\0\0\0\0\0");
-        assert_eq!(test.head, 0x0502, "file byte 1282 -- page 2 offset 0x102");
-        assert_eq!(test.tail, None);
-        assert_eq!(test.child, Some(0), "the last entry's literal-zero placeholder, not NOWHERE");
-
-        assert_eq!(idx.padding, vec![0u8; 512 - 0x34], "460 zero bytes after the last entry");
     }
 
     /// The last-entry **omission** branch, unwitnessed by any of the 102

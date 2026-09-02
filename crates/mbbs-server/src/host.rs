@@ -552,7 +552,6 @@ fn report_census<A: Abi>(
 /// `mjrfin` -- `MAJORBBS.C:4818-4831`: hang every channel up, then run every
 /// module's `finrou`.
 ///
-///
 /// **Hangup first, and in that order.** A module's `huprou`/`lofrou` is where
 /// per-player state is written back; its `finrou` is where the world's is.
 /// Running them the other way round would finalise a world whose players had

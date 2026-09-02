@@ -21,7 +21,6 @@
 //! `GCOMM.H` defines two of these as macros over the C library, and both
 //! reverse an order everyone has memorised:
 //!
-//!
 //! Neither mistake fails; both write the wrong bytes and are noticed much
 //! later, somewhere else. So their tests use a count and a fill value that
 //! differ, and a source and destination that differ -- a test written
@@ -161,7 +160,6 @@ pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `CHAR *alcdup(const CHAR *stg)` -- allocate a copy of a string.
 ///
-///
 /// The block comes from the same heap [`alcmem`] reserves out of, and the
 /// module frees it the same way -- `alcdup` is `alcmem` plus a `strcpy`, not
 /// a separate allocator. The `+1` is the terminator, so duplicating the empty
@@ -210,7 +208,6 @@ pub fn alcdup<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// and function 3 (the selector-increment) -- around three Phar Lap
 /// extender calls:
 ///
-///
 /// `DosAllocLinMem`, `DosMapLinMemToSelector` and `DosFreeSeg` are in neither
 /// `re/vendor-bodies.tsv` nor `re/host-exports.tsv`, because they are not
 /// Galacticomm's: they belong to the DOS extender the module was linked
@@ -251,7 +248,6 @@ pub fn pltile<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// shipped, non-debug module links against. That branch -- `DEBUG` and
 /// `GCWINNT` both undefined, which is every `GCDOSP`/RTSLORD-class build --
 /// is exactly:
-///
 ///
 /// `nmalloc`/`lstalcsiz` are `GCOMMLIB`'s own static counters; the only thing
 /// that reads them, `memdbgrpt`, is not among the 49 symbols this track
@@ -428,7 +424,6 @@ impl crate::heap::Heap<Wg16> {
 
 /// `void *ptrtile(void *bigptr, int index)` -- the `index`th tile of a region.
 ///
-///
 /// A far pointer is a 32-bit value with the selector in the high word, so
 /// `+ (index << 19)` is `+ index * 8` **on the selector** -- which is
 /// [`SELECTOR_STEP`](mbbs_machine::m16::SELECTOR_STEP), and the same shift `DOSCALLS.135`
@@ -512,7 +507,6 @@ fn elements_per_glob(size: u16) -> usize {
 /// Encode `alcblok`'s `Wg16` header, byte-for-byte identical to
 /// `ALCBLOK.C`'s own `struct blokhdr`:
 ///
-///
 /// `numblk` is a plain `USHORT` in the struct **and** `qty` is a `USHORT`
 /// parameter to `alcblok` itself (`GCOMM.H:485`) -- a `Wg16` module cannot
 /// pass more than 65,535 in the first place, so storing it any wider than
@@ -533,7 +527,6 @@ fn wg16_blok_header(qty: u16, size: u16, each: u16, globs: &[FarPtr]) -> Vec<u8>
 /// Encode `alcblok`'s `Wg32` header, byte-for-byte identical to
 /// `ALCBLOK.C`'s own flat (non-`GCDOS`) branch at the one offset it ever
 /// writes:
-///
 ///
 /// `size` sits at offset 0, exactly where the vendor puts it, so a `Wg32`
 /// module computing `size = *(USHORT *)bigptr` itself -- bypassing
@@ -674,7 +667,6 @@ pub fn alcblok(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 ///
 /// # `NULL` is the vendor's own documented answer, not an absence of one
 ///
-///
 /// "No plausible zeros" forbids *inventing* a value this host does not
 /// know -- it does not forbid returning the value the vendor's own body
 /// returns when the vendor's own body is right there to read. A `NULL`
@@ -748,7 +740,6 @@ pub fn ptrblok(call: &mut Call<Wg16>, _: &mut Host<Wg16>) -> Result<abi::Ret<Wg1
 ///
 /// `ALCBLOK.C`'s own `GCDOS` body:
 ///
-///
 /// Frees every glob first, with the same `n = ceil(numblk/each)` this
 /// host's [`alcblok`] already uses to decide how many globs to make:
 /// recompute `glob_count` from the header's own `qty`/`each`, free each
@@ -801,7 +792,6 @@ pub fn freblok(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 
 /// `VOID *alcblok(USHORT qty, USHORT size)` -- `re/wg33src/INC/GCOMM.H:261`,
 /// `Wg32` side -- `ALCBLOK.C`'s non-`GCDOS` (`GCWINNT`) branch:
-///
 ///
 /// One allocation, no chaining, no bounds record -- a flat 32-bit
 /// `malloc()` has no 64 KiB ceiling to work around, so the vendor never
@@ -916,7 +906,6 @@ pub fn alcblok32(call: &mut Call<Wg32>, host: &mut Host<Wg32>) -> Result<abi::Re
 
 /// `void *ptrblok(void *bigptr, unsigned idx)` -- `GCOMM.H:486`, `Wg32`
 /// side -- `ALCBLOK.C`'s non-`GCDOS` branch:
-///
 ///
 /// # The vendor's own flat branch cannot bounds-check `idx` -- this host does
 ///

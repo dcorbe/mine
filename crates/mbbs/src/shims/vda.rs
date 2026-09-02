@@ -48,7 +48,6 @@ use crate::abi::{self, Abi, Call};
 ///
 /// `MAJORBBS.C:1379-1384`:
 ///
-///
 /// `MAJORBBS.H:665` is the prototype.
 ///
 /// # The channel bound, and why it refuses rather than computes

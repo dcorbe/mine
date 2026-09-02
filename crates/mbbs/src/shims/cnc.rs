@@ -155,7 +155,6 @@ const INJOIP: u8 = 0x02;
 
 /// `void bgncnc(void)` -- `CNCUTL.C:27-33`:
 ///
-///
 /// **Fully implemented.** `nxtcmd=margv[0]` is one global read and one
 /// global write: [`crate::globals::Globals::pointer_mem`] on `"margv"`
 /// already answers `margv[0]`'s own contents (a global's address *is*
@@ -192,7 +191,6 @@ pub fn bgncnc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `int endcnc(void)` -- `CNCUTL.C:35-47`:
-///
 ///
 /// **Fully implemented against this host's own `maxcat` gap** -- see this
 /// file's own module doc comment for what that gap is and why it cannot be
@@ -274,7 +272,6 @@ pub fn endcnc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `char cncchr(void)` -- `CNCUTL.C:49-58`:
 ///
-///
 /// **Fully implemented.** Reads the one byte `nxtcmd` currently points at,
 /// upper-cases it with [`crate::strings::toupper`] (the same fold
 /// [`text::toupper`]'s own shim uses), and advances `nxtcmd` past it --
@@ -322,7 +319,6 @@ fn cncchr_mem<A: Abi>(mem: &mut A::Mem, host: &Host<A>) -> Result<u8, ShimError>
 }
 
 /// `char *cncall(void)` -- `CNCUTL.C:161-169`:
-///
 ///
 /// **Fully implemented.** Hands back `nxtcmd` exactly as it stood -- a
 /// pointer into `input`'s own bytes, not a copy -- and then points `nxtcmd`
@@ -444,7 +440,6 @@ fn lingo_yes_no<A: Abi>(mem: &mut A::Mem, host: &Host<A>) -> Result<(Vec<u8>, Ve
 
 /// `long cnclon(void)` -- `CNCUTL.C:66-74`:
 ///
-///
 /// **Fully implemented**, and one of the three routines here that no corpus
 /// module imports -- [`cncint`] calls it, which is reason enough under this
 /// host's own rule that a symbol is implemented because it exists in the API.
@@ -487,7 +482,6 @@ fn cnclon_mem<A: Abi>(mem: &mut A::Mem, host: &Host<A>) -> Result<u32, ShimError
 
 /// `int cncint(void)` -- `CNCUTL.C:60-64`:
 ///
-///
 /// **Fully implemented.** The `(int)` cast is [`Abi::int_from_u32`], which is
 /// a truncation to 16 bits under `Wg16` and the identity under `Wg32` --
 /// exactly what a C cast from `long` to `int` does in each. That is not a
@@ -503,7 +497,6 @@ pub fn cncint<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `char *cncwrd(void)` -- `CNCUTL.C:133-145`:
-///
 ///
 /// **Fully implemented.** Three things this reproduces exactly, each of which
 /// a plausible rewrite would get wrong:
@@ -549,7 +542,6 @@ pub fn cncwrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `char *cncsig(void)` -- `CNCUTL.C:93-108`:
 ///
-///
 /// **Fully implemented**, and the second of the three routines no corpus
 /// module imports -- [`cncuid`] calls it.
 ///
@@ -594,7 +586,6 @@ pub fn cncsig<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `char *cncuid(void)` -- `CNCUTL.C:77-90`:
-///
 ///
 /// **Fully implemented.** Two consequences worth stating, because both look
 /// like bugs and are not:
@@ -644,7 +635,6 @@ pub fn cncuid<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `GBOOL isuidc(int c)` -- `SRC/api/gcommlib/ISUIDC.C:18-30`:
 ///
-///
 /// **Fully implemented**, and the third routine here no corpus module
 /// imports -- [`cncuid`] calls it.
 ///
@@ -671,7 +661,6 @@ pub fn isuidc<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 }
 
 /// `char cncyesno(void)` -- `CNCUTL.C:111-131`:
-///
 ///
 /// **Fully implemented.** The routine that made
 /// `crate::globals::default_lingo` a prerequisite: `languages[clingo]` is
@@ -722,7 +711,6 @@ pub fn cncyesno<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::R
 
 /// `char morcnc(void)` -- `CNCUTL.C:171-182`:
 ///
-///
 /// **Fully implemented.** `maxcat` is [`MAXCAT`], the same constant
 /// [`endcnc`] already tests against and for the same reason -- this host has
 /// no message-file parser to read a sysop's real setting from.
@@ -764,7 +752,6 @@ pub fn morcnc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `char *cncnum(void)` -- `CNCUTL.C:212-225`:
-///
 ///
 /// **Fully implemented.** Two differences from [`cnclon`] over the same
 /// input, both deliberate:
@@ -808,7 +795,6 @@ pub fn cncnum<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `int onsys(char *uid)` -- `MAJORBBS.C:3009-3031`:
-///
 ///
 /// **Fully implemented for its return value; one side effect deliberately
 /// not reproduced (named below).** `onsys(uid)` is `onsysn(uid,0)` with
@@ -944,7 +930,6 @@ pub fn strupr<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 /// `int injoth(void)` -- `MAJORBBS.C:3903-3931`, with its fallback,
 /// `dftinj`, at `:3933-3939`:
 ///
-///
 /// # The `16-bit-only` project note this task asked to verify was wrong
 ///
 /// Project memory (`mbbs-headless-module-scope.md`) recorded
@@ -1059,7 +1044,6 @@ pub fn injoth<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `VOID dftinj(VOID)` -- `MAJORBBS.H:848`. `MAJORBBS.C:4637-4643`:
-///
 ///
 /// **Fully implemented**, and one of the two most demanded routines in Phase
 /// 2 -- six of the corpus's modules import it.

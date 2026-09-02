@@ -65,7 +65,6 @@ const YES: u16 = 1;
 /// `int dedcrd(long amt, int asmuch)` -- deduct credits from the *current*
 /// online account. `ACCOUNT.C:412-418`:
 ///
-///
 /// **Deducts nothing and always reports success.** This host keeps no credit
 /// balance for any account, and per the repository owner's own instruction
 /// (see [`YES`]) that is deliberate laziness rather than a gap to fill later:
@@ -102,7 +101,6 @@ pub fn dedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `int rdedcrd(long amt, int asmuch)` -- deduct **real** credits from the
 /// current online account. `ACCOUNT.C:409-415`:
 ///
-///
 /// **[`dedcrd`] with `real` set, and the same answer for the same reason.**
 /// The two differ by one argument to `ldedcrd`: `dedcrd` passes `real=0` and
 /// `rdedcrd` passes `real=1`, which selects whether the class table's debt
@@ -130,7 +128,6 @@ pub fn rdedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// `int tstcrd(long amt)` -- does the *current* user have `amt` credits to
 /// spare? `ACCOUNT.C:574-579`:
 ///
-///
 /// **Always yes**, for the same reason [`dedcrd`] always succeeds -- see
 /// [`YES`]. `amt` is read and discarded; there is no balance here for it to
 /// be compared against.
@@ -154,7 +151,6 @@ pub fn tstcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 const CONCEX: u32 = 0x0000_0800;
 
 /// `void condex(void)` -- conditional module-exit. `MAJORBBS.C:2544-2557`:
-///
 ///
 /// `re/tasrc/tsgarn-2.c:438-442` is the real call site -- Tele-Arena's
 /// `EXTING` substate, reached from the credit-refusal branch quoted on
@@ -288,7 +284,6 @@ fn pack_int(mag: u64, neg: bool, width: usize) -> Result<Vec<u8>, ShimError> {
 /// below are cited to the *host's own* internal use of the real C library
 /// `sscanf`, as the only measured evidence of what a Galacticomm-style format
 /// string for this routine looks like:
-///
 ///
 /// # What is implemented, and what refuses
 ///

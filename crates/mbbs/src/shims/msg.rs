@@ -5,7 +5,6 @@
 //! `:95`, `stgopt` `:103`, `tokopt` `:112`. `setmbk` has no prototype of its
 //! own there -- `:43` declares the `curmbk` it sets.
 //!
-//!
 //! The file format and what a value is are [`crate::msg`]'s; this is the part
 //! that knows about the module. `rawmsg` and `getasc` are both implemented:
 //! The Rose imports `getasc` at six sites, and this host serves an API
@@ -316,7 +315,6 @@ pub fn numopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// `MCVAPI.H:75-79` (wg33src):
 ///
-///
 /// No surviving `.C` body -- `MCVAPI.H` is a prototype header with nothing to
 /// quote, the same gap [`numopt`]'s own citation does not have. But
 /// `GCOMM.H:289`'s declaration and every real call site
@@ -470,7 +468,6 @@ pub fn prfmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `BBSUTILS.C:32-39` -- print a message, picking the ANSI variant when the
 /// caller's account wants ANSI.
 ///
-///
 /// **The ANSI variant is the message *after* it.** `ANSON` is 1
 /// (`INC/UStructs.h:60`), and the convention the `.MSG` file follows is that
 /// an ANSI-capable message is written as a pair, plain first. So a module
@@ -501,7 +498,6 @@ pub fn dspmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `VOID inimsg(UINT maxsiz)` -- `MCVAPI.C:37-51` -- make sure the message
 /// buffer is at least this big.
 ///
-///
 /// **Monotonic**: a smaller request after a larger one does nothing at all,
 /// which is the whole of the `mxmssz < maxsiz` guard and the one behaviour
 /// worth pinning.
@@ -529,7 +525,6 @@ const MAXCHG: usize = 100;
 
 /// `VOID setcnf(CHAR *optnam, CHAR *optval)` -- `SETCNF.C:56-76` -- record a
 /// configuration change for a later `applyem`.
-///
 ///
 /// Pure bookkeeping: nothing is written to any file until [`applyem`] runs.
 /// The first `setcnf` after an `applyem` clears the list, which is what the
@@ -606,7 +601,6 @@ pub fn applyem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 /// `UINT hexopt(INT msgnum, UINT floor, UINT ceiling)` -- `MCVAPI.C:252-266`
 /// -- a hexadecimal option from the current message file.
 ///
-///
 /// [`numopt`]'s shape with base 16, and it reaches the message text the same
 /// way -- the plan this was written against expected `rawmsg` to be missing
 /// and `hexopt` to depend on implementing it first; `rawmsg` is in fact
@@ -655,7 +649,6 @@ pub(crate) const SCNMDF_BYTES: u16 = 512;
 
 /// `CHAR *scnmdf(CHAR *mdfnam, CHAR *linpfx)` -- `MDFUTL.C:76-97` -- the
 /// value of one prefixed line in a `.MDF` file.
-///
 ///
 /// **The empty string is the answer for a prefix that is not there**, not an
 /// error: `retval=""` is set before the loop and survives it. Only failing to
