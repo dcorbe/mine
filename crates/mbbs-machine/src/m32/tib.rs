@@ -4,7 +4,6 @@
 //! This exists because of a disassembly, not a specification. `DllMain` at
 //! `0x401000` in `wccmmud.dll` does:
 //!
-//!
 //! -- part of Borland's stack-limit setup. `FS` therefore has to name a real
 //! Thread Information Block whose `StackBase` points at genuinely mapped,
 //! readable memory: a plausible-looking constant faults on the third

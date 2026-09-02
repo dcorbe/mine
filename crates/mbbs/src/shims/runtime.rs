@@ -368,7 +368,6 @@ pub fn f_scopy(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret
 ///
 /// Every site is
 ///
-///
 /// with nothing pushed before the call and no `add sp`/`pop` after it --
 /// `re/ne_arity.py 884 tmp/gapsurvey/rose/RCIROSE.DLL` reports "cleans void"
 /// for all six sites, exactly what it reports for `f_lxmul@`/`f_lxlsh@`/
