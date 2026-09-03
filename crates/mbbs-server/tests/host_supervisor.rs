@@ -1720,7 +1720,9 @@ async fn maintenance_fires_on_its_own_at_the_deadline() {
     let (chan, mut out) = connect_raw(&tx, "before").await;
     assert!(chan.is_some());
 
+    let started = Instant::now();
     wait_for_close(&mut out, "the timed maintenance deadline").await;
+    assert!(started.elapsed() >= Duration::from_secs(1), "the deadline fired early: {:?}", started.elapsed());
 
     let (chan, _out) = connect_raw(&tx, "after").await;
     assert!(chan.is_some(), "the life after the timed maintenance serves again");
