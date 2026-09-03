@@ -5933,15 +5933,54 @@ impl<A: Abi> Host<A> {
         /// `finrou`'s position in `struct module` after `descrp`. See
         /// [`Registration::dispatch`], whose own doc fixes the order.
         const FINROU: usize = 8;
+        self.sweep(machine, module, FINROU, dispatched)
+    }
 
+    /// `midnit` -- `MAJORBBS.C:3899-3917`: every module's `mcurou`, in
+    /// registration order, with `clingo` reset to 0 first.
+    ///
+    /// The vendor runs this after `hupall` has hung every user up and before
+    /// `mjrfin` runs every `finrou`. A driver must keep that order: `huprou`
+    /// and `lofrou` write per-player state, `mcurou` and `finrou` write the
+    /// world's. See [`Host::finalize`] for the sweep's own rules, which are
+    /// shared.
+    ///
+    /// # Errors
+    ///
+    /// If a registration's `struct module` no longer names memory the module
+    /// owns, or `clingo` cannot be written.
+    pub fn cleanup(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        dispatched: &mut usize,
+    ) -> io::Result<Option<A::Poison>> {
+        /// `mcurou`'s position in `struct module` after `descrp`.
+        const MCUROU: usize = 6;
+        // LINGO.H:41, and `midnit`'s `clingo=0` before each call.
+        let mem = A::mem(machine);
+        self.globals().write_int_mem(mem, "clingo", 0)?;
+        self.sweep(machine, module, MCUROU, dispatched)
+    }
+
+    /// Call entry `slot` of every registered module from index 1, skipping a
+    /// null, stopping at the first poison. The body [`Host::finalize`] and
+    /// [`Host::cleanup`] share. Its rules are documented on `finalize`.
+    fn sweep(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        slot: usize,
+        dispatched: &mut usize,
+    ) -> io::Result<Option<A::Poison>> {
         let mut index = 1;
         while index < self.modules().len() {
             let entry = self.modules()[index]
-                .dispatch(A::mem(machine), FINROU)
+                .dispatch(A::mem(machine), slot)
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            // Only a real module has a `finrou` to call. `Native` has no
+            // Only a real module has a vector to call. `Native` has no
             // `struct module` to index and `AbsentBbs` is the slot this loop
-            // starts past; neither is a module with shutdown work to do.
+            // starts past.
             if let Dispatch::Module(Some(vector)) = entry {
                 match self.run(machine, module, vector, &[], None)? {
                     Outcome::Stopped(poison) => return Ok(Some(poison)),

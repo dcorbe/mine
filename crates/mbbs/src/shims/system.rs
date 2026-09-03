@@ -2741,6 +2741,75 @@ mod tests {
         assert_eq!(dispatched, 0, "a null finrou is skipped, not dispatched");
     }
 
+    /// A registered module's midnight cleanup vector is the one `cleanup`
+    /// calls. `mcurou` is entry 6. The other eight entries are null, so a
+    /// sweep of any other slot dispatches nothing and the count says so.
+    #[test]
+    fn cleanup_dispatches_mcurou_and_nothing_else() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+
+        let mut entries = vec![FarPtr { offset: 0, selector: 0 }; 9];
+        entries[6] = f.machine.code_ptr(0);
+        let block = module_block(&mut f, "MajorMUD", &entries);
+        f.invoke(register_module, &Fixture::far(block)).expect("registered");
+
+        // After the invoke, for the same reason finalize's test does it there.
+        f.machine.load_code(&[0xcb]).expect("a retf fits");
+
+        let mut dispatched = 0;
+        let stopped = f
+            .host
+            .cleanup(&mut f.machine, &module, &mut dispatched)
+            .expect("cleanup ran");
+
+        assert!(stopped.is_none(), "a retf cleanup routine returns, it does not stop: {stopped:?}");
+        assert_eq!(dispatched, 1, "exactly the one module's mcurou, and only entry 6");
+    }
+
+    /// A module with no `mcurou` is skipped, not called through a null.
+    /// `midnit`'s own `if ((rouptr=module[i]->mcurou) != NULL)` is the guard
+    /// this mirrors.
+    #[test]
+    fn cleanup_skips_a_module_that_supplies_no_mcurou() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let block = module_block(&mut f, "MajorMUD", &[FarPtr { offset: 0, selector: 0 }; 9]);
+        f.invoke(register_module, &Fixture::far(block)).expect("registered");
+
+        let mut dispatched = 0;
+        let stopped = f
+            .host
+            .cleanup(&mut f.machine, &module, &mut dispatched)
+            .expect("cleanup ran");
+
+        assert!(stopped.is_none());
+        assert_eq!(dispatched, 0, "a null mcurou is skipped, not dispatched");
+    }
+
+    /// `midnit` sets `clingo=0` before each module's `mcurou`. A module that
+    /// left the current language on another value would otherwise run its
+    /// cleanup in that language.
+    #[test]
+    fn cleanup_resets_clingo_before_the_call() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let block = module_block(&mut f, "MajorMUD", &[FarPtr { offset: 0, selector: 0 }; 9]);
+        f.invoke(register_module, &Fixture::far(block)).expect("registered");
+        f.host
+            .globals()
+            .write_int_mem(f.machine.mem_mut(), "clingo", 7)
+            .expect("clingo is a placed global");
+
+        let mut dispatched = 0;
+        f.host
+            .cleanup(&mut f.machine, &module, &mut dispatched)
+            .expect("cleanup ran");
+
+        let clingo = f.host.globals().word_mem(f.machine.mem(), "clingo").expect("clingo");
+        assert_eq!(clingo, 0, "cleanup must write clingo=0 before sweeping");
+    }
+
     /// A `struct agent` in module memory: nine bytes of appid, then four far
     /// vectors.
     fn agent_block(f: &mut Fixture, appid: &str, vectors: &[FarPtr]) -> FarPtr {
