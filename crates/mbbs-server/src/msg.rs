@@ -36,6 +36,12 @@ pub enum In {
         done: oneshot::Sender<()>,
     },
 
+    /// Run daily maintenance now: hang everyone up, sweep every module's
+    /// `mcurou` and `finrou`, and boot the modules again in a fresh life.
+    /// Sent by `SIGUSR1`. Carries nothing: the deadline path inside `life`
+    /// reaches the same code without a message at all.
+    Maintain,
+
     /// A deadline the driver itself asked for has passed -- see
     /// `crate::alarm`. Carries nothing: the timer task never learns *why* it
     /// was armed, only *when*, and `Host::cycle`'s own clock-anchored

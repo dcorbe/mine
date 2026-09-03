@@ -425,6 +425,9 @@ struct Drain {
     /// because ending the loop is `life`'s job, not `apply`'s -- see
     /// `apply`'s own doc for what happens if one reaches it directly.
     stopping: Option<oneshot::Sender<()>>,
+    /// Whether an `In::Maintain` was drained. `false` whenever `stopping` is
+    /// `Some`: a shutdown in the same batch wins.
+    maintaining: bool,
     /// Whether this turn should end with `LifeEnd::Gone`, once `apply`'s
     /// batch has actually been applied and, if `stopping` is `Some`,
     /// `shut_down` has run instead of this.
@@ -452,19 +455,21 @@ fn drain_turn(
 ) -> Drain {
     let mut apply = Vec::new();
     let mut stopping = None;
+    let mut maintaining = false;
     for msg in peeked
         .into_iter()
         .chain(first)
         .chain(std::iter::from_fn(|| rx.try_recv().ok()))
     {
-        if let In::Shutdown { done } = msg {
-            stopping = Some(done);
-            continue;
+        match msg {
+            In::Shutdown { done } => stopping = Some(done),
+            In::Maintain => maintaining = true,
+            other => apply.push(other),
         }
-        apply.push(msg);
     }
     let ends_gone = woke_gone && stopping.is_none();
-    Drain { apply, stopping, ends_gone }
+    let maintaining = maintaining && stopping.is_none();
+    Drain { apply, stopping, maintaining, ends_gone }
 }
 
 /// How often to report [`mbbs::PollCensus`], from `MBBS_POLL_CENSUS` -- a
@@ -1368,6 +1373,9 @@ fn apply<A: Abi>(
             drop(done);
             Ok(())
         }
+        // `life` takes this out of the batch too. Reaching here is a caller
+        // that is not `life`, and there is nothing to do with it.
+        In::Maintain => Ok(()),
     }
 }
 
@@ -1739,6 +1747,39 @@ mod tests {
             !batch.ends_gone,
             "a drained Shutdown must win over Gone, not be absorbed by a bare exit"
         );
+    }
+
+    /// `Maintain` is pulled out of the batch the way `Shutdown` is: ending
+    /// the life is `life`'s job, not `apply`'s.
+    #[test]
+    fn drain_turn_pulls_maintain_out_of_the_batch() {
+        let (tx, rx) = std::sync::mpsc::channel::<In>();
+        tx.send(In::Maintain).expect("queued");
+        tx.send(In::Alarm).expect("queued");
+
+        let batch = drain_turn(None, None, &rx, false);
+
+        assert!(batch.maintaining, "life must see the Maintain");
+        assert!(batch.stopping.is_none());
+        assert_eq!(batch.apply.len(), 1, "only the Alarm reaches apply");
+        assert!(matches!(batch.apply[0], In::Alarm));
+        assert!(!batch.ends_gone);
+    }
+
+    /// One batch holding both: `Shutdown` wins. A shutdown after a reload
+    /// would be the same shutdown a minute later.
+    #[test]
+    fn drain_turn_lets_shutdown_win_over_maintain() {
+        let (tx, rx) = std::sync::mpsc::channel::<In>();
+        let (done, _waiter) = oneshot::channel();
+        tx.send(In::Maintain).expect("queued");
+        tx.send(In::Shutdown { done }).expect("queued");
+
+        let batch = drain_turn(None, None, &rx, false);
+
+        assert!(batch.stopping.is_some());
+        assert!(!batch.maintaining, "a Shutdown in the same batch drops the Maintain");
+        assert!(batch.apply.is_empty());
     }
 
     /// `apply`'s `Connect` arm, stripped of the `Host`/`Module` it would
