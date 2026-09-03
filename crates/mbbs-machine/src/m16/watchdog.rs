@@ -163,6 +163,14 @@ impl Watched {
         self.set(Duration::ZERO, Duration::ZERO)
     }
 
+    /// Forget a tick that was recorded before this context stopped being
+    /// armed. `disarm` stops the clock but leaves `expired` as it found it,
+    /// and only `arm` clears it, so a caller that means to stop watching for
+    /// good rather than pause before the next `arm` has to clear it itself.
+    pub(crate) fn clear_expired(&mut self) {
+        self.ctx.expired = 0;
+    }
+
     /// Is the clock running?
     ///
     /// Asks the kernel with `timer_gettime` rather than tracking a flag,

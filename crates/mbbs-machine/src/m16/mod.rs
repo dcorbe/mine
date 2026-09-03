@@ -572,7 +572,7 @@ impl Machine {
     ///
     /// If `budget` is zero, which would mean "no time at all" but is how
     /// `timer_settime` spells "no limit". Nothing good comes of guessing which
-    /// was meant; "no limit" is spelt [`Machine::unwatch`].
+    /// was meant. "No limit" is spelt [`Machine::unwatch`].
     pub fn set_budget(&mut self, budget: Duration) {
         assert!(!budget.is_zero(), "a zero watchdog budget is not a budget");
         self.budget = Some(budget);
@@ -584,12 +584,21 @@ impl Machine {
     ///
     /// For a program someone is watching, not for a BBS module. A module's
     /// entry point must return, since a spinning `sttrou` freezes every
-    /// player on the board, so the host keeps the budget. A standalone
-    /// program under an operator has the operator: a time limit there can
-    /// only ever cut off correct work, and "still running" is not the
-    /// machine's to judge.
+    /// player on the board, so the host keeps the budget for an ordinary
+    /// entry. `Host::sweep` is the one exception: it lifts the budget around
+    /// the vendor's own unbounded `midnit`/`mjrfin` sweeps and puts it back
+    /// after. A standalone program under an operator has the operator: a
+    /// time limit there can only ever cut off correct work, and "still
+    /// running" is not the machine's to judge.
+    ///
+    /// Also clears any tick already recorded against this context. Nothing
+    /// after this call will arm the timer to clear it the ordinary way, so a
+    /// tick that landed between the last entry's return and its own
+    /// `disarm` would otherwise sit there and poison the very next entry
+    /// with a timeout that was never real.
     pub fn unwatch(&mut self) {
         self.budget = None;
+        self.ctx.clear_expired();
     }
 
     /// Why this machine will not run again, if it will not.

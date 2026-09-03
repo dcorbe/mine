@@ -377,14 +377,13 @@ impl Abi for Wg32 {
         cpu.machine.arg_frame(cpu.mem.stack())
     }
 
-    /// Direct delegation -- `mbbs_machine::m32::Machine::poison` mirrors
-    /// `mbbs_machine::m16::Machine::poison` exactly since Task 16 landed the
-    /// 32-bit watchdog, disarm included. Forward the reason and the
-    /// `io::Result` straight through.
+    /// Direct delegation -- `mbbs_machine::m32::Machine::budget`.
     fn budget(cpu: &mut Self::Cpu) -> Option<std::time::Duration> {
         cpu.machine.budget()
     }
 
+    /// `Some` delegates to `mbbs_machine::m32::Machine::set_budget`, `None`
+    /// to `unwatch`.
     fn set_budget(cpu: &mut Self::Cpu, budget: Option<std::time::Duration>) {
         match budget {
             Some(d) => cpu.machine.set_budget(d),
@@ -392,6 +391,10 @@ impl Abi for Wg32 {
         }
     }
 
+    /// Direct delegation -- `mbbs_machine::m32::Machine::poison` mirrors
+    /// `mbbs_machine::m16::Machine::poison` exactly since Task 16 landed the
+    /// 32-bit watchdog, disarm included. Forward the reason and the
+    /// `io::Result` straight through.
     fn poison(cpu: &mut Self::Cpu, why: Self::Poison) -> std::io::Result<()> {
         cpu.machine.poison(why)
     }

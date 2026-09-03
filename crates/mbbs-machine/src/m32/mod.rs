@@ -725,13 +725,23 @@ impl Machine {
     ///
     /// For a *program* someone is watching, not for a BBS module. A module's
     /// entry point must return -- a spinning `sttrou` freezes every player on
-    /// the board -- so the host keeps the budget. A standalone program under
-    /// an operator has the operator: a time limit there can only ever cut
-    /// off correct work (a 120-second cap did, 2026-08-29, ten minutes into
-    /// a database recovery), and "still running" is not the machine's to
-    /// judge. [`Self::interrupter`] is how the operator stops it.
+    /// the board -- so the host keeps the budget for an ordinary entry.
+    /// `Host::sweep` is the one exception: it lifts the budget around the
+    /// vendor's own unbounded `midnit`/`mjrfin` sweeps and puts it back
+    /// after. A standalone program under an operator has the operator: a
+    /// time limit there can only ever cut off correct work (a 120-second cap
+    /// did, 2026-08-29, ten minutes into a database recovery), and "still
+    /// running" is not the machine's to judge. [`Self::interrupter`] is how
+    /// the operator stops it.
+    ///
+    /// Also clears any tick already recorded against this context. Nothing
+    /// after this call will arm the timer to clear it the ordinary way, so a
+    /// tick that landed between the last entry's return and its own
+    /// `disarm` would otherwise sit there and poison the very next entry
+    /// with a timeout that was never real.
     pub fn unwatch(&mut self) {
         self.budget = None;
+        self.ctx.clear_expired();
     }
 
     /// A handle that stops this machine's module on demand, from any thread
