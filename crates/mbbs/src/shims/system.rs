@@ -2823,7 +2823,7 @@ mod tests {
     }
 
     /// `midnit` sets `clingo=0` before sweeping cleanup. This module's nine
-    /// slots are all null, so nothing is dispatched; the only thing this
+    /// slots are all null, so nothing is dispatched. The only thing this
     /// checks is that `clingo` reads 0 after the sweep.
     #[test]
     fn cleanup_resets_clingo() {
