@@ -84,8 +84,9 @@ use crate::pool::Pool;
 pub type ExtensionBuilder<A> = Box<dyn Fn(&[(String, <A as Abi>::Module)]) -> io::Result<Box<dyn mbbs::extension::Extension<A>>> + Send>;
 
 /// Whether the board is taking callers. False from the start of maintenance
-/// until the next life has booted. Read by every accept path, written only
-/// by the host thread. Starts true so the first boot behaves as before.
+/// until the next life has booted. Read by every accept path, set by the
+/// host thread once a life is serving, cleared by it when maintenance
+/// starts. Starts true so the first boot behaves as before.
 pub type Serving = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
 /// Everything the host thread needs, all of it `Send`. `A::Cpu` is not
@@ -598,10 +599,11 @@ enum Teardown {
 /// world's is. Running them the other way round would finalise a world whose
 /// players had not yet been saved into it.
 ///
-/// A module that stops inside its `mcurou` poisons the machine, and a
-/// poisoned machine refuses every further call, so the `finrou` sweep is
-/// skipped. Btrieve is still closed so dirty blocks reach disk. The poison
-/// is returned so `life` can end `Stopped` rather than `Maintained`. A stop
+/// A module that stops inside its `mcurou` poisons the machine, and the
+/// `if poisoned.is_none()` branch below skips the `finrou` sweep itself
+/// rather than run it against a machine that would only refuse the call.
+/// Btrieve is still closed so dirty blocks reach disk. The poison is
+/// returned so `life` can end `Stopped` rather than `Maintained`. A stop
 /// inside `finrou` is reported and the tail still runs, as before.
 fn tear_down<A: Abi>(
     host: &mut mbbs::Host<A>,
@@ -676,8 +678,8 @@ fn tear_down<A: Abi>(
 }
 
 /// One maintenance, as a life end: `Maintained` when every sweep returned,
-/// `Stopped` when a module's `mcurou` poisoned the machine. `chan` is `None`
-/// because no channel was dispatched into.
+/// `Stopped` when a module's `mcurou` poisoned the machine, at
+/// `StopSite::Maintenance` -- no channel was dispatched into.
 fn maintain<A: Abi>(
     host: &mut mbbs::Host<A>,
     machine: &mut A::Cpu,
@@ -687,7 +689,7 @@ fn maintain<A: Abi>(
     serving: &Serving,
 ) -> LifeEnd<A> {
     match tear_down(host, machine, module, conns, terms, serving, Teardown::Maintenance) {
-        Some(poison) => LifeEnd::Stopped { poison, chan: None },
+        Some(poison) => LifeEnd::Stopped { poison, site: StopSite::Maintenance },
         None => LifeEnd::Maintained,
     }
 }
@@ -758,6 +760,17 @@ impl RestartPolicy {
     }
 }
 
+/// Where a module stop happened, for `run`'s log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopSite {
+    /// A dispatch on this channel.
+    Chan(Chan),
+    /// `Host::cycle`'s kick sweep. A timer callback has no channel.
+    Kick,
+    /// The `mcurou` sweep during maintenance.
+    Maintenance,
+}
+
 /// How one life of the host thread ended.
 enum LifeEnd<A: Abi> {
     /// Every `Sender<In>` is gone -- see [`Woke::Gone`]. The whole
@@ -769,12 +782,11 @@ enum LifeEnd<A: Abi> {
     /// back up -- and, for MajorMUD, rewrite the `WCCRECOV.FLG` that the
     /// shutdown just removed.
     ShutDown,
-    /// The module stopped inside the steady-state driver loop.
-    ///
-    /// `chan` is `None` when the stop came from [`Host::cycle`]'s kick
-    /// sweep rather than a channel dispatch: a timer callback has no
-    /// channel to name. See [`mbbs::Ended::Stopped`].
-    Stopped { poison: A::Poison, chan: Option<Chan> },
+    /// The module stopped: either inside the steady-state driver loop
+    /// (`site` is [`StopSite::Chan`] or [`StopSite::Kick`], see
+    /// [`mbbs::Ended::Stopped`]) or inside the `mcurou` sweep during
+    /// maintenance (`site` is [`StopSite::Maintenance`], see [`maintain`]).
+    Stopped { poison: A::Poison, site: StopSite },
     /// Daily maintenance ran: every channel hung up, every `mcurou` and
     /// `finrou` swept. `run` boots the modules again at once, and this does
     /// not count against [`RestartPolicy`]: a reload is not a stop.
@@ -783,14 +795,16 @@ enum LifeEnd<A: Abi> {
 
 /// Names who a stop happened to, for [`run`]'s log line -- pulled out as its
 /// own pure function so it has a unit test of its own rather than being
-/// legible only by eyeballing `--nocapture` output. `None` is spelled out
-/// rather than left to a reader's inference, because the honest fact ("a
-/// kick fired, not a player") is exactly the thing a driver reading the log
-/// wants to know and a bare "no channel" does not say.
-fn describe_stop(chan: Option<Chan>) -> String {
-    match chan {
-        Some(chan) => format!("channel {chan}"),
-        None => "no channel (a kick fired, not a player)".to_owned(),
+/// legible only by eyeballing `--nocapture` output. Each [`StopSite`] is
+/// spelled out rather than left to a reader's inference, because the honest
+/// fact ("a kick fired, not a player") is exactly the thing a driver reading
+/// the log wants to know and a bare "no channel" does not say -- and a stop
+/// during maintenance is not a player's channel closing either.
+fn describe_stop(site: StopSite) -> String {
+    match site {
+        StopSite::Chan(chan) => format!("channel {chan}"),
+        StopSite::Kick => "no channel (a kick fired, not a player)".to_owned(),
+        StopSite::Maintenance => "maintenance (a module stopped inside its mcurou)".to_owned(),
     }
 }
 
@@ -1178,9 +1192,8 @@ fn life<A: Abi>(
             let _ = done.send(());
             return Ok(LifeEnd::ShutDown);
         }
-        // A message-driven `In::Maintain` and the 24-hour deadline coming
-        // due are two triggers for the same path. Both end this life the
-        // same way, so they share one `maintain` call rather than two.
+        // A message-driven `In::Maintain` and the maintenance deadline coming
+        // due share one `maintain` call rather than two.
         if batch.maintaining || Instant::now() >= due {
             return Ok(maintain(&mut host, &mut machine, &module, &mut conns, terms, &boot.serving));
         }
@@ -1307,7 +1320,11 @@ fn life<A: Abi>(
                 for conn in conns.iter().flatten() {
                     let _ = conn.try_send(Out::Close);
                 }
-                return Ok(LifeEnd::Stopped { poison, chan });
+                let site = match chan {
+                    Some(chan) => StopSite::Chan(chan),
+                    None => StopSite::Kick,
+                };
+                return Ok(LifeEnd::Stopped { poison, site });
             }
             other => wait = other.wait(),
         }
@@ -1364,8 +1381,8 @@ pub fn run<A: Abi>(
             Ok(LifeEnd::Maintained) => {
                 eprintln!("mbbs-server: maintenance done; booting the module again");
             }
-            Ok(LifeEnd::Stopped { poison, chan }) => {
-                eprintln!("mbbs-server: module stopped ({}): {poison}", describe_stop(chan));
+            Ok(LifeEnd::Stopped { poison, site }) => {
+                eprintln!("mbbs-server: module stopped ({}): {poison}", describe_stop(site));
 
                 if !policy.allow(Instant::now()) {
                     break Err(io::Error::other(format!(
@@ -1863,7 +1880,7 @@ mod tests {
         let batch = drain_turn(peeked, None, &rx, true);
 
         assert!(batch.apply.is_empty(), "Shutdown must not reach apply's batch");
-        assert!(batch.stopping.is_some(), "life must still see it to run shut_down");
+        assert!(batch.stopping.is_some(), "life must still see it to run tear_down");
         assert!(
             !batch.ends_gone,
             "a drained Shutdown must win over Gone, not be absorbed by a bare exit"
@@ -2054,20 +2071,25 @@ mod tests {
     // `Duration` math, never `std::thread::sleep`), which is exactly what
     // makes `RestartPolicy` testable without paying sixty real seconds per
     // assertion.
-    use super::{MAX_RESTARTS, RESTART_WINDOW, RestartPolicy, describe_stop};
+    use super::{MAX_RESTARTS, RESTART_WINDOW, RestartPolicy, StopSite, describe_stop};
     use std::time::{Duration, Instant};
 
-    /// `describe_stop` names a channel when it has one, and says plainly
-    /// when it does not -- the only place these two facts get formatted for
-    /// the log line `run` prints on every stop, so a mutation swapping the
-    /// two arms (or losing the "not a player" honesty) would otherwise only
-    /// be visible by eyeballing `cargo test -- --nocapture` output from
-    /// `tests/host_supervisor.rs`.
+    /// `describe_stop` names a channel when it has one, says plainly when a
+    /// kick fired instead, and says plainly when the stop came from
+    /// maintenance's own `mcurou` sweep -- the only place these three facts
+    /// get formatted for the log line `run` prints on every stop, so a
+    /// mutation swapping the arms (or losing the "not a player" honesty)
+    /// would otherwise only be visible by eyeballing `cargo test --
+    /// --nocapture` output from `tests/host_supervisor.rs`.
     #[test]
-    fn describe_stop_names_a_channel_or_says_there_is_none() {
+    fn describe_stop_names_a_channel_kick_or_maintenance() {
         let chan = mbbs::Terms::new(1).chan(0).expect("channel zero of one");
-        assert_eq!(describe_stop(Some(chan)), "channel 0");
-        assert_eq!(describe_stop(None), "no channel (a kick fired, not a player)");
+        assert_eq!(describe_stop(StopSite::Chan(chan)), "channel 0");
+        assert_eq!(describe_stop(StopSite::Kick), "no channel (a kick fired, not a player)");
+        assert_eq!(
+            describe_stop(StopSite::Maintenance),
+            "maintenance (a module stopped inside its mcurou)"
+        );
     }
 
     /// The first `MAX_RESTARTS` stops, all at the same instant, are every

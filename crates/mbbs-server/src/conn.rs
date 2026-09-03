@@ -93,7 +93,7 @@ const OPT_SGA: u8 = 3;
 pub(crate) const OUT_CHANNEL_BOUND: usize = 32;
 
 /// What a caller is told while maintenance is running.
-pub const MAINTENANCE_LINE: &[u8] = b"The system is down for daily maintenance. Try again in a few minutes.\r\n";
+pub(crate) const MAINTENANCE_LINE: &[u8] = b"The system is down for daily maintenance. Try again in a few minutes.\r\n";
 
 /// The keys `crates/mbbs/tests/wccmmud.rs:3623` uses for a player who reaches
 /// the Realm. This is a *default*, not a policy: [`serve`]'s `keys` parameter
