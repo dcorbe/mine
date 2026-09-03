@@ -1602,3 +1602,56 @@ async fn a_shutdown_ends_the_host_thread_and_does_not_restart_it() {
     }
     panic!("the host thread was still accepting messages 10s after it said it had shut down");
 }
+
+/// `In::Maintain` hangs up every connected channel and the next life serves
+/// a fresh connect. Driven over the raw `In` channel: `connect_raw`'s reply
+/// only arrives once the new life is polling, so no sleep is needed to know
+/// the reboot finished.
+#[tokio::test]
+async fn a_maintain_closes_a_connected_channel_and_the_next_life_serves() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-maintain",
+        &builder::boots_and_runs_forever(),
+    );
+    let tx = conn::spawn_machine(boot(module, "mbbs-server-host-supervisor-maintain-root", 1));
+
+    let (chan, mut out) = connect_raw(&tx, "before").await;
+    assert!(chan.is_some(), "the first life serves the only channel");
+
+    tx.send(In::Maintain).expect("the host thread is alive");
+
+    let closed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match out.recv().await {
+                Some(Out::Close) | None => break true,
+                Some(Out::Bytes(_)) => continue,
+            }
+        }
+    })
+    .await
+    .expect("maintenance must hang the channel up inside 10s");
+    assert!(closed);
+
+    let (chan, _out) = connect_raw(&tx, "after").await;
+    assert!(chan.is_some(), "the life after maintenance serves the channel again");
+}
+
+/// A maintenance reload is not a stop. `MAX_RESTARTS` is five, so six
+/// reloads inside the window prove the restart policy was never consulted.
+#[tokio::test]
+async fn six_maintenances_in_a_row_leave_the_board_serving() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-maintain-six",
+        &builder::boots_and_runs_forever(),
+    );
+    let tx = conn::spawn_machine(boot(module, "mbbs-server-host-supervisor-maintain-six-root", 1));
+
+    for round in 0..6 {
+        let (chan, _out) = connect_raw(&tx, "probe").await;
+        assert!(chan.is_some(), "round {round}: the board must be serving before each maintenance");
+        tx.send(In::Maintain).expect("the host thread is alive");
+    }
+
+    let (chan, _out) = connect_raw(&tx, "final").await;
+    assert!(chan.is_some(), "after six maintenances the board still serves");
+}

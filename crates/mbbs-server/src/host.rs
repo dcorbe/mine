@@ -48,7 +48,8 @@
 //! bound. A boot failure (the machine cannot be built, the module cannot be
 //! loaded or relocated, ordinal 1 itself stops, or `finish_init` fails) is a
 //! broken deployment, not a survivable stop, and is not retried: only a stop
-//! reached from the steady-state driver loop restarts.
+//! reached from the steady-state driver loop restarts. A maintenance reload
+//! also starts a new life, and does not count as a stop.
 
 use std::collections::VecDeque;
 use std::io;
@@ -412,14 +413,15 @@ fn wait_with_peek(wait: Wait, peeked: bool) -> Wait {
 /// `peeked`, `first` and `rx`'s backlog happens *before* a `Woke::Gone` wake
 /// gets any say in whether the turn ends -- can be tested without a real
 /// `Host`/`Machine`/`Module`, the way [`wait_with_peek`] already is.
-/// `drain_turn` never touches `apply` or `shut_down` itself; it hands the
+/// `drain_turn` never touches `apply` or `tear_down` itself; it hands the
 /// caller a plan, in order, and reports the decision rather than the side
 /// effects.
 struct Drain {
     /// Every message to hand to `apply`, in the order `life`'s step 2 always
     /// used: `peeked` first (it was received before anything `wake`
     /// returned this turn), then `first`, then the rest of `rx`'s backlog.
-    /// Never contains `In::Shutdown` -- see `stopping`.
+    /// Never contains `In::Shutdown` -- see `stopping`. Never contains
+    /// `In::Maintain` either -- see `maintaining`.
     apply: Vec<In>,
     /// The first `In::Shutdown` drained, pulled out of `apply`'s batch
     /// because ending the loop is `life`'s job, not `apply`'s -- see
@@ -430,7 +432,7 @@ struct Drain {
     maintaining: bool,
     /// Whether this turn should end with `LifeEnd::Gone`, once `apply`'s
     /// batch has actually been applied and, if `stopping` is `Some`,
-    /// `shut_down` has run instead of this.
+    /// `tear_down` has run instead of this.
     ends_gone: bool,
 }
 
@@ -444,7 +446,7 @@ struct Drain {
 /// `rx` -- `peeked`'s reason to exist -- is a message already received, and
 /// `Woke::Gone` says nobody can send *again*, not that this batch never
 /// happened. A drained `Shutdown` always wins over a `Gone` wake too: it
-/// still deserves the real `shut_down()` sweep `life` runs for `stopping`,
+/// still deserves the real `tear_down()` sweep `life` runs for `stopping`,
 /// not silent starvation because it happened to be the last message anyone
 /// ever sent.
 fn drain_turn(
@@ -554,32 +556,47 @@ fn report_census<A: Abi>(
     }
 }
 
-/// `mjrfin` -- `MAJORBBS.C:4818-4831`: hang every channel up, then run every
-/// module's `finrou`.
+/// Which of the two ends of a life this teardown is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Teardown {
+    /// `In::Shutdown`: the process is about to exit.
+    Shutdown,
+    /// Daily maintenance: the next life boots the modules again.
+    Maintenance,
+}
+
+/// `mjrfin` and `midnit` together -- `MAJORBBS.C:4818-4831` and
+/// `MAJORBBS.C:3899-3917`: hang every channel up, run every module's
+/// `mcurou` when this is maintenance, then run every module's `finrou`.
 ///
 /// **Hangup first, and in that order.** A module's `huprou`/`lofrou` is where
-/// per-player state is written back; its `finrou` is where the world's is.
-/// Running them the other way round would finalise a world whose players had
-/// not yet been saved into it.
+/// per-player state is written back; its `mcurou` and `finrou` are where the
+/// world's is. Running them the other way round would finalise a world whose
+/// players had not yet been saved into it.
 ///
-/// Nothing here is allowed to abort the rest. A module that stops during its
-/// own shutdown has already had whatever `finrou` ran before the fault, and
-/// the remaining modules still have theirs to run -- so a stop is reported
-/// and the sweep continues rather than propagating. There is no next life to
-/// recover into: this is the last thing the thread does.
-fn shut_down<A: Abi>(
+/// A module that stops inside its `mcurou` poisons the machine, and a
+/// poisoned machine refuses every further call, so the `finrou` sweep is
+/// skipped. Btrieve is still closed so dirty blocks reach disk. The poison
+/// is returned so `life` can end `Stopped` rather than `Maintained`. A stop
+/// inside `finrou` is reported and the tail still runs, as before.
+fn tear_down<A: Abi>(
     host: &mut mbbs::Host<A>,
     machine: &mut A::Cpu,
     module: &A::Module,
     conns: &mut [Option<Sender<Out>>],
     terms: Terms,
-) {
+    mode: Teardown,
+) -> Option<A::Poison> {
+    let what = match mode {
+        Teardown::Shutdown => "shutdown",
+        Teardown::Maintenance => "maintenance",
+    };
     for chan in terms.all() {
         if conns[chan.index()].is_none() {
             continue;
         }
         if let Err(e) = host.hangup(machine, module, chan) {
-            eprintln!("mbbs-server: shutdown: hanging up channel {chan}: {e}");
+            eprintln!("mbbs-server: {what}: hanging up channel {chan}: {e}");
         }
         if let Some(conn) = conns[chan.index()].as_ref() {
             let _ = conn.try_send(Out::Close);
@@ -587,18 +604,34 @@ fn shut_down<A: Abi>(
         conns[chan.index()] = None;
     }
 
-    let mut dispatched = 0;
-    match host.finalize(machine, module, &mut dispatched) {
-        Ok(None) => {
-            eprintln!("mbbs-server: shutdown: {dispatched} module(s) finalised");
+    let mut poisoned = None;
+    if mode == Teardown::Maintenance {
+        let mut dispatched = 0;
+        match host.cleanup(machine, module, &mut dispatched) {
+            Ok(None) => eprintln!("mbbs-server: maintenance: {dispatched} module(s) cleaned up"),
+            Ok(Some(poison)) => {
+                eprintln!(
+                    "mbbs-server: maintenance: a module stopped during its own mcurou after \
+                     {dispatched} cleaned up: {poison:?}"
+                );
+                poisoned = Some(poison);
+            }
+            Err(e) => eprintln!("mbbs-server: maintenance: mcurou sweep failed after {dispatched}: {e}"),
         }
-        Ok(Some(poison)) => eprintln!(
-            "mbbs-server: shutdown: a module stopped during its own finrou after \
-             {dispatched} finalised: {poison:?}"
-        ),
-        Err(e) => eprintln!(
-            "mbbs-server: shutdown: finrou sweep failed after {dispatched}: {e}"
-        ),
+    }
+
+    if poisoned.is_none() {
+        let mut dispatched = 0;
+        match host.finalize(machine, module, &mut dispatched) {
+            Ok(None) => eprintln!("mbbs-server: {what}: {dispatched} module(s) finalised"),
+            Ok(Some(poison)) => eprintln!(
+                "mbbs-server: {what}: a module stopped during its own finrou after \
+                 {dispatched} finalised: {poison:?}"
+            ),
+            Err(e) => eprintln!("mbbs-server: {what}: finrou sweep failed after {dispatched}: {e}"),
+        }
+    } else {
+        eprintln!("mbbs-server: maintenance: finrou sweep skipped, the machine is poisoned");
     }
 
     // After the modules' own shutdown, not before -- a `finrou` still has
@@ -606,11 +639,28 @@ fn shut_down<A: Abi>(
     // whatever a module leaves dirty rather than assuming every module
     // closed everything itself.
     match host.close_btrieve() {
-        Ok(n) => eprintln!("mbbs-server: shutdown: {n} btrieve block(s) closed"),
-        Err(e) => eprintln!("mbbs-server: shutdown: closing btrieve blocks failed: {e}"),
+        Ok(n) => eprintln!("mbbs-server: {what}: {n} btrieve block(s) closed"),
+        Err(e) => eprintln!("mbbs-server: {what}: closing btrieve blocks failed: {e}"),
     }
 
     report_notes(host);
+    poisoned
+}
+
+/// One maintenance, as a life end: `Maintained` when every sweep returned,
+/// `Stopped` when a module's `mcurou` poisoned the machine. `chan` is `None`
+/// because no channel was dispatched into.
+fn maintain<A: Abi>(
+    host: &mut mbbs::Host<A>,
+    machine: &mut A::Cpu,
+    module: &A::Module,
+    conns: &mut [Option<Sender<Out>>],
+    terms: Terms,
+) -> LifeEnd<A> {
+    match tear_down(host, machine, module, conns, terms, Teardown::Maintenance) {
+        Some(poison) => LifeEnd::Stopped { poison, chan: None },
+        None => LifeEnd::Maintained,
+    }
 }
 
 /// How many times [`run`] will rebuild a machine after [`Ended::Stopped`]
@@ -679,7 +729,7 @@ enum LifeEnd<A: Abi> {
     /// Every `Sender<In>` is gone -- see [`Woke::Gone`]. The whole
     /// supervisor should stop, not just this life.
     Gone,
-    /// [`In::Shutdown`] arrived and [`shut_down`] has already run. Distinct
+    /// [`In::Shutdown`] arrived and [`tear_down`] has already run. Distinct
     /// from [`LifeEnd::Gone`] because a restart would be actively wrong here:
     /// the module has been finalised, and rebuilding it would take the board
     /// back up -- and, for MajorMUD, rewrite the `WCCRECOV.FLG` that the
@@ -691,6 +741,10 @@ enum LifeEnd<A: Abi> {
     /// sweep rather than a channel dispatch: a timer callback has no
     /// channel to name. See [`mbbs::Ended::Stopped`].
     Stopped { poison: A::Poison, chan: Option<Chan> },
+    /// Daily maintenance ran: every channel hung up, every `mcurou` and
+    /// `finrou` swept. `run` boots the modules again at once, and this does
+    /// not count against [`RestartPolicy`]: a reload is not a stop.
+    Maintained,
 }
 
 /// Names who a stop happened to, for [`run`]'s log line -- pulled out as its
@@ -1078,13 +1132,16 @@ fn life<A: Abi>(
             apply(&mut host, &mut machine, &module, &mut pool, &mut conns, msg)?;
         }
         if let Some(done) = batch.stopping {
-            shut_down(&mut host, &mut machine, &module, &mut conns, terms);
+            tear_down(&mut host, &mut machine, &module, &mut conns, terms, Teardown::Shutdown);
             // Sent after the sweep, not before: the whole point of the
             // channel is that the waiter learns when `finrou` has finished,
             // which for MajorMUD is when its buffers are on disk and
             // `WCCRECOV.FLG` is gone.
             let _ = done.send(());
             return Ok(LifeEnd::ShutDown);
+        }
+        if batch.maintaining {
+            return Ok(maintain(&mut host, &mut machine, &module, &mut conns, terms));
         }
         if batch.ends_gone {
             // Everything `peeked` and `rx` were holding has just been
@@ -1263,6 +1320,9 @@ pub fn run<A: Abi>(
             Err(e) => break Err(e),
             Ok(LifeEnd::Gone) => break Ok(()),
             Ok(LifeEnd::ShutDown) => break Ok(()),
+            Ok(LifeEnd::Maintained) => {
+                eprintln!("mbbs-server: maintenance done; booting the module again");
+            }
             Ok(LifeEnd::Stopped { poison, chan }) => {
                 eprintln!("mbbs-server: module stopped ({}): {poison}", describe_stop(chan));
 
@@ -1729,7 +1789,7 @@ mod tests {
 
     /// A `Shutdown` drained in the very batch that also found `rx` gone
     /// must still win: `ends_gone` is `false` whenever `stopping` is
-    /// `Some`, so `life` runs the real `shut_down()` sweep instead of a bare
+    /// `Some`, so `life` runs the real `tear_down()` sweep instead of a bare
     /// `LifeEnd::Gone` exit that would drop `done` without ever touching
     /// `finrou`.
     #[test]
