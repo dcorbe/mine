@@ -452,8 +452,9 @@ pub struct Machine {
     call_ax: u16,
     call_cx: u16,
 
-    /// How much CPU time one entry point may have.
-    budget: Duration,
+    /// How much CPU time one entry point may have, or `None` after
+    /// [`Machine::unwatch`]. See [`Machine::set_budget`].
+    budget: Option<Duration>,
 
     /// Set once the module has faulted or overrun, and never cleared. A
     /// poisoned machine refuses to be entered.
@@ -554,13 +555,14 @@ impl Machine {
             frame_sp: None,
             call_ax: 0,
             call_cx: 0,
-            budget: DEFAULT_BUDGET,
+            budget: Some(DEFAULT_BUDGET),
             poisoned: None,
         })
     }
 
-    /// How much CPU time one entry point may have. See [`Machine::set_budget`].
-    pub fn budget(&self) -> Duration {
+    /// How much CPU time one entry point may have, or `None` after
+    /// [`Machine::unwatch`]. See [`Machine::set_budget`].
+    pub fn budget(&self) -> Option<Duration> {
         self.budget
     }
 
@@ -570,10 +572,24 @@ impl Machine {
     ///
     /// If `budget` is zero, which would mean "no time at all" but is how
     /// `timer_settime` spells "no limit". Nothing good comes of guessing which
-    /// was meant.
+    /// was meant; "no limit" is spelt [`Machine::unwatch`].
     pub fn set_budget(&mut self, budget: Duration) {
         assert!(!budget.is_zero(), "a zero watchdog budget is not a budget");
-        self.budget = budget;
+        self.budget = Some(budget);
+    }
+
+    /// Run entry points with no budget at all: nothing arms the timer, so a
+    /// module only ever stops because it returned, faulted, or was poisoned
+    /// directly.
+    ///
+    /// For a program someone is watching, not for a BBS module. A module's
+    /// entry point must return, since a spinning `sttrou` freezes every
+    /// player on the board, so the host keeps the budget. A standalone
+    /// program under an operator has the operator: a time limit there can
+    /// only ever cut off correct work, and "still running" is not the
+    /// machine's to judge.
+    pub fn unwatch(&mut self) {
+        self.budget = None;
     }
 
     /// Why this machine will not run again, if it will not.
@@ -823,7 +839,9 @@ impl Machine {
         // whatever the module last had, since DS is callee-saved.
         self.ctx.out_ds = u64::from(self.mem.data);
 
-        self.ctx.arm(self.budget)?;
+        if let Some(budget) = self.budget {
+            self.ctx.arm(budget)?;
+        }
         self.run(entry, sp, Ret::Void)
     }
 
@@ -1345,8 +1363,10 @@ impl Machine {
                 ))
             })?;
         }
-        if !self.ctx.armed()? {
-            self.ctx.arm(self.budget)?;
+        if let Some(budget) = self.budget
+            && !self.ctx.armed()?
+        {
+            self.ctx.arm(budget)?;
         }
         self.enter()
     }
@@ -1881,5 +1901,41 @@ mod register_tests {
             machine.ctx.armed().expect("gettime"),
             "a cold jump left the module running unwatched"
         );
+    }
+
+    /// [`Machine::unwatch`]: no budget means no timer, and a module that
+    /// takes longer than any budget would have allowed still returns.
+    /// Mirrors `mbbs_machine::m32::Machine`'s own
+    /// `an_unwatched_machine_never_times_out`.
+    #[test]
+    fn unwatch_lets_an_entry_outlive_the_default_budget() {
+        // Two nested loops, about 150ms of spinning, then retf.
+        let code = [
+            0xB9, 0x00, 0x08, // mov cx, 0x0800
+            0x51, // push cx
+            0xB9, 0xFF, 0xFF, // mov cx, 0xFFFF
+            0xE2, 0xFE, // loop $
+            0x59, // pop cx
+            0xE2, 0xF7, // loop outer
+            0xCB, // retf
+        ];
+
+        let mut machine = Machine::new().expect("16-bit machine");
+        machine.load_code(&code).expect("the spin fits");
+        let entry = machine.code_ptr(0);
+
+        machine.set_budget(Duration::from_millis(20));
+        let exit = machine.call(entry, &[]).expect("the module runs");
+        assert!(matches!(exit, Exit::Timeout { .. }), "over budget: {exit:?}");
+
+        let mut machine = Machine::new().expect("16-bit machine");
+        machine.load_code(&code).expect("the spin fits");
+        let entry = machine.code_ptr(0);
+
+        machine.set_budget(Duration::from_millis(20));
+        machine.unwatch();
+        assert_eq!(machine.budget(), None, "unwatch clears the budget");
+        let exit = machine.call(entry, &[]).expect("the module runs");
+        assert!(matches!(exit, Exit::Returned { .. }), "unwatched: {exit:?}");
     }
 }

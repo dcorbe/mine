@@ -2767,6 +2767,41 @@ mod tests {
         assert_eq!(dispatched, 1, "exactly the one module's mcurou, and only entry 6");
     }
 
+    /// `midnit` has no watchdog. A cleanup routine that outlives the call
+    /// budget returns rather than stopping the machine, and the budget is
+    /// back in place once the sweep is over.
+    #[test]
+    fn cleanup_runs_with_the_call_budget_lifted_and_restores_it() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+
+        let mut entries = vec![FarPtr { offset: 0, selector: 0 }; 9];
+        entries[6] = f.machine.code_ptr(0);
+        let block = module_block(&mut f, "MajorMUD", &entries);
+        f.invoke(register_module, &Fixture::far(block)).expect("registered");
+
+        // About 150ms of spinning, then retf. Written after the invoke, for
+        // the same reason the other cleanup tests do it there.
+        f.machine
+            .load_code(&[0xB9, 0x00, 0x08, 0x51, 0xB9, 0xFF, 0xFF, 0xE2, 0xFE, 0x59, 0xE2, 0xF7, 0xCB])
+            .expect("the spin fits");
+        f.machine.set_budget(std::time::Duration::from_millis(20));
+
+        let mut dispatched = 0;
+        let stopped = f
+            .host
+            .cleanup(&mut f.machine, &module, &mut dispatched)
+            .expect("cleanup ran");
+
+        assert!(stopped.is_none(), "the sweep must not be bounded by the call budget: {stopped:?}");
+        assert_eq!(dispatched, 1);
+        assert_eq!(
+            f.machine.budget(),
+            Some(std::time::Duration::from_millis(20)),
+            "the budget is put back after the sweep"
+        );
+    }
+
     /// A module with no `mcurou` is skipped, not called through a null.
     /// `midnit`'s own `if ((rouptr=module[i]->mcurou) != NULL)` is the guard
     /// this mirrors.

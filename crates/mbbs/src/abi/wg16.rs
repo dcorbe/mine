@@ -222,6 +222,17 @@ impl Abi for Wg16 {
         cpu.arg_frame()
     }
 
+    fn budget(cpu: &mut Self::Cpu) -> Option<std::time::Duration> {
+        cpu.budget()
+    }
+
+    fn set_budget(cpu: &mut Self::Cpu, budget: Option<std::time::Duration>) {
+        match budget {
+            Some(d) => cpu.set_budget(d),
+            None => cpu.unwatch(),
+        }
+    }
+
     fn poison(cpu: &mut Self::Cpu, why: Self::Poison) -> std::io::Result<()> {
         cpu.poison(why)
     }

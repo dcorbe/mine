@@ -5966,7 +5966,28 @@ impl<A: Abi> Host<A> {
     /// Call entry `slot` of every registered module from index 1, skipping a
     /// null, stopping at the first poison. The body [`Host::finalize`] and
     /// [`Host::cleanup`] share. Its rules are documented on `finalize`.
+    ///
+    /// The vendor's `midnit` and `mjrfin` have no watchdog, so the sweep
+    /// lifts the call budget before it starts and puts it back once it is
+    /// over, on every exit path.
     fn sweep(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        slot: usize,
+        dispatched: &mut usize,
+    ) -> io::Result<Option<A::Poison>> {
+        let budget = A::budget(machine);
+        A::set_budget(machine, None);
+        let result = self.sweep_unbounded(machine, module, slot, dispatched);
+        A::set_budget(machine, budget);
+        result
+    }
+
+    /// The sweep itself, run with whatever budget the caller already put in
+    /// place. Split out of [`Host::sweep`] so that method can restore the
+    /// budget after this returns, whichever of its exit paths that was.
+    fn sweep_unbounded(
         &mut self,
         machine: &mut A::Cpu,
         module: &A::Module,

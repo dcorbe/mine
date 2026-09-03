@@ -381,6 +381,17 @@ impl Abi for Wg32 {
     /// `mbbs_machine::m16::Machine::poison` exactly since Task 16 landed the
     /// 32-bit watchdog, disarm included. Forward the reason and the
     /// `io::Result` straight through.
+    fn budget(cpu: &mut Self::Cpu) -> Option<std::time::Duration> {
+        cpu.machine.budget()
+    }
+
+    fn set_budget(cpu: &mut Self::Cpu, budget: Option<std::time::Duration>) {
+        match budget {
+            Some(d) => cpu.machine.set_budget(d),
+            None => cpu.machine.unwatch(),
+        }
+    }
+
     fn poison(cpu: &mut Self::Cpu, why: Self::Poison) -> std::io::Result<()> {
         cpu.machine.poison(why)
     }

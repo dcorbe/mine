@@ -570,6 +570,16 @@ pub trait Abi {
     /// read. Direct delegation to the machine's own `arg_frame`.
     fn arg_frame(cpu: &Self::Cpu) -> &[u8];
 
+    /// The per-call time budget the machine arms for each entry, or `None`
+    /// for no budget at all. See [`Abi::set_budget`].
+    fn budget(cpu: &mut Self::Cpu) -> Option<std::time::Duration>;
+
+    /// Change the per-call time budget for entries made from now on. `None`
+    /// arms nothing, so an entry stops only by returning, faulting, or an
+    /// interrupter. A driver lifts it around the vendor's unbounded sweeps
+    /// and puts it back after. See [`Host::sweep`](crate::Host).
+    fn set_budget(cpu: &mut Self::Cpu, budget: Option<std::time::Duration>);
+
     /// Mark this ABI's machine as refusing to run again, and say why.
     ///
     /// The generic `Host::stop` needs this to record a host-side judgement
@@ -1420,6 +1430,14 @@ mod tests {
 
         fn arg_frame(_cpu: &Self::Cpu) -> &[u8] {
             unreachable!("Call's read tests never call Abi::arg_frame")
+        }
+
+        fn budget(_cpu: &mut Self::Cpu) -> Option<std::time::Duration> {
+            unreachable!("Call's read tests never call Abi::budget")
+        }
+
+        fn set_budget(_cpu: &mut Self::Cpu, _budget: Option<std::time::Duration>) {
+            unreachable!("Call's read tests never call Abi::set_budget")
         }
 
         fn poison(_cpu: &mut Self::Cpu, _why: Self::Poison) -> std::io::Result<()> {
