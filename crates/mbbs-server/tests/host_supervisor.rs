@@ -755,6 +755,22 @@ async fn connect_raw(tx: &std::sync::mpsc::Sender<In>, who: &str) -> (Option<Cha
     (chan, out_rx)
 }
 
+/// Wait for `Out::Close` on a connection's receiver, or panic after ten
+/// seconds naming `what`. Bytes before the close are discarded. A dropped
+/// sender counts as closed, the way the connection task treats it.
+async fn wait_for_close(out: &mut Receiver<Out>, what: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match out.recv().await {
+                Some(Out::Close) | None => break,
+                Some(Out::Bytes(_)) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: the channel was not closed inside 10s"));
+}
+
 /// Two `In::Connect`s, sent back-to-back with no `.await` between the two
 /// `send`s, so they are already both queued before the host thread can have
 /// processed either one.
@@ -1680,17 +1696,7 @@ async fn a_maintain_closes_a_connected_channel_and_the_next_life_serves() {
 
     tx.send(In::Maintain).expect("the host thread is alive");
 
-    let closed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match out.recv().await {
-                Some(Out::Close) | None => break true,
-                Some(Out::Bytes(_)) => continue,
-            }
-        }
-    })
-    .await
-    .expect("maintenance must hang the channel up inside 10s");
-    assert!(closed);
+    wait_for_close(&mut out, "maintenance").await;
 
     let (chan, _out) = connect_raw(&tx, "after").await;
     assert!(chan.is_some(), "the life after maintenance serves the channel again");
@@ -1723,17 +1729,7 @@ async fn six_maintenances_in_a_row_leave_the_board_serving() {
         // Wait for this probe's hangup before the next connect. The Close is
         // sent inside the teardown, so a Connect sent after it cannot share
         // a batch with the Maintain and is answered by the next life.
-        let closed = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match out.recv().await {
-                    Some(Out::Close) | None => break true,
-                    Some(Out::Bytes(_)) => continue,
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("round {round}: maintenance must hang the probe up inside 10s"));
-        assert!(closed);
+        wait_for_close(&mut out, &format!("round {round}: maintenance")).await;
     }
 
     let (chan, _out) = connect_raw(&tx, "final").await;
@@ -1762,17 +1758,7 @@ async fn maintenance_runs_the_modules_mcurou() {
     // Wait for this probe's hangup before the next connect. The Close is
     // sent inside the teardown, so a Connect sent after it cannot share a
     // batch with the Maintain and is answered by the next life.
-    let closed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match out.recv().await {
-                Some(Out::Close) | None => break true,
-                Some(Out::Bytes(_)) => continue,
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("maintenance must hang the probe up inside 10s"));
-    assert!(closed);
+    wait_for_close(&mut out, "maintenance").await;
 
     // Answered only once the next life is polling, so maintenance is over.
     let (chan, _out2) = connect_raw(&tx, "after").await;
@@ -1803,17 +1789,7 @@ async fn a_stop_inside_mcurou_counts_against_the_restart_policy() {
         // wait for this round's hangup before the next connect, so a
         // Connect sent right after cannot share a batch with the Maintain
         // and get applied against the dying life's pool.
-        let closed = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match out.recv().await {
-                    Some(Out::Close) | None => break true,
-                    Some(Out::Bytes(_)) => continue,
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("round {round}: maintenance must hang the probe up inside 10s"));
-        assert!(closed);
+        wait_for_close(&mut out, &format!("round {round}: maintenance")).await;
     }
     let (chan, _out) = connect_raw(&tx, "probe").await;
     assert!(chan.is_some(), "the fifth stop is still survived");
