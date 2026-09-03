@@ -92,6 +92,9 @@ const OPT_SGA: u8 = 3;
 /// character-creation drop that retired that rule.
 pub(crate) const OUT_CHANNEL_BOUND: usize = 32;
 
+/// What a caller is told while maintenance is running.
+pub const MAINTENANCE_LINE: &[u8] = b"The system is down for daily maintenance. Try again in a few minutes.\r\n";
+
 /// The keys `crates/mbbs/tests/wccmmud.rs:3623` uses for a player who reaches
 /// the Realm. This is a *default*, not a policy: [`serve`]'s `keys` parameter
 /// is the actual seam, because who gets what keys is a login-backend decision
@@ -183,7 +186,8 @@ pub async fn serve<A: mbbs::abi::Abi + 'static>(
     keys: Vec<String>,
     listeners: &[Listener<'_>],
 ) -> io::Result<Vec<SocketAddr>> {
-    serve_on(spawn_machine(boot), keys, listeners).await
+    let serving = boot.serving.clone();
+    serve_on(spawn_machine(boot), keys, listeners, serving).await
 }
 
 /// Bind every listener in front of the one machine `host_tx` reaches.
@@ -195,10 +199,11 @@ pub async fn serve_on(
     host_tx: std_mpsc::Sender<In>,
     keys: Vec<String>,
     listeners: &[Listener<'_>],
+    serving: crate::host::Serving,
 ) -> io::Result<Vec<SocketAddr>> {
     let mut bound = Vec::with_capacity(listeners.len());
     for &(addr, stack) in listeners {
-        bound.push(spawn_listener(addr, stack, host_tx.clone(), keys.clone()).await?);
+        bound.push(spawn_listener(addr, stack, host_tx.clone(), keys.clone(), serving.clone()).await?);
     }
     Ok(bound)
 }
@@ -212,6 +217,7 @@ async fn spawn_listener(
     stack: fn() -> Stack,
     host_tx: std_mpsc::Sender<In>,
     keys: Vec<String>,
+    serving: crate::host::Serving,
 ) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -227,8 +233,9 @@ async fn spawn_listener(
             };
             let host_tx = host_tx.clone();
             let keys = keys.clone();
+            let serving = serving.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(socket, host_tx, &keys, stack).await {
+                if let Err(e) = handle(socket, host_tx, &keys, stack, serving).await {
                     eprintln!("mbbs-server: connection ended: {e}");
                 }
             });
@@ -250,6 +257,7 @@ async fn handle(
     host_tx: std_mpsc::Sender<In>,
     keys: &[String],
     stack: fn() -> Stack,
+    serving: crate::host::Serving,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = socket.into_split();
 
@@ -257,6 +265,11 @@ async fn handle(
     // deliberate.
     writer.write_all(&[IAC, WILL, OPT_SGA, IAC, WILL, OPT_ECHO]).await?;
     writer.flush().await?;
+
+    if !serving.load(std::sync::atomic::Ordering::Relaxed) {
+        writer.write_all(MAINTENANCE_LINE).await?;
+        return Ok(());
+    }
 
     let Some((userid, leftover)) = read_user_id(&mut reader, &mut writer).await? else {
         return Ok(()); // gone during login
@@ -534,6 +547,7 @@ mod tests {
             survey: None,
             extension: None,
             maintenance_interval: crate::host::MAINTENANCE_INTERVAL,
+            serving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
 
         let bound = super::serve(boot, default_keys(), &[("127.0.0.1:0", super::Stack::modern)])
@@ -559,6 +573,34 @@ mod tests {
             text.contains("Server error, try again later."),
             "a host thread that died loading its module must tell a fresh \
              connection something instead of silently vanishing: {text:?}"
+        );
+    }
+
+    /// While `serving` is false a caller is told and closed before any user
+    /// ID is asked for, and nothing reaches the host thread.
+    #[tokio::test]
+    async fn a_caller_during_maintenance_is_told_and_no_connect_is_sent() {
+        use crate::msg::In;
+        use std::sync::mpsc as std_mpsc;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+
+        let (tx, rx) = std_mpsc::channel::<In>();
+        let serving: crate::host::Serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bound = super::serve_on(tx, default_keys(), &[("127.0.0.1:0", super::Stack::modern)], serving)
+            .await
+            .expect("bind");
+
+        let mut sock = TcpStream::connect(bound[0]).await.expect("connect");
+        let mut received = Vec::new();
+        sock.read_to_end(&mut received).await.expect("the server closes the socket");
+        let text = String::from_utf8_lossy(&received);
+
+        assert!(text.contains("The system is down for daily maintenance."), "{text:?}");
+        assert!(!text.contains("Enter your user ID: "), "no prompt during maintenance: {text:?}");
+        assert!(
+            matches!(rx.try_recv(), Err(std_mpsc::TryRecvError::Empty)),
+            "no In::Connect may reach the host during maintenance"
         );
     }
 
@@ -848,7 +890,8 @@ mod tests {
 
         tokio::spawn(async move {
             let (server, _peer) = listener.accept().await.expect("accept");
-            let _ = handle(server, host_tx, &[], super::Stack::modern).await;
+            let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let _ = handle(server, host_tx, &[], super::Stack::modern, serving).await;
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
@@ -966,6 +1009,7 @@ mod tests {
             host_tx.clone(),
             default_keys(),
             &[("127.0.0.1:0", Stack::modern as fn() -> Stack), ("127.0.0.1:0", Stack::raw)],
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         )
         .await
         .expect("bind both listeners");
@@ -1052,6 +1096,7 @@ mod tests {
             survey: None,
             extension: None,
             maintenance_interval: crate::host::MAINTENANCE_INTERVAL,
+            serving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
 
         let bound = super::serve(
@@ -1095,7 +1140,8 @@ mod tests {
         let (host_tx, _host_rx) = std::sync::mpsc::channel::<crate::msg::In>();
         tokio::spawn(async move {
             let (server, _peer) = listener.accept().await.expect("accept");
-            let _ = handle(server, host_tx, &[], Stack::modern).await;
+            let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let _ = handle(server, host_tx, &[], Stack::modern, serving).await;
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");

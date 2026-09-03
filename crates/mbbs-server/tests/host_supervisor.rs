@@ -335,6 +335,56 @@ mod builder {
         finish(Ne { code, data: block, relocs, entry_offset })
     }
 
+    /// A module whose `mcurou` spins for a few hundred milliseconds and
+    /// returns. 2048 outer rounds of a 65535-count `loop`, about 134 million
+    /// iterations, which is hundreds of milliseconds on any machine that
+    /// runs this suite and far inside the 5 second call budget. Wide enough
+    /// for a test to read the `serving` flag while maintenance is inside it.
+    ///
+    /// Same slot 6 write through `es` as `cleans_up_via_unimplemented_symbol`.
+    pub fn cleans_up_slowly() -> Vec<u8> {
+        let mut code = Vec::new();
+        let mut relocs = Vec::new();
+
+        let mcurou_offset: u16 = 0;
+        // mov cx, 0x0800
+        code.extend_from_slice(&[0xB9, 0x00, 0x08]);
+        // outer: push cx
+        code.push(0x51);
+        // mov cx, 0xFFFF
+        code.extend_from_slice(&[0xB9, 0xFF, 0xFF]);
+        // inner: loop inner  (rel8 = -2)
+        code.extend_from_slice(&[0xE2, 0xFE]);
+        // pop cx
+        code.push(0x59);
+        // loop outer  (rel8 = -(1 + 3 + 2 + 1 + 2) = -9)
+        code.extend_from_slice(&[0xE2, 0xF7]);
+        retf(&mut code);
+
+        let entry_offset = code.len() as u16;
+
+        mov_ax_own_segment(&mut code, &mut relocs, 2);
+        mov_es_ax(&mut code);
+        mov_ax_imm(&mut code, mcurou_offset);
+        store_ax_es(&mut code, 49);
+        mov_ax_own_segment(&mut code, &mut relocs, 1);
+        store_ax_es(&mut code, 51);
+
+        mov_ax_own_segment(&mut code, &mut relocs, 2);
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, 0);
+        push_ax(&mut code);
+        call_far_import(&mut code, &mut relocs, name_offset("register_module"));
+        add_sp(&mut code, 4);
+
+        retf(&mut code);
+
+        let mut block = vec![0u8; 25 + 9 * 4];
+        block[..7].copy_from_slice(b"TESTMOD");
+
+        finish(Ne { code, data: block, relocs, entry_offset })
+    }
+
     /// A module whose ordinal 1 (init) registers with the host and schedules
     /// a `delay`-second kick that re-arms *itself* forever -- `retf`, not
     /// `HLT`, at the `dstrou` end, so nothing ever stops this module the way
@@ -691,6 +741,7 @@ fn boot_many(modules: Vec<PathBuf>, root_name: &str, terms: u16) -> Boot<Wg16> {
         survey: None,
         extension: None,
         maintenance_interval: mbbs_server::host::MAINTENANCE_INTERVAL,
+        serving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     }
 }
 
@@ -1829,4 +1880,37 @@ async fn a_stop_inside_mcurou_counts_against_the_restart_policy() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("six stops inside mcurou must make the supervisor give up, and it was still alive");
+}
+
+/// The host thread clears `serving` when maintenance begins and sets it
+/// again once the next life has booted. The flag starts false here, so the
+/// first assertion pins the set in `life`. `Out::Close` is sent in the
+/// hangup loop, after the clear and before the slow `mcurou`, so the read
+/// after it lands inside the window and pins the clear in `tear_down`.
+#[tokio::test]
+async fn serving_is_cleared_by_maintenance_and_set_again_after_the_reboot() {
+    use std::sync::atomic::Ordering;
+    let module = module_file(
+        "mbbs-server-host-supervisor-serving-flag",
+        &builder::cleans_up_slowly(),
+    );
+    let boot = boot(module, "mbbs-server-host-supervisor-serving-flag-root", 1);
+    let serving = boot.serving.clone();
+    serving.store(false, Ordering::Relaxed);
+    let tx = conn::spawn_machine(boot);
+
+    let (chan, mut out) = connect_raw(&tx, "before").await;
+    assert!(chan.is_some());
+    assert!(serving.load(Ordering::Relaxed), "life sets serving once booted");
+
+    tx.send(In::Maintain).expect("alive");
+    wait_for_close(&mut out, "maintenance").await;
+    assert!(
+        !serving.load(Ordering::Relaxed),
+        "tear_down clears serving before the hangup, and mcurou is still spinning"
+    );
+
+    let (chan, _out) = connect_raw(&tx, "after").await;
+    assert!(chan.is_some());
+    assert!(serving.load(Ordering::Relaxed), "serving again once the next life booted");
 }

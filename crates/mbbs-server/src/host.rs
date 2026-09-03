@@ -83,6 +83,11 @@ use crate::pool::Pool;
 /// own doc for the exact derivation `life` uses.
 pub type ExtensionBuilder<A> = Box<dyn Fn(&[(String, <A as Abi>::Module)]) -> io::Result<Box<dyn mbbs::extension::Extension<A>>> + Send>;
 
+/// Whether the board is taking callers. False from the start of maintenance
+/// until the next life has booted. Read by every accept path, written only
+/// by the host thread. Starts true so the first boot behaves as before.
+pub type Serving = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
 /// Everything the host thread needs, all of it `Send`. `A::Cpu` is not
 /// here and cannot be: it is `!Send`, and the thread builds its own -- see
 /// [`Boot::build`].
@@ -304,6 +309,9 @@ pub struct Boot<A: Abi> {
     /// Time from this life's boot to its maintenance. `main` always passes
     /// [`MAINTENANCE_INTERVAL`]. Per life: a crash restart starts it over.
     pub maintenance_interval: Duration,
+    /// The flag the accept paths read. `life` sets it true once booted,
+    /// `tear_down` sets it false at the start of maintenance.
+    pub serving: Serving,
 }
 
 /// What one wake yielded.
@@ -601,8 +609,12 @@ fn tear_down<A: Abi>(
     module: &A::Module,
     conns: &mut [Option<Sender<Out>>],
     terms: Terms,
+    serving: &Serving,
     mode: Teardown,
 ) -> Option<A::Poison> {
+    if mode == Teardown::Maintenance {
+        serving.store(false, Ordering::Relaxed);
+    }
     let what = match mode {
         Teardown::Shutdown => "shutdown",
         Teardown::Maintenance => "maintenance",
@@ -672,8 +684,9 @@ fn maintain<A: Abi>(
     module: &A::Module,
     conns: &mut [Option<Sender<Out>>],
     terms: Terms,
+    serving: &Serving,
 ) -> LifeEnd<A> {
-    match tear_down(host, machine, module, conns, terms, Teardown::Maintenance) {
+    match tear_down(host, machine, module, conns, terms, serving, Teardown::Maintenance) {
         Some(poison) => LifeEnd::Stopped { poison, chan: None },
         None => LifeEnd::Maintained,
     }
@@ -1074,6 +1087,7 @@ fn life<A: Abi>(
         boot.terms.count()
     );
     let booted_at = Instant::now();
+    boot.serving.store(true, Ordering::Relaxed);
     let due = booted_at + boot.maintenance_interval;
     // Granted by the clock inside `Host::cycle` now, not by this loop. The
     // pump's wake pattern is a property of socket traffic; the module's
@@ -1156,7 +1170,7 @@ fn life<A: Abi>(
             apply(&mut host, &mut machine, &module, &mut pool, &mut conns, msg)?;
         }
         if let Some(done) = batch.stopping {
-            tear_down(&mut host, &mut machine, &module, &mut conns, terms, Teardown::Shutdown);
+            tear_down(&mut host, &mut machine, &module, &mut conns, terms, &boot.serving, Teardown::Shutdown);
             // Sent after the sweep, not before: the whole point of the
             // channel is that the waiter learns when `finrou` has finished,
             // which for MajorMUD is when its buffers are on disk and
@@ -1164,11 +1178,11 @@ fn life<A: Abi>(
             let _ = done.send(());
             return Ok(LifeEnd::ShutDown);
         }
-        if batch.maintaining {
-            return Ok(maintain(&mut host, &mut machine, &module, &mut conns, terms));
-        }
-        if Instant::now() >= due {
-            return Ok(maintain(&mut host, &mut machine, &module, &mut conns, terms));
+        // A message-driven `In::Maintain` and the 24-hour deadline coming
+        // due are two triggers for the same path. Both end this life the
+        // same way, so they share one `maintain` call rather than two.
+        if batch.maintaining || Instant::now() >= due {
+            return Ok(maintain(&mut host, &mut machine, &module, &mut conns, terms, &boot.serving));
         }
         if batch.ends_gone {
             // Everything `peeked` and `rx` were holding has just been

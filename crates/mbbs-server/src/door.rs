@@ -201,7 +201,7 @@ pub fn connection(h: &Handshake) -> Connection {
 /// can connect can claim any `user=` and `sysop=1`. The directory `path`
 /// lives in must be traversable only by the serving user (`/run/user/<uid>`
 /// is `0700`) to close the window between `bind` and this call.
-pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>) -> io::Result<()> {
+pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>, serving: crate::host::Serving) -> io::Result<()> {
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_socket() => {
             if std::os::unix::net::UnixStream::connect(&path).is_ok() {
@@ -228,8 +228,9 @@ pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>) -> io::Result<()> {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let tx = tx.clone();
+                    let serving = serving.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = session(stream, tx).await {
+                        if let Err(e) = session(stream, tx, serving).await {
                             eprintln!("mbbs-server: door session ended: {e}");
                         }
                     });
@@ -245,7 +246,7 @@ pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>) -> io::Result<()> {
 }
 
 /// One door session: header, connect, pump.
-async fn session(stream: UnixStream, tx: std_mpsc::Sender<In>) -> io::Result<()> {
+async fn session(stream: UnixStream, tx: std_mpsc::Sender<In>, serving: crate::host::Serving) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
     let mut buf = Vec::with_capacity(256);
@@ -270,6 +271,11 @@ async fn session(stream: UnixStream, tx: std_mpsc::Sender<In>) -> io::Result<()>
         "mbbs-server: door session for {:?} (sysop={}, node={:?})",
         handshake.user, handshake.sysop, handshake.node
     );
+
+    if !serving.load(std::sync::atomic::Ordering::Relaxed) {
+        writer.write_all(conn::MAINTENANCE_LINE).await?;
+        return Ok(());
+    }
 
     let (out_tx, out_rx) = mpsc::channel::<Out>(OUT_CHANNEL_BOUND);
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -438,7 +444,9 @@ mod tests {
         let path = socket_path("door-dead-host");
         let (tx, rx) = std_mpsc::channel::<In>();
         drop(rx);
-        serve(path.clone(), tx).await.expect("bind");
+        serve(path.clone(), tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .await
+            .expect("bind");
 
         let mut sock = UnixStream::connect(&path).await.expect("connect");
         sock.write_all(b"mbbs-door 1\nuser=Dan\n\n").await.expect("write");
@@ -450,7 +458,9 @@ mod tests {
     async fn a_bad_header_is_refused_with_its_reason() {
         let path = socket_path("door-bad-header");
         let (tx, _rx) = std_mpsc::channel::<In>();
-        serve(path.clone(), tx).await.expect("bind");
+        serve(path.clone(), tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .await
+            .expect("bind");
 
         let mut sock = UnixStream::connect(&path).await.expect("connect");
         sock.write_all(b"HELLO\n\n").await.expect("write");
@@ -486,11 +496,26 @@ mod tests {
     async fn a_full_board_tells_the_relay_and_closes() {
         let path = socket_path("door-full");
         let (tx, _connected, _rest) = fake_host(None);
-        serve(path.clone(), tx).await.expect("bind");
+        serve(path.clone(), tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .await
+            .expect("bind");
 
         let mut sock = UnixStream::connect(&path).await.expect("connect");
         sock.write_all(b"mbbs-door 1\nuser=Dan\n\n").await.expect("write");
         assert_eq!(read_to_end(&mut sock).await, b"All lines are busy.\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_relay_during_maintenance_is_told_and_closes() {
+        let path = socket_path("door-maintenance");
+        let (tx, rx) = std_mpsc::channel::<In>();
+        let serving: crate::host::Serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        serve(path.clone(), tx, serving).await.expect("bind");
+
+        let mut sock = UnixStream::connect(&path).await.expect("connect");
+        sock.write_all(b"mbbs-door 1\nuser=Dan\n\n").await.expect("write");
+        assert_eq!(read_to_end(&mut sock).await, crate::conn::MAINTENANCE_LINE);
+        assert!(matches!(rx.try_recv(), Err(std_mpsc::TryRecvError::Empty)));
     }
 
     /// The whole prelude, then the wire: the host sees the handshake's
@@ -502,7 +527,9 @@ mod tests {
         let path = socket_path("door-session");
         let chan = mbbs::Terms::new(1).chan(0).expect("channel zero");
         let (tx, connected, rest) = fake_host(Some(chan));
-        serve(path.clone(), tx).await.expect("bind");
+        serve(path.clone(), tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .await
+            .expect("bind");
 
         let mut sock = UnixStream::connect(&path).await.expect("connect");
         sock.write_all(b"mbbs-door 1\nuser=Dan\nsysop=1\nrows=25\ncols=132\n\nlook\r")
@@ -555,14 +582,18 @@ mod tests {
         let path = socket_path("door-stale");
         std::os::unix::net::UnixListener::bind(&path).expect("a stale socket file");
         let (tx, _rx) = std_mpsc::channel::<In>();
-        serve(path.clone(), tx.clone()).await.expect("rebinds over a stale socket");
+        serve(path.clone(), tx.clone(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .await
+            .expect("rebinds over a stale socket");
 
         let regular = mbbs::testing::scratch("door-regular")
             .canonicalize()
             .expect("scratch dir exists")
             .join("door.sock");
         std::fs::write(&regular, b"not a socket").expect("write");
-        let err = serve(regular, tx).await.expect_err("refuses a regular file");
+        let err = serve(regular, tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .await
+            .expect_err("refuses a regular file");
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 
@@ -575,7 +606,9 @@ mod tests {
         let live = std::os::unix::net::UnixListener::bind(&path).expect("a live socket");
         let (tx, _rx) = std_mpsc::channel::<In>();
 
-        let err = serve(path.clone(), tx).await.expect_err("refuses a live socket");
+        let err = serve(path.clone(), tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .await
+            .expect_err("refuses a live socket");
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
 
         std::os::unix::net::UnixStream::connect(&path).expect("the original listener still accepts");
@@ -591,7 +624,9 @@ mod tests {
 
         let path = socket_path("door-perms");
         let (tx, _rx) = std_mpsc::channel::<In>();
-        serve(path.clone(), tx).await.expect("bind");
+        serve(path.clone(), tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .await
+            .expect("bind");
 
         let mode = std::fs::symlink_metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);

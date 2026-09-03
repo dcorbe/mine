@@ -399,6 +399,12 @@ async fn main() -> ExitCode {
         }
     };
 
+    // The accept paths' shared "is the board taking callers" flag. `life`
+    // sets it true once a life has booted, `tear_down` clears it at the
+    // start of maintenance. See `host::Serving`'s own doc.
+    let serving: mbbs_server::host::Serving =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
     // One machine per process. Its host thread builds its own `A::Cpu`
     // (`Boot::build`, called from `host::life`) -- `A::Cpu` is `!Send` and
     // never crosses into this `async fn`.
@@ -418,6 +424,7 @@ async fn main() -> ExitCode {
             survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
             extension: cli.scripts.clone().map(build_lua_extension),
             maintenance_interval: mbbs_server::host::MAINTENANCE_INTERVAL,
+            serving: serving.clone(),
         }),
         Plan::Wg32 { modules, root } => conn::spawn_machine(Boot::<Wg32> {
             build: Box::new(build_wg32_cpu()),
@@ -434,12 +441,13 @@ async fn main() -> ExitCode {
             survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
             extension: cli.scripts.clone().map(build_lua_extension),
             maintenance_interval: mbbs_server::host::MAINTENANCE_INTERVAL,
+            serving: serving.clone(),
         }),
     };
     let shutdown = tx.clone();
     let door_tx = tx.clone();
 
-    let addrs = match conn::serve_on(tx, keys, &listeners).await {
+    let addrs = match conn::serve_on(tx, keys, &listeners, serving.clone()).await {
         Ok(addrs) => addrs,
         Err(e) => {
             eprintln!("mbbs-server: failed to start: {e}");
@@ -452,7 +460,7 @@ async fn main() -> ExitCode {
     }
 
     if let Some(path) = &cli.listen_door {
-        if let Err(e) = mbbs_server::door::serve(path.clone(), door_tx).await {
+        if let Err(e) = mbbs_server::door::serve(path.clone(), door_tx, serving.clone()).await {
             eprintln!("mbbs-server: failed to bind the door socket {}: {e}", path.display());
             return ExitCode::FAILURE;
         }
