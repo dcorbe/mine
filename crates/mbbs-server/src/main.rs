@@ -470,7 +470,7 @@ async fn main() -> ExitCode {
     // The accept loop and the host thread are already spawned; this task's
     // only remaining job is to keep the process alive for it, and to shut it
     // down in an orderly way when told to.
-    let signal = wait_for_signal().await;
+    let signal = wait_for_signal(&shutdown).await;
     eprintln!("mbbs-server: {signal} -- shutting the module down");
     shut_down(&shutdown, SHUTDOWN_GRACE).await;
     if let Some(path) = &cli.listen_door {
@@ -489,36 +489,53 @@ async fn main() -> ExitCode {
 /// slower exit, it is an exit that never happens.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
-/// Resolve when the process is asked to stop, naming what asked.
+/// Resolve when the process is asked to stop, naming what asked. `SIGUSR1`
+/// does not stop anything: it sends `In::Maintain` and keeps waiting.
 ///
-/// Both signals, because they arrive from different places and mean the same
-/// thing here: SIGINT is the operator at a terminal, SIGTERM is `systemd`,
-/// `docker stop`, or a plain `kill`. Handling only the first would mean every
-/// service-managed shutdown skipped `finrou` -- which is the case that matters
-/// most, since it is the one that happens unattended.
+/// Both stop signals, because they arrive from different places and mean
+/// the same thing here: SIGINT is the operator at a terminal, SIGTERM is
+/// `systemd`, `docker stop`, or a plain `kill`. Handling only the first
+/// would mean every service-managed shutdown skipped `finrou`, which is the
+/// case that matters most, since it is the one that happens unattended.
 ///
 /// SIGKILL is deliberately absent: it cannot be caught, which is the whole
 /// reason the module's own recovery marker exists and why `WCCMMUTL -recover`
 /// ships with MajorMUD. A host cannot promise a clean shutdown, only take one
 /// when it is offered.
-async fn wait_for_signal() -> &'static str {
+async fn wait_for_signal(tx: &std::sync::mpsc::Sender<In>) -> &'static str {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut terminate = match signal(SignalKind::terminate()) {
         Ok(stream) => stream,
         Err(e) => {
-            // Losing SIGTERM is not worth refusing to run over, but it is
-            // worth saying: an operator whose `systemctl stop` silently skips
-            // shutdown would otherwise find out from the next boot's recovery
-            // mode instead of from here.
             eprintln!("mbbs-server: cannot listen for SIGTERM ({e}); SIGINT only");
             std::future::pending::<()>().await;
             unreachable!("pending never resolves");
         }
     };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => "SIGINT",
-        _ = terminate.recv() => "SIGTERM",
+    let mut maintain = match signal(SignalKind::user_defined1()) {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            eprintln!("mbbs-server: cannot listen for SIGUSR1 ({e}); maintenance runs on its timer only");
+            None
+        }
+    };
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return "SIGINT",
+            _ = terminate.recv() => return "SIGTERM",
+            Some(()) = async {
+                match maintain.as_mut() {
+                    Some(stream) => stream.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                eprintln!("mbbs-server: SIGUSR1 -- running maintenance now");
+                if tx.send(In::Maintain).is_err() {
+                    eprintln!("mbbs-server: the host thread is gone; nothing to maintain");
+                }
+            }
+        }
     }
 }
 
