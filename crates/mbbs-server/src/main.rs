@@ -417,6 +417,7 @@ async fn main() -> ExitCode {
             calls_total: None,
             survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
             extension: cli.scripts.clone().map(build_lua_extension),
+            maintenance_interval: mbbs_server::host::MAINTENANCE_INTERVAL,
         }),
         Plan::Wg32 { modules, root } => conn::spawn_machine(Boot::<Wg32> {
             build: Box::new(build_wg32_cpu()),
@@ -432,6 +433,7 @@ async fn main() -> ExitCode {
             calls_total: None,
             survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
             extension: cli.scripts.clone().map(build_lua_extension),
+            maintenance_interval: mbbs_server::host::MAINTENANCE_INTERVAL,
         }),
     };
     let shutdown = tx.clone();

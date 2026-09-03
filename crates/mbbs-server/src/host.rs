@@ -301,6 +301,9 @@ pub struct Boot<A: Abi> {
     /// `None` is the supported default: a board given no builder here runs
     /// exactly as it did before this field existed.
     pub extension: Option<ExtensionBuilder<A>>,
+    /// Time from this life's boot to its maintenance. `main` always passes
+    /// [`MAINTENANCE_INTERVAL`]. Per life: a crash restart starts it over.
+    pub maintenance_interval: Duration,
 }
 
 /// What one wake yielded.
@@ -404,6 +407,19 @@ fn wait_with_peek(wait: Wait, peeked: bool) -> Wait {
     match wait {
         Wait::Blocked | Wait::Until(_) if peeked => Wait::Now,
         other => other,
+    }
+}
+
+/// Cut a wait back so the bell rings by the maintenance deadline.
+///
+/// `Blocked` would never wake on an idle board, so it becomes a timed wait.
+/// A timed wait later than the deadline is shortened. `Now` does not block
+/// and `Stop` ends the life, so neither is touched.
+fn clamp_to_deadline(wait: Wait, remaining: Duration) -> Wait {
+    match wait {
+        Wait::Blocked => Wait::Until(remaining),
+        Wait::Until(d) => Wait::Until(d.min(remaining)),
+        Wait::Now | Wait::Stop => wait,
     }
 }
 
@@ -680,6 +696,11 @@ fn maintain<A: Abi>(
 /// not the mechanism.
 const MAX_RESTARTS: usize = 5;
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
+
+/// How long a life runs before daily maintenance: 24 hours from the moment
+/// the modules finished booting. A constant, not a flag. `Boot` carries it
+/// as a field only so a test can shorten it.
+pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Bounds how often [`run`] may rebuild the machine after [`Ended::Stopped`].
 ///
@@ -1052,6 +1073,8 @@ fn life<A: Abi>(
         boot.modules.len(),
         boot.terms.count()
     );
+    let booted_at = Instant::now();
+    let due = booted_at + boot.maintenance_interval;
     // Granted by the clock inside `Host::cycle` now, not by this loop. The
     // pump's wake pattern is a property of socket traffic; the module's
     // world rate must not be.
@@ -1100,7 +1123,8 @@ fn life<A: Abi>(
         // board would hang holding a keystroke (see `wait_with_peek`'s doc).
         // `wait` itself -- the strategy the *next* turn inherits -- is left
         // alone; only `armed`, this turn's own arm/wake value, is downgraded.
-        let armed = wait_with_peek(wait, peeked.is_some());
+        let remaining = due.saturating_duration_since(Instant::now());
+        let armed = clamp_to_deadline(wait_with_peek(wait, peeked.is_some()), remaining);
         arm(armed, deadline);
         if let Some(age) = &boot.wake_age_ms {
             let now_ms = SystemTime::now()
@@ -1141,6 +1165,9 @@ fn life<A: Abi>(
             return Ok(LifeEnd::ShutDown);
         }
         if batch.maintaining {
+            return Ok(maintain(&mut host, &mut machine, &module, &mut conns, terms));
+        }
+        if Instant::now() >= due {
             return Ok(maintain(&mut host, &mut machine, &module, &mut conns, terms));
         }
         if batch.ends_gone {
@@ -1602,7 +1629,7 @@ mod tests {
 
     use crate::pool::Pool;
 
-    use super::{Woke, collapse, drain_turn, offer, wait_with_peek, wake};
+    use super::{Woke, clamp_to_deadline, collapse, drain_turn, offer, wait_with_peek, wake};
     use crate::msg::{In, Out};
     use mbbs::Wait;
 
@@ -1747,6 +1774,26 @@ mod tests {
             Wait::Until(Duration::from_secs(5))
         );
         assert_eq!(wait_with_peek(Wait::Stop, true), Wait::Stop);
+    }
+
+    /// The bell must ring by the maintenance deadline whatever the module
+    /// asked for. `Blocked` would never wake on an idle board.
+    #[test]
+    fn clamp_to_deadline_covers_every_wait() {
+        let remaining = Duration::from_secs(30);
+        assert_eq!(clamp_to_deadline(Wait::Blocked, remaining), Wait::Until(remaining));
+        assert_eq!(
+            clamp_to_deadline(Wait::Until(Duration::from_secs(60)), remaining),
+            Wait::Until(remaining),
+            "a later kick is cut back to the deadline"
+        );
+        assert_eq!(
+            clamp_to_deadline(Wait::Until(Duration::from_secs(5)), remaining),
+            Wait::Until(Duration::from_secs(5)),
+            "an earlier kick is left alone"
+        );
+        assert_eq!(clamp_to_deadline(Wait::Now, remaining), Wait::Now);
+        assert_eq!(clamp_to_deadline(Wait::Stop, remaining), Wait::Stop);
     }
 
     /// The whole fix, pinned directly against `drain_turn` (not a hand

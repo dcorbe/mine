@@ -690,6 +690,7 @@ fn boot_many(modules: Vec<PathBuf>, root_name: &str, terms: u16) -> Boot<Wg16> {
         calls_total: None,
         survey: None,
         extension: None,
+        maintenance_interval: mbbs_server::host::MAINTENANCE_INTERVAL,
     }
 }
 
@@ -1700,6 +1701,29 @@ async fn a_maintain_closes_a_connected_channel_and_the_next_life_serves() {
 
     let (chan, _out) = connect_raw(&tx, "after").await;
     assert!(chan.is_some(), "the life after maintenance serves the channel again");
+}
+
+/// The deadline fires without any message from outside: a two-second
+/// interval closes a connected channel and the next life serves. An idle
+/// module asks for `Wait::Blocked`, so without the clamp nothing would ever
+/// wake the driver and this test hangs.
+#[tokio::test]
+async fn maintenance_fires_on_its_own_at_the_deadline() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-maintain-timer",
+        &builder::boots_and_runs_forever(),
+    );
+    let mut boot = boot(module, "mbbs-server-host-supervisor-maintain-timer-root", 1);
+    boot.maintenance_interval = Duration::from_secs(2);
+    let tx = conn::spawn_machine(boot);
+
+    let (chan, mut out) = connect_raw(&tx, "before").await;
+    assert!(chan.is_some());
+
+    wait_for_close(&mut out, "the timed maintenance deadline").await;
+
+    let (chan, _out) = connect_raw(&tx, "after").await;
+    assert!(chan.is_some(), "the life after the timed maintenance serves again");
 }
 
 /// A maintenance reload is not a stop. `MAX_RESTARTS` is five, so six

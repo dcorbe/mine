@@ -533,6 +533,7 @@ mod tests {
             calls_total: None,
             survey: None,
             extension: None,
+            maintenance_interval: crate::host::MAINTENANCE_INTERVAL,
         };
 
         let bound = super::serve(boot, default_keys(), &[("127.0.0.1:0", super::Stack::modern)])
@@ -1050,6 +1051,7 @@ mod tests {
             calls_total: None,
             survey: None,
             extension: None,
+            maintenance_interval: crate::host::MAINTENANCE_INTERVAL,
         };
 
         let bound = super::serve(
