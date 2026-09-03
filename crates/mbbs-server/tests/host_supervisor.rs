@@ -340,6 +340,11 @@ mod builder {
     /// iterations, which is hundreds of milliseconds on any machine that
     /// runs this suite and far inside the 5 second call budget. Wide enough
     /// for a test to read the `serving` flag while maintenance is inside it.
+    /// Measured about 200 ms on the machine this was written on, by
+    /// differencing `serving_is_cleared_by_maintenance_and_set_again_after_the_reboot`'s
+    /// reported runtime (this builder) against
+    /// `a_maintain_closes_a_connected_channel_and_the_next_life_serves`'s
+    /// (`boots_and_runs_forever`, no spin) -- 0.22s vs 0.02s.
     ///
     /// Same slot 6 write through `es` as `cleans_up_via_unimplemented_symbol`.
     pub fn cleans_up_slowly() -> Vec<u8> {
@@ -809,12 +814,15 @@ async fn connect_raw(tx: &std::sync::mpsc::Sender<In>, who: &str) -> (Option<Cha
 
 /// Wait for `Out::Close` on a connection's receiver, or panic after ten
 /// seconds naming `what`. Bytes before the close are discarded. A dropped
-/// sender counts as closed, the way the connection task treats it.
+/// sender is a failure, not a close: `tear_down` sends the explicit
+/// `Out::Close` before it drops the sender, so a `recv` that yields `None`
+/// first means the sweep this test is checking never ran.
 async fn wait_for_close(out: &mut Receiver<Out>, what: &str) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match out.recv().await {
-                Some(Out::Close) | None => break,
+                Some(Out::Close) => break,
+                None => panic!("{what}: the sender dropped without an explicit Out::Close"),
                 Some(Out::Bytes(_)) => continue,
             }
         }

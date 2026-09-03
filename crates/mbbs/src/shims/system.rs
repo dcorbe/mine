@@ -2822,11 +2822,11 @@ mod tests {
         assert_eq!(dispatched, 0, "a null mcurou is skipped, not dispatched");
     }
 
-    /// `midnit` sets `clingo=0` before each module's `mcurou`. A module that
-    /// left the current language on another value would otherwise run its
-    /// cleanup in that language.
+    /// `midnit` sets `clingo=0` before sweeping cleanup. This module's nine
+    /// slots are all null, so nothing is dispatched; the only thing this
+    /// checks is that `clingo` reads 0 after the sweep.
     #[test]
-    fn cleanup_resets_clingo_before_the_call() {
+    fn cleanup_resets_clingo() {
         let mut f = Fixture::new();
         let module = f.minimal_module();
         let block = module_block(&mut f, "MajorMUD", &[FarPtr { offset: 0, selector: 0 }; 9]);
