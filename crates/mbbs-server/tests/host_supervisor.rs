@@ -145,6 +145,18 @@ mod builder {
         code.push(0x50);
     }
 
+    /// `mov es, ax`.
+    fn mov_es_ax(code: &mut Vec<u8>) {
+        code.extend_from_slice(&[0x8E, 0xC0]);
+    }
+
+    /// `mov [es:offset], ax`.
+    fn store_ax_es(code: &mut Vec<u8>, offset: u16) {
+        code.push(0x26);
+        code.push(0xA3);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+
     /// `call far ptr16:16` -- `9A cd`, to a thunk the loader hands out for
     /// `MAJORBBS.<name>` (module reference 1, the only one this module
     /// imports). Every relocation here is `IMPORTNAME`/`FAR_ADDR`, a single
@@ -269,6 +281,54 @@ mod builder {
         // Same all-null-vectors shape as `faults_one_second_after_boot`: a
         // connection's `Host::connect` is a clean no-op, and there is
         // nothing here to exercise a logon hook.
+        let mut block = vec![0u8; 25 + 9 * 4];
+        block[..7].copy_from_slice(b"TESTMOD");
+
+        finish(Ne { code, data: block, relocs, entry_offset })
+    }
+
+    /// A module whose `mcurou` (slot 6 of `struct module`) calls an import
+    /// this host does not implement and then returns. In survey mode the
+    /// call is fabricated and the symbol lands in the inventory, which is
+    /// how a test sees that slot 6 was dispatched at all. Outside survey
+    /// mode the call stops the machine, which is how a test sees that a
+    /// stop inside `mcurou` is a stop.
+    ///
+    /// The slot's far pointer is written at init time through `es`, because
+    /// this builder's NE writer only relocates the code segment. Slot 6
+    /// starts at byte 25 + 6 * 4 = 49 of the block: offset word at 49,
+    /// selector word at 51.
+    pub fn cleans_up_via_unimplemented_symbol() -> Vec<u8> {
+        let mut code = Vec::new();
+        let mut relocs = Vec::new();
+
+        // The cleanup routine itself, at offset 0.
+        let mcurou_offset: u16 = 0;
+        call_far_import(&mut code, &mut relocs, name_offset("definitely_not_a_real_host_routine"));
+        retf(&mut code);
+
+        let entry_offset = code.len() as u16;
+
+        // es = data segment.
+        mov_ax_own_segment(&mut code, &mut relocs, 2);
+        mov_es_ax(&mut code);
+        // block.mcurou.offset = mcurou_offset
+        mov_ax_imm(&mut code, mcurou_offset);
+        store_ax_es(&mut code, 49);
+        // block.mcurou.selector = code segment
+        mov_ax_own_segment(&mut code, &mut relocs, 1);
+        store_ax_es(&mut code, 51);
+
+        // register_module(&block) -- block lives at data segment offset 0.
+        mov_ax_own_segment(&mut code, &mut relocs, 2);
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, 0);
+        push_ax(&mut code);
+        call_far_import(&mut code, &mut relocs, name_offset("register_module"));
+        add_sp(&mut code, 4);
+
+        retf(&mut code);
+
         let mut block = vec![0u8; 25 + 9 * 4];
         block[..7].copy_from_slice(b"TESTMOD");
 
@@ -1678,4 +1738,93 @@ async fn six_maintenances_in_a_row_leave_the_board_serving() {
 
     let (chan, _out) = connect_raw(&tx, "final").await;
     assert!(chan.is_some(), "after six maintenances the board still serves");
+}
+
+/// Slot 6 is what maintenance dispatches. The only thing this module's
+/// `mcurou` does is call a symbol nothing else calls, and only the survey
+/// inventory can see that it happened.
+#[tokio::test]
+async fn maintenance_runs_the_modules_mcurou() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-mcurou-runs",
+        &builder::cleans_up_via_unimplemented_symbol(),
+    );
+    let survey_path = mbbs::testing::scratch("mbbs-server-host-supervisor-mcurou-runs-out")
+        .join("survey.log");
+    let _ = std::fs::remove_file(&survey_path);
+    let mut boot = boot(module, "mbbs-server-host-supervisor-mcurou-runs-root", 1);
+    boot.survey = Some(survey_path.clone());
+    let tx = conn::spawn_machine(boot);
+
+    let (chan, mut out) = connect_raw(&tx, "before").await;
+    assert!(chan.is_some());
+    tx.send(In::Maintain).expect("alive");
+    // Wait for this probe's hangup before the next connect. The Close is
+    // sent inside the teardown, so a Connect sent after it cannot share a
+    // batch with the Maintain and is answered by the next life.
+    let closed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match out.recv().await {
+                Some(Out::Close) | None => break true,
+                Some(Out::Bytes(_)) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("maintenance must hang the probe up inside 10s"));
+    assert!(closed);
+
+    // Answered only once the next life is polling, so maintenance is over.
+    let (chan, _out2) = connect_raw(&tx, "after").await;
+    assert!(chan.is_some());
+
+    let text = std::fs::read_to_string(&survey_path).expect("the survey file must exist");
+    assert!(
+        text.contains("definitely_not_a_real_host_routine"),
+        "mcurou never ran: the symbol only it calls is missing from:\n{text}"
+    );
+}
+
+/// A module that stops inside its `mcurou` ends the life `Stopped`, and the
+/// restart policy applies: five stops are survived, the sixth is not.
+#[tokio::test]
+async fn a_stop_inside_mcurou_counts_against_the_restart_policy() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-mcurou-stops",
+        &builder::cleans_up_via_unimplemented_symbol(),
+    );
+    let tx = conn::spawn_machine(boot(module, "mbbs-server-host-supervisor-mcurou-stops-root", 1));
+
+    for round in 0..5 {
+        let (chan, mut out) = connect_raw(&tx, "probe").await;
+        assert!(chan.is_some(), "round {round}: still serving after {round} stop(s)");
+        tx.send(In::Maintain).expect("alive");
+        // Same synchronisation as `six_maintenances_in_a_row_leave_the_board_serving`:
+        // wait for this round's hangup before the next connect, so a
+        // Connect sent right after cannot share a batch with the Maintain
+        // and get applied against the dying life's pool.
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match out.recv().await {
+                    Some(Out::Close) | None => break true,
+                    Some(Out::Bytes(_)) => continue,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: maintenance must hang the probe up inside 10s"));
+        assert!(closed);
+    }
+    let (chan, _out) = connect_raw(&tx, "probe").await;
+    assert!(chan.is_some(), "the fifth stop is still survived");
+    tx.send(In::Maintain).expect("alive");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if tx.send(In::Alarm).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("six stops inside mcurou must make the supervisor give up, and it was still alive");
 }
