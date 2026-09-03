@@ -1638,6 +1638,16 @@ async fn a_maintain_closes_a_connected_channel_and_the_next_life_serves() {
 
 /// A maintenance reload is not a stop. `MAX_RESTARTS` is five, so six
 /// reloads inside the window prove the restart policy was never consulted.
+///
+/// Each round waits for its own probe's `Out::Close` before the next
+/// connect. `drain_turn` puts everything queued in one wake into a single
+/// batch, in no particular order, so a `Connect` sent right after a
+/// `Maintain` with no wait between them can land in the very same batch as
+/// that `Maintain` and get applied against the old life's pool before the
+/// teardown that would have freed it runs. Waiting for `Close`, which
+/// `tear_down` sends only once that teardown has actually hung the probe
+/// up, guarantees the next `Connect` is sent after the batch that carried
+/// the `Maintain` is long over, so it lands in the new life instead.
 #[tokio::test]
 async fn six_maintenances_in_a_row_leave_the_board_serving() {
     let module = module_file(
@@ -1647,9 +1657,23 @@ async fn six_maintenances_in_a_row_leave_the_board_serving() {
     let tx = conn::spawn_machine(boot(module, "mbbs-server-host-supervisor-maintain-six-root", 1));
 
     for round in 0..6 {
-        let (chan, _out) = connect_raw(&tx, "probe").await;
+        let (chan, mut out) = connect_raw(&tx, "probe").await;
         assert!(chan.is_some(), "round {round}: the board must be serving before each maintenance");
         tx.send(In::Maintain).expect("the host thread is alive");
+        // Wait for this probe's hangup before the next connect. The Close is
+        // sent inside the teardown, so a Connect sent after it cannot share
+        // a batch with the Maintain and is answered by the next life.
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match out.recv().await {
+                    Some(Out::Close) | None => break true,
+                    Some(Out::Bytes(_)) => continue,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: maintenance must hang the probe up inside 10s"));
+        assert!(closed);
     }
 
     let (chan, _out) = connect_raw(&tx, "final").await;
