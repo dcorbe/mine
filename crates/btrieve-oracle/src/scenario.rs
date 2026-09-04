@@ -57,7 +57,8 @@
 //!
 //! # The `B_CREATE` wire layout, for whoever writes the replay
 //!
-//! Every seed in this file's fixtures is a `B_CREATE` request whose
+//! Every seed here but the three `v5_variable_*` fixtures' -- those carry a
+//! whole file, [`Seed::File`] -- is a `B_CREATE` request whose
 //! `databuf` is one `FileSpec` (16 bytes) followed by one `KeySpec` (16
 //! bytes), `tools/btrieve-oracle/btrvprobe.c:76-104`, both `#pragma
 //! pack(push, 1)`:
@@ -107,9 +108,14 @@ pub enum Seed {
     /// from nothing.
     Create(Request),
     /// A pre-built file's raw bytes, written into place before the first
-    /// call. Nothing in this crate currently produces one -- every fixture
-    /// here is seeded with [`Seed::Create`] -- but the shape is part of the
-    /// interface this module promises, not a hypothetical.
+    /// call. What the three `v5_variable_*` fixtures are seeded with: a
+    /// version 5, variable-length file `btrieve::create` wrote, a shape a
+    /// `B_CREATE` over this wire cannot ask the genuine engine for.
+    ///
+    /// The file's name comes from the scenario's first call, which must be
+    /// the `B_OPEN` that opens it (`generate::record_fixtures_from_the_
+    /// genuine_engine`); nothing else in a file-seeded scenario says what
+    /// to call it.
     File(Vec<u8>),
 }
 
@@ -495,7 +501,9 @@ mod encoding_tests {
 // in this crate (indeed, in the whole differential-testing story this task
 // is Phase 4 of) that is allowed to build the actual `Scenario`s. Everyday
 // runs -- Task 12's replay included -- read only the committed
-// `fixtures/*.fixture` files this produces.
+// `fixtures/*.fixture` files this produces. The one exception is the nested
+// `gate` module, which reads one of those committed fixtures and spawns no
+// engine at all.
 // =========================================================================
 
 #[cfg(test)]
@@ -548,6 +556,13 @@ mod generate {
         let mut p = format!(r"C:\btrieve\{name}").into_bytes();
         p.push(0);
         p
+    }
+
+    /// The `C:\btrieve\<name>` a request carries in its key buffer, read
+    /// back out: everything up to the NUL terminator, as text.
+    fn name_in(keybuf: &[u8]) -> String {
+        let end = keybuf.iter().position(|b| *b == 0).unwrap_or(keybuf.len());
+        String::from_utf8_lossy(&keybuf[..end]).into_owned()
     }
 
     /// A `B_CREATE` request for a file with exactly one key: an
@@ -736,6 +751,134 @@ mod generate {
         }
     }
 
+    // -----------------------------------------------------------------
+    // The v5 variable-length key file. Everything above builds a
+    // fixed-length file through the wire's own B_CREATE; the three
+    // scenarios below start from a file `crates/btrieve`'s own
+    // `create` wrote instead (`Seed::File`), because a B_CREATE over this
+    // wire cannot ask for the shape they need: version 5, variable-length
+    // records, and a key collating through an ALLCAPS alternate collating
+    // sequence. Whether genuine Btrieve 6.15 will keep such a file at
+    // version 5 rather than rebuilding it as v6 is exactly what
+    // `gate::the_genuine_engine_left_the_file_v5_and_folded_sysop_through_the_acs`
+    // measures.
+    // -----------------------------------------------------------------
+
+    /// The variable tail's buffer size, `RINGSZ` in MajorBBS's own key
+    /// file. What a Get offers the engine as its data-buffer capacity.
+    const RINGSZ: u32 = 1024;
+
+    /// The key file the auth work needs: 31-byte fixed portion, one key --
+    /// a 30-byte string at offset 0 collating through an ALLCAPS ACS --
+    /// and a variable tail. Byte-for-byte the spec
+    /// `crates/btrieve/src/create.rs`'s own `keyrec_spec` test helper
+    /// builds; that helper is private to its module's test mod, so the
+    /// literal is repeated here rather than reached for.
+    fn keyrec_spec() -> btrieve::FileSpec {
+        btrieve::FileSpec {
+            record_length: 31,
+            page_size: 1024,
+            keys: vec![btrieve::KeySpec {
+                segments: vec![btrieve::SegmentSpec {
+                    offset: 0,
+                    length: 30,
+                    kind: 0x0b,
+                    descending: false,
+                }],
+                duplicates: false,
+                modifiable: false,
+                acs: true,
+            }],
+            acs: Some(btrieve::acs::allcaps()),
+            variable: true,
+        }
+    }
+
+    /// Builds one empty [`keyrec_spec`] file with `btrieve::create` and
+    /// returns its bytes, for a [`Seed::File`] scenario to write into the
+    /// Wine prefix.
+    ///
+    /// The scratch file lives under this crate's own `target/` (gitignored)
+    /// and is never committed -- the committed copy of these bytes is the
+    /// one inside each fixture, which is also the only copy the replay
+    /// harness ever reads.
+    fn seed_keyrec_file() -> Vec<u8> {
+        let path = fixtures_dir().join("../target/seed_keyrec.dat");
+        let dir = path.parent().expect("the path has a parent");
+        std::fs::create_dir_all(dir)
+            .unwrap_or_else(|e| panic!("creating {}: {e}", dir.display()));
+        // `btrieve::create` never overwrites, and this runs once per
+        // scenario that wants the seed.
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .unwrap_or_else(|e| panic!("removing {}: {e}", path.display()));
+        }
+        btrieve::create(&path, &keyrec_spec())
+            .unwrap_or_else(|e| panic!("creating the seed file: {e}"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    }
+
+    /// One key record: the 30-byte key (a userid, NUL-padded to the key's
+    /// full length) followed by the variable tail (a ring of key names,
+    /// NUL-terminated). The fixed portion is 31 bytes, so the tail's first
+    /// byte still falls inside it -- that is this file's geometry, not an
+    /// off-by-one.
+    fn keyrec(userid: &str, ring: &str) -> Vec<u8> {
+        assert!(
+            userid.len() <= 30,
+            "userid {userid:?} does not fit this file's 30-byte key"
+        );
+        let mut rec = vec![0u8; 30];
+        rec[..userid.len()].copy_from_slice(userid.as_bytes());
+        rec.extend_from_slice(ring.as_bytes());
+        rec.push(0);
+        rec
+    }
+
+    /// Insert one [`keyrec`]. `keylen`/`keybuf` mirror [`insert_request`]:
+    /// an Insert takes its key from the record, not from the key buffer,
+    /// but the buffer is still handed over at the size the measured calling
+    /// convention uses.
+    fn insert_keyrec_request(userid: &str, ring: &str) -> Request {
+        let data = keyrec(userid, ring);
+        Request {
+            op: B_INSERT,
+            posblk: [0u8; 128],
+            datalen: data.len() as u32,
+            databuf: data,
+            keylen: 255,
+            keynum: 0,
+            keybuf: vec![0u8; 255],
+        }
+    }
+
+    /// A keyed read against the key file: the search value is a 30-byte
+    /// NUL-padded userid (the key's full declared length), and the engine
+    /// is offered a [`RINGSZ`]-byte data buffer so a record with its whole
+    /// variable tail fits. `databuf` itself stays empty for the same reason
+    /// [`get_request`]'s does -- only `datalen` governs the real engine's
+    /// buffer capacity on this wire.
+    ///
+    /// Pass `""` for the userid on Get First/Next, which take no search
+    /// value.
+    fn get_keyrec_request(op: u16, userid: &str) -> Request {
+        assert!(
+            userid.len() <= 30,
+            "userid {userid:?} does not fit this file's 30-byte key"
+        );
+        let mut keybuf = vec![0u8; 30];
+        keybuf[..userid.len()].copy_from_slice(userid.as_bytes());
+        Request {
+            op,
+            posblk: [0u8; 128],
+            datalen: RINGSZ,
+            databuf: Vec::new(),
+            keylen: 255,
+            keynum: 0,
+            keybuf,
+        }
+    }
+
     /// Every scenario this crate commits fixtures for, covering Open,
     /// Close, Insert, Update, Delete, the Get family, Step and Stat -- the
     /// opcodes `crates/btrieve/src/btrcall.rs`'s dispatch table implements
@@ -746,6 +889,9 @@ mod generate {
             insert_get_step_stat_scenario(),
             update_and_delete_scenario(),
             status_ten_scenario(),
+            v5_variable_insert_scenario(),
+            v5_variable_delete_scenario(),
+            v5_variable_grow_scenario(),
         ]
     }
 
@@ -848,6 +994,161 @@ mod generate {
         }
     }
 
+    /// Insert two key records into a v5 variable-length file our own
+    /// `create` wrote, then read them back -- including a Get Equal for
+    /// `sysop` in lower case against a record inserted as `Sysop`, which
+    /// only finds anything if the ALLCAPS alternate collating sequence is
+    /// really in force.
+    ///
+    /// Each of the three scenarios below uses its own DOS filename: the
+    /// Microkernel caches pages by path across processes, so two scenarios
+    /// in one run must never share one (this module's own doc comment).
+    fn v5_variable_insert_scenario() -> Scenario {
+        let name = "KEYSINS.DAT";
+        Scenario {
+            name: "v5_variable_insert".to_owned(),
+            seed: Seed::File(seed_keyrec_file()),
+            calls: vec![
+                open_request(name),
+                insert_keyrec_request("Sysop", "DEMO NORMAL SYSOP"),
+                insert_keyrec_request("&USER", "DEMO NORMAL"),
+                get_keyrec_request(B_GET_EQUAL, "sysop"), // ACS: lower case finds it
+                get_keyrec_request(B_GET_FIRST, ""),
+                get_keyrec_request(B_GET_NEXT, ""),
+                get_keyrec_request(B_GET_NEXT, ""), // status 9: end of file
+                close_request(),
+            ],
+        }
+    }
+
+    /// Delete a record from a v5 variable-length file, confirm it is gone,
+    /// then insert a longer record -- does the engine reuse the freed
+    /// fragment, and what does the file look like afterwards.
+    fn v5_variable_delete_scenario() -> Scenario {
+        let name = "KEYSDEL.DAT";
+        Scenario {
+            name: "v5_variable_delete".to_owned(),
+            seed: Seed::File(seed_keyrec_file()),
+            calls: vec![
+                open_request(name),
+                insert_keyrec_request("Sysop", "DEMO NORMAL SYSOP"),
+                insert_keyrec_request("Test", "DEMO"),
+                get_keyrec_request(B_GET_EQUAL, "Sysop"), // establishes currency
+                delete_request(),
+                get_keyrec_request(B_GET_EQUAL, "Sysop"), // status 4: gone
+                insert_keyrec_request("Testy", "DEMO NORMAL MODERATE MASS_MAIL"),
+                close_request(),
+            ],
+        }
+    }
+
+    /// Enough records to need a second variable page: 1024-byte pages, so
+    /// 60 records of about 50 bytes force the engine off the file's one
+    /// pre-allocated data page and into fresh physical pages.
+    fn v5_variable_grow_scenario() -> Scenario {
+        let name = "KEYSGRW.DAT";
+        let mut calls = vec![open_request(name)];
+        for n in 0..60u32 {
+            calls.push(insert_keyrec_request(
+                &format!("User{n:02}"),
+                "DEMO NORMAL MODERATE",
+            ));
+        }
+        calls.push(get_keyrec_request(B_GET_EQUAL, "User59"));
+        calls.push(close_request());
+        Scenario {
+            name: "v5_variable_grow".to_owned(),
+            seed: Seed::File(seed_keyrec_file()),
+            calls,
+        }
+    }
+
+    /// The one thing in this module that runs in an ordinary `cargo test`:
+    /// it reads the committed `v5_variable_insert.fixture` and never goes
+    /// near Wine. It lives here rather than beside `encoding_tests`
+    /// because it reads the same opcode constants the scenarios are built
+    /// from.
+    mod gate {
+        use super::*;
+
+        fn insert_fixture() -> Fixture {
+            let path = fixtures_dir().join("v5_variable_insert.fixture");
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            Fixture::decode(&bytes)
+                .unwrap_or_else(|e| panic!("decoding {}: {e}", path.display()))
+        }
+
+        /// Two questions this branch could not answer without a recording,
+        /// asked of the same transcript.
+        ///
+        /// **Did the file stay v5?** Genuine Btrieve 6.15 is a v6 engine,
+        /// and nothing promised it would leave a v5 file alone rather than
+        /// rebuilding it in its own format on the first write. If it had,
+        /// every v5 measurement taken from these fixtures would be about a
+        /// file the engine no longer had, and this branch's plan would have
+        /// stopped here. A v5 control record opens with four zero bytes and
+        /// carries its version in byte 7 (`crate::version`, and
+        /// `btrieve::create`'s `fcr::VERSION_BYTE`); a v6 one opens `"FC"`.
+        ///
+        /// **Did the ALLCAPS collating sequence work?** The scenario
+        /// inserts `Sysop` and then asks for `sysop`. Under raw byte
+        /// ordering that finds nothing (status 4). Status 0, with the
+        /// `Sysop` record and its whole variable tail in the reply, is the
+        /// genuine engine reading -- from a file this project's own
+        /// `create` wrote -- the ACS block and the key's collating flag
+        /// that Tasks 1 and 2 put there.
+        #[test]
+        fn the_genuine_engine_left_the_file_v5_and_folded_sysop_through_the_acs() {
+            let fixture = insert_fixture();
+            let file = &fixture.transcript.file;
+
+            assert_ne!(
+                &file[..2],
+                b"FC",
+                "the engine rebuilt the file as v6; first 0x40 bytes: {:02x?}",
+                &file[..0x40]
+            );
+            assert_eq!(
+                &file[..4],
+                &[0, 0, 0, 0],
+                "not a v5 file control record; first 0x40 bytes: {:02x?}",
+                &file[..0x40]
+            );
+            assert_eq!(
+                file[0x07],
+                4,
+                "v5 version byte; first 0x40 bytes: {:02x?}",
+                &file[..0x40]
+            );
+
+            let calls = fixture.scenario.calls.iter();
+            let pairs: Vec<_> = calls.zip(&fixture.transcript.responses).collect();
+            for (call, resp) in &pairs {
+                if call.op == B_INSERT {
+                    assert_eq!(
+                        resp.status, 0,
+                        "the engine refused an insert into the v5 variable-length file"
+                    );
+                }
+            }
+
+            let (_, resp) = pairs
+                .iter()
+                .find(|(call, _)| call.op == B_GET_EQUAL && call.keybuf.starts_with(b"sysop"))
+                .expect("the scenario asks for `sysop` in lower case");
+            assert_eq!(
+                resp.status, 0,
+                "lower-case `sysop` did not find the `Sysop` record: the ACS did not collate"
+            );
+            assert_eq!(
+                &resp.databuf[..5],
+                b"Sysop",
+                "the record found under `sysop` is not the one inserted as `Sysop`"
+            );
+        }
+    }
+
     /// Drives one `Scenario` over an already-spawned `Engine`: performs the
     /// seed, then every call in order, threading `posblk` by hand (see this
     /// module's top-level doc comment), and reads the resulting file's
@@ -914,19 +1215,33 @@ mod generate {
         let work_dir = btrieve_work_dir();
 
         for scenario in all_scenarios() {
+            // A recorded fixture is data, and the process id below is baked
+            // into it, so re-recording rewrites a committed file for no
+            // reason. Only a deliberate RERECORD=1 does that.
+            if fixtures_dir().join(format!("{}.fixture", scenario.name)).exists()
+                && std::env::var("RERECORD").as_deref() != Ok("1")
+            {
+                eprintln!("skipped (exists): {}", scenario.name);
+                continue;
+            }
+
             // Every scenario's own filename, per its `create_request`/seed,
             // is prefixed with this process's id so two runs -- or two
             // scenarios that happened to pick the same base name -- never
             // collide on a path the Microkernel might have cached.
             let dos_name = match &scenario.seed {
-                Seed::Create(req) => {
-                    let end = req.keybuf.iter().position(|b| *b == 0).unwrap_or(req.keybuf.len());
-                    String::from_utf8_lossy(&req.keybuf[..end]).into_owned()
-                }
-                Seed::File(_) => panic!(
-                    "{}: Seed::File scenarios need their own file-placement logic, not written yet",
-                    scenario.name
-                ),
+                Seed::Create(req) => name_in(&req.keybuf),
+                // A pre-built file carries no filename of its own, so the
+                // scenario's first call -- which must be the B_OPEN that
+                // opens it -- is what says where the file goes.
+                Seed::File(_) => match scenario.calls.first() {
+                    Some(req) if req.op == B_OPEN => name_in(&req.keybuf),
+                    _ => panic!(
+                        "{}: a Seed::File scenario must open its file with a B_OPEN first call; \
+                         nothing else says what to call the file",
+                        scenario.name
+                    ),
+                },
             };
             // dos_name is `C:\btrieve\<base>`; re-derive the base and give
             // it this process's id, then rebuild every request that

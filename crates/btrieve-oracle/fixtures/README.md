@@ -17,8 +17,12 @@ successful-Get `databuf`, and post-scenario record contents against what the
 engine under test produced for the same calls. It never compares `posblk`
 (genuine Btrieve's is 128 bytes of engine-private cursor state; this
 project's is a host-side handle — neither shape is scenario data) and never
-compares raw file bytes (every seed file here is genuine Btrieve's own v6
-layout; nothing this project builds is byte-identical to that in principle).
+compares raw file bytes. Four of the seven fixtures are seeded by a
+`B_CREATE` over the wire, so their files are genuine Btrieve's own v6 layout,
+and nothing this project builds is byte-identical to that in principle. The
+three `v5_variable_*` fixtures are seeded the other way, from a v5 file
+`btrieve::create` wrote, and their transcripts hold that same file after the
+genuine engine wrote into it.
 
 ## `open_close.fixture` (3,963 bytes)
 
@@ -87,6 +91,81 @@ oracle.md`'s narration of the same rule measured through the raw C probe
 through the wire this crate's own Rust client uses, not only through a
 probe transcript.
 
+## `v5_variable_insert.fixture` (16,193 bytes)
+
+**Scenario:** seeded, unlike every fixture above it, with a file this
+project's own `btrieve::create` wrote rather than with a `B_CREATE` over the
+wire. The seed is a **version 5** file with **variable-length** records, a
+31-byte fixed portion, and one key: a 30-byte string at offset 0 collating
+through the **ALLCAPS** alternate collating sequence MajorBBS itself uses.
+Open, insert `Sysop` with the tail `DEMO NORMAL SYSOP`, insert `&USER` with
+`DEMO NORMAL`, Get Equal `sysop` **in lower case**, Get First, Get Next, Get
+Next (status 9), Close. Statuses: 0, 0, 0, 0, 0, 0, 9, 0.
+
+**Engine:** genuine Pervasive Btrieve 6.15 under Wine.
+
+**Confirmed by reading the file:** the 4,096-byte seed came back 6,144 bytes,
+six 1,024-byte pages, still opening with a v5 control record: four zero
+bytes, version byte 4 at offset 0x07, no `"FC"`. The virgin file's
+`ff ff ff ff` at 0x38..0x3c now reads `ff 00 05 00`, the engine's own record
+of which page the variable tail reached.
+
+**What it proves:** two things nothing else in this repository could answer.
+First, a v6 engine handed a v5 file does not quietly rebuild it in its own
+format. It writes into the v5 layout, so every v5 measurement taken from
+these transcripts is about a file the engine really had. Second, the
+alternate collating sequence works. The Get Equal for `sysop` answers status
+0 and returns the record inserted as `Sysop`, tail and all, where raw byte
+ordering would have answered 4. That is the genuine engine reading the ACS
+block and the key's collating flag out of a file this project wrote, the
+strongest confirmation available that `btrieve::create` writes them
+correctly.
+
+## `v5_variable_delete.fixture` (16,151 bytes)
+
+**Scenario:** the same seed file. Open, insert `Sysop` with the tail
+`DEMO NORMAL SYSOP` (48 bytes) and `Test` with `DEMO` (35 bytes), Get Equal
+`Sysop` to establish currency, Delete, Get Equal `Sysop` again, insert
+`Testy` with a longer tail, `DEMO NORMAL MODERATE MASS_MAIL` (61 bytes),
+Close. Statuses: 0, 0, 0, 0, 0, **4**, 0, 0.
+
+**Engine:** genuine Pervasive Btrieve 6.15 under Wine.
+
+**Confirmed by reading the file:** 6,144 bytes, still v5 (version byte 4),
+0x38..0x3c reading `ff 00 05 00`. The record inserted after the delete needed
+no page beyond the one the deleted record had already reached.
+
+**What it proves:** deletion on a *variable-length* file, which no fixture
+above covers and no corpus file can show. A Get Equal for the deleted key
+answers **4**, the same code `update_and_delete.fixture` measured on a
+fixed-length v6 file, and the following insert of a record **longer** than
+the one deleted still succeeds. That last call is the one that matters for
+the engine under test: whatever it decides to do with the freed fragment,
+the genuine engine's answer and resulting file are recorded here to check it
+against.
+
+## `v5_variable_grow.fixture` (73,083 bytes)
+
+**Scenario:** the same seed file, then 60 inserts, `User00` through `User59`,
+each with the tail `DEMO NORMAL MODERATE`, 51 bytes a record. Then a Get
+Equal for `User59`, and Close. 63 calls, every one status 0.
+
+**Engine:** genuine Pervasive Btrieve 6.15 under Wine.
+
+**Confirmed by reading the file:** the 4,096-byte seed came back 13,312
+bytes, thirteen 1,024-byte pages, so the engine allocated nine new ones. It
+is still v5: version byte 4, no `"FC"`. 0x38..0x3c reads `ff 00 0a 00`
+against the insert fixture's `05`, so the variable tail reached page 10
+rather than page 5.
+
+**What it proves:** growth. The seed file carries exactly one pre-allocated
+data page, so 60 records cannot fit it. This fixture records what genuine
+Btrieve does when a v5 variable-length file has to allocate: how many pages,
+in what order, and with what bookkeeping in the control record. Without it
+the engine under test would be free to invent an allocation policy with
+nothing to check it against. The final Get Equal for the last-inserted key
+answering 0 says the index survived every one of those allocations.
+
 ## Why these are kept, and what changed
 
 The design spec that pitches the old census machinery (`census.rs`,
@@ -122,14 +201,16 @@ ground truth for:**
 - **Mutation behaviour of any kind** — Update, the modifiable/unmodifiable
   key rule, currency after a mutating call. Same reason: a corpus file is a
   snapshot, not a sequence of operations.
-- **Variable-tail Allocation Tables (VATs).** None of these four fixtures
-  cover this either — every scenario here creates a fixed-length,
-  single-key file (`create_request`'s `record_len` is a plain byte count,
-  and the FileSpec's flags word is always built with no variable-length
-  bit set). VATs remain unwitnessed by both the corpus (harvest 5 found
-  zero corpus evidence and zero mentions in the 45,175-line decompile) and
-  by every fixture recorded so far. That gap is not closed by anything in
-  this repository today.
+- **Variable-tail Allocation Tables (VATs).** The four `B_CREATE`-seeded
+  fixtures cannot cover this: each creates a fixed-length, single-key file
+  (`create_request`'s `record_len` is a plain byte count, and the FileSpec's
+  flags word is always built with no variable-length bit set). The three
+  `v5_variable_*` fixtures do hold variable-length records the genuine
+  engine wrote, so that path is witnessed here as well as in the corpus.
+  Whether their files carry a VAT specifically has **not** been measured,
+  and nothing above claims it. VATs found zero corpus evidence and zero
+  mentions in the 45,175-line decompile (harvest 5), and that gap stands
+  until someone measures one.
 
 A recording nobody can interpret is not evidence — that is why each section
 above states the scenario, the engine, and what was directly confirmed by
