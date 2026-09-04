@@ -51,3 +51,6 @@ re/
 # Code graphs
 graphify-out/
 
+
+# Skill-generated plans and specs; never tracked.
+docs/superpowers/
