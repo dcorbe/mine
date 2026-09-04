@@ -47,3 +47,7 @@ tools/oracle/
 
 # Reverse-engineering workspace: vendor extracts, disassembly, notes. Never tracked.
 re/
+
+# Code graphs
+graphify-out/
+
