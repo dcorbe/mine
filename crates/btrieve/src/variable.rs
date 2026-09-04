@@ -97,6 +97,52 @@ pub(crate) fn head_of(fcr: &[u8]) -> Option<u32> {
     }
 }
 
+/// What [`v5_head_of`] reads when no variable page is offered: the sentinel
+/// a virgin variable-length file carries at
+/// [`super::format::fcr::at::VARIABLE_HIGHEST`], and what
+/// [`set_v5_head`] writes back when the chain empties.
+const NO_V5_HEAD: u16 = 0xffff;
+
+/// Read the free-space chain's head out of a **version 5** file control
+/// record.
+///
+/// A different field from [`head_of`]'s: v5 keeps its head at
+/// [`super::format::fcr::at::VARIABLE_HIGHEST`] (`0x3a`, a plain
+/// little-endian `u16`) rather than at `pages::fcr::VARIABLE_HEAD`
+/// (`0xa0`, a [`super::pages::long`]), which stays zero on every v5 file
+/// this crate has written or read. See [`V5Pages`]'s doc comment for the two
+/// genuine recordings that measured it and for why `0x3a` is the head rather
+/// than only the highest page reached.
+pub(crate) fn v5_head_of(fcr: &[u8]) -> Option<u32> {
+    use super::format::fcr::at::VARIABLE_HIGHEST;
+    match u16::from_le_bytes([fcr[VARIABLE_HIGHEST], fcr[VARIABLE_HIGHEST + 1]]) {
+        NO_V5_HEAD | 0 => None,
+        page => Some(u32::from(page)),
+    }
+}
+
+/// Write the free-space chain's head into a **version 5** file control
+/// record, and mark the file as no longer virgin.
+///
+/// Both bytes together, because the genuine engine changed both: the seed's
+/// `ff ff ff ff` at `0x38..0x3c` reads `ff 00 05 00` after the insert
+/// scenario, which is [`super::format::fcr::at::VARIABLE_SUBFLAG`] going
+/// from `0xff` (virgin) to `0x00` in the same breath as the head being set.
+/// `create.rs`'s own `VARIABLE_SUBFLAG` doc comment measured the same flip
+/// across the corpus; this is the write side of it.
+pub(crate) fn set_v5_head(fcr: &mut [u8], head: Option<u32>) -> Result<(), String> {
+    use super::format::fcr::at::{VARIABLE_HIGHEST, VARIABLE_SUBFLAG};
+    let value = match head {
+        None => NO_V5_HEAD,
+        Some(page) => u16::try_from(page).map_err(|_| {
+            format!("variable page {page} is past the 65,535 a v5 control record can name")
+        })?,
+    };
+    fcr[VARIABLE_SUBFLAG] = 0x00;
+    fcr[VARIABLE_HIGHEST..VARIABLE_HIGHEST + 2].copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
 /// Where a page says how many fragments it holds.
 const FRAGMENT_COUNT: usize = 0x0a;
 
@@ -1100,8 +1146,8 @@ pub(crate) const V_TAG: [u8; 2] = [0x00, b'V'];
 ///
 /// Separate from [`PagesMut`] because claiming is the one thing v5 and v6
 /// disagree about in kind rather than in degree: v6 claims a **logical** id
-/// through the `"PP"` allocation table, and v5 takes a **physical** page off
-/// the file's own free chain or appends one. Folding that into [`PagesMut`]
+/// through the `"PP"` allocation table, and v5 **appends** a physical page to
+/// the end of the file ([`V5Pages`], measured). Folding that into [`PagesMut`]
 /// would hand every reader a capability it never uses, which is the mistake
 /// [`PagesMut`]'s own doc comment already declines to make.
 pub(crate) trait PageSource: PagesMut {
@@ -1177,6 +1223,188 @@ impl PageSource for V6Pages<'_> {
 
     fn page_size(&self) -> u16 {
         self.page_size
+    }
+}
+
+/// A version 5 file's pages, addressed physically, with a fresh one appended
+/// to the end of the file.
+///
+/// # Measured, not inferred
+///
+/// Every rule below was read out of the two committed recordings of genuine
+/// Pervasive Btrieve 6.15 writing into a **version 5** variable-length file
+/// this crate's own [`create`](super::create) wrote:
+/// `crates/btrieve-oracle/fixtures/v5_variable_insert.fixture` and
+/// `v5_variable_grow.fixture` (see `fixtures/README.md` for each scenario).
+/// The offsets below are offsets into those fixtures' own
+/// `transcript.file` -- the genuine engine's resulting file, byte for byte.
+/// Both files have 1,024-byte pages.
+///
+/// ## Where a fresh variable page comes from: the end of the file
+///
+/// The seed is four pages (`fcr::PAGES`, `0x26..0x2a`, reads `00 00 04 00`).
+/// After the insert scenario's two records it reads `00 00 06 00` and the
+/// file is six pages; after the grow scenario's sixty it reads `00 00 0d 00`
+/// and the file is thirteen. Every page the engine brought in is a page it
+/// **appended**: the first variable page of the insert scenario is physical
+/// page 5, at file offset `0x1400`, which is one past the last page the file
+/// had. Nothing was taken from a free list -- the v5 free-list head at
+/// `0x10..0x14` (`super::pages::fcr::FREE`) is `ff ff ff ff` in the seed and
+/// holds a **record slot position** afterwards, not a page: `00 00 4c 10` =
+/// `0x104c` in the insert scenario (page 4, third 35-byte slot) and
+/// `00 00 4c 30` = `0x304c` in the grow one. That field threads free record
+/// slots on data pages and never names a variable page, so a v5 claim has
+/// nowhere to take one from and appends.
+///
+/// ## The fresh page's own bytes
+///
+/// The insert scenario's page 5 opens
+/// `00 00 05 00 | 01 00 | ff 00 ff ff | 02 00` at `0x1400`:
+///
+/// - `0x00..0x04` [`PAGE_NUMBER`]: `00 00 05 00`, [`super::pages::long`] of
+///   5 -- its own **physical** page number. [`Header::read`] checks it, so
+///   [`claim`](PageSource::claim) has to stamp it; [`blank_page`] cannot,
+///   because it does not know which page it is about to become.
+/// - `0x04..0x06`: `01 00`. The same modification stamp
+///   [`super::pages::Header`] reads for a data page, and on all three
+///   genuine variable pages it is one less than the fragment count: 1 with
+///   2 fragments here, `2b 00` (43) with `2c 00` (44) fragments on the grow
+///   scenario's page 5 at `0x1400`, `0f 00` (15) with `10 00` (16) on its
+///   page 10 at `0x2800`. Reproduced as a counter incremented by every write
+///   *after* the one that fills a blank page, which is the same number for
+///   an insert-only history and the reading that survives a delete (Task 5).
+/// - `0x06..0x0a` [`FREE_CHAIN`]: `ff 00 ff ff`, [`FreeChain::Last`]. What
+///   [`Space::reoffer`] already writes for a fresh page joining an empty
+///   chain.
+/// - `0x0a..0x0c` [`FRAGMENT_COUNT`], then fragment 0 at [`FIRST_FRAGMENT`]
+///   and the entry array growing down from the end of the page -- the
+///   layout this module's own doc comment describes, unchanged for v5.
+///
+/// ## The chain head is `VARIABLE_HIGHEST`, at `0x3a`
+///
+/// The seed reads `ff ff ff ff` at `0x38..0x3c`; the insert scenario's file
+/// reads `ff 00 05 00` and the grow scenario's `ff 00 0a 00`. That is
+/// [`super::format::fcr::at::VARIABLE_SUBFLAG`] (`0x39`) flipping to `0x00`
+/// -- the file is no longer virgin -- and
+/// [`super::format::fcr::at::VARIABLE_HIGHEST`] (`0x3a`, a plain
+/// little-endian `u16`) becoming 5 and 10, the number of the last variable
+/// page each scenario claimed. The corpus already reads this field as "the
+/// v5 analogue of v6's `pages::fcr::VARIABLE_HEAD`"
+/// (`format::fcr::v5_fixed`'s own `variable_highest` citation), and the grow
+/// recording is what settles it: its page 5 fills up (44 fragments, `ff ff
+/// ff ff` at `0x1406` -- [`FreeChain::Off`]) before its page 10 is claimed,
+/// and page 10's own chain field at `0x2806` reads `ff 00 ff ff`
+/// ([`FreeChain::Last`]), **nothing following it**. Had the head still been
+/// 5 when page 10 was claimed, [`Space::reoffer`]'s measured
+/// last-in-first-out threading would have written `Next(5)` there instead.
+/// So the field really is the head, and it goes back to the `0xffff`
+/// sentinel when a page fills up and no other page is offered.
+///
+/// Reading and writing that field is [`Block`](super::Block)'s job, not this
+/// type's, exactly as the v6 head at `pages::fcr::VARIABLE_HEAD` is -- see
+/// [`Space`]'s own doc comment on why the head is passed in and handed back
+/// rather than read from the file here.
+///
+/// ## The pointer in the record's own slot
+///
+/// [`Pointer::decode`]'s encoding, unchanged: the insert scenario's first
+/// record sits at `0x1006` (page 4, first slot), its 31-byte fixed part runs
+/// to `0x1025`, and the four bytes at `0x1025..0x1029` read `00 05 00 00` --
+/// page 5, fragment 0. The second record's, at `0x1048..0x104c`, read
+/// `00 05 00 01` -- page 5, fragment 1. That is `[high][low][mid][fragment]`
+/// exactly as [`Pointer::encode`] produces it and `records::walk` reads it
+/// back at `reclen`, so the v5 write side needs nothing the v5 read side did
+/// not already have.
+pub(crate) struct V5Pages<'a> {
+    file: FilePages<'a>,
+}
+
+impl<'a> V5Pages<'a> {
+    /// `pages` is how many pages the file will be once the caller's own
+    /// pending write has landed, **not** how many it is right now.
+    ///
+    /// The distinction matters because a v5 insert can need two new pages at
+    /// once: `pages::Layout::next_slot` has already decided that the record
+    /// goes on a new data page numbered `pages` when it answers
+    /// `Slot::NewPage`, and that page is not written until after the body is
+    /// placed. Counting it here is what stops [`PageSource::claim`] handing
+    /// out the same number twice, and it is also the order the genuine
+    /// engine used: `v5_variable_insert.fixture`'s data page is 4 and its
+    /// variable page 5.
+    pub(crate) fn new(path: &'a std::path::Path, page_len: u16, pages: u32) -> Self {
+        Self {
+            file: FilePages::new(path, page_len, pages),
+        }
+    }
+
+    /// How many pages the file is once everything this source claimed has
+    /// landed -- what the caller writes to `pages::fcr::PAGES`.
+    pub(crate) fn pages(&self) -> u32 {
+        self.file.pages
+    }
+
+    /// The modification stamp a page should carry once `page` is written
+    /// over whatever is on disk at `number`.
+    ///
+    /// Zero for a page that is still blank (no fragments), one more than
+    /// what is there otherwise. See this type's doc comment for the three
+    /// genuine pages this reproduces.
+    fn stamped(&mut self, number: u32, page: &mut [u8]) {
+        const STAMP: usize = 0x04;
+        let stamp = match self.file.page(number) {
+            Ok(on_disk) if fragment_count(on_disk) != 0 => {
+                u16::from_le_bytes([on_disk[STAMP], on_disk[STAMP + 1]]).wrapping_add(1)
+            }
+            Ok(_) => 0,
+            // A page the file does not have yet: nothing to carry forward.
+            Err(_) => 0,
+        };
+        page[STAMP..STAMP + 2].copy_from_slice(&stamp.to_le_bytes());
+    }
+}
+
+impl Pages for V5Pages<'_> {
+    fn page(&mut self, number: u32) -> Result<&[u8], String> {
+        self.file.page(number)
+    }
+}
+
+impl PagesMut for V5Pages<'_> {
+    fn write_page(&mut self, number: u32, page: &[u8]) -> Result<(), String> {
+        let mut page = page.to_vec();
+        self.stamped(number, &mut page);
+        self.file.write_page(number, &page)
+    }
+}
+
+impl PageSource for V5Pages<'_> {
+    /// Append `content` as the file's next physical page, stamped with the
+    /// number it just became.
+    ///
+    /// The page is written here rather than left in memory because
+    /// [`Space::place`] reads it straight back -- and it has to, since
+    /// [`Header::read`] refuses a page whose [`PAGE_NUMBER`] does not match
+    /// the number asked for and [`blank_page`] cannot know that number.
+    fn claim(&mut self, content: &[u8]) -> Result<u32, String> {
+        let number = self.file.pages;
+        let mut page = content.to_vec();
+        if page.len() < FIRST_FRAGMENT as usize {
+            return Err(format!(
+                "a {}-byte page cannot be claimed as variable page {number}",
+                page.len()
+            ));
+        }
+        page[PAGE_NUMBER..PAGE_NUMBER + 4].copy_from_slice(&super::pages::to_long(number));
+        // The file does not reach this page yet, so `write_page` has to be
+        // allowed to seek past its end. Counting the page first is what
+        // makes `FilePages::page` able to read it back afterwards.
+        self.file.pages += 1;
+        self.file.write_page(number, &page)?;
+        Ok(number)
+    }
+
+    fn page_size(&self) -> u16 {
+        self.file.page_len
     }
 }
 
@@ -2735,5 +2963,65 @@ mod tests {
         assert_eq!(&after[..64], &blank(64)[..], "page 0 is untouched");
         let at = 64 + FIRST_FRAGMENT as usize;
         assert_eq!(&after[at..at + new_body.len()], new_body.as_slice(), "the payload landed on disk");
+    }
+
+    /// A v5 claim appends: the page lands at the end of the file, carries
+    /// its own physical number, and the file is one page longer. Genuine
+    /// Btrieve's own answer -- see [`V5Pages`]'s doc comment on where the
+    /// insert scenario's first variable page went.
+    #[test]
+    fn a_v5_claim_appends_a_page_stamped_with_its_own_number() {
+        let dir = crate::testing::scratch("variable-v5-claim");
+        let path = dir.join("CLAIM.DAT");
+        // Two pages: page 0 standing in for the file control record, page 1
+        // for anything else the file already has.
+        std::fs::write(&path, vec![0u8; 128]).expect("write the fixture");
+
+        let mut source = V5Pages::new(&path, 64, 2);
+        let number = source
+            .claim(&blank_page(64, Version::V5))
+            .expect("appends rather than refusing");
+        assert_eq!(number, 2, "the claim takes the page one past the last");
+        assert_eq!(source.pages(), 3, "and the file is a page longer");
+
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(after.len(), 192, "the file really grew on disk");
+        let page = &after[128..];
+        assert_eq!(
+            super::super::pages::long(&page[PAGE_NUMBER..PAGE_NUMBER + 4]),
+            2,
+            "the page names itself, which is what `Header::read` checks for v5"
+        );
+        assert_eq!(
+            super::super::pages::long(&page[FREE_CHAIN..FREE_CHAIN + 4]),
+            NO_PAGE,
+            "a page with no fragments on it yet is not offered to anyone"
+        );
+    }
+
+    /// The v5 free-space head reads and writes at `0x3a`, with `0xffff`
+    /// meaning "nothing offered" -- and setting it clears the virgin flag at
+    /// `0x39` in the same breath, which is what the genuine engine did.
+    #[test]
+    fn the_v5_head_round_trips_through_the_control_record() {
+        use super::super::format::fcr::at::{VARIABLE_HIGHEST, VARIABLE_SUBFLAG};
+
+        let mut fcr = vec![0u8; 512];
+        fcr[VARIABLE_SUBFLAG] = 0xff;
+        fcr[VARIABLE_HIGHEST..VARIABLE_HIGHEST + 2].copy_from_slice(&NO_V5_HEAD.to_le_bytes());
+        assert_eq!(v5_head_of(&fcr), None, "a virgin file offers no page");
+
+        set_v5_head(&mut fcr, Some(5)).expect("5 fits a u16");
+        assert_eq!(&fcr[VARIABLE_SUBFLAG..VARIABLE_HIGHEST + 2], &[0x00, 0x05, 0x00]);
+        assert_eq!(v5_head_of(&fcr), Some(5));
+
+        set_v5_head(&mut fcr, None).expect("the sentinel always fits");
+        assert_eq!(v5_head_of(&fcr), None, "an emptied chain offers no page");
+        assert_eq!(fcr[VARIABLE_SUBFLAG], 0x00, "and the file is still not virgin");
+
+        assert!(
+            set_v5_head(&mut fcr, Some(0x1_0000)).is_err(),
+            "a page number a v5 control record cannot name is refused, not truncated"
+        );
     }
 }

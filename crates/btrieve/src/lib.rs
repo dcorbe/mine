@@ -5956,31 +5956,32 @@ impl<M: Mem> Block<M> {
     /// `geometry.reclen` bytes, and the two would disagree the moment the
     /// cache is dropped and the file is read again.
     ///
-    /// **A variable-length file is not normalised, and a version 5 one
-    /// still refuses outright.** Normalising is right when `reclen` really
-    /// is the length of every record; on a variable-length file it is not,
-    /// and cutting a real record down to it is the same silent truncation
-    /// [`Self::update`] already refuses for exactly this reason. A version
-    /// 6 variable-length file does not refuse -- it diverges to
-    /// [`Self::insert_v6`] below, which places the body on a variable page;
-    /// only a version 5 one still has no proven write-side allocator for
-    /// this shape and refuses (see the refusal a few lines down). See
-    /// [`Self::update`]'s doc comment for the normalising rule this
-    /// mirrors.
+    /// **A variable-length file is not normalised, on either version.**
+    /// Normalising is right when `reclen` really is the length of every
+    /// record; on a variable-length file it is not, and cutting a real
+    /// record down to it is the same silent truncation [`Self::update`]
+    /// already refuses for exactly this reason. What is past `reclen` is the
+    /// record's body: a version 6 file diverges to [`Self::insert_v6`]
+    /// below, and a version 5 one reaches [`Self::place_v5_body`], which
+    /// puts the body on a variable page of its own. See [`Self::update`]'s
+    /// doc comment for the normalising rule this mirrors.
     ///
     /// `self.geometry` is updated last: `records` always grows by one, and
-    /// `pages` grows by one only when the slot was a new page. Both fields are
-    /// `Copy` and are what the next `Records::read` bounds its walk by, so
-    /// leaving either stale here would make a later re-read of this same file
-    /// -- after the cache is dropped -- silently wrong rather than merely
-    /// inconvenient. See `a_block_that_writes_is_readable_after_its_cache_is_dropped`.
+    /// `pages` grows by however many pages the write actually added -- the
+    /// slot's own new data page, plus any variable page
+    /// [`Self::place_v5_body`] claimed for the record's body. Both fields
+    /// are `Copy` and are what the next `Records::read` bounds its walk by,
+    /// so leaving either stale here would make a later re-read of this same
+    /// file -- after the cache is dropped -- silently wrong rather than
+    /// merely inconvenient. See
+    /// `a_block_that_writes_is_readable_after_its_cache_is_dropped`.
     ///
     /// # Errors
     ///
     /// If the records cannot be read, the file holds variable-length
     /// records and `bytes` is shorter than the fixed part every record has,
-    /// the file holds variable-length records and is version 5, or the file
-    /// cannot be written.
+    /// the body needs more room than one page can give (see
+    /// [`variable::Space::place`]), or the file cannot be written.
     fn insert_inner(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
         // A fixed-length v6 block with a page cache diverges to
         // `Self::insert_v6` below before anything past this point ever
@@ -6026,25 +6027,6 @@ impl<M: Mem> Block<M> {
             return self.insert_v6(bytes);
         }
 
-        // v5 variable-length files still refuse: `variable::Space` has a v6
-        // page source and no v5 one, and v5 takes a physical page off the
-        // file's own free chain rather than claiming a logical id through an
-        // allocation table. Refusing here rather than in `Space` keeps the
-        // v5 arithmetic below reachable only for the shape it was written
-        // for.
-        if self.geometry.variable {
-            return Err(BtvError {
-                file: name,
-                why: format!(
-                    "is a version 5 file holding variable-length records up to {} bytes, \
-                     and this host writes them only to version 6 files so far -- v5 takes \
-                     a fresh variable page off the file's own free chain, which has not \
-                     been measured",
-                    self.geometry.reclen
-                ),
-            });
-        }
-
         // Reached only for v5 now, but kept explicit rather than deleted:
         // `writable` is what refuses a version this match does not
         // recognise, and a future third version should hit that refusal
@@ -6076,10 +6058,32 @@ impl<M: Mem> Block<M> {
         // rather than at the top of the function.
         self.capture_for_journal()?;
 
-        pages::write_record(&self.path, layout, slot, &bytes, count).map_err(|why| BtvError {
-            file: name.clone(),
-            why,
+        // A variable-length record's body goes down first, on a variable
+        // page, and what lands in the data slot is the fixed part plus four
+        // bytes of pointer to it -- the same order and the same reason as
+        // `Self::insert_v6`'s own variable branch: a slot written first and
+        // then orphaned leaves a record pointing at fragments that were
+        // never allocated, while a fragment placed and then abandoned costs
+        // a page and corrupts nothing.
+        let (slot_bytes, variable) = self.place_v5_body(&bytes, layout, slot)?;
+
+        pages::write_record(&self.path, layout, slot, &slot_bytes, count).map_err(|why| {
+            BtvError {
+                file: name.clone(),
+                why,
+            }
         })?;
+
+        // After the record, because `pages::write_record` writes `fcr::PAGES`
+        // itself and only knows about the data page it may have appended --
+        // the variable page claimed above is past that, so the count it
+        // wrote is one or more too low until this puts the real one back.
+        if let Some((pages_after, head)) = variable {
+            self.write_v5_variable_fcr(pages_after, head).map_err(|why| BtvError {
+                file: name.clone(),
+                why,
+            })?;
+        }
 
         let position = slot.position();
         self.records
@@ -6092,9 +6096,14 @@ impl<M: Mem> Block<M> {
             })?;
 
         self.geometry.records = count;
-        if matches!(slot, pages::Slot::NewPage { .. }) {
-            self.geometry.pages += 1;
-        }
+        // `place_v5_body` already counted the data page this slot may add,
+        // so its answer is the whole file's page count and this must not add
+        // it a second time.
+        self.geometry.pages = match variable {
+            Some((pages_after, _)) => pages_after,
+            None if matches!(slot, pages::Slot::NewPage { .. }) => self.geometry.pages + 1,
+            None => self.geometry.pages,
+        };
         self.dirty = true;
 
         // After the model, never before it: the count is read off the model,
@@ -6106,6 +6115,128 @@ impl<M: Mem> Block<M> {
         })?;
 
         Ok(position)
+    }
+
+    /// Put a version 5 variable-length record's body on a variable page and
+    /// answer with the bytes that go in its data slot.
+    ///
+    /// A no-op on a fixed-length file: the slot bytes are the record, and
+    /// there is no variable bookkeeping to hand back. On a variable-length
+    /// one the slot is the fixed part followed by four bytes of
+    /// [`variable::Pointer`] -- the same four bytes `records::walk` reads
+    /// back at `reclen` and hands to [`variable::Chain::follow`], encoded by
+    /// [`variable::Pointer::encode`], which is that decode's own inverse.
+    ///
+    /// # The page count handed to `V5Pages`
+    ///
+    /// `layout.pages` plus one when `slot` is a `Slot::NewPage`, because
+    /// that slot's own page has already been decided (it *is* `layout.pages`)
+    /// and is not written until after this returns. See
+    /// [`variable::V5Pages::new`]'s doc comment: counting it is what stops a
+    /// single insert that needs both a new data page and a new variable page
+    /// from handing out one page number twice, and it is the order genuine
+    /// Btrieve used.
+    ///
+    /// # Returns
+    ///
+    /// The data slot's bytes, and -- for a variable-length file only -- how
+    /// many pages the file is now and what the free-space chain's head
+    /// became, both for the caller to write to the file control record.
+    ///
+    /// # Errors
+    ///
+    /// If the control record cannot be read, or the body cannot be placed
+    /// (a body too long for one page is refused rather than split -- see
+    /// [`variable::Space::place`]).
+    fn place_v5_body(
+        &self,
+        bytes: &[u8],
+        layout: pages::Layout,
+        slot: pages::Slot,
+    ) -> Result<(Vec<u8>, Option<(u32, Option<u32>)>), BtvError> {
+        if !self.geometry.variable {
+            return Ok((bytes.to_vec(), None));
+        }
+        let fail = |why: String| BtvError {
+            file: self.name.clone(),
+            why,
+        };
+
+        let fcr = self.read_control_record().map_err(&fail)?;
+        let was = variable::v5_head_of(&fcr);
+
+        let claimed = layout.pages + u32::from(matches!(slot, pages::Slot::NewPage { .. }));
+        let mut source = variable::V5Pages::new(&self.path, self.geometry.page, claimed);
+        let mut space = variable::Space::new(&mut source, Version::V5, was);
+
+        let reclen = usize::from(self.geometry.reclen);
+        let at = space.place(&bytes[reclen..]).map_err(|why| {
+            fail(format!(
+                "placing the {}-byte body of a {}-byte record: {why}",
+                bytes.len() - reclen,
+                bytes.len()
+            ))
+        })?;
+        let head = space.head();
+
+        let mut slot_bytes = bytes[..reclen].to_vec();
+        slot_bytes.extend_from_slice(&at.encode());
+        Ok((slot_bytes, Some((source.pages(), head))))
+    }
+
+    /// Write the two file control record fields a v5 variable-length insert
+    /// changes that `pages::write_record` does not: the file's page count
+    /// (`pages::fcr::PAGES`) and the free-space chain's head
+    /// ([`variable::set_v5_head`]).
+    ///
+    /// `pages::write_record` writes `PAGES` too, from the data page it may
+    /// have appended, and it has no way to know a variable page was appended
+    /// past that -- so this runs after it and overwrites the field rather
+    /// than adding to it.
+    ///
+    /// # Errors
+    ///
+    /// If the control record cannot be read or written back.
+    fn write_v5_variable_fcr(&self, pages_after: u32, head: Option<u32>) -> Result<(), String> {
+        let mut fcr = self.read_control_record()?;
+        fcr[pages::fcr::PAGES..pages::fcr::PAGES + 4]
+            .copy_from_slice(&pages::to_long(pages_after));
+        variable::set_v5_head(&mut fcr, head)?;
+
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&fcr))
+            .and_then(|_| file.flush())
+            .map_err(|e| format!("{}: writing the file control record: {e}", self.path.display()))
+    }
+
+    /// Page 0 of the file: the control record.
+    ///
+    /// One whole page rather than a hard-coded [`FCR`], for the reason
+    /// `pages::write_record` gives where it reads the same page: a real
+    /// Btrieve page is always at least 512 bytes, but this module's own
+    /// fixtures use 64-byte pages to stay readable, and every field either
+    /// caller touches is well inside a page of any size this format uses.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be opened, or is shorter than one page.
+    fn read_control_record(&self) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let mut file = open_for_read(&self.path)
+            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        let mut bytes = vec![0u8; usize::from(self.geometry.page)];
+        file.read_exact(&mut bytes).map_err(|e| {
+            format!(
+                "{}: reading the file control record: {e}",
+                self.path.display()
+            )
+        })?;
+        Ok(bytes)
     }
 
     /// Replace the record at `position`. See [`Self::update_inner`] for the
@@ -11905,9 +12036,25 @@ mod tests {
     }
 
 
+    /// A variable-length record's body is never cut down to the file's own
+    /// `reclen`: what does not fit the fixed part goes on a variable page,
+    /// and a body too large for even a fresh page is **refused**, not
+    /// truncated (`variable::Space::place`).
+    ///
+    /// This used to assert that a version 5 variable-length file refused
+    /// every insert, which it no longer does. The refusal it checks now is
+    /// the one that survives: `seed`'s pages are 64 bytes, so a 2,006-byte
+    /// body cannot fit any page this file has, and splitting one across
+    /// pages is not implemented.
+    ///
+    /// The old assertion was `e.why.contains("variable-length")`, and that
+    /// phrase also appears in this test's own **scratch directory name**,
+    /// which is inside `e.why` -- so it kept passing against a refusal that
+    /// had nothing to do with variable-length records at all. The phrase
+    /// checked below appears nowhere but the refusal itself.
     #[test]
-    fn insert_refuses_a_variable_length_file_rather_than_truncate() {
-        let dir = crate::testing::scratch("block-insert-refuses-variable-length");
+    fn insert_refuses_a_variable_length_body_too_large_for_a_page_rather_than_truncate() {
+        let dir = crate::testing::scratch("block-insert-refuses-oversized-body");
         let path = seed(&dir);
         let mut block = block(path);
         block.geometry.variable = true;
@@ -11915,8 +12062,11 @@ mod tests {
         let long = vec![7u8; 2022];
         let e = block
             .insert(&long)
-            .expect_err("a variable-length file refuses insert, the same as update");
-        assert!(e.why.contains("variable-length"), "{e}");
+            .expect_err("a body no page can hold is refused, not cut down");
+        assert!(
+            e.why.contains("splitting a body across pages is not implemented"),
+            "{e}"
+        );
 
         // The refusal did not touch the model, the count, or the file.
         assert_eq!(block.geometry.records, 0, "the refused insert did not count");
@@ -11934,8 +12084,8 @@ mod tests {
     /// see different bytes before and after the cache is dropped.
     ///
     /// This is the fixed-length case -- see
-    /// [`insert_refuses_a_variable_length_file_rather_than_truncate`] for why
-    /// the same normalising is wrong on a variable-length file.
+    /// [`insert_refuses_a_variable_length_body_too_large_for_a_page_rather_than_truncate`]
+    /// for why the same normalising is wrong on a variable-length file.
     #[test]
     fn insert_normalizes_to_the_files_own_reclen_not_the_callers_buffer() {
         let dir = crate::testing::scratch("block-insert-normalizes-to-reclen");

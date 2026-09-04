@@ -195,11 +195,14 @@ fn sized(databuf: &[u8], capacity: u32) -> Vec<u8> {
 /// path the fixture recorded, since this replay's file lives somewhere the
 /// genuine engine's `C:\btrieve\...` never did.
 ///
-/// Returns one `(status, databuf-after-the-call)` pair per call, in order.
-/// Call 0's own `databuf` is not meaningful to compare -- [`sized`] gives it
-/// the length the fixture recorded, which for an Open is zero -- so
-/// [`replay_and_diff`] skips it deliberately rather than by accident.
-fn drive(calls: &[Request], path: &Path) -> Vec<(i16, Vec<u8>)> {
+/// Returns one `(status, databuf-after-the-call)` pair per call answered, in
+/// order, and -- if this engine had no answer at all for one of them -- that
+/// call's index and what it said instead. A gap stops the replay: nothing
+/// after it ran, so there are fewer pairs than calls. Call 0's own `databuf`
+/// is not meaningful to compare -- [`sized`] gives it the length the fixture
+/// recorded, which for an Open is zero -- so [`replay_and_diff`] skips it
+/// deliberately rather than by accident.
+fn drive(calls: &[Request], path: &Path) -> (Vec<(i16, Vec<u8>)>, Option<(usize, String)>) {
     let mut mem = FlatMem::new(64 * 1024);
     let mut heap = FlatHeap::new(0x100);
     let mut session: Btrieve<Flat> = Btrieve::default();
@@ -216,46 +219,48 @@ fn drive(calls: &[Request], path: &Path) -> Vec<(i16, Vec<u8>)> {
     // and is gone. A harness that has to rewrite its own recorded input to
     // get a pass is describing a defect in what it is testing.
 
-    calls
-        .iter()
-        .enumerate()
-        .map(|(i, call)| {
-            let mut datalen = call.datalen;
-            let mut databuf = sized(&call.databuf, datalen);
-            let mut keybuf = if i == 0 {
-                let mut b = path.to_string_lossy().as_bytes().to_vec();
-                b.push(0);
-                b
-            } else {
-                call.keybuf.clone()
-            };
-            let keylen = if i == 0 {
-                u8::try_from(keybuf.len()).expect("a scratch path under 255 bytes")
-            } else {
-                call.keylen
-            };
+    let mut outcomes = Vec::with_capacity(calls.len());
+    for (i, call) in calls.iter().enumerate() {
+        let mut datalen = call.datalen;
+        let mut databuf = sized(&call.databuf, datalen);
+        let mut keybuf = if i == 0 {
+            let mut b = path.to_string_lossy().as_bytes().to_vec();
+            b.push(0);
+            b
+        } else {
+            call.keybuf.clone()
+        };
+        let keylen = if i == 0 {
+            u8::try_from(keybuf.len()).expect("a scratch path under 255 bytes")
+        } else {
+            call.keylen
+        };
 
-            let status = btrcall(
-                &mut session,
-                &mut mem,
-                &mut heap,
-                Call {
-                    op: call.op,
-                    posblk: &mut posblk,
-                    databuf: &mut databuf,
-                    datalen: &mut datalen,
-                    keybuf: &mut keybuf,
-                    keylen,
-                    keynum: call.keynum,
-                },
-            )
-            .unwrap_or_else(|gap| {
-                panic!("call {i} (op {}): this engine has no answer at all: {}", call.op, gap.what)
-            });
+        let status = match btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: call.op,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut keybuf,
+                keylen,
+                keynum: call.keynum,
+            },
+        ) {
+            Ok(status) => status,
+            // A gap is not a status: this engine had no answer at all.
+            // Handed back with whatever was already answered rather than
+            // panicked on, so [`PENDING`] can assert the one refusal that is
+            // expected today while every other one still fails the test.
+            Err(gap) => return (outcomes, Some((i, gap.what))),
+        };
 
-            (status.0, databuf)
-        })
-        .collect()
+        outcomes.push((status.0, databuf));
+    }
+    (outcomes, None)
 }
 
 /// Reopens `path` fresh and walks every record in key order (`Get First`,
@@ -375,40 +380,195 @@ fn seed(fixture: &scenario::Fixture, path: &Path) {
     }
 }
 
-/// The prefix of every fixture whose resulting file bytes are compared to
-/// genuine Btrieve's, byte for byte.
+/// A scenario this engine cannot finish yet: which call it stops at, and
+/// what its refusal has to say.
+struct Pending {
+    /// The fixture's `Scenario::name`.
+    fixture: &'static str,
+    /// The index of the call this engine has no answer for. Every call
+    /// before it is still replayed and diffed exactly as usual.
+    call: usize,
+    /// A phrase the refusal must contain, so a *different* gap at the same
+    /// call still fails.
+    refusal: &'static str,
+}
+
+/// Every scenario this engine stops partway through, and why.
 ///
-/// The whole point of the `v5_variable_*` recordings: their seed is one file
-/// [`btrieve::create`] wrote, so both engines started from the same bytes
-/// and both maintained a version 5 layout from there. Nothing else here can
-/// be compared that way -- every other fixture's file is genuine Btrieve's
-/// own v6 layout, which this crate does not build (this module's own doc
-/// comment).
+/// One entry today. `v5_variable_delete`'s call 4 is a `B_DELETE` against a
+/// version 5 variable-length record, and freeing a v5 fragment is the other
+/// half of the allocator this crate has only ever proven for insert -- the
+/// engine says so and refuses rather than unlinking a chain it cannot put
+/// back. This list is what keeps the rest of that fixture honest: calls 0
+/// through 3 are replayed and diffed like any other, the refusal itself is
+/// asserted, and the moment a v5 delete lands this test fails on the entry
+/// having gone stale rather than quietly passing on it.
+///
+/// It is not a way to park a fixture. Nothing is skipped except the calls
+/// past the refusal and the two whole-file comparisons, which cannot mean
+/// anything for a scenario that never finished.
+const PENDING: &[Pending] = &[Pending {
+    fixture: "v5_variable_delete",
+    call: 4,
+    refusal: "does not delete them for Btrieve 5",
+}];
+
+/// The prefix of every fixture whose resulting file this replay compares to
+/// genuine Btrieve's as **bytes**, not only as records.
+///
+/// Only the `v5_variable_*` recordings can be compared that way at all:
+/// their seed is one file [`btrieve::create`] wrote, so both engines started
+/// from the same bytes and both maintained a version 5 layout from there.
+/// Every other fixture's file is genuine Btrieve's own v6 layout, which this
+/// crate does not build (this module's own doc comment).
+///
+/// # What is compared, and why it is not the whole file
+///
+/// The whole file was compared first, and the answer is worth writing down
+/// rather than only working around. Against `v5_variable_insert` it is:
+///
+/// ```text
+/// the resulting file's bytes disagree at offset 0x0004
+///   ours:    00 00 00 04 00 04 00 00 ff ff ff ff ff ff ff ff
+///   genuine: 01 00 00 04 00 04 00 00 ff ff ff ff 00 00 4c 10
+/// ```
+///
+/// and against `v5_variable_grow` the same offset, with `02 00` and
+/// `00 00 4c 30`. Both are one cause, and it is not the variable pages:
+/// **genuine Btrieve never puts a record on the empty data page
+/// [`btrieve::create`] pre-allocates.** The seed is four pages, the fourth
+/// (physical page 3) a data page with no records; genuine appends a
+/// *fifth* page for its first record and threads that page's remaining
+/// slots onto the v5 free list at `fcr::FREE` (`0x104c` in the insert
+/// scenario, `0x304c` in the grow one, both a slot on a page the engine
+/// added). This crate's `pages::Layout::next_slot` scans the data pages the
+/// file already has, finds page 3 empty and fills it, leaving `fcr::FREE`
+/// at `ff ff ff ff`. Every later byte follows from that: the record
+/// positions, so the index entries that name them; which page number each
+/// variable page gets; `fcr::PAGES`; and the pages' own modification
+/// stamps.
+///
+/// That divergence is in the **fixed-length** allocator, which no fixture
+/// before these three could witness, and it long predates the variable
+/// insert this compares. So what is compared here is the part these
+/// recordings were made to pin and this crate does own: every variable page
+/// in each file, in order, byte for byte
+/// ([`diff_variable_pages`]). Measured today, each one matches genuine
+/// Btrieve's in **every byte but its own page number** -- fragment bytes,
+/// entry array, fragment count, free-chain field and modification stamp all
+/// exact -- and the page number differs only because the file's data pages
+/// are numbered differently for the reason above.
 const BYTE_COMPARED: &str = "v5_variable_";
 
-/// Diffs two files byte for byte, reporting the first offset that differs
-/// with sixteen bytes of context from each side.
-fn diff_bytes(name: &str, ours: &[u8], genuine: &[u8]) {
+/// Diffs two byte strings, reporting the first offset that differs with
+/// sixteen bytes of context from each side. `at` is what that offset is
+/// called in the message, so a caller comparing a page can name the page.
+fn diff_bytes(name: &str, at: &str, ours: &[u8], genuine: &[u8]) {
     const CONTEXT: usize = 16;
     let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-    if let Some(at) = (0..ours.len().min(genuine.len())).find(|&i| ours[i] != genuine[i]) {
-        let end = (at + CONTEXT).min(ours.len().min(genuine.len()));
+    if let Some(i) = (0..ours.len().min(genuine.len())).find(|&i| ours[i] != genuine[i]) {
+        let end = (i + CONTEXT).min(ours.len().min(genuine.len()));
         panic!(
-            "{name}: the resulting file's bytes disagree at offset {at:#06x}\n\
+            "{name}: {at} disagree at offset {i:#06x}\n\
              \x20 ours:    {}\n\
              \x20 genuine: {}",
-            hex(&ours[at..end]),
-            hex(&genuine[at..end])
+            hex(&ours[i..end]),
+            hex(&genuine[i..end])
         );
     }
     assert_eq!(
         ours.len(),
         genuine.len(),
-        "{name}: the resulting files agree on every shared byte but not on their length -- \
-         ours is {} bytes, genuine Btrieve's is {}",
+        "{name}: {at} agree on every shared byte but not on their length -- ours is {} \
+         bytes, genuine Btrieve's is {}",
         ours.len(),
         genuine.len()
     );
+}
+
+/// Every version 5 variable page in `file`, lowest page first, as
+/// `(number, bytes)`.
+///
+/// A page qualifies when all four of `variable.rs`'s own v5 rules hold, and
+/// they are the engine's own: the data bit of the header's second field is
+/// clear (`pages::Header::decode`, so no record page qualifies), the first
+/// four bytes decode -- high word first, `pages::long` -- to the page's own
+/// physical number ([`variable::Header::read`]'s v5 check), the fragment
+/// count at `0x0a` is between 1 and 256, and entry 0, the last two bytes of
+/// the page, names `0x0c` (`W32MKDE_decompiled.c:19035`: fragment 0 starts
+/// where the header ends, or the engine refuses the file with status 54).
+///
+/// That last rule is what separates a variable page from an index page,
+/// which also clears the data bit and also opens with its own page number:
+/// an index page's tail is its unused entry space, all zero, so its entry 0
+/// reads `0x0000`.
+fn variable_pages(file: &[u8], page: usize) -> Vec<(u32, &[u8])> {
+    const DATA_BIT: u16 = 0x8000;
+    const FRAGMENT_COUNT: usize = 0x0a;
+    const FIRST_FRAGMENT: u16 = 0x0c;
+    const MAX_FRAGMENTS: u16 = 256;
+
+    let u16le = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+    // High word first, the way every page pointer in this format is stored.
+    let long = |b: &[u8]| u32::from(u16le(b, 0)) << 16 | u32::from(u16le(b, 2));
+
+    (1..file.len() / page)
+        .filter_map(|number| {
+            let bytes = &file[number * page..(number + 1) * page];
+            let fragments = u16le(bytes, FRAGMENT_COUNT);
+            let entry_zero = u16le(bytes, page - 2);
+            (u16le(bytes, 4) & DATA_BIT == 0
+                && long(bytes) == number as u32
+                && (1..=MAX_FRAGMENTS).contains(&fragments)
+                && entry_zero == FIRST_FRAGMENT)
+                .then_some((number as u32, bytes))
+        })
+        .collect()
+}
+
+/// Compares every variable page of `ours` with every variable page of
+/// `genuine`, in order. See [`BYTE_COMPARED`] for why this and not the
+/// whole file.
+///
+/// Each page is compared from offset `0x04` -- past its own page number,
+/// the one field the two files legitimately disagree about. The number is
+/// not left unchecked by that: [`variable_pages`] only counts a page whose
+/// number field names the page it is actually at, the same self-consistency
+/// `variable::Header::read` enforces on the read side, so a page that got
+/// its own number wrong is not compared, it is missing -- and the count
+/// below is what fails.
+fn diff_variable_pages(name: &str, ours: &[u8], genuine: &[u8]) {
+    const PAGE_SIZE: usize = 0x08;
+    let page = usize::from(u16::from_le_bytes([genuine[PAGE_SIZE], genuine[PAGE_SIZE + 1]]));
+    assert!(page >= 512, "{name}: a {page}-byte page is not a Btrieve page size");
+
+    let mine = variable_pages(ours, page);
+    let theirs = variable_pages(genuine, page);
+    assert_eq!(
+        mine.len(),
+        theirs.len(),
+        "{name}: we wrote {} variable page(s) ({:?}) and genuine Btrieve wrote {} ({:?}) -- \
+         a different number of pages is a different allocation policy, not a layout detail",
+        mine.len(),
+        mine.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        theirs.len(),
+        theirs.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+    );
+    assert!(
+        !mine.is_empty(),
+        "{name}: neither file has a variable page, and both scenarios insert records with a \
+         body -- this comparison found nothing to compare, which is a failure"
+    );
+
+    const NUMBER: usize = 4;
+    for ((ours_at, ours_page), (their_at, their_page)) in mine.iter().zip(theirs.iter()) {
+        diff_bytes(
+            name,
+            &format!("our variable page {ours_at} and genuine Btrieve's {their_at}"),
+            &ours_page[NUMBER..],
+            &their_page[NUMBER..],
+        );
+    }
 }
 
 /// Runs one fixture through [`drive`], diffs every call against the
@@ -425,14 +585,39 @@ fn replay_and_diff(fixture: &scenario::Fixture) {
 
     seed(fixture, &ours);
 
-    let outcomes = drive(&fixture.scenario.calls, &ours);
-    assert_eq!(
-        outcomes.len(),
-        fixture.transcript.responses.len(),
-        "{name}: replayed {} call(s), the fixture recorded {}",
-        outcomes.len(),
-        fixture.transcript.responses.len()
-    );
+    let pending = PENDING.iter().find(|p| p.fixture == name);
+    // One run only: a gap hands back what it had already answered, so the
+    // calls before it are diffed from the same run that produced them --
+    // replaying the prefix a second time would be replaying it against a
+    // file the first run had already written to.
+    let (outcomes, gap) = drive(&fixture.scenario.calls, &ours);
+    match (gap, pending) {
+        (None, None) => assert_eq!(
+            outcomes.len(),
+            fixture.transcript.responses.len(),
+            "{name}: replayed {} call(s), the fixture recorded {}",
+            outcomes.len(),
+            fixture.transcript.responses.len()
+        ),
+        (None, Some(p)) => panic!(
+            "{name}: this engine answered every call, including call {} -- the PENDING \
+             entry expecting it to refuse with {:?} is stale and must be removed",
+            p.call, p.refusal
+        ),
+        (Some((at, why)), Some(p)) if at == p.call => {
+            assert!(
+                why.contains(p.refusal),
+                "{name}: call {at} refused, as PENDING expects, but with {why:?} rather \
+                 than something containing {:?}",
+                p.refusal
+            );
+            assert_eq!(outcomes.len(), at, "{name}: a gap at call {at} answers {at} calls");
+        }
+        (Some((at, why)), _) => panic!(
+            "{name}: call {at} (op {}): this engine has no answer at all: {why}",
+            fixture.scenario.calls[at].op
+        ),
+    }
 
     for (i, ((status, databuf), recorded)) in
         outcomes.iter().zip(fixture.transcript.responses.iter()).enumerate()
@@ -482,6 +667,12 @@ fn replay_and_diff(fixture: &scenario::Fixture) {
         }
     }
 
+    // A scenario that stopped partway has no resulting file to compare: the
+    // recorded one is what the genuine engine wrote after every call.
+    if pending.is_some() {
+        return;
+    }
+
     // The resulting file's own contents: reopen what this replay's run
     // produced, and separately materialise the fixture's own recorded file
     // bytes and reopen those -- both through this crate's own reader, so
@@ -505,7 +696,7 @@ fn replay_and_diff(fixture: &scenario::Fixture) {
     if name.starts_with(BYTE_COMPARED) {
         let written = std::fs::read(&ours)
             .unwrap_or_else(|e| panic!("{name}: reading back what we wrote: {e}"));
-        diff_bytes(name, &written, &fixture.transcript.file);
+        diff_variable_pages(name, &written, &fixture.transcript.file);
     }
 }
 
