@@ -3635,7 +3635,7 @@ mod tests {
     fn register_module_keeps_the_pointer_and_hands_back_a_number() {
         let mut f = Fixture::new();
         // `Fixture::new` runs `finish_init`, which registers the FSD's own
-        // native slot (`Host::fsd_state`) before any module can -- so "the
+        // native slot (`Fsd::state`) before any module can -- so "the
         // first module is module zero" is no longer true; the number wanted
         // is read back rather than assumed, the same way a real caller would
         // only ever know it by what `register_module` hands back.

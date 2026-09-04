@@ -50,6 +50,7 @@ use std::fmt;
 use crate::abi::Abi;
 
 pub mod ain;
+pub mod bbs;
 
 /// Maximum length of any one answer. `FSD.H:238`.
 pub(crate) const ANSLEN: u16 = 80;
@@ -2275,7 +2276,7 @@ pub fn gtohlp(form: &Form) -> Vec<u8> {
 /// template in place -- the comment at `FSD.C:750` says so in as many words,
 /// "may corrupt template (wiping out help field symbols)". This takes a copy
 /// instead. The output is identical and the caller's buffer survives, which
-/// matters here because [`Host::forms`](crate::Host) hands out a cached
+/// matters here because [`Fsd::forms`](crate::fsd::bbs::Fsd::forms) hands out a cached
 /// template that later calls still read.
 #[must_use]
 pub fn fsddsp(form: &Form, answers: &Answers, template: &[u8]) -> Vec<u8> {

@@ -248,7 +248,7 @@ type ScratchResult = io::Result<mbbs_machine::m16::FarPtr>;
 /// per call. See `task-6-report.md`'s fix-report addendum for why this
 /// matters: `summon` is player-retypable, and `ModuleMem::alloc_region`'s
 /// `Wg16` backing is a real, finite, shared descriptor other subsystems
-/// (`Heap::reserve`, `Host::fsd_scratch`) also draw from.
+/// (`Heap::reserve`, `Fsd::scratch`) also draw from.
 struct ScratchTwice {
     result: Arc<Mutex<Option<(ScratchResult, ScratchResult)>>>,
 }

@@ -1412,114 +1412,10 @@ pub struct Host<A: Abi> {
     /// every time and starve the rest.
     poll_cursor: u16,
 
-    /// Every form `fsdroom` has sized, keyed by the `(message number, amode)`
-    /// it was compiled from. See [`Host::forms`].
-    ///
-    /// **Channel-keyed as of the commit that added this doc comment.** Used
-    /// to be a flat `Vec<Form>` -- see [`Host::fsdscb`](Host#structfield.fsdscb)'s
-    /// history for why that was a debt -- but the compiled form itself is not
-    /// per-channel state at all: two channels filling out the *same* form
-    /// (the same message number and amode) share one compilation, the way the
-    /// real host's `fsdroom` would have parsed the same template twice and
-    /// gotten the same answer both times. What is per-channel is which form a
-    /// given channel is using, which [`Host::fsdtmp`] records.
-    pub(crate) forms: std::collections::HashMap<(u16, i16), Form>,
-
-    /// Where each channel's `struct fsdscb` lives, once its `fsdroom` has
-    /// needed one. Indexed by [`Chan::index`].
-    ///
-    /// `inifsdscb()`, `FSDBBS.C:64`, allocates `nterms` of them, and the real
-    /// `setfsd(chan)` exists precisely to select among them -- which this
-    /// mirrors: one segment per channel rather than one segment shared by
-    /// all of them. `None` until that channel's first `fsdroom`, because the
-    /// module *tests* the `fsdscb` global for null -- `seg 3:0x430f` -- and
-    /// takes another path when it is.
-    ///
-    /// # The debt this repays
-    ///
-    /// This used to be a single `Option<FarPtr>`, on the reasoning that the
-    /// FSD was out of scope for the multi-channel work and nothing could
-    /// reach the hazard. That reasoning held until [`Host::fsd_state`]
-    /// existed to dispatch a channel into an FSD session at all -- from that
-    /// point on, two channels entering data at once would have shared one
-    /// control block and interleaved their answers into a single `newans`.
-    /// Keyed by channel now, so that cannot happen by construction.
-    pub(crate) fsdscb: Vec<Option<A::Ptr>>,
-
-    /// Each channel's `fsdusr->{curmbk,tmpmsg,amode}` -- which message block
-    /// `fsdroom` last read a template out of, which template, and in which
-    /// mode. `FSDBBS.C:134`, and Rust-side rather than in module memory
-    /// because `fsdusr` is ordinal 264 and `WCCMMUD.DLL` never imports it.
-    /// Indexed by [`Chan::index`], for the same reason [`Host::fsdscb`] is.
-    pub(crate) fsdtmp: Vec<Option<(A::Ptr, u16, i16)>>,
-
-    /// The FSD's own `state` slot, registered in [`Host::finish_init`] the
-    /// way `inifsd()` registers FSDBBS as a module. `None` before
-    /// `finish_init` has run.
-    pub(crate) fsd_state: Option<usize>,
-
-    /// Per-channel state an entry session needs that no module can see, so
-    /// it lives only here rather than round-tripping through `Machine` the
-    /// way [`Scb`](fsd::Scb) does.
-    ///
-    /// `FSDBBS.C`'s own home for these is `struct fsdbbs` (`fsdusr`):
-    /// `whndun` there is a far pointer into the module the host must call
-    /// back, and the save/quit flag is `fsdusr->flags & FBSAVE`, read by
-    /// `goback()` after the session's own buffer may already be gone. Both
-    /// are genuinely invisible to the module -- unlike `Scb`'s bytes, which
-    /// the module dereferences directly -- so they are Rust-side. Indexed by
-    /// [`Chan::index`], for the reason [`Host::fsdscb`] is: one session per
-    /// channel, not one shared by all of them.
-    pub(crate) fsd_sessions: Vec<Option<FsdSession<A>>>,
-
-    /// Per-channel ANSI keystroke-decoder state, one byte apiece.
-    ///
-    /// The original hangs this off `struct fsdbbs` as `fsdusr->ainscb` and
-    /// reaches it through a global pointer that `fsdchi` swaps in and back
-    /// out around each call (`FSDBBS.C:344-355`). It is invisible to the
-    /// module either way -- a half-finished `ESC [` is not something a form
-    /// can ask about -- so it lives here rather than in [`Scb`](fsd::Scb).
-    ///
-    /// Sized for every channel and never `Option`: a decoder with no session
-    /// in progress is just one sitting in `WT4ESC`, which is exactly what
-    /// [`Ainscb::default`](fsd::ain::Ainscb::default) is. `fsdego` calls
-    /// `ainbeg` on it for **both** modes (`FSDBBS.C:217-218`), which is the
-    /// whole reason line mode is decoded too.
-    pub(crate) fsd_ain: Vec<fsd::ain::Ainscb>,
-
-    /// `getasc(tmpmsg)`'s output, materialised in module memory, keyed by the
-    /// `(message block, message number)` it came from.
-    ///
-    /// `fsdrft` hands the module a `char *`, and the module passes it straight
-    /// back in as `fsdbkg(fsdrft())` (`FSDBBS.C:87`). That pointer has to
-    /// address the *same* string the form's field offsets were measured
-    /// against -- the ASCII-expanded one (`FSDBBS.C:137`) -- so it cannot
-    /// simply be the message text where it already sits. The genuine host has
-    /// the same problem and solves it the same way: `getasc` writes into a
-    /// buffer of the host's and returns a pointer to that.
-    ///
-    /// Cached rather than rebuilt because message text does not change once
-    /// read, and because a fresh segment per `fsdrft` call would leak one per
-    /// redisplay.
-    pub(crate) fsd_ascii: std::collections::HashMap<(A::Ptr, u16), A::Ptr>,
-
-    /// Scratch memory for the candidate answer `fsdprc`'s `FSDBUF` arm
-    /// hands `fldvfy`: the module reads `char *answer` out of it, and
-    /// `VFYOK`'s own contract (`FSD.H` Note 2) lets it rewrite the bytes
-    /// there in place. `None` until the first field-verify call needs it.
-    ///
-    /// **Not per-channel, unlike [`Host::fsdscb`].** The original's own
-    /// `fsdbuf` (`FSDBBS.C:45`) is a single global buffer too, not one per
-    /// channel -- `alcmem(fsdbln)` runs once, in `inifsd()`. That is safe
-    /// there for the same reason it is safe here: only one channel's
-    /// `fsdprc` ever runs at a time (this host is single-threaded by
-    /// force), and the buffer's whole lifetime is the span of one
-    /// `fldvfy` call, never carried across one. Sized `ANSLEN+1` rather
-    /// than the original's `fsdbln` (`ANSILN*ANSIWD*2`, a much larger
-    /// buffer also used by the ANSI screen paths this crate does not
-    /// build) -- the one purpose this port ever writes it for is a single
-    /// candidate answer, never longer than `ANSLEN`.
-    pub(crate) fsd_scratch: Option<A::Ptr>,
+    /// The FSD's host-side state: which channel is in which form, where
+    /// each channel's control block lives, and the two board-wide caches.
+    /// See [`fsd::bbs`].
+    pub(crate) fsd: fsd::bbs::Fsd<A>,
 
     /// The `static` return buffers `CNCUTL.C`'s pointer-returning routines
     /// hand back, in one region. `None` until the first of them is called.
@@ -1540,7 +1436,7 @@ pub struct Host<A: Abi> {
     /// about to return instead, and `cncwrd` must not clobber a `cncuid`
     /// result the caller still holds.
     ///
-    /// Not per-channel, for the reason [`Host::fsd_scratch`] gives at
+    /// Not per-channel, for the reason [`Fsd::scratch`](fsd::bbs::Fsd::scratch) gives at
     /// length: only one channel's command line is ever being parsed at a
     /// time, this host being single-threaded by force, and the vendor's own
     /// storage is a plain `static` rather than anything per-channel either.
@@ -1551,7 +1447,7 @@ pub struct Host<A: Abi> {
     /// what it holds, how big it is, and why it is allocated once and reused
     /// rather than once per call. `None` until the first call that needs it.
     ///
-    /// Same shape and same justification as [`Host::fsd_scratch`] and
+    /// Same shape and same justification as [`Fsd::scratch`](fsd::bbs::Fsd::scratch) and
     /// [`Host::cnc_statics`] just above: only one channel's command line is
     /// ever being handled at a time, this host being single-threaded by
     /// force, so one persistent allocation serves every call. That matters
@@ -1669,7 +1565,7 @@ pub struct Host<A: Abi> {
     /// The line editor's own `state` slot, registered in
     /// [`Host::finish_init`] the way `init__inifse()` registers `fseedit`
     /// (`EDITFSE.C:245`). `None` before `finish_init` has run. Beside
-    /// [`Host::fsd_state`] for the same reason it exists.
+    /// [`Fsd::state`](fsd::bbs::Fsd::state) for the same reason it exists.
     pub(crate) editor_state: Option<usize>,
     /// The host thunk seeded into the `syscyc` global as the chain tail (see
     /// `shims::system::syscyc_tail`). `Host::syscyc` treats a `syscyc` still
@@ -1680,7 +1576,7 @@ pub struct Host<A: Abi> {
 
     /// Each channel's editing session, if one is under way -- the vendor's
     /// `fseusr[usrnum]` (`EDITFSE.H`), Rust-side because no module ever
-    /// addresses it. Indexed by [`Chan::index`], like [`Host::fsd_sessions`].
+    /// addresses it. Indexed by [`Chan::index`], like [`Fsd::sessions`](fsd::bbs::Fsd::sessions).
     pub(crate) editor_sessions: Vec<Option<shims::editor::Session<A>>>,
 }
 
@@ -1727,74 +1623,6 @@ enum Serviced<P> {
     /// the FSD's native slot at an index it has no handler for. The status
     /// is dropped.
     Unregistered,
-}
-
-/// The two things about an FSD session no module can see. See
-/// [`Host::fsd_sessions`].
-///
-/// `A` carries no default, for the same reason [`DateBuffers`] carries
-/// none. Not
-/// `#[derive(Debug, Clone, Default)]`: same trap, same fix -- see
-/// `DateBuffers`'s own doc comment. `Default` in particular would bound `A:
-/// Default`, which `Wg16` does not implement and does not need to: every
-/// field here defaults on its own (`bool` and `Option<A::Ptr>` both do,
-/// regardless of what `A::Ptr` is).
-pub(crate) struct FsdSession<A: Abi> {
-    /// Whether `fsdego` started this session with `fsdent` rather than
-    /// `fsdlin` -- the original's `fsdusr->flags & FBFULL` (`FSDBBS.C:207`,
-    /// `:211`). `goback` reads it to decide whether to park the cursor below
-    /// the form on the way out (`FSDBBS.C:227`).
-    ///
-    /// Written by `fsdego`, and read by `goback` (Task 12) to decide whether
-    /// to emit the `FBFULL` cursor park. Recorded at `fsdego` time rather
-    /// than reconstructed later from `amode`, because it is the original's
-    /// own `fsdusr->flags` bookkeeping, set at the moment the fork is taken;
-    /// reconstructing it later would be a second source of truth for one
-    /// fact.
-    pub(crate) full_screen: bool,
-
-    /// The `whndun(save)` callback `fsdego` was handed, or `None` if the
-    /// module passed `NULL` -- `goback()`'s own `else` branch
-    /// (`FSDBBS.C:236`) is what a `None` here means to it.
-    pub whndun: Option<A::Ptr>,
-
-    /// Whether the session is exiting to save (`FSDSAV`) or to quit
-    /// (`FSDQIT`). `fsdusr->flags & FBSAVE`, read by `goback()` after
-    /// `xitfsd` decided.
-    pub save: bool,
-}
-
-impl<A: Abi> Clone for FsdSession<A> {
-    fn clone(&self) -> Self {
-        Self {
-            full_screen: self.full_screen,
-            whndun: self.whndun,
-            save: self.save,
-        }
-    }
-}
-
-impl<A: Abi> std::fmt::Debug for FsdSession<A>
-where
-    A::Ptr: std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FsdSession")
-            .field("full_screen", &self.full_screen)
-            .field("whndun", &self.whndun)
-            .field("save", &self.save)
-            .finish()
-    }
-}
-
-impl<A: Abi> Default for FsdSession<A> {
-    fn default() -> Self {
-        Self {
-            full_screen: false,
-            whndun: None,
-            save: false,
-        }
-    }
 }
 
 /// Every method here works purely off the fields `Host<A>` already owns --
@@ -2020,14 +1848,7 @@ impl<A: Abi> Host<A> {
             syscyc_period: None,
             poll_cursor: 0,
             census: PollCensus::default(),
-            forms: HashMap::new(),
-            fsdscb: vec![None; usize::from(terms.count())],
-            fsdtmp: vec![None; usize::from(terms.count())],
-            fsd_state: None,
-            fsd_sessions: vec![None; usize::from(terms.count())],
-            fsd_ain: vec![fsd::ain::Ainscb::default(); usize::from(terms.count())],
-            fsd_ascii: std::collections::HashMap::new(),
-            fsd_scratch: None,
+            fsd: fsd::bbs::Fsd::new(terms),
             cnc_statics: None,
             command_scratch: None,
             heap,
@@ -2392,19 +2213,6 @@ impl<A: Abi> Host<A> {
             .find(|r| matches!(r, Registration::Module { .. }))
     }
 
-    /// The FSD's own `state` slot, the way `register_module`'s caller keeps
-    /// the number it returned.
-    ///
-    /// # Panics
-    ///
-    /// If called before [`Host::finish_init`] has registered it -- nothing
-    /// in this crate can reach a channel's `state` that early, so this is a
-    /// programming error rather than a condition callers should handle.
-    pub(crate) fn fsd_state(&self) -> usize {
-        self.fsd_state
-            .expect("finish_init registers the FSD before anything can reach it")
-    }
-
     /// What time it is, and one step later than the last time anyone asked.
     ///
     /// **Reading the clock moves it**, under [`Clock::stepped`]. The returned
@@ -2598,17 +2406,6 @@ impl<A: Abi> Host<A> {
     /// order. See [`Host::rtirs`] for why none of them runs.
     pub fn rtihdlrs(&self) -> &[A::Ptr] {
         &self.rtirs
-    }
-
-    /// Every form the module asked `fsdroom` to size, keyed by the
-    /// `(message number, amode)` it was compiled from.
-    ///
-    /// A cache, not a session: what a caller can usefully ask this host is
-    /// "what forms exist" and not "what is channel 0 in the middle of" --
-    /// see [`Host::fsdtmp`] and [`Host::fsdscb`] for the per-channel half of
-    /// that question.
-    pub fn forms(&self) -> &std::collections::HashMap<(u16, i16), Form> {
-        &self.forms
     }
 
     /// The message files that are open.
@@ -6315,7 +6112,7 @@ impl<A: Abi> Host<A> {
         // this is that registration. It must happen before `inited` is set,
         // so nothing can reach a channel's `state` before the FSD's slot
         // exists to be named.
-        self.fsd_state = Some(self.register_native(Native::Fsd));
+        self.fsd.state_slot = Some(self.register_native(Native::Fsd));
         // `init__inifse()` (`EDITFSE.C:243-256`): register the editor as a
         // module of its own, and point `bgnedt` at it. The pointer is a
         // host-reserved thunk -- see [`Host::vectors`] for why an import
@@ -7137,14 +6934,14 @@ mod tests {
         // `inifsd()` registers FSDBBS as an ordinary module during startup,
         // the same startup sequence `finish_init` already runs `alcvda` and
         // the `rstchn` loop for. The FSD's own `state` slot must exist by
-        // the time anything could reach it -- `Host::fsd_state()` is how the
+        // the time anything could reach it -- `Fsd::state()` is how the
         // rest of the FSD subsystem finds that slot's number.
         let mut machine = Machine::new().expect("16-bit machine");
         let mut host = Host::<Wg16>::new(&mut machine, testing::data(), Terms::new(1)).expect("host");
 
         host.finish_init(&mut machine).expect("finished starting up");
 
-        let n = host.fsd_state();
+        let n = host.fsd.state();
         assert_eq!(
             host.modules()[n],
             Registration::Native(Native::Fsd),
@@ -7797,11 +7594,11 @@ mod tests {
         let stub = returns_stub(1);
         f.machine.load_code(&stub).expect("the stub fits");
         // `Fixture::new` -> `finish_init` has already registered the FSD's
-        // own native slot (`Host::fsd_state`), so that is the native
+        // own native slot (`Fsd::state`), so that is the native
         // registration this test drives against -- a second one is not
         // needed, and registering one would only add a slot nothing else
         // points at.
-        let native = f.host.fsd_state() as u16;
+        let native = f.host.fsd.state() as u16;
         let module_state = register_named(&mut f, "MajorMUD", &[(1, sttrou)]);
         assert_ne!(
             module_state, native,

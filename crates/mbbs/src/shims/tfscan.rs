@@ -89,7 +89,7 @@
 //!
 //! `TFSCAN.H` declares `tfstate`/`tfsbuf`/`tfspst`/`tfsfb`/`tfsfp` as plain
 //! `extern` globals -- not an array, not anything indexed by channel, unlike
-//! e.g. `Host::fsdscb` (per-channel, because two channels really can be
+//! e.g. `Fsd::scb` (per-channel, because two channels really can be
 //! mid-`fsdroom` at once). That only makes sense under MajorBBS's
 //! cooperative, non-preemptive scheduling: a routine runs to completion (or
 //! to its next `alertsc`) before another gets the CPU, and every call site
@@ -157,7 +157,7 @@ impl Default for State {
 /// The one running (or finished, or never-started) `tfsopn`/`tfsrdl` scan --
 /// see this file's own module doc, "one scan, not one per channel", for why
 /// this is a single value and not a per-channel table like
-/// [`crate::Host::fsdscb`].
+/// [`crate::fsd::bbs::Fsd::scb`].
 ///
 /// Not generic over `A`: nothing in here is module memory, an `A::Ptr`, or
 /// anything else ABI-shaped. It is a directory listing and a file handle,

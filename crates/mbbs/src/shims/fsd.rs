@@ -6,12 +6,12 @@
 //! # The three pieces of state, and where each one lives
 //!
 //! - **The compiled form** -- fields, widths, punctuation templates, `maxans`
-//!   -- is host-side, in [`Host::forms`], put there by [`fsdroom`]. The real
+//!   -- is host-side, in [`Fsd::forms`](crate::fsd::bbs::Fsd::forms), put there by [`fsdroom`]. The real
 //!   host leaves it in `prfbuf` for [`fsdapr`] to copy out (`FSDBBS.C:131`, and
 //!   `FSDBBS.H:109` warns that those bytes must survive in between); this host
 //!   does not, so an intervening `prf` cannot corrupt a form here.
 //! - **`struct fsdscb`** is in a segment of the host's -- one per channel, in
-//!   [`Host::fsdscb`] -- and the `fsdscb` global points at whichever channel's
+//!   [`Fsd::scb`](crate::fsd::bbs::Fsd::scb) -- and the `fsdscb` global points at whichever channel's
 //!   is current. Not host-side: the module dereferences that global at 55
 //!   sites and *writes* through it -- fourteen `flddat[i].flags |= FFFAVD` from
 //!   `seg 3:0x4344` on, marking the fields a player may see but not type into,
@@ -48,6 +48,7 @@
 use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::{self, Abi, Call, ModuleMem};
+use crate::fsd::bbs::Session;
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
 use crate::shims::{NO, ShimError, text};
@@ -86,7 +87,7 @@ fn is_null<A: Abi>(ptr: A::Ptr) -> bool {
 /// helpers below that [`fsdprc`] (a different, unconverted routine) also
 /// calls.
 fn control_block<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>, chan: Chan) -> Result<A::Ptr, ShimError> {
-    let at = match host.fsdscb[chan.index()] {
+    let at = match host.fsd.scb[chan.index()] {
         Some(at) => at,
         None => {
             // The whole `struct fsdbbs`, not just its `fsdscb` prefix: a
@@ -95,7 +96,7 @@ fn control_block<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>, chan: Chan) -> Re
             let at = mem.alloc_region(usize::from(fsd::FSDBBS)).map_err(|e| {
                 ShimError::Failed(format!("fsdroom: no room for a session block: {e}"))
             })?;
-            host.fsdscb[chan.index()] = Some(at);
+            host.fsd.scb[chan.index()] = Some(at);
             at
         }
     };
@@ -198,7 +199,7 @@ fn answer_string<A: Abi>(mem: &A::Mem, mut at: A::Ptr) -> Result<Vec<u8>, ShimEr
 /// What is *not* done is writing into `prfbuf`. The real one leaves the
 /// punctuation array at `prfbuf` and the field array at `prfbuf+MBPMAX` for a
 /// later `fsdapr()` to read (`FSDBBS.H:108`); there is no `fsdapr` here, so the
-/// parse is kept in [`Host::forms`] instead, where a test can see it and a
+/// parse is kept in [`Fsd::forms`](crate::fsd::bbs::Fsd::forms) instead, where a test can see it and a
 /// future session can find it already done.
 ///
 /// # Errors
@@ -279,12 +280,12 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     // and the module itself read them. `flddat` and `mbpunc` are *not* set
     // here: the real host leaves them pointing into `prfbuf` (`FSDBBS.C:131`)
     // for `fsdapr` to copy out of, and this host keeps the parse in
-    // `Host::forms` instead -- see the module documentation above.
+    // `Fsd::forms` instead -- see the module documentation above.
     //
-    // `Host::forms` is keyed by `(message number, amode)`, not by channel --
+    // `Fsd::forms` is keyed by `(message number, amode)`, not by channel --
     // see its doc comment -- so the cache is filled in regardless of whether
     // anyone is current right now.
-    host.forms.insert((number, amode), form.clone());
+    host.fsd.forms.insert((number, amode), form.clone());
 
     // `setfsd(usrnum)`, `FSDBBS.C:129`. `_INIT__WCCMMUD` calls `fsdroom` for
     // message 6 and message 7 at calls 7326 and 7328, before any channel has
@@ -337,7 +338,7 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
             .globals()
             .pointer_mem(call.mem(), "curmbk")
             .map_err(|e| ShimError::Failed(e.to_string()))?;
-        host.fsdtmp[chan.index()] = Some((curmbk, number, amode));
+        host.fsd.tmp[chan.index()] = Some((curmbk, number, amode));
 
         // `fsdusr->tmpmsg = tmpmsg` (FSDBBS.C:139): the module-visible copy,
         // for a module that reads `fsdusr` directly (The Rose, both builds:
@@ -373,7 +374,7 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// `fsdroom` leaves `mbpunc` at `prfbuf` and `flddat` at `prfbuf+MBPMAX` and
 /// this copies them out, which is why `FSDBBS.H:109` warns that those bytes
 /// must go untouched in between. This host kept the compiled form in
-/// [`Host::forms`] instead, so the copy comes from there. The bytes written
+/// [`Fsd::forms`](crate::fsd::bbs::Fsd::forms) instead, so the copy comes from there. The bytes written
 /// into `sesbuf` are the same bytes; what differs is that an intervening `prf`
 /// cannot corrupt them, which makes this strictly harder to break than the
 /// original rather than differently behaved.
@@ -390,19 +391,19 @@ pub fn fsdapr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let defaults = call.ptr();
 
     let chan = host.current_channel_mem(call.mem())?;
-    let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
+    let Some((_, msgno, amode)) = host.fsd.tmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdapr: no form has been sized, and FSDBBS.H:245 has this called after fsdroom()"
                 .into(),
         ));
     };
-    // Invariant: `fsdroom` always inserts into `Host::forms` before it
+    // Invariant: `fsdroom` always inserts into `Fsd::forms` before it
     // records this channel's `fsdtmp` entry, and nothing ever removes a
-    // `Host::forms` entry -- so if `fsdtmp` names a `(msgno, amode)`, that key
+    // `Fsd::forms` entry -- so if `fsdtmp` names a `(msgno, amode)`, that key
     // is in the map. Refused rather than assumed, because a Rust-side
     // invariant across two fields is exactly the kind of thing a future edit
     // could quietly break.
-    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+    let Some(form) = host.fsd.forms.get(&(msgno, amode)).cloned() else {
         return Err(ShimError::Failed(format!(
             "fsdapr: channel {chan} recorded message {msgno} (amode {amode}) but no such form \
              is cached -- fsdroom and fsdtmp have gone out of sync"
@@ -419,7 +420,7 @@ pub fn fsdapr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         )));
     }
 
-    let at = host.fsdscb[chan.index()]
+    let at = host.fsd.scb[chan.index()]
         .ok_or_else(|| ShimError::Failed("fsdapr: no session control block".into()))?;
     let mut block = read_block_mem::<A>(call.mem(), at)?;
     let spec = block
@@ -469,7 +470,7 @@ pub fn fsdapr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// [`fsdprc`] calls.
 fn prepared_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, who: &str) -> Result<(fsd::Scb<A>, A::Ptr), ShimError> {
     let chan = host.current_channel_mem(mem)?;
-    let at = host.fsdscb[chan.index()].ok_or_else(|| {
+    let at = host.fsd.scb[chan.index()].ok_or_else(|| {
         ShimError::Failed(format!(
             "{who}: no form has been sized, so there is no session; FSDBBS.H:245 has \
              fsdroom() first"
@@ -734,7 +735,7 @@ pub fn fsdrhd<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
 /// `FSD.C:1036`.
 ///
 /// The field is read back out of the module's own array rather than out of
-/// [`Host::forms`], because the module edits it: fourteen sites set `FFFAVD`.
+/// [`Fsd::forms`](crate::fsd::bbs::Fsd::forms), because the module edits it: fourteen sites set `FFFAVD`.
 ///
 /// MajorMUD calls this three times -- `HAIR_LEN`, `HAIR_COL` and `EYE_COL`,
 /// fields 22, 23 and 24 -- and stores each answer as one byte of the character
@@ -946,7 +947,7 @@ pub fn fsdxan<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// point of that pair is that the answer comes from *that* message file
 /// whatever is current now. `Messages::text` takes the block explicitly, so
 /// this asks the recorded block directly; the round trip through `curmbk`
-/// arrives at the same pointer. Recorded per channel, in [`Host::fsdtmp`],
+/// arrives at the same pointer. Recorded per channel, in [`Fsd::tmp`](crate::fsd::bbs::Fsd::tmp),
 /// because `fsdusr` -- and so which block a `fsdroom` recorded -- is itself
 /// per channel.
 ///
@@ -974,7 +975,7 @@ pub fn fsdxan<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// current when one was.
 pub fn fsdrft<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = host.current_channel_mem(call.mem())?;
-    let Some((block, number, amode)) = host.fsdtmp[chan.index()] else {
+    let Some((block, number, amode)) = host.fsd.tmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdrft: no template has been compiled; FSDBBS.C:419 refreshes the one fsdroom \
              recorded, and fsdroom has not run"
@@ -991,7 +992,7 @@ pub fn fsdrft<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// hands back the pointer `getmsg` would have. Otherwise it is
 /// [`getasc`](crate::msg::getasc)'s expansion, which exists nowhere in memory
 /// until something writes it -- so this allocates a segment, writes it, and
-/// caches it in [`Host::fsd_ascii`].
+/// caches it in [`Fsd::ascii`](crate::fsd::bbs::Fsd::ascii).
 ///
 /// # Why it cannot simply return the message text
 ///
@@ -1016,7 +1017,7 @@ fn ascii_template<A: Abi>(
     if amode == -1 {
         return Ok(at);
     }
-    if let Some(cached) = host.fsd_ascii.get(&(block, number)) {
+    if let Some(cached) = host.fsd.ascii.get(&(block, number)) {
         return Ok(*cached);
     }
 
@@ -1034,7 +1035,7 @@ fn ascii_template<A: Abi>(
         ))
     })?;
     buffer.write(call.mem(), &expanded).map_err(|e| ShimError::Failed(e.to_string()))?;
-    host.fsd_ascii.insert((block, number), buffer);
+    host.fsd.ascii.insert((block, number), buffer);
     Ok(buffer)
 }
 
@@ -1075,14 +1076,14 @@ pub fn fsdbkg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     // `void fsdbkg(char *templt)` -- FSDBBS.H:258-259.
     let templt = call.ptr();
     let chan = host.current_channel_mem(call.mem())?;
-    let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
+    let Some((_, msgno, amode)) = host.fsd.tmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdbkg: no template has been compiled for this channel; FSDBBS.H:245 has \
              fsdroom() first"
                 .into(),
         ));
     };
-    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+    let Some(form) = host.fsd.forms.get(&(msgno, amode)).cloned() else {
         return Err(ShimError::Failed(format!(
             "fsdbkg: channel {chan} recorded message {msgno} (amode {amode}) but no such \
              form is cached"
@@ -1292,7 +1293,7 @@ fn ascn_for(amode: i16) -> fsd::Ascn {
 const EURMSK: i16 = 0x7F;
 
 /// The [`fsd::Form`] `fsdlin` should walk for this channel's session: the
-/// compiled [`Host::forms`] entry, with every field's `flags` refreshed from
+/// compiled [`Fsd::forms`](crate::fsd::bbs::Fsd::forms) entry, with every field's `flags` refreshed from
 /// the module's own `flddat[]` rather than trusted from the cache.
 ///
 /// `_EDIT_CHARACTER_STATS` sets `FFFAVD` on fourteen fields (`seg 3:0x4344`
@@ -1301,7 +1302,7 @@ const EURMSK: i16 = 0x7F;
 /// them. A `Form` still carrying `fsdroom`-time flags would let the cursor
 /// land on a field the player was never meant to type into. Same reasoning
 /// [`fsdord`]'s own doc comment gives for reading `flddat` fresh rather than
-/// [`Host::forms`]'s copy; no other field of [`fsd::Field`] is module-mutable
+/// [`Fsd::forms`](crate::fsd::bbs::Fsd::forms)'s copy; no other field of [`fsd::Field`] is module-mutable
 /// (fourteen `or byte [...+12],0x80` sites are the only writes into
 /// `flddat[]` anywhere in this crate's own measurements), so `flags` is the
 /// only one refreshed.
@@ -1358,9 +1359,9 @@ fn live_form<A: Abi>(machine: &A::Cpu, block: &fsd::Scb<A>, form: &fsd::Form) ->
 /// [`fsdroom`] already refuses to size a full-screen (`amode == 1`) form at
 /// all -- the module never reaches `fsdapr`, let alone `fsdego`, over one --
 /// so in this host's own call sequence this branch is dead code reachable
-/// only from a forged `Host::fsdtmp` entry. Checked anyway, and checked
+/// only from a forged `Fsd::tmp` entry. Checked anyway, and checked
 /// *before* anything below is allowed to mutate `block`/`state`/`substt`/
-/// [`Host::fsd_sessions`]: one refusing gate is what `fsdroom` itself is,
+/// [`Fsd::sessions`](crate::fsd::bbs::Fsd::sessions): one refusing gate is what `fsdroom` itself is,
 /// and a second, independent one here is this crate's defense-in-depth
 /// discipline rather than trusting that gate alone.
 ///
@@ -1384,13 +1385,13 @@ pub fn fsdego<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let chan = host.current_channel_mem(call.mem())?;
 
     let (mut block, at) = prepared_mem(call.mem(), host, "fsdego")?;
-    let Some((mbk, msgno, amode)) = host.fsdtmp[chan.index()] else {
+    let Some((mbk, msgno, amode)) = host.fsd.tmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdego: no template on record for this channel; FSDBBS.H:245 has fsdroom() first"
                 .into(),
         ));
     };
-    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+    let Some(form) = host.fsd.forms.get(&(msgno, amode)).cloned() else {
         return Err(ShimError::Failed(format!(
             "fsdego: channel {chan} recorded message {msgno} (amode {amode}) but no such form \
              is cached -- fsdroom and fsdtmp have gone out of sync"
@@ -1423,13 +1424,13 @@ pub fn fsdego<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
     host
         .users
-        .set_state_mem(call.mem(), chan, host.fsd_state() as u16)
+        .set_state_mem(call.mem(), chan, host.fsd.state() as u16)
         .map_err(|e| ShimError::Failed(format!("fsdego: {e}")))?;
     host
         .users
         .set_substt_mem(call.mem(), chan, ENTERING)
         .map_err(|e| ShimError::Failed(format!("fsdego: {e}")))?;
-    host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+    host.fsd.sessions[chan.index()] = Some(Session {
         whndun: (!is_null::<A>(whndun)).then_some(whndun),
         save: false,
         full_screen,
@@ -1438,7 +1439,7 @@ pub fn fsdego<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     // `ainscb=&fsdusr->ainscb; ainbeg();` -- FSDBBS.C:217-218, *outside* the
     // amode branch above and immediately before fsdcon(). Line mode gets a
     // decoder too; see `fsd::ain`'s module docs for what that changes.
-    host.fsd_ain[chan.index()].ainbeg();
+    host.fsd.ain[chan.index()].ainbeg();
 
     fsdcon(host, chan);
     crate::shims::text::append_mem(call.mem(), host, &output)?;
@@ -1448,10 +1449,10 @@ pub fn fsdego<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// This channel's -- rather, this host's -- scratch buffer for
 /// [`fsd::candidate_answer`], allocating it on first use. See
-/// [`crate::Host::fsd_scratch`]'s own doc comment for why one segment,
+/// [`Fsd::scratch`](crate::fsd::bbs::Fsd::scratch)'s own doc comment for why one segment,
 /// not one per channel, is the right shape here.
 fn fsd_scratch<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>) -> Result<A::Ptr, ShimError> {
-    match host.fsd_scratch {
+    match host.fsd.scratch {
         Some(at) => Ok(at),
         None => {
             // `ModuleMem::alloc_region`, not `Machine::alloc_segment`
@@ -1461,7 +1462,7 @@ fn fsd_scratch<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>) -> Result<A::Pt
                 .map_err(|e| {
                     ShimError::Failed(format!("fsdprc: no room for a scratch buffer: {e}"))
                 })?;
-            host.fsd_scratch = Some(at);
+            host.fsd.scratch = Some(at);
             Ok(at)
         }
     }
@@ -1470,7 +1471,7 @@ fn fsd_scratch<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>) -> Result<A::Pt
 /// The answer string and every field's `(ansoff, anslen)`, read out of
 /// module memory -- [`fsd::Answers`], built the way [`fsd::store`] (this
 /// port's `stfans()`) needs it, rather than trusted from
-/// [`Host::forms`]'s own cache: `fsdord`'s own doc comment already
+/// [`Fsd::forms`](crate::fsd::bbs::Fsd::forms)'s own cache: `fsdord`'s own doc comment already
 /// explains why a field's mutable members are read live, and `ansoff`/
 /// `anslen` are exactly the members `fsdord` itself already writes.
 ///
@@ -1549,12 +1550,12 @@ pub(crate) fn fsdprc<A: Abi>(
     chan: Chan,
 ) -> Result<abi::Ret<A>, ShimError> {
     let (block, at) = prepared(machine, host, "fsdprc")?;
-    let Some((mbk, msgno, amode)) = host.fsdtmp[chan.index()] else {
+    let Some((mbk, msgno, amode)) = host.fsd.tmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdprc: no template on record for this channel".into(),
         ));
     };
-    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+    let Some(form) = host.fsd.forms.get(&(msgno, amode)).cloned() else {
         return Err(ShimError::Failed(format!(
             "fsdprc: channel {chan} recorded message {msgno} (amode {amode}) but no such form \
              is cached"
@@ -1659,15 +1660,15 @@ pub(crate) fn fsdprc<A: Abi>(
     at.write(A::mem(machine), block.as_bytes())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-    // Propagate the outcome into `Host::fsd_sessions`, right while
+    // Propagate the outcome into `Fsd::sessions`, right while
     // `block.state()` is known-fresh (re-read from `Machine` above, per
     // the callback discipline). `goback()` (Task 11) needs `save` after
     // the session buffer this `state` came from may already be gone --
-    // see [`crate::FsdSession::save`]'s own doc comment -- so this is the
+    // see [`Session::save`]'s own doc comment -- so this is the
     // one place that state is both current and about to stop being
     // readable, and the only place it is copied out to the Rust-side flag
     // that survives past it.
-    if let Some(session) = host.fsd_sessions[chan.index()].as_mut() {
+    if let Some(session) = host.fsd.sessions[chan.index()].as_mut() {
         match block.state() {
             fsd::state::FSDSAV => session.save = true,
             fsd::state::FSDQIT => session.save = false,
@@ -1786,7 +1787,7 @@ fn account_scnwid<A: Abi>(machine: &A::Cpu, host: &Host<A>, chan: Chan) -> Resul
 /// `if (fsdusr->flags&FBFULL) { prf("\x1B[%d;1f",min(ANSILN,fsdscb->maxy+1)); }`
 /// -- `FSDBBS.C:227-229` -- parks the cursor below a full-screen (ANSI,
 /// `amode==1`) form before handing the channel back. `FBFULL` is
-/// [`crate::FsdSession::full_screen`], set by `fsdego`'s `amode==1` branch
+/// [`Session::full_screen`], set by `fsdego`'s `amode==1` branch
 /// (`fsdego`'s own doc comment) at the moment the fork is taken, the same
 /// bookkeeping the original does at `FSDBBS.C:207`.
 ///
@@ -1794,15 +1795,15 @@ fn account_scnwid<A: Abi>(machine: &A::Cpu, host: &Host<A>, chan: Chan) -> Resul
 /// [`fsd::scb::MAXY`]) is never written by anything in this port. The value
 /// it would hold is computed once, at compile time, by [`fsd::Form::max_y`]
 /// -- see that member's own doc comment, which already names this exact
-/// caller. This function reads `Host::forms` the same way [`fsd_cycle`]
-/// does (`host.fsdtmp[chan]` for the `(msgno, amode)` key, then
-/// `host.forms.get`) rather than adding a second place that carries the
+/// caller. This function reads `Fsd::forms` the same way [`fsd_cycle`]
+/// does (`host.fsd.tmp[chan]` for the `(msgno, amode)` key, then
+/// `host.fsd.forms.get`) rather than adding a second place that carries the
 /// same number: `fsd::scb::MAXY` would need `fsdroom`/`fsdego` to start
 /// writing a field nothing else ever reads, purely so `goback` could read it
 /// back from the one place the C happened to keep it. `Form::max_y` already
 /// has a home; giving `maxy` a second one is not reproducing the original's
 /// *behaviour*, only its *storage*, and the design doc's own instinct
-/// (`Host::forms` caching a `fsdroom` parse instead of re-scanning it on
+/// (`Fsd::forms` caching a `fsdroom` parse instead of re-scanning it on
 /// every call) already made that trade once for this exact structure.
 ///
 /// The one place this could matter: the original computes `maxy` afresh
@@ -1838,7 +1839,7 @@ fn account_scnwid<A: Abi>(machine: &A::Cpu, host: &Host<A>, chan: Chan) -> Resul
 ///
 /// # The callback discipline
 ///
-/// The session is [`Option::take`]n out of [`Host::fsd_sessions`] *before*
+/// The session is [`Option::take`]n out of [`Fsd::sessions`](crate::fsd::bbs::Fsd::sessions) *before*
 /// `whndun` runs, so there is no live borrow across the call -- the same
 /// rule `fsdprc`'s own `fldvfy` call follows (this file, above), stated for
 /// exactly this reason by the design doc's "The two callbacks into module
@@ -1866,7 +1867,7 @@ fn account_scnwid<A: Abi>(machine: &A::Cpu, host: &Host<A>, chan: Chan) -> Resul
 /// `huprou`" for `lonrou`/`lofrou`/`huprou` alike, which is right for the
 /// first two -- `FSDBBS.C` supplies neither -- but wrong for the third. A
 /// channel that disconnects while mid-field never reaches `goback` at all
-/// today: its session sits in `Host::fsd_sessions` until the channel is
+/// today: its session sits in `Fsd::sessions` until the channel is
 /// reused, `whndun` never runs, and no `_LJNDUN`-style cleanup fires. Fixing
 /// this means revisiting Task 1's dispatch design (giving `Vector::Hangup`
 /// a way to reach a `Native` handler) and is out of scope for this task,
@@ -1885,7 +1886,7 @@ pub(crate) fn goback<A: Abi>(
     module: &A::Module,
     chan: Chan,
 ) -> Result<abi::Ret<A>, ShimError> {
-    let session = host.fsd_sessions[chan.index()].take().ok_or_else(|| {
+    let session = host.fsd.sessions[chan.index()].take().ok_or_else(|| {
         ShimError::Failed(format!("goback: channel {chan} has no session to close"))
     })?;
 
@@ -1896,15 +1897,15 @@ pub(crate) fn goback<A: Abi>(
     // `if (fsdusr->flags&FBFULL) { prf("\x1B[%d;1f",min(ANSILN,fsdscb->maxy+1)); }`
     // -- FSDBBS.C:227-229. See this function's own doc comment, "The FBFULL
     // cursor park, and where `maxy` comes from", for why `maxy` is read out
-    // of `Host::forms` rather than a per-session `Scb` member.
+    // of `Fsd::forms` rather than a per-session `Scb` member.
     if session.full_screen {
-        let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
+        let Some((_, msgno, amode)) = host.fsd.tmp[chan.index()] else {
             return Err(ShimError::Failed(format!(
                 "goback: channel {chan} has FBFULL set but no template on record -- fsdego's \
                  own invariant has come apart"
             )));
         };
-        let Some(form) = host.forms.get(&(msgno, amode)) else {
+        let Some(form) = host.fsd.forms.get(&(msgno, amode)) else {
             return Err(ShimError::Failed(format!(
                 "goback: channel {chan} recorded message {msgno} (amode {amode}) but no such \
                  form is cached -- fsdroom and fsdtmp have gone out of sync"
@@ -2020,9 +2021,9 @@ pub(crate) fn goback<A: Abi>(
 /// # Errors
 ///
 /// If this channel has no session control block or no
-/// [`crate::Host::fsd_sessions`] entry -- reaching the FSD's own `CYCLE`
+/// [`Fsd::sessions`](crate::fsd::bbs::Fsd::sessions) entry -- reaching the FSD's own `CYCLE`
 /// dispatch with neither means `fsdego` never ran for this channel, which is
-/// a bug in whatever put it in [`crate::Host::fsd_state`] rather than a
+/// a bug in whatever put it in [`Fsd::state`](crate::fsd::bbs::Fsd::state) rather than a
 /// condition to paper over -- or if anything [`fsd::fsdinc`]/[`fsdprc`]
 /// themselves need turns out missing (the same errors `fsdprc` and its
 /// neighbours already raise).
@@ -2032,15 +2033,15 @@ pub(crate) fn fsd_cycle<A: Abi>(
     module: &A::Module,
     chan: Chan,
 ) -> Result<(), ShimError> {
-    let at = host.fsdscb[chan.index()].ok_or_else(|| {
+    let at = host.fsd.scb[chan.index()].ok_or_else(|| {
         ShimError::Failed(format!(
             "fsd_cycle: channel {chan} is in the FSD's own state but has no session control \
              block -- fsdego never ran for it"
         ))
     })?;
-    if host.fsd_sessions[chan.index()].is_none() {
+    if host.fsd.sessions[chan.index()].is_none() {
         return Err(ShimError::Failed(format!(
-            "fsd_cycle: channel {chan} is in the FSD's own state but Host::fsd_sessions has \
+            "fsd_cycle: channel {chan} is in the FSD's own state but Fsd::sessions has \
              nothing recorded for it -- fsdego never ran, or the session already ended"
         )));
     }
@@ -2073,20 +2074,20 @@ pub(crate) fn fsd_cycle<A: Abi>(
         //   guarded by `c < 256` so it cannot touch a special key: `eurmsk`
         //   is 0x7F on a U.S. board (`MAJORBBS.C:311`) and `CRSRUP & 0x7F`
         //   would be 0.
-        let key = host.fsd_ain[chan.index()].ainchr(byte);
+        let key = host.fsd.ain[chan.index()].ainchr(byte);
         if key == 0 {
             continue;
         }
         let key = if key < 256 { key & EURMSK } else { key };
 
         let mut block = read_block::<A>(machine, at)?;
-        let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
+        let Some((_, msgno, amode)) = host.fsd.tmp[chan.index()] else {
             return Err(ShimError::Failed(format!(
                 "fsd_cycle: channel {chan} recorded no template -- fsdego's own invariant has \
                  come apart"
             )));
         };
-        let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+        let Some(form) = host.fsd.forms.get(&(msgno, amode)).cloned() else {
             return Err(ShimError::Failed(format!(
                 "fsd_cycle: channel {chan} recorded message {msgno} (amode {amode}) but no \
                  such form is cached"
@@ -2122,7 +2123,7 @@ pub(crate) fn fsd_cycle<A: Abi>(
 
             fsdprc(machine, host, module, chan)?;
 
-            if host.fsd_sessions[chan.index()].is_none() {
+            if host.fsd.sessions[chan.index()].is_none() {
                 // `goback` already ran (from inside `fsdprc`), flushed its
                 // own output and torn the session down. Nothing left in
                 // `channel.input` is this channel's to read any more.
@@ -2212,7 +2213,7 @@ pub(crate) fn fsd_cycle<A: Abi>(
 /// If this channel has no template on record, or the form it names is not
 /// cached -- both would mean `fsdego` never ran for it, the same
 /// inconsistency [`fsd_cycle`]'s own errors already guard against, reached
-/// here instead because `fsd_cycle` checks `Host::fsdscb`/`fsd_sessions`
+/// here instead because `fsd_cycle` checks `Fsd::scb`/`fsd_sessions`
 /// before ever reading `status`.
 fn fsd_drain_edge<A: Abi>(
     machine: &mut A::Cpu,
@@ -2230,13 +2231,13 @@ fn fsd_drain_edge<A: Abi>(
         return Ok(());
     }
     let block = read_block::<A>(machine, at)?;
-    let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
+    let Some((_, msgno, amode)) = host.fsd.tmp[chan.index()] else {
         return Err(ShimError::Failed(format!(
             "fsd_drain_edge: channel {chan} recorded no template -- fsdego's own invariant has \
              come apart"
         )));
     };
-    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+    let Some(form) = host.fsd.forms.get(&(msgno, amode)).cloned() else {
         return Err(ShimError::Failed(format!(
             "fsd_drain_edge: channel {chan} recorded message {msgno} (amode {amode}) but no \
              such form is cached"
@@ -2313,8 +2314,8 @@ mod tests {
         let args = [0, spec.offset, spec.selector, 0];
         assert!(matches!(f.invoke(fsdroom, &args), Ok(Ret::U16(n)) if n == expected));
 
-        assert_eq!(f.host.forms().len(), 1, "{:?}", f.host.forms());
-        let form = f.host.forms().get(&(0, 0)).expect("message 0, amode 0");
+        assert_eq!(f.host.fsd.forms().len(), 1, "{:?}", f.host.fsd.forms());
+        let form = f.host.fsd.forms().get(&(0, 0)).expect("message 0, amode 0");
         assert_eq!(form.fields.len(), 2);
     }
 
@@ -2404,7 +2405,7 @@ mod tests {
         assert_eq!(scb.crsatr(), 0x70, "FSDBBS.C:180");
         assert_eq!(
             scb.numfld(),
-            f.host.forms()[&(0, 0)].fields.len() as u16,
+            f.host.fsd.forms()[&(0, 0)].fields.len() as u16,
             "message 0, amode 0"
         );
         assert_eq!(scb.allans(), b"ONE=\0TWO=\0\0".len() as u16);
@@ -2952,7 +2953,7 @@ mod tests {
     #[test]
     fn fsdord_reads_the_flags_the_module_left_and_not_the_host_s_copy() {
         // The module edits `flddat[i].flags`. Clear FFFALT there and `chkalt`
-        // must bail on its first line, whatever `Host::forms` still says.
+        // must bail on its first line, whatever `Fsd::forms` still says.
         let mut f = Fixture::new();
         let spec = "COLOUR(ALT=Black ALT=Red)";
         let _ = session(&mut f, spec, b"COLOUR=Red\0\0");
@@ -2970,7 +2971,7 @@ mod tests {
 
         assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
         assert!(
-            f.host.forms()[&(0, 0)].fields[0].flags & crate::fsd::flags::ALTERNATES != 0,
+            f.host.fsd.forms()[&(0, 0)].fields[0].flags & crate::fsd::flags::ALTERNATES != 0,
             "the host's own copy still says otherwise, which is the point"
         );
     }
@@ -3045,7 +3046,7 @@ mod tests {
         // string". A version that required `fsdapr` would refuse a call the
         // real host answers.
         let mut f = Fixture::new();
-        assert!(f.host.forms().is_empty());
+        assert!(f.host.fsd.forms().is_empty());
         let answers = f.bytes(b"A=1\0\0", false);
         let name = f.text("A");
         let Ok(Ret::Far(at)) = f.invoke(fsdxan,
@@ -3213,10 +3214,10 @@ mod tests {
             spec,
             "the module's own copy of the spec, not a host one"
         );
-        assert_eq!(block.maxans(), f.host.forms()[&(0, 0)].answer_max);
+        assert_eq!(block.maxans(), f.host.fsd.forms()[&(0, 0)].answer_max);
         assert_eq!(
             block.mbleng(),
-            f.host.forms()[&(0, 0)].punctuation.len() as u16
+            f.host.fsd.forms()[&(0, 0)].punctuation.len() as u16
         );
     }
 
@@ -3246,7 +3247,7 @@ mod tests {
 
     #[test]
     fn two_channels_sizing_different_forms_do_not_share_a_session() {
-        // The shape that catches a flat `Host::forms`/`fsdscb`/`fsdtmp`: size
+        // The shape that catches a flat `Fsd::forms`/`fsdscb`/`fsdtmp`: size
         // and prepare a session for channel A, then a *different* one for
         // channel B, before anything reads either back. A test that only
         // ever looked at one channel could not tell "keyed by channel" from
@@ -3339,7 +3340,7 @@ mod tests {
         };
         assert!(size > 0);
         assert!(
-            f.host.forms().contains_key(&(0, 1)),
+            f.host.fsd.forms().contains_key(&(0, 1)),
             "and the full-screen form is cached under its own amode"
         );
         // This file's message 0 has no field runs, so there are no cursor
@@ -3372,7 +3373,7 @@ mod tests {
             .invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
             .expect_err("refused");
         assert!(format!("{e}").contains("too long"), "{e}");
-        assert!(f.host.forms().is_empty());
+        assert!(f.host.fsd.forms().is_empty());
     }
 
     #[test]
@@ -3481,7 +3482,7 @@ mod tests {
         // this test does not otherwise depend on the exact wording of.
         let template = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
         let template = f.machine.read_cstr(template).expect("text").to_vec();
-        let form = f.host.forms()[&(0, 0)].clone();
+        let form = f.host.fsd.forms()[&(0, 0)].clone();
         let mut expected_scb =
             fsd::Scb::<Wg16>::from_bytes(&[0u8; fsd::FSDSCB as usize]).expect("zeroed");
         let expected = fsd::fsdlin(&form, b"NAME", &template, &mut expected_scb, b"NAME=Kaimon\0\0");
@@ -3510,7 +3511,7 @@ mod tests {
 
         assert_eq!(
             f.host.users().state_mem(f.machine.mem(), chan).expect("read"),
-            f.host.fsd_state() as u16,
+            f.host.fsd.state() as u16,
             "usrptr->state = fsdstt"
         );
         assert_eq!(
@@ -3527,7 +3528,7 @@ mod tests {
              twelve prf calls already are"
         );
 
-        match &f.host.fsd_sessions[chan.index()] {
+        match &f.host.fsd.sessions[chan.index()] {
             Some(session) => {
                 assert_eq!(session.whndun, Some(whndun));
                 assert!(!session.save, "not exiting yet");
@@ -3576,7 +3577,7 @@ mod tests {
         ));
         assert_eq!(
             f.host.users().state_mem(f.machine.mem(), chan).expect("read"),
-            f.host.fsd_state() as u16,
+            f.host.fsd.state() as u16,
             "the channel is in the FSD, which is the whole premise"
         );
 
@@ -3607,9 +3608,9 @@ mod tests {
     #[test]
     fn fsdego_reads_flddat_flags_live_not_the_host_s_cached_form() {
         // `_EDIT_CHARACTER_STATS` sets FFFAVD on flddat[i].flags directly,
-        // after fsdroom/fsdapr already cached the form in Host::forms. This
+        // after fsdroom/fsdapr already cached the form in Fsd::forms. This
         // reproduces that: two fields, FFFAVD poked into field 0's *live*
-        // module record only -- Host::forms's copy is left alone, which is
+        // module record only -- Fsd::forms's copy is left alone, which is
         // the whole point live_form exists for. If fsdego trusted the cache
         // instead, movfld(0,1,0) would land the cursor on field 0.
         let mut f = Fixture::new();
@@ -3623,9 +3624,9 @@ mod tests {
         f.machine.write(scb.flddat(), &record).expect("written");
 
         assert_eq!(
-            f.host.forms()[&(0, 0)].fields[0].flags & crate::fsd::flags::AVOID,
+            f.host.fsd.forms()[&(0, 0)].fields[0].flags & crate::fsd::flags::AVOID,
             0,
-            "Host::forms's cached copy must NOT have FFFAVD set -- only the \
+            "Fsd::forms's cached copy must NOT have FFFAVD set -- only the \
              live module record does"
         );
 
@@ -3651,16 +3652,16 @@ mod tests {
     fn fsdego_refuses_a_forged_amode_recording_defensively() {
         // `amode == 1` is legitimate since Stage 5's Task 8, so this no
         // longer forges *that*. What it forges instead is the same class of
-        // fault: a `Host::fsdtmp` that has come apart from `Host::forms`, the
+        // fault: a `Fsd::tmp` that has come apart from `Fsd::forms`, the
         // way `a_field_count_the_module_forged_cannot_index_out_of_the_
         // segment` forges `numfld`. fsdego must refuse on its own terms
         // rather than index into a form that was never compiled.
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"\0");
         let chan = f.console();
-        let (mbk, msgno, _) = f.host.fsdtmp[chan.index()].expect("recorded by session()");
+        let (mbk, msgno, _) = f.host.fsd.tmp[chan.index()].expect("recorded by session()");
         // amode 1 recorded, but only the amode-0 form was ever compiled.
-        f.host.fsdtmp[chan.index()] = Some((mbk, msgno, 1));
+        f.host.fsd.tmp[chan.index()] = Some((mbk, msgno, 1));
 
         let e = f.invoke(fsdego, &[0, 0, 0, 0]).expect_err("refused");
         assert!(format!("{e}").contains("no such form"), "{e}");
@@ -3668,7 +3669,7 @@ mod tests {
         // And refusing did not half-mutate anything on the way there.
         assert_eq!(f.host.users().state_mem(f.machine.mem(), chan).expect("read"), 0);
         assert_eq!(f.host.users().substt_mem(f.machine.mem(), chan).expect("read"), 0);
-        assert!(f.host.fsd_sessions[chan.index()].is_none());
+        assert!(f.host.fsd.sessions[chan.index()].is_none());
         assert!(!f.host.gsbl_mut().channel_mut(chan).raw, "fsdcon did not run");
     }
 
@@ -3851,7 +3852,7 @@ mod tests {
         // can still drive `fsdprc` directly. `whndun: None` keeps this
         // test's own focus on `scb.state()`/the stored answer, not on the
         // callback -- that is what the `goback_*` tests below are for.
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: false,
             whndun: None,
             save: false,
@@ -3895,12 +3896,12 @@ mod tests {
         // landing on FSDSAV is not, by itself, enough for `goback()` to know
         // a session ended in save -- by the time it runs, the session
         // buffer FSDSAV was read from may already be gone (design doc:
-        // `FsdSession.save` exists precisely so the flag survives that).
-        // `fsdprc` propagates the outcome into `Host::fsd_sessions[chan]
+        // `Session::save` exists precisely so the flag survives that).
+        // `fsdprc` propagates the outcome into `Fsd::sessions[chan]
         // .save` itself, while `block.state()` is still fresh, and -- since
         // Task 11 -- immediately calls `goback` with it, which is why this
         // is now observed through `whndun`'s own argument rather than by
-        // reading `Host::fsd_sessions` back afterward: `goback` consumes
+        // reading `Fsd::sessions` back afterward: `goback` consumes
         // the session as part of the same call, so nothing is left to read.
         let mut f = Fixture::new();
         let module = f.minimal_module();
@@ -3913,14 +3914,14 @@ mod tests {
             .expect("placed");
 
         // A session normally starts life through `fsdego`, which is what
-        // populates `Host::fsd_sessions` in the first place; recreated by
+        // populates `Fsd::sessions` in the first place; recreated by
         // hand here so this test can drive `fsdprc` directly the way its
         // neighbours already do, without `fsdego`'s own `fsdlin` call
         // moving `state` off `FSDBUF` before `set_buffered` gets to it.
         let marker = f.buffer(2);
         f.machine.write(marker, &[0xff, 0xff]).expect("seeded");
         let whndun = stub_recording_save(&mut f, 0x200, marker);
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: false,
             whndun: Some(whndun),
             save: false,
@@ -3941,7 +3942,7 @@ mod tests {
         crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
         assert!(
-            f.host.fsd_sessions[chan.index()].is_none(),
+            f.host.fsd.sessions[chan.index()].is_none(),
             "goback consumed the session -- FSDSAV must reach whndun, not just module memory"
         );
         let recorded = f.machine.resolve(marker, 2).expect("in range");
@@ -3960,7 +3961,7 @@ mod tests {
         // exit -- FSDSAV included -- would not be masked by FSDQIT's own
         // outcome already matching an untouched default. See the FSDSAV
         // sibling test above for why this reads `whndun`'s own argument
-        // rather than `Host::fsd_sessions` after the call.
+        // rather than `Fsd::sessions` after the call.
         let mut f = Fixture::new();
         let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
@@ -3977,7 +3978,7 @@ mod tests {
         let marker = f.buffer(2);
         f.machine.write(marker, &[1, 0]).expect("seeded");
         let whndun = stub_recording_save(&mut f, 0x200, marker);
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: false,
             whndun: Some(whndun),
             save: true,
@@ -3997,7 +3998,7 @@ mod tests {
 
         crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
-        assert!(f.host.fsd_sessions[chan.index()].is_none(), "goback consumed the session");
+        assert!(f.host.fsd.sessions[chan.index()].is_none(), "goback consumed the session");
         let recorded = f.machine.resolve(marker, 2).expect("in range");
         assert_eq!(
             u16::from_le_bytes([recorded[0], recorded[1]]),
@@ -4122,7 +4123,7 @@ mod tests {
     /// above the return address -- into `marker`, so a test can read back
     /// both "was this called at all" and "with which value". `goback`'s own
     /// argument is `(fsdusr->flags&FBSAVE) != 0` (`FSDBBS.C:229`), i.e.
-    /// exactly [`crate::FsdSession::save`] cast to a word.
+    /// exactly [`Session::save`] cast to a word.
     fn stub_recording_save(f: &mut Fixture, code_offset: u16, marker: FarPtr) -> FarPtr {
         let mut code = Vec::new();
         code.extend_from_slice(&[0x8b, 0xec]); // mov bp, sp
@@ -4164,7 +4165,7 @@ mod tests {
             .write(marker, &[0xff, 0xff])
             .expect("seeded with a value session.save as u16 can never be");
         let whndun = stub_recording_save(&mut f, 0x100, marker);
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: false,
             whndun: Some(whndun),
             save: true,
@@ -4178,7 +4179,7 @@ mod tests {
         assert!(!f.host.gsbl_mut().channel_mut(chan).raw, "fsdcof turned raw off");
         assert!(f.host.gsbl_mut().channel_mut(chan).echo, "fsdcof turned echo on");
         assert!(
-            f.host.fsd_sessions[chan.index()].is_none(),
+            f.host.fsd.sessions[chan.index()].is_none(),
             "the session is consumed, not left behind"
         );
 
@@ -4205,7 +4206,7 @@ mod tests {
         let marker = f.buffer(2);
         f.machine.write(marker, &[1, 0]).expect("seeded");
         let whndun = stub_recording_save(&mut f, 0x100, marker);
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: false,
             whndun: Some(whndun),
             save: false,
@@ -4230,7 +4231,7 @@ mod tests {
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         entered(&mut f, chan);
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: false,
             whndun: None,
             save: true,
@@ -4252,7 +4253,7 @@ mod tests {
     fn goback_parks_the_cursor_below_a_full_screen_form_and_not_a_line_mode_one() {
         // `FSDBBS.C:227-229`: `if (fsdusr->flags&FBFULL) prf("\x1B[%d;1f",
         // min(ANSILN,fsdscb->maxy+1));`, ported now that
-        // `crate::FsdSession::full_screen` has a real reader.
+        // `Session::full_screen` has a real reader.
         //
         // `Form::max_y` is pinned to a chosen value rather than trusted from
         // whatever FSDFORM.MSG's own field layout happens to compile to, so
@@ -4265,11 +4266,11 @@ mod tests {
         let chan = f.console();
         entered(&mut f, chan);
         f.host
-            .forms
+            .fsd.forms
             .get_mut(&(0, 1))
             .expect("fsdroom cached message 0, amode 1")
             .max_y = 10;
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: true,
             whndun: None,
             save: false,
@@ -4300,11 +4301,11 @@ mod tests {
         let chan = f.console();
         entered(&mut f, chan);
         f.host
-            .forms
+            .fsd.forms
             .get_mut(&(0, 1))
             .expect("fsdroom cached message 0, amode 1")
             .max_y = u8::MAX;
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: true,
             whndun: None,
             save: false,
@@ -4332,7 +4333,7 @@ mod tests {
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         entered(&mut f, chan);
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: false,
             whndun: None,
             save: false,
@@ -4362,7 +4363,7 @@ mod tests {
         entered(&mut f, chan);
 
         let whndun = stub_that_faults(&mut f, 0x100);
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: false,
             whndun: Some(whndun),
             save: false,
@@ -4378,7 +4379,7 @@ mod tests {
         assert!(!f.host.gsbl_mut().channel_mut(chan).raw, "fsdcof still ran");
         assert!(f.host.gsbl_mut().channel_mut(chan).echo, "fsdcof still ran");
         assert!(
-            f.host.fsd_sessions[chan.index()].is_none(),
+            f.host.fsd.sessions[chan.index()].is_none(),
             "the session is still consumed, even though whndun never returned"
         );
 
@@ -4424,7 +4425,7 @@ mod tests {
         let marker = f.buffer(2);
         f.machine.write(marker, &[0xff, 0xff]).expect("seeded");
         let whndun = stub_recording_save(&mut f, 0x200, marker);
-        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        f.host.fsd.sessions[chan.index()] = Some(Session {
             full_screen: false,
             whndun: Some(whndun),
             save: false,
@@ -4448,7 +4449,7 @@ mod tests {
         ));
 
         assert!(
-            f.host.fsd_sessions[chan.index()].is_none(),
+            f.host.fsd.sessions[chan.index()].is_none(),
             "fsdprc must reach goback itself -- no dispatch loop exists yet to do it later"
         );
         assert!(!f.host.gsbl_mut().channel_mut(chan).raw, "fsdcof ran");
@@ -4507,7 +4508,7 @@ mod tests {
             "Enter on a non-final field commits it and moves the cursor to the next one"
         );
         assert!(
-            f.host.fsd_sessions[chan.index()].is_some(),
+            f.host.fsd.sessions[chan.index()].is_some(),
             "the session is not over -- there is still a field left"
         );
         assert!(
@@ -4559,7 +4560,7 @@ mod tests {
             "every queued byte must be drained, even the one that ended the session"
         );
         assert!(
-            f.host.fsd_sessions[chan.index()].is_none(),
+            f.host.fsd.sessions[chan.index()].is_none(),
             "fsdprc must reach goback itself when the last field is saved"
         );
         assert!(
@@ -4599,7 +4600,7 @@ mod tests {
             Ok(())
         ));
         assert!(
-            f.host.fsd_sessions[chan.index()].is_some(),
+            f.host.fsd.sessions[chan.index()].is_some(),
             "one ESC is swallowed by the decoder -- the session must still be open"
         );
         assert_eq!(
@@ -4616,7 +4617,7 @@ mod tests {
             Ok(())
         ));
         assert!(
-            f.host.fsd_sessions[chan.index()].is_none(),
+            f.host.fsd.sessions[chan.index()].is_none(),
             "the second ESC reaches fsdinc and abandons the session"
         );
     }
@@ -4649,7 +4650,7 @@ mod tests {
             "CRSRDN commits the field and advances, exactly as Enter does"
         );
         assert!(
-            f.host.fsd_sessions[chan.index()].is_some(),
+            f.host.fsd.sessions[chan.index()].is_some(),
             "there is still a field left -- the session is not over"
         );
 
@@ -4882,12 +4883,12 @@ mod tests {
         };
         assert!(size > 0);
 
-        // And the two forms of one message coexist, because Host::forms is
+        // And the two forms of one message coexist, because Fsd::forms is
         // keyed by (message, amode) -- the ANSI one carries cursor gotos and
         // the line one does not.
         f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]).expect("sized");
-        let ansi = f.host.forms()[&(0, 1)].clone();
-        let line = f.host.forms()[&(0, 0)].clone();
+        let ansi = f.host.fsd.forms()[&(0, 1)].clone();
+        let line = f.host.fsd.forms()[&(0, 0)].clone();
         assert!(!ansi.fields[0].ansgto.is_empty(), "the ANSI form has gotos");
         assert!(line.fields[0].ansgto.is_empty(), "the line form does not");
     }
@@ -4927,7 +4928,7 @@ mod tests {
         assert_eq!(scb.chgcnt(), 0);
 
         let drawn = f.read(f.host.globals().prf_buffer());
-        let gto = String::from_utf8_lossy(&f.host.forms()[&(0, 1)].fields[0].ansgto).into_owned();
+        let gto = String::from_utf8_lossy(&f.host.fsd.forms()[&(0, 1)].fields[0].ansgto).into_owned();
         assert!(drawn.contains(&gto), "it went to field 0: {drawn:?}");
         assert!(drawn.contains("Kai"), "and drew its answer: {drawn:?}");
         assert!(
@@ -4937,7 +4938,7 @@ mod tests {
         );
 
         assert!(
-            f.host.fsd_sessions[chan.index()]
+            f.host.fsd.sessions[chan.index()]
                 .as_ref()
                 .expect("a session")
                 .full_screen,
@@ -4954,7 +4955,7 @@ mod tests {
         let chan = f.console();
         f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
 
-        let session = f.host.fsd_sessions[chan.index()].as_ref().expect("a session");
+        let session = f.host.fsd.sessions[chan.index()].as_ref().expect("a session");
         assert!(!session.full_screen);
         assert_eq!(block(&f).state(), fsd::state::FSDNPT, "fsdlin's own state");
         assert_eq!(block(&f).flags(), 0, "and fsdlin zeroes flags outright");

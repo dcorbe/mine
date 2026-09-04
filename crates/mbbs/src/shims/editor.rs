@@ -22,7 +22,7 @@
 //! the channel to `ldunedt` -- its `sttrou` -- until the user saves or quits,
 //! at which point the caller's `whndun(flags)` runs (`0` to save,
 //! `ED_QUITEX` to quit) and is expected to put `state` back itself. That is
-//! exactly the shape [`crate::Host::fsd_state`] already has for the FSD, so
+//! exactly the shape [`crate::fsd::bbs::Fsd::state`] already has for the FSD, so
 //! the editor is the second [`crate::shims::system::Native`] slot, and
 //! [`dispatch`] is its `sttrou`.
 //!
@@ -129,7 +129,7 @@ pub(crate) enum Sub {
 }
 
 /// One channel's editing session -- the line-editor subset of the vendor's
-/// `struct fseusr` (`EDITFSE.H`). Rust-side, like [`crate::FsdSession`]:
+/// `struct fseusr` (`EDITFSE.H`). Rust-side, like [`crate::fsd::bbs::Session`]:
 /// no module ever addresses it.
 pub struct Session<A: Abi> {
     /// `txtbuf`/`txtsiz` -- the caller's text buffer and its size.

@@ -182,7 +182,7 @@ impl<'a, A: Abi> CommandCtx<'a, A> {
     /// module's own heap. A command a player can retype as often as they
     /// like must not cost the board one of those every time it runs; this
     /// reuses the same region on every call instead, allocated once on
-    /// first use, the same pattern [`crate::Host::fsd_scratch`] and
+    /// first use, the same pattern [`crate::fsd::bbs::Fsd::scratch`] and
     /// [`crate::Host::cnc_statics`] already establish for exactly this
     /// reason. See those two fields' own doc comments for why reuse, not a
     /// matching free, is the right shape here -- `ModuleMem` offers no free
