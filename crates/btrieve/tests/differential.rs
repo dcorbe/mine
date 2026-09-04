@@ -452,8 +452,10 @@ const PENDING: &[Pending] = &[Pending {
 /// before these three could witness, and it long predates the variable
 /// insert this compares. So what is compared here is the part these
 /// recordings were made to pin and this crate does own: every variable page
-/// in each file, in order, byte for byte
-/// ([`diff_variable_pages`]). Measured today, each one matches genuine
+/// in each file, in order, byte for byte, plus the two control-record bytes
+/// at `0x39` and `0x3a` that say the file is no longer virgin and which
+/// variable page it offers ([`diff_variable_pages`] and
+/// [`diff_variable_head`]). Measured today, each page matches genuine
 /// Btrieve's in **every byte but its own page number** -- fragment bytes,
 /// entry array, fragment count, free-chain field and modification stamp all
 /// exact -- and the page number differs only because the file's data pages
@@ -527,8 +529,9 @@ fn variable_pages(file: &[u8], page: usize) -> Vec<(u32, &[u8])> {
 }
 
 /// Compares every variable page of `ours` with every variable page of
-/// `genuine`, in order. See [`BYTE_COMPARED`] for why this and not the
-/// whole file.
+/// `genuine`, in order, and then the two control-record bytes that name
+/// them ([`diff_variable_head`]). See [`BYTE_COMPARED`] for why this and not
+/// the whole file.
 ///
 /// Each page is compared from offset `0x04` -- past its own page number,
 /// the one field the two files legitimately disagree about. The number is
@@ -569,6 +572,61 @@ fn diff_variable_pages(name: &str, ours: &[u8], genuine: &[u8]) {
             &their_page[NUMBER..],
         );
     }
+
+    diff_variable_head(name, ours, genuine, &mine, &theirs);
+}
+
+/// The two control-record bytes a variable-length write owns, compared the
+/// only two ways they can be.
+///
+/// `VARIABLE_SUBFLAG` (`0x39`) is compared **absolutely**: it is a flag, not
+/// a page number, and both engines wrote records into the same virgin file,
+/// so both must have cleared it. The seed carries `0xff` here.
+///
+/// `VARIABLE_HIGHEST` (`0x3a`, a little-endian `u16`) is compared
+/// **relatively**: it is the free-space chain's head, so each engine's must
+/// name the last variable page *that engine* wrote. Genuine's is 5 for the
+/// insert scenario and 10 for the grow one; ours is 4 and 6, because this
+/// crate's data pages are numbered differently (see [`BYTE_COMPARED`]).
+/// Comparing the two numbers to each other would only re-measure that
+/// divergence; comparing each to its own file's last variable page is what
+/// catches a head written one off, written stale, or not written at all.
+fn diff_variable_head(
+    name: &str,
+    ours: &[u8],
+    genuine: &[u8],
+    mine: &[(u32, &[u8])],
+    theirs: &[(u32, &[u8])],
+) {
+    const SUBFLAG: usize = 0x39;
+    const HIGHEST: usize = 0x3a;
+    let head = |fcr: &[u8]| u32::from(u16::from_le_bytes([fcr[HIGHEST], fcr[HIGHEST + 1]]));
+    let last = |pages: &[(u32, &[u8])]| pages.last().expect("checked non-empty above").0;
+
+    assert_eq!(
+        ours[SUBFLAG], genuine[SUBFLAG],
+        "{name}: the control record's variable subflag at {SUBFLAG:#04x} is {:#04x} for us \
+         and {:#04x} for genuine Btrieve -- both engines wrote records into the same virgin \
+         file, so both must say it is no longer virgin",
+        ours[SUBFLAG], genuine[SUBFLAG]
+    );
+    assert_eq!(
+        head(ours),
+        last(mine),
+        "{name}: our control record offers variable page {} at {HIGHEST:#04x}, and the last \
+         variable page we wrote is {}",
+        head(ours),
+        last(mine)
+    );
+    assert_eq!(
+        head(genuine),
+        last(theirs),
+        "{name}: genuine Btrieve's control record offers variable page {} at {HIGHEST:#04x}, \
+         and the last variable page it wrote is {} -- this side of the check is the \
+         recording disagreeing with itself, which would mean the rule read off it is wrong",
+        head(genuine),
+        last(theirs)
+    );
 }
 
 /// Runs one fixture through [`drive`], diffs every call against the

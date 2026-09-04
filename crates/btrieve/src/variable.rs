@@ -1349,17 +1349,25 @@ impl<'a> V5Pages<'a> {
     /// Zero for a page that is still blank (no fragments), one more than
     /// what is there otherwise. See this type's doc comment for the three
     /// genuine pages this reproduces.
-    fn stamped(&mut self, number: u32, page: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// If the page cannot be read. Every page written through
+    /// [`PagesMut::write_page`] is already inside the file --
+    /// [`PageSource::claim`] counts a page and writes it before anything
+    /// rewrites it -- so a failure here is a real one, and answering `0`
+    /// instead would put a wrong byte in the field the oracle comparison
+    /// pins.
+    fn stamped(&mut self, number: u32, page: &mut [u8]) -> Result<(), String> {
         const STAMP: usize = 0x04;
-        let stamp = match self.file.page(number) {
-            Ok(on_disk) if fragment_count(on_disk) != 0 => {
-                u16::from_le_bytes([on_disk[STAMP], on_disk[STAMP + 1]]).wrapping_add(1)
-            }
-            Ok(_) => 0,
-            // A page the file does not have yet: nothing to carry forward.
-            Err(_) => 0,
+        let on_disk = self.file.page(number)?;
+        let stamp = if fragment_count(on_disk) == 0 {
+            0
+        } else {
+            u16::from_le_bytes([on_disk[STAMP], on_disk[STAMP + 1]]).wrapping_add(1)
         };
         page[STAMP..STAMP + 2].copy_from_slice(&stamp.to_le_bytes());
+        Ok(())
     }
 }
 
@@ -1372,7 +1380,7 @@ impl Pages for V5Pages<'_> {
 impl PagesMut for V5Pages<'_> {
     fn write_page(&mut self, number: u32, page: &[u8]) -> Result<(), String> {
         let mut page = page.to_vec();
-        self.stamped(number, &mut page);
+        self.stamped(number, &mut page)?;
         self.file.write_page(number, &page)
     }
 }
