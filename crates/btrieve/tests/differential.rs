@@ -76,11 +76,11 @@ use btrieve_oracle::Request;
 /// The fewest fixtures a clean run must find. Pinned at the number
 /// `crates/btrieve-oracle/fixtures/` carries today (`open_close`,
 /// `insert_get_step_stat`, `update_and_delete`,
-/// `status_ten_refusal_and_same_value_rewrite`) so a run that silently finds
-/// zero fixtures -- a moved directory, a build that never copied them, a
-/// glob that stopped matching -- fails loudly instead of reporting a clean
-/// sweep of nothing.
-const MIN_SCENARIOS: usize = 4;
+/// `status_ten_refusal_and_same_value_rewrite`, and the three
+/// `v5_variable_*` recordings) so a run that silently finds zero fixtures --
+/// a moved directory, a build that never copied them, a glob that stopped
+/// matching -- fails loudly instead of reporting a clean sweep of nothing.
+const MIN_SCENARIOS: usize = 7;
 
 /// Decodes a `B_CREATE` request's `databuf` into the [`FileSpec`] shape
 /// [`btrieve::create`] accepts.
@@ -338,6 +338,79 @@ fn resulting_records(path: &Path) -> Vec<Vec<u8>> {
     records
 }
 
+/// Puts `fixture`'s seed file in place at `path`, ready for the scenario's
+/// own first call (always a `B_OPEN`) to open.
+///
+/// The two seed shapes are the recorder's own, and this mirrors what its
+/// `drive` (`crates/btrieve-oracle/src/scenario.rs`) did when the fixture
+/// was recorded:
+///
+/// - [`Seed::Create`]: the recorder sent a `B_CREATE` over the wire and the
+///   genuine engine built the file. This replay cannot send that request to
+///   anything, so it decodes the request's geometry ([`filespec_of`]) and
+///   builds the same file with [`btrieve::create`] instead. The two files
+///   are not byte-identical -- genuine Btrieve builds v6, `create` builds v5
+///   -- which is why nothing downstream compares their bytes.
+/// - [`Seed::File`]: the recorder wrote a file [`btrieve::create`] had
+///   already built into the Wine prefix verbatim, and this replay writes
+///   those same recorded bytes to its own path. Here the two engines really
+///   did start from one identical file, which is what makes the byte
+///   comparison in [`replay_and_diff`] meaningful.
+fn seed(fixture: &scenario::Fixture, path: &Path) {
+    let name = &fixture.scenario.name;
+    match &fixture.scenario.seed {
+        Seed::Create(req) => {
+            let spec = filespec_of(&req.databuf);
+            btrieve::create(path, &spec)
+                .unwrap_or_else(|e| panic!("{name}: building the file: {e}"));
+        }
+        Seed::File(bytes) => {
+            assert!(
+                !bytes.is_empty(),
+                "{name}: a Seed::File seed of zero bytes is not a file any B_OPEN can open"
+            );
+            std::fs::write(path, bytes)
+                .unwrap_or_else(|e| panic!("{name}: writing the seed file: {e}"));
+        }
+    }
+}
+
+/// The prefix of every fixture whose resulting file bytes are compared to
+/// genuine Btrieve's, byte for byte.
+///
+/// The whole point of the `v5_variable_*` recordings: their seed is one file
+/// [`btrieve::create`] wrote, so both engines started from the same bytes
+/// and both maintained a version 5 layout from there. Nothing else here can
+/// be compared that way -- every other fixture's file is genuine Btrieve's
+/// own v6 layout, which this crate does not build (this module's own doc
+/// comment).
+const BYTE_COMPARED: &str = "v5_variable_";
+
+/// Diffs two files byte for byte, reporting the first offset that differs
+/// with sixteen bytes of context from each side.
+fn diff_bytes(name: &str, ours: &[u8], genuine: &[u8]) {
+    const CONTEXT: usize = 16;
+    let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+    if let Some(at) = (0..ours.len().min(genuine.len())).find(|&i| ours[i] != genuine[i]) {
+        let end = (at + CONTEXT).min(ours.len().min(genuine.len()));
+        panic!(
+            "{name}: the resulting file's bytes disagree at offset {at:#06x}\n\
+             \x20 ours:    {}\n\
+             \x20 genuine: {}",
+            hex(&ours[at..end]),
+            hex(&genuine[at..end])
+        );
+    }
+    assert_eq!(
+        ours.len(),
+        genuine.len(),
+        "{name}: the resulting files agree on every shared byte but not on their length -- \
+         ours is {} bytes, genuine Btrieve's is {}",
+        ours.len(),
+        genuine.len()
+    );
+}
+
 /// Runs one fixture through [`drive`], diffs every call against the
 /// recorded [`Transcript`](scenario::Transcript), then diffs the resulting
 /// records against the fixture's own recorded file (re-read through this
@@ -350,15 +423,7 @@ fn replay_and_diff(fixture: &scenario::Fixture) {
     let ours = dir.join("OURS.DAT");
     let genuine = dir.join("GENUINE.DAT");
 
-    let create_databuf = match &fixture.scenario.seed {
-        Seed::Create(req) => &req.databuf,
-        Seed::File(_) => panic!(
-            "{name}: this replay only decodes a Seed::Create seed -- no committed fixture uses \
-             Seed::File today, so a File seed here is worth investigating, not skipping"
-        ),
-    };
-    let spec = filespec_of(create_databuf);
-    btrieve::create(&ours, &spec).unwrap_or_else(|e| panic!("{name}: building the file: {e}"));
+    seed(fixture, &ours);
 
     let outcomes = drive(&fixture.scenario.calls, &ours);
     assert_eq!(
@@ -434,6 +499,14 @@ fn replay_and_diff(fixture: &scenario::Fixture) {
         ours_records.len(),
         genuine_records.len()
     );
+
+    // And, for the fixtures that started from one file both engines could
+    // maintain, the bytes themselves. See [`BYTE_COMPARED`].
+    if name.starts_with(BYTE_COMPARED) {
+        let written = std::fs::read(&ours)
+            .unwrap_or_else(|e| panic!("{name}: reading back what we wrote: {e}"));
+        diff_bytes(name, &written, &fixture.transcript.file);
+    }
 }
 
 /// Task 12: every committed fixture, replayed through this crate's own
