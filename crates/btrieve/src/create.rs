@@ -595,6 +595,20 @@ fn validate(spec: &FileSpec) -> Result<(u16, u16), String> {
              measure)"
         ));
     }
+    // Same refusal, one clause down: a duplicate-permitting key on a
+    // variable-length file would need both the eight-byte `[prev][next]`
+    // chain and the four-byte fragment pointer in the same physical record,
+    // and nothing measured here says how the two combine -- no file in
+    // `tmp/` carries both. Guessed at additivity once and caught in review
+    // (this module's own doc comment on why even *one* combination beyond
+    // what is measured is refused rather than assumed).
+    if spec.variable && duplicate_keys > 0 {
+        return Err(format!(
+            "a variable-length file with {duplicate_keys} duplicate-permitting key(s) -- \
+             this module has no measured layout for how the eight-byte duplicate chain and \
+             the four-byte fragment pointer combine in the same physical record"
+        ));
+    }
 
     // The physical record is the logical one plus eight bytes of
     // `[prev][next]` duplicate chain when any key permits duplicates --
@@ -606,7 +620,10 @@ fn validate(spec: &FileSpec) -> Result<(u16, u16), String> {
     // pointer `Block::insert_v6`/`variable::Pointer` already expect to find
     // at the logical record length (`lib.rs::flag`'s own doc comment: "the
     // fragment pointer is at the logical record length whichever other flags
-    // are set").
+    // are set"). The two additions never both apply -- the refusal above
+    // rules out a duplicate-permitting key on a variable-length file -- so
+    // this is not really "additive", just written as the sum of two
+    // mutually exclusive terms.
     let physical = u32::from(spec.record_length)
         + if duplicate_keys > 0 { 8 } else { 0 }
         + if spec.variable { 4 } else { 0 };
@@ -1131,6 +1148,21 @@ mod tests {
         };
         let err = create(&path, &spec).expect_err("refuses");
         assert!(err.why.contains("duplicate-permitting"), "{}", err.why);
+    }
+
+    /// A duplicate-permitting key on a variable-length file needs the
+    /// eight-byte chain and the four-byte fragment pointer in the same
+    /// physical record, and nothing measured here says how the two combine --
+    /// refused rather than guessed, the same shape as
+    /// `create_refuses_more_than_one_duplicate_key` above.
+    #[test]
+    fn create_refuses_a_duplicate_key_on_a_variable_file() {
+        let path = scratch("dup-key-variable.dat");
+        let mut spec = single_key_spec(12, 512, true);
+        spec.variable = true;
+        let err = create(&path, &spec).expect_err("refuses");
+        assert!(err.why.contains("duplicate-permitting"), "{}", err.why);
+        assert!(err.why.contains("variable-length"), "{}", err.why);
     }
 
     /// Mutation testing gap, closed: nothing exercised the `SEGMAX` (24)
