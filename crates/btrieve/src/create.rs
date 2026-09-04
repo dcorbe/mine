@@ -83,10 +83,16 @@
 //!   read-side only, from files this crate never built -- so [`FileSpec`] has
 //!   no field for any of them, and asking for one is not a call this module's
 //!   signature can even express.
-//! - Variable-length records. [`FileSpec::variable`] exists and must be
-//!   `false`: the field is here so the shape a caller describes has a place
-//!   to say so, and the refusal is here because `DFACF_VARIABLE`'s
-//!   create-time bytes are not measured yet.
+//! - Variable-length records ([`FileSpec::variable`], `DFACF_VARIABLE`) are
+//!   now written -- measured off the MajorBBS 6 kit's `BBSK.DAT`, a virgin
+//!   copy of which carries `variable_tag` (`0xff`), `variable_subflag`
+//!   (`0xff`) and `variable_highest` (`0xffff`), [`fcr::USRFLGS_VARIABLE`]
+//!   set, and a physical record four bytes wider than its logical one -- the
+//!   fragment pointer every variable-length insert (Task 4) will place a
+//!   record's body through. What this module does *not* do: pre-allocate a
+//!   variable page, or let [`super::Block::insert`] write into a file it
+//!   created this way -- both are refused today (`lib.rs`'s own `insert`
+//!   doc comment) until a later task gives them a measured layout.
 //! - An alternate collating sequence is now written rather than refused --
 //!   [`FileSpec::acs`] and [`KeySpec::acs`] -- measured off the MajorBBS 6
 //!   kit's own `BBSUSR.DAT`, which is a v5 file carrying `ALLCAPS` on
@@ -271,6 +277,25 @@ mod fcr {
     /// to `2048 - 6 = 2042` for `WCCUSERS.VIR`'s. Not consumed by anything
     /// this crate reads.
     pub const PAGE_USABLE: usize = 0x2a;
+    /// `0xff` when the file holds variable-length records, `0x00` otherwise.
+    /// Same offset [`super::super::at::VARIABLE_MARK`] already reads and
+    /// checks against [`USRFLGS_VARIABLE`] on open (`Geometry::read`
+    /// refuses the two disagreeing). The kit's `BBSK.DAT` -- a populated
+    /// file -- still carries `0xff` here (`format::fcr::at::VARIABLE_TAG`'s
+    /// doc comment); only [`VARIABLE_SUBFLAG`] and [`VARIABLE_HIGHEST`]
+    /// change once records exist.
+    pub const VARIABLE_TAG: usize = 0x38;
+    /// `0xff` on a virgin (zero-record) variable file, `0x00` once the file
+    /// has ever held a record. `format::fcr::at::VARIABLE_SUBFLAG`'s doc
+    /// comment measures both across the corpus; a freshly created file is
+    /// always virgin, so this module always writes `0xff`.
+    pub const VARIABLE_SUBFLAG: usize = 0x39;
+    /// A [`u16`], `0xffff` (sentinel) on a virgin variable file --
+    /// `format::fcr::at::VARIABLE_HIGHEST`'s doc comment. The kit's
+    /// `BBSK.DAT` (populated) reads `0x0004` here instead; this module never
+    /// writes that value because it never pre-allocates a variable page
+    /// (Task 4's job).
+    pub const VARIABLE_HIGHEST: usize = 0x3a;
     /// The alternate collating sequence's 8-byte name. Same offset the read
     /// side already knows (`acs.rs`'s own `NAME_IN_FCR`); the engine's
     /// `Create` writes this, [`ACS_PAGE_POINTER`] and `0x40` together
@@ -289,6 +314,21 @@ mod fcr {
     pub const ACS_PAGE_POINTER: usize = 0x10a;
     pub const KEYS_BASE: usize = 0x110;
     pub const KEY_WIDTH: usize = 0x1e;
+
+    /// User flags word. Same offset [`super::super::at::USRFLGS`] already
+    /// reads. This module only ever sets [`USRFLGS_VARIABLE`]; every other
+    /// bit stays clear, which is what every one of the five `.VIR` files
+    /// (none variable) and the kit's `BBSK.DAT` (variable, and no other bit
+    /// set) carries.
+    pub const USRFLGS: usize = 0x106;
+    /// Bit 0 of [`USRFLGS`]: the file holds variable-length records. Same
+    /// bit `format::fcr::usrflgs::VARIABLE` names on the read side.
+    pub const USRFLGS_VARIABLE: u16 = 1 << 0;
+    /// One byte, `page_size / 20` on a variable file, `0x00` otherwise --
+    /// `format::fcr::at::VARIABLE_PAGE_CAPACITY`'s doc comment. The kit's
+    /// `BBSK.DAT` is a 1024-byte-page file and reads `0x33` (51) here:
+    /// `1024 / 20 = 51.2`, truncated.
+    pub const VARIABLE_PAGE_CAPACITY: usize = 0x108;
 }
 
 /// One segment of a key to create: a field of the record, and how Btrieve
@@ -369,8 +409,12 @@ pub struct FileSpec {
     /// versions are found differently. [`super::acs::allcaps`] is the one
     /// MajorBBS itself uses.
     pub acs: Option<super::acs::Acs>,
-    /// `DFACF_VARIABLE`. **Must be `false`.** Refused rather than written --
-    /// see this module's doc comment.
+    /// `DFACF_VARIABLE`: the file holds variable-length records. Widens the
+    /// physical record by four bytes for the fragment pointer -- see this
+    /// module's doc comment and [`validate`]. Does **not** by itself let
+    /// [`super::Block::insert`] write into the file: inserting into a
+    /// variable-length file is Task 4's job, and refuses today regardless of
+    /// how the file was created.
     pub variable: bool,
 }
 
@@ -389,9 +433,9 @@ pub struct FileSpec {
 /// [`SEGMAX`] segments in total, a page size that is not a multiple of 512,
 /// a record that does not fit its own page, more than one duplicate-
 /// permitting key, a segment whose type [`Kind::of`] cannot order, a key
-/// whose index entry does not fit one page, variable-length records, a key
-/// collating through an ACS the file does not carry, or an ACS on a segment
-/// that is not text), or if the file cannot be created or written.
+/// whose index entry does not fit one page, a key collating through an ACS
+/// the file does not carry, or an ACS on a segment that is not text), or if
+/// the file cannot be created or written.
 pub fn create(path: &Path, spec: &FileSpec) -> Result<(), BtvError> {
     let name = path.display().to_string();
     let fail = |why: String| BtvError {
@@ -464,11 +508,6 @@ fn first_root(spec: &FileSpec) -> u32 {
 fn validate(spec: &FileSpec) -> Result<(u16, u16), String> {
     if spec.record_length == 0 {
         return Err("a record length of zero".to_owned());
-    }
-    if spec.variable {
-        return Err("variable-length records, which have no measured create-time \
-                    layout here"
-            .to_owned());
     }
     if spec.page_size < MIN_PAGE || !spec.page_size.is_multiple_of(MIN_PAGE) {
         return Err(format!(
@@ -562,8 +601,15 @@ fn validate(spec: &FileSpec) -> Result<(u16, u16), String> {
     // `WCCBANKS.VIR` 72 -> 80, `WCCGANGS.VIR` 253 -> 261, `WCCITOWN.VIR`
     // 65 -> 73, `WCCUSERS.VIR` 1998 -> 2006, all eight bytes, all measured
     // the same. `keys.rs`'s own `at::CHAIN` doc comment: "physical - 8 is
-    // therefore the general rule."
-    let physical = u32::from(spec.record_length) + if duplicate_keys > 0 { 8 } else { 0 };
+    // therefore the general rule." A variable-length file adds four more --
+    // the kit's `BBSK.DAT` reads reclen 31, physical 35 -- the fragment
+    // pointer `Block::insert_v6`/`variable::Pointer` already expect to find
+    // at the logical record length (`lib.rs::flag`'s own doc comment: "the
+    // fragment pointer is at the logical record length whichever other flags
+    // are set").
+    let physical = u32::from(spec.record_length)
+        + if duplicate_keys > 0 { 8 } else { 0 }
+        + if spec.variable { 4 } else { 0 };
     let physical =
         u16::try_from(physical).map_err(|_| format!("a physical record length of {physical}"))?;
     // The record has to fit in what a page has left over after its own
@@ -626,6 +672,18 @@ fn build_fcr(spec: &FileSpec, physical: u16, usable: u16, nkeys: u16, pages: u32
     fcr[fcr::DATA_PAGE_COUNT..fcr::DATA_PAGE_COUNT + 4].copy_from_slice(&pages::to_long(1));
     fcr[fcr::PAGES..fcr::PAGES + 4].copy_from_slice(&pages::to_long(pages));
     fcr[fcr::PAGE_USABLE..fcr::PAGE_USABLE + 2].copy_from_slice(&usable.to_le_bytes());
+
+    if spec.variable {
+        fcr[fcr::VARIABLE_TAG] = 0xff;
+        // A freshly created file is always virgin -- see VARIABLE_SUBFLAG
+        // and VARIABLE_HIGHEST's own doc comments for what changes once a
+        // record has been inserted (not this module's job).
+        fcr[fcr::VARIABLE_SUBFLAG] = 0xff;
+        fcr[fcr::VARIABLE_HIGHEST..fcr::VARIABLE_HIGHEST + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+        let usrflgs = u16::from_le_bytes([fcr[fcr::USRFLGS], fcr[fcr::USRFLGS + 1]]) | fcr::USRFLGS_VARIABLE;
+        fcr[fcr::USRFLGS..fcr::USRFLGS + 2].copy_from_slice(&usrflgs.to_le_bytes());
+        fcr[fcr::VARIABLE_PAGE_CAPACITY] = (spec.page_size / 20) as u8;
+    }
 
     if let Some(acs) = &spec.acs {
         fcr[fcr::ACS_NAME..fcr::ACS_NAME + acs.name.len()].copy_from_slice(&acs.name);
@@ -1314,5 +1372,48 @@ mod tests {
         spec.keys[0].segments[0].kind = 0x0e; // unsigned binary
         let err = create(&scratch("acs-binary"), &spec).expect_err("refused");
         assert!(err.why.contains("folds text"), "{}", err.why);
+    }
+
+    /// The shape of the kit's `BBSK.DAT`, read straight off its own control
+    /// record: a 31-byte record (`fcr::RECLEN`), 1024-byte pages, one unique
+    /// zstring key over the first 30 bytes, collating through `ALLCAPS`, and
+    /// variable-length records.
+    fn keyrec_spec() -> FileSpec {
+        FileSpec {
+            record_length: 31,
+            page_size: 1024,
+            keys: vec![KeySpec {
+                segments: vec![SegmentSpec { offset: 0, length: 30, kind: 0x0b, descending: false }],
+                duplicates: false,
+                modifiable: false,
+                acs: true,
+            }],
+            acs: Some(crate::acs::allcaps()),
+            variable: true,
+        }
+    }
+
+    #[test]
+    fn a_variable_file_matches_the_kits_key_file_where_records_do_not_matter() {
+        let Some(oracle) = kit("BBSK.DAT") else { return };
+        let path = scratch("variable-keyrec");
+        create(&path, &keyrec_spec()).expect("created");
+        let ours = std::fs::read(&path).expect("read back");
+        for (lo, hi, what) in [
+            (0x06usize, 0x0a, "version and page size"),
+            (0x14, 0x1a, "key count, record length, physical length"),
+            (0x38, 0x39, "variable tag"),
+            (0x3c, 0x44, "ACS name"),
+            (0x106, 0x110, "user flags, variable capacity, ACS pointer"),
+            (0x110 + 0x08, 0x110 + 0x1e, "key 0 definition past its root"),
+        ] {
+            assert_eq!(&ours[lo..hi], &oracle[lo..hi], "{what} at {lo:#x}..{hi:#x}");
+        }
+        // Virgin-file sentinels the populated oracle no longer carries.
+        assert_eq!(ours[0x39], 0xff, "variable subflag on a virgin file");
+        assert_eq!(&ours[0x3a..0x3c], &[0xff, 0xff], "variable highest on a virgin file");
+        let geometry = crate::Geometry::read("K", &path).expect("readable");
+        assert!(geometry.variable);
+        assert_eq!(geometry.physical, 35);
     }
 }
