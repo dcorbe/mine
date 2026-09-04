@@ -1564,6 +1564,10 @@ fn decode_create_buffer(bytes: &[u8]) -> Result<crate::btrieve::FileSpec, ShimEr
                 segments: std::mem::take(&mut segments),
                 duplicates,
                 modifiable,
+                // `DFASF_ALTCOLLATE` is refused above rather than passed
+                // through: this host has no table to hand `create` for a
+                // module's own sequence.
+                acs: false,
             });
             seen_keys += 1;
         }
@@ -1573,6 +1577,8 @@ fn decode_create_buffer(bytes: &[u8]) -> Result<crate::btrieve::FileSpec, ShimEr
         record_length,
         page_size,
         keys,
+        acs: None,
+        variable: false,
     })
 }
 
@@ -1809,6 +1815,9 @@ pub fn dfaCreateSpec<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<a
             segments,
             duplicates,
             modifiable,
+            // See the note in the `BTRCALL` create path: `DFASF_ALTCOLLATE`
+            // is refused rather than passed through.
+            acs: false,
         });
     }
 
@@ -1817,6 +1826,8 @@ pub fn dfaCreateSpec<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<a
         record_length,
         page_size,
         keys: file_keys,
+        acs: None,
+        variable: false,
     };
     crate::btrieve::create(&path, &spec)
         .map_err(|e| ShimError::Failed(format!("dfaCreateSpec({name}): {e}")))?;

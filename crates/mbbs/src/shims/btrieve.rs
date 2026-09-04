@@ -3654,6 +3654,10 @@ fn decode_file_spec(bytes: &[u8]) -> Result<crate::btrieve::FileSpec, ShimError>
                 segments: std::mem::take(&mut segments),
                 duplicates,
                 modifiable,
+                // `ALT_COLLATING` is refused above rather than passed
+                // through: this host has no table to hand `create` for a
+                // module's own sequence.
+                acs: false,
             });
             seen_keys += 1;
         }
@@ -3663,6 +3667,8 @@ fn decode_file_spec(bytes: &[u8]) -> Result<crate::btrieve::FileSpec, ShimError>
         record_length,
         page_size,
         keys,
+        acs: None,
+        variable: false,
     })
 }
 
@@ -4393,6 +4399,7 @@ mod tests {
             }],
             duplicates: false,
             modifiable: false,
+            acs: false,
         };
 
         let dir = crate::testing::scratch(scratch);
@@ -4402,6 +4409,8 @@ mod tests {
                 record_length: 8,
                 page_size: 512,
                 keys: vec![key(0), key(2)],
+                acs: None,
+                variable: false,
             },
         )
         .expect("creates a two-key file");

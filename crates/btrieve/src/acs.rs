@@ -77,6 +77,27 @@ impl Acs {
     }
 }
 
+/// The `ALLCAPS` sequence MajorBBS 6 and Worldgroup create their account and
+/// key files with: identity everywhere except that lowercase ASCII letters
+/// collate as their uppercase forms.
+///
+/// Measured byte for byte off the kit's `BBSUSR.DAT` page 1 -- `table[b] == b`
+/// for every byte outside `0x61..=0x7a`, and `b - 0x20` inside it -- and
+/// checked against that same file by
+/// `create`'s `an_acs_file_matches_the_kits_account_file_where_records_do_not_matter`,
+/// which compares the whole 265-byte block this produces against the kit's.
+#[must_use]
+pub fn allcaps() -> Acs {
+    let mut table = [0u8; 256];
+    for (i, slot) in table.iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    for b in 0x61u8..=0x7a {
+        table[usize::from(b)] = b - 0x20;
+    }
+    Acs { name: *b"ALLCAPS ", table }
+}
+
 /// Both tag bytes the engine accepts (`W32MKDE_decompiled.c:18000`).
 pub const TAGS: [u8; 2] = [0xac, 0xad];
 

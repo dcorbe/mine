@@ -126,7 +126,10 @@ fn filespec_of(databuf: &[u8]) -> FileSpec {
             }],
             duplicates: flags & DUP != 0,
             modifiable: flags & MODIFY != 0,
+            acs: false,
         }],
+        acs: None,
+        variable: false,
     }
 }
 

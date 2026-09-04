@@ -63,6 +63,11 @@
 //! [`super::Block::insert`] into a file this module created lands there
 //! without growing the file, exactly as it would on a virgin `WCCUSERS.DAT`.
 //!
+//! One page more when the file declares an alternate collating sequence: the
+//! block goes on physical page 1 ([`super::acs::V5_PAGE`], the only place a
+//! v5 reader looks for it), and everything after it moves down one, so the
+//! roots are at `2..=keys + 1` and the data page at `keys + 2`.
+//!
 //! # What this module refuses
 //!
 //! - More than one duplicate-permitting key. Every real file measured here
@@ -72,13 +77,21 @@
 //!   [`super::keys::at::CHAIN`]'s doc comment on why even *one* key's chain
 //!   offset varies between `WCCUSERS.DAT` and `WCCUSERS.VIR`. Refused rather
 //!   than guessed.
-//! - Variable-length records, compression, blank truncation, key-only files
-//!   and alternate collating sequences. None of `DFACF_VARIABLE`,
-//!   `DFACF_COMPRESS`, `DFACF_BLANKTRUNC`, `DFACF_KEYONLY` or
-//!   `DFASF_ALTCOLLATE` has a measured *create-time* byte layout here --
-//!   [`super::at::USRFLGS`]'s bits are read-side only, from files this crate
-//!   never built -- so [`FileSpec`] has no field for any of them, and asking
-//!   for one is not a call this module's signature can even express.
+//! - Compression, blank truncation and key-only files. None of
+//!   `DFACF_COMPRESS`, `DFACF_BLANKTRUNC` or `DFACF_KEYONLY` has a measured
+//!   *create-time* byte layout here -- [`super::at::USRFLGS`]'s bits are
+//!   read-side only, from files this crate never built -- so [`FileSpec`] has
+//!   no field for any of them, and asking for one is not a call this module's
+//!   signature can even express.
+//! - Variable-length records. [`FileSpec::variable`] exists and must be
+//!   `false`: the field is here so the shape a caller describes has a place
+//!   to say so, and the refusal is here because `DFACF_VARIABLE`'s
+//!   create-time bytes are not measured yet.
+//! - An alternate collating sequence is now written rather than refused --
+//!   [`FileSpec::acs`] and [`KeySpec::acs`] -- measured off the MajorBBS 6
+//!   kit's own `BBSUSR.DAT`, which is a v5 file carrying `ALLCAPS` on
+//!   physical page 1. See [`build_fcr`] for the three fields the control
+//!   record gains and [`create`] for the page.
 //! - A key segment whose type this crate's own reader
 //!   ([`super::keys::Kind::of`]) has no ordering for. Writing one would
 //!   build a file this crate could create but never read back -- the same
@@ -176,6 +189,10 @@ mod attrs {
     /// leaves it to the caller of `dfaCreateSpec`.
     pub const MODIFIABLE: u16 = 1 << 1;
     pub const ANOSEG: u16 = 1 << 4;
+    /// `DFASF_ALTCOLLATE` -- the same bit [`super::super::keys::flag`] calls
+    /// `ALT_COLLATING`, read back off the kit's `BBSUSR.DAT` key 0, whose
+    /// attribute word is `0x0120`: this bit and [`EXTENDED`].
+    pub const ALT_COLLATING: u16 = 1 << 5;
     pub const DESCENDING: u16 = 1 << 6;
     pub const EXTENDED: u16 = 1 << 8;
     /// **Not caller-controlled.** Set automatically whenever a segment's
@@ -254,6 +271,22 @@ mod fcr {
     /// to `2048 - 6 = 2042` for `WCCUSERS.VIR`'s. Not consumed by anything
     /// this crate reads.
     pub const PAGE_USABLE: usize = 0x2a;
+    /// The alternate collating sequence's 8-byte name. Same offset the read
+    /// side already knows (`acs.rs`'s own `NAME_IN_FCR`); the engine's
+    /// `Create` writes this, [`ACS_PAGE_POINTER`] and `0x40` together
+    /// (`W32MKDE_decompiled.c:18430`). `ALLCAPS ` on the kit's `BBSUSR.DAT`.
+    pub const ACS_NAME: usize = 0x3c;
+    /// The first block's **logical** page, as a [`super::pages::long`]
+    /// (word-swapped, high half first). `acs.rs`'s own `PAGE_IN_FCR`.
+    ///
+    /// The kit's `BBSUSR.DAT` holds `00 00 01 00` here, which is logical page
+    /// 1 -- the same page the v5 block sits on physically, because a fresh
+    /// file's logical and physical page numbers have not yet diverged.
+    /// Written even though a v5 *reader* must not trust it (`CLASSADS.DAT`
+    /// and `EMAIL.DAT` read zero here while holding a real block): matching
+    /// the file the kit itself writes costs nothing, and the engine's own
+    /// "has an ACS" predicate reads it.
+    pub const ACS_PAGE_POINTER: usize = 0x10a;
     pub const KEYS_BASE: usize = 0x110;
     pub const KEY_WIDTH: usize = 0x1e;
 }
@@ -262,9 +295,10 @@ mod fcr {
 /// should compare it. `re/wg33src/INC/DFAAPI.H`'s `struct dfaSegSpec`, minus
 /// `nullChar` (the null-key flags are unsupported on the read side --
 /// [`super::keys`]'s `UNSUPPORTED` table -- so there is nothing here for one
-/// to configure) and minus the alternate-collating-sequence flag (also
-/// unsupported on read, and this module has no file to read one from
-/// either).
+/// to configure). `DFASF_ALTCOLLATE` is per *key* here ([`KeySpec::acs`])
+/// rather than per segment: [`super::keys::parse`] binds one table to a whole
+/// key and refuses a key whose segments name two, so a per-segment field
+/// could express nothing this crate could read back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentSpec {
     /// Byte offset of this segment within the record, **0-based** -- the
@@ -300,6 +334,16 @@ pub struct KeySpec {
     /// this bit), so a caller with no reason to match a specific real file's
     /// value can simply pass `false`.
     pub modifiable: bool,
+    /// `DFASF_ALTCOLLATE`: order this key through the file's alternate
+    /// collating sequence rather than by raw byte value. Requires
+    /// [`FileSpec::acs`] -- a key that collates through a table the file does
+    /// not carry is a file [`super::keys::parse`] refuses to open, so
+    /// [`validate`] refuses to write one.
+    ///
+    /// Sets [`attrs::ALT_COLLATING`] on every one of the key's segment words,
+    /// which is what the kit's `BBSUSR.DAT` carries on its single key
+    /// (attributes `0x0120`: extended type, alternate collating).
+    pub acs: bool,
 }
 
 /// A new file's shape: fixed record length, page size, and its keys.
@@ -316,6 +360,18 @@ pub struct FileSpec {
     /// [`super::Geometry::read`] checks an opened file against.
     pub page_size: u16,
     pub keys: Vec<KeySpec>,
+    /// The one alternate collating sequence this file's ACS-flagged keys
+    /// order through, or `None` for a file that orders by raw byte value.
+    ///
+    /// One table, not a list: a v5 file holds its block at a fixed page
+    /// ([`super::acs::V5_PAGE`]) and its keys carry no page number of their
+    /// own, so v5 has exactly one -- see `acs.rs`'s own header on why the two
+    /// versions are found differently. [`super::acs::allcaps`] is the one
+    /// MajorBBS itself uses.
+    pub acs: Option<super::acs::Acs>,
+    /// `DFACF_VARIABLE`. **Must be `false`.** Refused rather than written --
+    /// see this module's doc comment.
+    pub variable: bool,
 }
 
 /// Create a new, empty Btrieve file at `path`.
@@ -332,9 +388,10 @@ pub struct FileSpec {
 /// layout for (zero keys, a key with no segments, more than
 /// [`SEGMAX`] segments in total, a page size that is not a multiple of 512,
 /// a record that does not fit its own page, more than one duplicate-
-/// permitting key, a segment whose type [`Kind::of`] cannot order, or a key
-/// whose index entry does not fit one page), or if the file cannot be
-/// created or written.
+/// permitting key, a segment whose type [`Kind::of`] cannot order, a key
+/// whose index entry does not fit one page, variable-length records, a key
+/// collating through an ACS the file does not carry, or an ACS on a segment
+/// that is not text), or if the file cannot be created or written.
 pub fn create(path: &Path, spec: &FileSpec) -> Result<(), BtvError> {
     let name = path.display().to_string();
     let fail = |why: String| BtvError {
@@ -353,27 +410,50 @@ pub fn create(path: &Path, spec: &FileSpec) -> Result<(), BtvError> {
     let (physical, usable) = validate(spec).map_err(fail)?;
 
     let nkeys = u16::try_from(spec.keys.len()).expect("validate bounds key count under SEGMAX");
-    let pages = u32::from(nkeys) + 2;
+    let first_root = first_root(spec);
+    let pages = u32::from(nkeys) + first_root + 1;
     let file_size = u64::from(pages) * u64::from(spec.page_size);
 
     let mut bytes = vec![0u8; file_size as usize];
     bytes[..usize::from(spec.page_size)]
         .copy_from_slice(&build_fcr(spec, physical, usable, nkeys, pages));
 
+    if let Some(acs) = &spec.acs {
+        let page = build_acs_page(super::acs::V5_PAGE, spec.page_size, acs);
+        let at = usize::from(spec.page_size) * super::acs::V5_PAGE as usize;
+        bytes[at..at + usize::from(spec.page_size)].copy_from_slice(&page);
+    }
+
     for (n, key) in spec.keys.iter().enumerate() {
-        let number = n as u32 + 1;
+        let number = n as u32 + first_root;
         let page = build_root_page(number, spec.page_size);
         let at = usize::from(spec.page_size) * number as usize;
         bytes[at..at + usize::from(spec.page_size)].copy_from_slice(&page);
         let _ = key; // the root page's own bytes carry no key-specific content
     }
 
-    let data_number = u32::from(nkeys) + 1;
+    let data_number = u32::from(nkeys) + first_root;
     let data_page = build_data_page(data_number, spec.page_size);
     let at = usize::from(spec.page_size) * data_number as usize;
     bytes[at..at + usize::from(spec.page_size)].copy_from_slice(&data_page);
 
     std::fs::write(path, &bytes).map_err(|e| fail(format!("{e}")))
+}
+
+/// Physical page the first key's root goes on: page 1 normally, page 2 when
+/// an ACS block took page 1 ahead of it -- the ACS block's page is fixed at
+/// [`super::acs::V5_PAGE`] and everything else shifts around it, rather than
+/// the other way around, because a v5 reader has nothing to search by and
+/// looks only there.
+///
+/// One function so [`create`]'s page assembly and [`build_fcr`]'s `ROOT`
+/// fields cannot disagree about where a root went.
+fn first_root(spec: &FileSpec) -> u32 {
+    if spec.acs.is_some() {
+        super::acs::V5_PAGE + 1
+    } else {
+        1
+    }
 }
 
 /// Check `spec` against every limit this module's doc comment names, and
@@ -384,6 +464,11 @@ pub fn create(path: &Path, spec: &FileSpec) -> Result<(), BtvError> {
 fn validate(spec: &FileSpec) -> Result<(u16, u16), String> {
     if spec.record_length == 0 {
         return Err("a record length of zero".to_owned());
+    }
+    if spec.variable {
+        return Err("variable-length records, which have no measured create-time \
+                    layout here"
+            .to_owned());
     }
     if spec.page_size < MIN_PAGE || !spec.page_size.is_multiple_of(MIN_PAGE) {
         return Err(format!(
@@ -414,6 +499,15 @@ fn validate(spec: &FileSpec) -> Result<(u16, u16), String> {
         if key.duplicates {
             duplicate_keys += 1;
         }
+        // A key that collates through a table the file does not carry is a
+        // file `keys::parse` refuses to open -- it looks page 1 up, finds no
+        // block, and rejects the whole file. Refused before a byte is
+        // written rather than discovered on the next open.
+        if key.acs && spec.acs.is_none() {
+            return Err(format!(
+                "key {kn} collates through an ACS but the file declares none"
+            ));
+        }
         for (sn, segment) in key.segments.iter().enumerate() {
             if segment.length == 0 {
                 return Err(format!("key {kn} segment {sn} has a length of zero"));
@@ -426,11 +520,23 @@ fn validate(spec: &FileSpec) -> Result<(u16, u16), String> {
                     segment.offset, spec.record_length
                 ));
             }
-            if Kind::of(segment.kind).is_none() {
+            let Some(kind) = Kind::of(segment.kind) else {
                 return Err(format!(
                     "key {kn} segment {sn} has type {:#04x}, which this host's own \
                      reader has no ordering for -- writing it would build a file \
                      this crate could create but never read back",
+                    segment.kind
+                ));
+            };
+            // The table maps a byte to the byte it compares as, which is only
+            // meaningful where the comparison is byte by byte. `keys::order`
+            // folds a text segment through it and compares every other kind
+            // as the number it is, so an ACS on a number would be a flag the
+            // file carried and nothing honoured.
+            if key.acs && kind != Kind::Text {
+                return Err(format!(
+                    "key {kn} segment {sn} has type {:#04x}, which is not text, and an \
+                     alternate collating sequence folds text only",
                     segment.kind
                 ));
             }
@@ -512,15 +618,25 @@ fn build_fcr(spec: &FileSpec, physical: u16, usable: u16, nkeys: u16, pages: u32
     // comment. Written explicitly, even though `fcr` starts zeroed, so this
     // function accounts for every byte its own doc comment names.
     fcr[fcr::HIGHEST..fcr::HIGHEST + 2].copy_from_slice(&0u16.to_le_bytes());
-    let allocated = nkeys + 1;
+    // `keys + 1` on every `.VIR` file measured, which is `pages - 1` -- the
+    // pre-allocated data page's own number. Written as `pages - 1` so an ACS
+    // block's extra page carries it along.
+    let allocated = u16::try_from(pages - 1).expect("validate bounds the page count");
     fcr[fcr::ALLOCATED..fcr::ALLOCATED + 2].copy_from_slice(&allocated.to_le_bytes());
     fcr[fcr::DATA_PAGE_COUNT..fcr::DATA_PAGE_COUNT + 4].copy_from_slice(&pages::to_long(1));
     fcr[fcr::PAGES..fcr::PAGES + 4].copy_from_slice(&pages::to_long(pages));
     fcr[fcr::PAGE_USABLE..fcr::PAGE_USABLE + 2].copy_from_slice(&usable.to_le_bytes());
 
+    if let Some(acs) = &spec.acs {
+        fcr[fcr::ACS_NAME..fcr::ACS_NAME + acs.name.len()].copy_from_slice(&acs.name);
+        fcr[fcr::ACS_PAGE_POINTER..fcr::ACS_PAGE_POINTER + 4]
+            .copy_from_slice(&pages::to_long(super::acs::V5_PAGE));
+    }
+
+    let first_root = first_root(spec);
     let mut at = fcr::KEYS_BASE;
     for (n, key) in spec.keys.iter().enumerate() {
-        let root = n as u32 + 1;
+        let root = n as u32 + first_root;
         let length: u16 = key.segments.iter().map(|s| s.length).sum();
         let shape = Shape {
             length: usize::from(length),
@@ -557,6 +673,9 @@ fn build_fcr(spec: &FileSpec, physical: u16, usable: u16, nkeys: u16, pages: u32
             }
             if key.modifiable {
                 word |= attrs::MODIFIABLE;
+            }
+            if key.acs {
+                word |= attrs::ALT_COLLATING;
             }
             if sn + 1 < key.segments.len() {
                 word |= attrs::ANOSEG;
@@ -610,6 +729,37 @@ fn build_root_page(number: u32, page_size: u16) -> Vec<u8> {
     page
 }
 
+/// Build the page holding the alternate collating sequence: an ordinary
+/// six-byte page header, then the 265-byte block, then zeros.
+///
+/// Measured off the MajorBBS 6 kit's `BBSUSR.DAT` page 1, which reads
+/// `00 00 01 00 00 00 ac 41 4c 4c 43 41 50 53 20` and then the table: the
+/// page's own number as a [`pages::long`], a zero flags word (**not** a data
+/// page, and no stamp), then the tag byte, the 8-byte name and the 256 table
+/// bytes. Everything past the block is zero on that file, and is here.
+///
+/// The tag is [`super::acs::TAGS`]`[0]`, `0xac`. The engine accepts `0xad`
+/// too, but nothing on hand says what distinguishes them, so this writes the
+/// one the file it is measured against carries.
+fn build_acs_page(number: u32, page_size: u16, acs: &super::acs::Acs) -> Vec<u8> {
+    let mut page = vec![0u8; usize::from(page_size)];
+    page[..usize::from(pages::HEADER)].copy_from_slice(
+        &Header {
+            number,
+            data: false,
+            stamp: 0,
+        }
+        .encode(),
+    );
+    let mut at = usize::from(pages::HEADER);
+    page[at] = super::acs::TAGS[0];
+    at += 1;
+    page[at..at + acs.name.len()].copy_from_slice(&acs.name);
+    at += acs.name.len();
+    page[at..at + acs.table.len()].copy_from_slice(&acs.table);
+    page
+}
+
 /// Build the pre-allocated, empty data page: a six-byte header with the data
 /// bit set, then all zero -- measured off `WCCBANKS.VIR` page 2,
 /// `WCCGANGS.VIR` page 3, `WCCITOWN.VIR` page 3, and `WCCUSERS.VIR` page 4
@@ -656,7 +806,10 @@ mod tests {
                 }],
                 duplicates,
                 modifiable: false,
+                acs: false,
             }],
+            acs: None,
+            variable: false,
         }
     }
 
@@ -768,7 +921,10 @@ mod tests {
                 ],
                 duplicates: false,
                 modifiable: false,
+                acs: false,
             }],
+            acs: None,
+            variable: false,
         };
         create(&path, &spec).expect("creates");
         let bytes = std::fs::read(&path).expect("reads back");
@@ -802,13 +958,17 @@ mod tests {
                     segments: vec![SegmentSpec { offset: 0, length: 4, kind: 0x0e, descending: false }],
                     duplicates: false,
                     modifiable: false,
+                    acs: false,
                 },
                 KeySpec {
                     segments: vec![SegmentSpec { offset: 4, length: 4, kind: 0x0e, descending: true }],
                     duplicates: false,
                     modifiable: false,
+                    acs: false,
                 },
             ],
+            acs: None,
+            variable: false,
         };
         create(&path, &spec).expect("creates");
         let bytes = std::fs::read(&path).expect("reads back");
@@ -849,7 +1009,7 @@ mod tests {
     #[test]
     fn create_refuses_zero_keys() {
         let path = scratch("zero-keys.dat");
-        let spec = FileSpec { record_length: 12, page_size: 512, keys: vec![] };
+        let spec = FileSpec { record_length: 12, page_size: 512, keys: vec![], acs: None, variable: false };
         let err = create(&path, &spec).expect_err("refuses");
         assert!(err.why.contains("no keys"), "{}", err.why);
         assert!(!path.exists(), "nothing should have been written");
@@ -865,7 +1025,10 @@ mod tests {
                 segments: vec![SegmentSpec { offset: 2, length: 4, kind: 0x0e, descending: false }],
                 duplicates: false,
                 modifiable: false,
+                acs: false,
             }],
+            acs: None,
+            variable: false,
         };
         let err = create(&path, &spec).expect_err("refuses");
         assert!(err.why.contains("past its"), "{}", err.why);
@@ -885,7 +1048,10 @@ mod tests {
                 segments: vec![SegmentSpec { offset: 0, length: 8, kind: 0x05, descending: false }],
                 duplicates: false,
                 modifiable: false,
+                acs: false,
             }],
+            acs: None,
+            variable: false,
         };
         let err = create(&path, &spec).expect_err("refuses");
         assert!(err.why.contains("no ordering"), "{}", err.why);
@@ -899,9 +1065,11 @@ mod tests {
             record_length: 8,
             page_size: 512,
             keys: vec![
-                KeySpec { segments: vec![seg(0)], duplicates: true, modifiable: false },
-                KeySpec { segments: vec![seg(4)], duplicates: true, modifiable: false },
+                KeySpec { segments: vec![seg(0)], duplicates: true, modifiable: false, acs: false },
+                KeySpec { segments: vec![seg(4)], duplicates: true, modifiable: false, acs: false },
             ],
+            acs: None,
+            variable: false,
         };
         let err = create(&path, &spec).expect_err("refuses");
         assert!(err.why.contains("duplicate-permitting"), "{}", err.why);
@@ -922,7 +1090,9 @@ mod tests {
         let spec = FileSpec {
             record_length: 25,
             page_size: 512,
-            keys: vec![KeySpec { segments, duplicates: false, modifiable: false }],
+            keys: vec![KeySpec { segments, duplicates: false, modifiable: false, acs: false }],
+            acs: None,
+            variable: false,
         };
         let err = create(&path, &spec).expect_err("refuses");
         assert!(err.why.contains("25 segments"), "{}", err.why);
@@ -1000,21 +1170,149 @@ mod tests {
                     segments: vec![SegmentSpec { offset: 0, length: 30, kind: 0x0b, descending: false }],
                     duplicates: false,
                     modifiable: false,
+                    acs: false,
                 },
                 KeySpec {
                     segments: vec![SegmentSpec { offset: 30, length: 11, kind: 0x0b, descending: false }],
                     duplicates: false,
                     modifiable: true,
+                    acs: false,
                 },
                 KeySpec {
                     segments: vec![SegmentSpec { offset: 60, length: 4, kind: 0x0e, descending: true }],
                     duplicates: true,
                     modifiable: true,
+                    acs: false,
                 },
             ],
+            acs: None,
+            variable: false,
         };
         create(&a, &spec).expect("creates");
         create(&b, &spec).expect("creates");
         assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    /// The kit's account file, if the operator has it. Third-party data:
+    /// never committed, so this skips rather than fails without it.
+    fn kit(name: &str) -> Option<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/bbsv6")
+            .join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => {
+                eprintln!("skipped: no {name} under tmp/bbsv6");
+                None
+            }
+        }
+    }
+
+    /// The shape of the kit's `BBSUSR.DAT`, read straight off its own control
+    /// record: a 338-byte record (`fcr::RECLEN`), 1024-byte pages, one unique
+    /// zstring key over the first 30 bytes, collating through `ALLCAPS`.
+    fn usracc_spec() -> FileSpec {
+        FileSpec {
+            record_length: 338,
+            page_size: 1024,
+            keys: vec![KeySpec {
+                segments: vec![SegmentSpec { offset: 0, length: 30, kind: 0x0b, descending: false }],
+                duplicates: false,
+                modifiable: false,
+                acs: true,
+            }],
+            acs: Some(crate::acs::allcaps()),
+            variable: false,
+        }
+    }
+
+    #[test]
+    fn an_acs_file_matches_the_kits_account_file_where_records_do_not_matter() {
+        let Some(oracle) = kit("BBSUSR.DAT") else { return };
+        let path = scratch("acs-usracc");
+        create(&path, &usracc_spec()).expect("created");
+        let ours = std::fs::read(&path).expect("read back");
+
+        // Page 0: every field that is not a record or page count. The kit's
+        // own copy holds four records on two data pages, so its page counts
+        // (`fcr::ALLOCATED`, `fcr::PAGES`), its high-water marks and its key
+        // 0 record count (`at::RECORDS`, the 0x114..0x118 hole below) all
+        // moved off what a virgin file writes and say nothing about create.
+        for (lo, hi, what) in [
+            (0x06usize, 0x0a, "version and page size"),
+            (0x14, 0x18, "key count and record length"),
+            (0x38, 0x44, "variable tag, name of the ACS"),
+            (0x106, 0x110, "user flags, variable capacity, ACS page pointer"),
+            (0x110, 0x114, "key 0's root"),
+            (0x118, 0x110 + 0x1e, "the rest of key 0's definition"),
+        ] {
+            assert_eq!(&ours[lo..hi], &oracle[lo..hi], "{what} at {lo:#x}..{hi:#x}");
+        }
+        // Key 0's root page moves down one because the ACS block took page 1.
+        assert_eq!(pages::long(&ours[0x110..0x114]), 2, "root of key 0 is physical page 2");
+
+        // Page 1: the whole ACS block, byte for byte.
+        assert_eq!(&ours[1024..1024 + 6 + 265], &oracle[1024..1024 + 6 + 265], "ACS page");
+        // And the rest of page 1 is zero in both.
+        assert!(ours[1024 + 271..2048].iter().all(|&b| b == 0));
+        assert!(oracle[1024 + 271..2048].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn an_acs_file_opens_and_folds_case_on_the_key() {
+        let path = scratch("acs-opens");
+        create(&path, &usracc_spec()).expect("created");
+        let geometry = crate::Geometry::read("USR", &path).expect("readable");
+        let mut engine: crate::Btrieve<crate::testing::Flat> = crate::Btrieve::default();
+        let mut mem = crate::testing::FlatMem::new(1 << 20);
+        let mut heap = crate::testing::FlatHeap::new(0x1000);
+        let block = engine
+            .open(&mut mem, &mut heap, "USR", &path, geometry, 338)
+            .expect("opens");
+        let file = engine.block_mut(block).expect("block");
+
+        // One record per letter the table folds, rather than `Sysop` alone.
+        // `Sysop` exercises five of the twenty-six mappings and leaves the
+        // other twenty-one free to be wrong: a table with `a` mapped to
+        // itself still finds it. Every letter here is load-bearing --
+        // `Aysop`'s key differs from `Bysop`'s in exactly the byte the fold
+        // has to get right.
+        for initial in b'A'..=b'Z' {
+            let mut record = vec![0u8; 338];
+            record[..5].copy_from_slice(b"Sysop");
+            record[0] = initial;
+            file.insert(&record).expect("inserted");
+        }
+        for initial in b'a'..=b'z' {
+            let mut key = vec![0u8; 30];
+            key[..5].copy_from_slice(b"sysop");
+            key[0] = initial;
+            assert!(
+                file.query(0, crate::Op::Equal, &key).expect("query"),
+                "lowercase {} finds {}ysop through ALLCAPS",
+                char::from(initial),
+                char::from(initial - 0x20)
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_collating_through_a_sequence_the_file_does_not_carry_is_refused() {
+        let mut spec = usracc_spec();
+        spec.acs = None;
+        let err = create(&scratch("acs-missing"), &spec).expect_err("refused");
+        assert!(
+            err.why.contains("collates through an ACS but the file declares none"),
+            "{}",
+            err.why
+        );
+    }
+
+    #[test]
+    fn a_non_text_segment_may_not_collate_through_a_sequence() {
+        let mut spec = usracc_spec();
+        spec.keys[0].segments[0].kind = 0x0e; // unsigned binary
+        let err = create(&scratch("acs-binary"), &spec).expect_err("refused");
+        assert!(err.why.contains("folds text"), "{}", err.why);
     }
 }

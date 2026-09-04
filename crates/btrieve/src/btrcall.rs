@@ -926,7 +926,10 @@ mod tests {
                 }],
                 duplicates: false,
                 modifiable: false,
+                acs: false,
             }],
+            acs: None,
+            variable: false,
         };
         create(&path, &spec).expect("creates a scratch Btrieve file");
         path
