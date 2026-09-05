@@ -139,7 +139,7 @@ pub(crate) const LOGIN_DEADLINE: Duration = Duration::from_secs(120);
 /// script can be read (and diffed) in one place: a caller's screen is a
 /// contract, and a prompt that quietly loses its trailing space is not the
 /// kind of change anybody notices in a diff of `login_dialogue`.
-pub(crate) const USERID_PROMPT: &[u8] = b"Enter your user ID, or NEW to sign up: ";
+const USERID_PROMPT: &[u8] = b"Enter your user ID, or NEW to sign up: ";
 const PASSWORD_PROMPT: &[u8] = b"Enter your password: ";
 const CHOOSE_ID_PROMPT: &[u8] = b"Choose a user ID: ";
 const CHOOSE_PROMPT: &[u8] = b"Choose a password (1 to 9 characters): ";
@@ -440,9 +440,9 @@ async fn login_dialogue(
         };
 
         if typed.trim().eq_ignore_ascii_case("new") {
-            // Step 4: a name of their own. The board still has the last word
+            // Step 2: a name of their own. The board still has the last word
             // on it -- `new` itself is reserved there, and a taken name is
-            // `Exists` -- and either is a counted refusal at step 6.
+            // `Exists` -- and either is a counted refusal at step 4.
             let Some(userid) = read_line(reader, writer, CHOOSE_ID_PROMPT, true).await? else {
                 return Ok(None);
             };
@@ -453,7 +453,7 @@ async fn login_dialogue(
                 continue;
             }
 
-            // Step 5: a new password, twice, neither echoed.
+            // Step 3: a new password, twice, neither echoed.
             let Some(chosen) = read_line(reader, writer, CHOOSE_PROMPT, false).await? else {
                 return Ok(None);
             };
@@ -473,7 +473,7 @@ async fn login_dialogue(
                 continue;
             }
 
-            // Step 6: claim the new account.
+            // Step 4: claim the new account.
             let claim = Login::Signup { userid, password: chosen };
             match claim_or_refuse(reader, writer, host_tx, claim, &mut refusals).await? {
                 Claimed::Channel(chan, out_rx) => {
@@ -492,7 +492,7 @@ async fn login_dialogue(
             continue;
         }
 
-        // Step 2: prove it. Not echoed -- see `read_line`'s `echo`.
+        // Step 5: prove it. Not echoed -- see `read_line`'s `echo`.
         let Some(password) = read_line(reader, writer, PASSWORD_PROMPT, false).await? else {
             return Ok(None);
         };
@@ -503,7 +503,7 @@ async fn login_dialogue(
             continue;
         }
 
-        // Step 3: ask the board. It owns the account file, so it -- not
+        // Step 6: ask the board. It owns the account file, so it -- not
         // this listener -- decides whether this is anybody. An unknown name
         // is a refusal like any other: NEW is the way to sign up.
         let claim = Login::Password { userid, password };
@@ -624,11 +624,11 @@ fn too_long(
 ///   apart and there is nothing either of them could do differently, so
 ///   both write `Server error, try again later.` and end the connection.
 /// - `Ok(Some(Err(refusal)))`: the board said no. **The wire line is not
-///   written here.** Telnet turns [`mbbs::Refusal::Unknown`] into a signup
-///   offer rather than a goodbye, and counts some refusals and not others,
-///   so which refusals become a line -- and which become a prompt -- is the
-///   listener's decision. [`refusal_line`] is the shared vocabulary it
-///   makes that decision with.
+///   written here.** `Full` and `Maintenance` end the connection outright;
+///   every other refusal, including [`mbbs::Refusal::Unknown`], is a
+///   counted try that sends the caller back to the user ID prompt. Which
+///   refusal gets which treatment is the listener's decision, made in
+///   [`claim_or_refuse`] with [`refusal_line`] as the shared vocabulary.
 ///
 /// The `Sender<Out>` half of the queue goes to the host with the claim; the
 /// `Receiver` comes back beside the channel, for [`pump`].

@@ -37,7 +37,9 @@
 //!
 //! An account someone is logged in as cannot be edited (`passwd`, `keys`,
 //! `master`, `delete`): the logoff write-back would undo it. The refusal is
-//! `USERID is online`, exit 1.
+//! `USERID is online`, exit 1. `list` reads the file, not the in-memory
+//! record, so an online caller's row shows the flags from their last
+//! logoff, not anything changed since.
 //!
 //! Exit 0 is done, exit 1 is a refusal (a userid nothing knows, a name
 //! already taken, an account that may not be deleted, a board with no pair or

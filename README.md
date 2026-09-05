@@ -133,7 +133,9 @@ clear, as MajorBBS stored them, and nothing rate-limits connections.
 command to the server over `mbbs-user.sock` in the board directory and the
 server applies it, so the next login sees the change. With the board stopped
 it edits the files directly. An account somebody is logged in as cannot be
-edited until they log off.
+edited until they log off. `list` always reads the file, so a caller with a
+session shows the flags they had at their last logoff, not whatever changed
+since.
 
 ```sh
 ./target/release/mbbs-user --root /path/to/board-data list
