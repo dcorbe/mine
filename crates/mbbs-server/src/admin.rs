@@ -68,9 +68,11 @@ pub enum Reply {
 /// speaks a later one is refused rather than half-understood.
 pub const PROTOCOL: &str = "mbbs-user 1";
 
-/// The most a frame either side may send before its blank line. A request
-/// is a handful of short lines; a reply lists a whole board, at about fifty
-/// bytes a row.
+/// The most a request may send before its blank line. A request is a
+/// handful of short lines, so one bigger than this is a mistake or an
+/// attack, not a legitimate one that grew. A reply is not bounded by this:
+/// it lists a whole board, at about fifty bytes a row, and the sysop who
+/// asked for the listing is entitled to all of it.
 pub const MAX_FRAME: usize = 65536;
 
 /// What looking at the bytes so far came to. `Incomplete` asks for more;
@@ -84,9 +86,16 @@ pub enum Parsed<T> {
 
 /// Split one frame into its `key=value` lines. The shared half of
 /// [`parse_request`] and [`parse_reply`].
-fn lines(buf: &[u8]) -> Parsed<Vec<(&str, &str)>> {
+///
+/// `cap` bounds how large the frame may grow before its blank line arrives;
+/// `None` means unbounded. [`parse_request`] passes [`MAX_FRAME`], since a
+/// request is a handful of short lines. [`parse_reply`] passes `None`: a
+/// reply lists a whole board, and the client reads it to EOF before it is
+/// ever parsed, so there is nothing left here to bound.
+fn lines(buf: &[u8], cap: Option<usize>) -> Parsed<Vec<(&str, &str)>> {
+    let too_long = |len: usize| cap.is_some_and(|cap| len >= cap);
     let Some(first_newline) = buf.iter().position(|&b| b == b'\n') else {
-        return if buf.len() >= MAX_FRAME {
+        return if too_long(buf.len()) {
             Parsed::Invalid("frame too long".into())
         } else {
             Parsed::Incomplete
@@ -97,10 +106,10 @@ fn lines(buf: &[u8]) -> Parsed<Vec<(&str, &str)>> {
     }
     let end = match buf.windows(2).position(|w| w == b"\n\n") {
         Some(i) => i + 2,
-        None if buf.len() >= MAX_FRAME => return Parsed::Invalid("frame too long".into()),
+        None if too_long(buf.len()) => return Parsed::Invalid("frame too long".into()),
         None => return Parsed::Incomplete,
     };
-    if end > MAX_FRAME {
+    if too_long(end) {
         return Parsed::Invalid("frame too long".into());
     }
     let Ok(text) = std::str::from_utf8(&buf[..end]) else {
@@ -180,7 +189,7 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>, String> {
 
 /// Parse a request from the front of `buf`.
 pub fn parse_request(buf: &[u8]) -> Parsed<Request> {
-    let pairs = match lines(buf) {
+    let pairs = match lines(buf, Some(MAX_FRAME)) {
         Parsed::Complete(pairs) => pairs,
         Parsed::Incomplete => return Parsed::Incomplete,
         Parsed::Invalid(why) => return Parsed::Invalid(why),
@@ -245,7 +254,7 @@ pub fn encode_reply(reply: &Reply) -> Vec<u8> {
 
 /// Parse a reply from the front of `buf`.
 pub fn parse_reply(buf: &[u8]) -> Parsed<Reply> {
-    let pairs = match lines(buf) {
+    let pairs = match lines(buf, None) {
         Parsed::Complete(pairs) => pairs,
         Parsed::Incomplete => return Parsed::Incomplete,
         Parsed::Invalid(why) => return Parsed::Invalid(why),
@@ -452,20 +461,23 @@ pub fn send(path: &Path, request: &Request) -> Result<Option<Reply>, String> {
     let bytes = encode_request(request)?;
     sock.write_all(&bytes).map_err(|e| format!("sending to mbbs-server: {e}"))?;
 
-    let mut got = Vec::with_capacity(256);
+    // The server answers with exactly one frame and then closes (`session`
+    // returns after its one write), so the whole reply is read to EOF
+    // before any of it is parsed. A reply is not capped the way a request
+    // is: `list` against a large board is exactly the case this is for.
+    let mut got = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
     loop {
-        match parse_reply(&got) {
-            Parsed::Complete(reply) => return Ok(Some(reply)),
-            Parsed::Invalid(why) => return Err(format!("mbbs-server answered something this mbbs-user cannot read: {why}")),
-            Parsed::Incomplete => {
-                let mut chunk = [0u8; 256];
-                let n = sock.read(&mut chunk).map_err(|e| format!("reading mbbs-server's reply: {e}"))?;
-                if n == 0 {
-                    return Err("mbbs-server closed the socket before it answered".into());
-                }
-                got.extend_from_slice(&chunk[..n]);
-            }
+        let n = sock.read(&mut chunk).map_err(|e| format!("reading mbbs-server's reply: {e}"))?;
+        if n == 0 {
+            break;
         }
+        got.extend_from_slice(&chunk[..n]);
+    }
+    match parse_reply(&got) {
+        Parsed::Complete(reply) => Ok(Some(reply)),
+        Parsed::Invalid(why) => Err(format!("mbbs-server answered something this mbbs-user cannot read: {why}")),
+        Parsed::Incomplete => Err("mbbs-server closed the socket before it answered".into()),
     }
 }
 
@@ -975,6 +987,20 @@ mod tests {
         assert_eq!(parse_reply(b"mbbs-user 1\nstatus=ok\nrow=Dan\t0\tDEMO\n\n"), Parsed::Complete(Reply::Listed(vec![Row { userid: "Dan".into(), flags: 0, ring: vec!["DEMO".into()] }])));
     }
 
+    /// `MAX_FRAME` bounds a request, not a reply: `list` against a board
+    /// with thousands of accounts answers with a frame well past it, and
+    /// the client side has to read the whole thing back.
+    #[test]
+    fn a_reply_larger_than_max_frame_round_trips() {
+        let rows: Vec<Row> = (0..3000)
+            .map(|i| Row { userid: format!("user{i}"), flags: 0, ring: vec!["DEMO".into(), "NORMAL".into()] })
+            .collect();
+        let reply = Reply::Listed(rows);
+        let bytes = encode_reply(&reply);
+        assert!(bytes.len() > MAX_FRAME, "this test needs a reply bigger than a request's cap, got {} bytes", bytes.len());
+        assert_eq!(parse_reply(&bytes), Parsed::Complete(reply));
+    }
+
     /// A stand-in host thread: answers every `In::Admin` with the next
     /// canned reply and hands everything else to `rest`.
     fn fake_host(
@@ -1102,5 +1128,36 @@ mod tests {
         // Live: a second server on the same root is refused.
         let err = serve(path.clone(), tx, serving(true)).await.expect_err("a live socket is another server's");
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    // Multi-thread, for the same reason `mbbs_user.rs`'s live tests need it:
+    // `send` is a blocking synchronous client, and a current-thread runtime
+    // would never get to run the server's spawned accept and session tasks
+    // while `send` sat inside `spawn_blocking` waiting on them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_returns_a_reply_larger_than_max_frame_intact() {
+        let root = scratch("admin-socket-huge-reply").canonicalize().expect("scratch dir exists");
+        let path = socket_path(&root);
+        let rows: Vec<Row> = (0..3000)
+            .map(|i| Row { userid: format!("user{i}"), flags: 0, ring: vec!["DEMO".into(), "NORMAL".into()] })
+            .collect();
+        let reply = Reply::Listed(rows);
+        assert!(
+            encode_reply(&reply).len() > MAX_FRAME,
+            "this test needs a reply bigger than a request's cap, got {} bytes",
+            encode_reply(&reply).len()
+        );
+        let (tx, _seen, _rest) = fake_host(vec![reply.clone()]);
+        serve(path.clone(), tx, serving(true)).await.expect("bind");
+
+        let got = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || send(&path, &Request::List)
+        })
+        .await
+        .expect("the blocking send task did not panic")
+        .expect("no transport error")
+        .expect("a server answered");
+        assert_eq!(got, reply);
     }
 }
