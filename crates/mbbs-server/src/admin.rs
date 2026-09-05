@@ -11,9 +11,20 @@
 //! [`serve`] binds under the board root, or by `mbbs-user` opening the
 //! pair itself.
 
+use std::io;
+use std::os::unix::fs::FileTypeExt;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::oneshot;
+
 use mbbs::abi::Abi;
 use mbbs::accounts::{self, flags, Refusal};
 use mbbs::Host;
+
+use crate::msg::In;
 
 /// One `mbbs-user` command, parsed and with every default already applied.
 ///
@@ -271,6 +282,115 @@ pub fn parse_reply(buf: &[u8]) -> Parsed<Reply> {
 /// A space-separated ring back into keys. Empty is no keys, not one empty key.
 fn split_ring(ring: &str) -> Vec<String> {
     ring.split(' ').filter(|k| !k.is_empty()).map(str::to_string).collect()
+}
+
+/// The admin socket's name under the board root. Both programs derive it
+/// from `--root`, so neither needs a flag for it.
+pub const SOCKET_NAME: &str = "mbbs-user.sock";
+
+/// Where the admin socket for the board at `root` lives.
+pub fn socket_path(root: &Path) -> PathBuf {
+    root.join(SOCKET_NAME)
+}
+
+/// Bind the admin socket at `path` and serve one request per connection.
+///
+/// Anyone who can connect can administer the board's accounts, so the
+/// socket is `0600` and lives in the board root, which the serving user
+/// owns. A socket file already there is a dead server's leftover if nothing
+/// answers on it, and is removed; one that answers is another live server
+/// on the same root, and this one refuses to start rather than steal it.
+///
+/// Does not block: the accept loop runs in its own spawned task.
+pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>, serving: crate::host::Serving) -> io::Result<()> {
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("{} is already served by another mbbs-server", path.display()),
+                ));
+            }
+            std::fs::remove_file(&path)?;
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let tx = tx.clone();
+                    let serving = serving.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = session(stream, tx, serving).await {
+                            eprintln!("mbbs-server: mbbs-user session ended: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("mbbs-server: mbbs-user accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// One session: read a request, answer it, close.
+async fn session(stream: UnixStream, tx: std_mpsc::Sender<In>, serving: crate::host::Serving) -> io::Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+
+    let mut buf = Vec::with_capacity(256);
+    let request = loop {
+        match parse_request(&buf) {
+            Parsed::Complete(request) => break request,
+            Parsed::Invalid(why) => {
+                writer.write_all(&encode_reply(&Reply::Faulted(why))).await?;
+                return Ok(());
+            }
+            Parsed::Incomplete => {
+                let mut chunk = [0u8; 256];
+                let n = reader.read(&mut chunk).await?;
+                if n == 0 {
+                    return Ok(()); // gone before the frame ended
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+    };
+
+    let reply = if !serving.load(std::sync::atomic::Ordering::Relaxed) {
+        Reply::Refused(sentence(crate::conn::MAINTENANCE_LINE))
+    } else {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx.send(In::Admin { request, reply: reply_tx }).is_err() {
+            Reply::Faulted(sentence(crate::conn::SERVER_ERROR_LINE))
+        } else {
+            match reply_rx.await {
+                Ok(reply) => reply,
+                // The host thread died between taking the message and
+                // answering: the same outcome as the send failing.
+                Err(_) => Reply::Faulted(sentence(crate::conn::SERVER_ERROR_LINE)),
+            }
+        }
+    };
+    writer.write_all(&encode_reply(&reply)).await?;
+    Ok(())
+}
+
+/// A listener's wire line as a sentence: the `\r\n` off the end.
+fn sentence(line: &[u8]) -> String {
+    String::from_utf8_lossy(line).trim_end_matches(['\r', '\n']).to_owned()
 }
 
 /// Apply one request to the host that has the account files open.
@@ -772,5 +892,134 @@ mod tests {
         assert_eq!(parse_reply(b"mbbs-user 1\nstatus=ok\nrow=Dan\t0\n\n"), Parsed::Invalid("bad row".into()));
         assert_eq!(parse_reply(b"mbbs-user 1\nstatus=ok\nrow=Dan\tlots\tDEMO\n\n"), Parsed::Invalid("bad row".into()));
         assert_eq!(parse_reply(b"mbbs-user 1\nstatus=ok\nrow=Dan\t0\tDEMO\n\n"), Parsed::Complete(Reply::Listed(vec![Row { userid: "Dan".into(), flags: 0, ring: vec!["DEMO".into()] }])));
+    }
+
+    /// A stand-in host thread: answers every `In::Admin` with the next
+    /// canned reply and hands everything else to `rest`.
+    fn fake_host(
+        replies: Vec<Reply>,
+    ) -> (
+        std::sync::mpsc::Sender<crate::msg::In>,
+        std::sync::mpsc::Receiver<Request>,
+        std::sync::mpsc::Receiver<crate::msg::In>,
+    ) {
+        use crate::msg::In;
+        let (tx, rx) = std::sync::mpsc::channel::<In>();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (rest_tx, rest_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            for msg in rx {
+                match msg {
+                    In::Admin { request, reply } => {
+                        let _ = seen_tx.send(request);
+                        let _ = reply.send(replies.next().unwrap_or(Reply::Faulted("out of canned replies".into())));
+                    }
+                    other => {
+                        let _ = rest_tx.send(other);
+                    }
+                }
+            }
+        });
+        (tx, seen_rx, rest_rx)
+    }
+
+    fn serving(on: bool) -> crate::host::Serving {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(on))
+    }
+
+    /// Connect, send one request, read to close, parse the reply.
+    async fn exchange(path: &std::path::Path, request: &Request) -> Reply {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut sock = tokio::net::UnixStream::connect(path).await.expect("connect");
+        sock.write_all(&encode_request(request).expect("encodes")).await.expect("send");
+        let mut got = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_to_end(&mut got))
+            .await
+            .expect("the server closes within 5s")
+            .expect("read");
+        match parse_reply(&got) {
+            Parsed::Complete(reply) => reply,
+            other => panic!("reply {other:?} from {:?}", String::from_utf8_lossy(&got)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_reaches_the_host_and_its_reply_comes_back() {
+        let root = scratch("admin-socket-roundtrip").canonicalize().expect("scratch dir exists");
+        let path = socket_path(&root);
+        let (tx, seen, _rest) = fake_host(vec![Reply::Ring(vec!["SYSOP".into()])]);
+        serve(path.clone(), tx, serving(true)).await.expect("bind");
+
+        let request = Request::Keys { userid: "Dan".into(), add: vec!["SYSOP".into()], remove: vec![] };
+        assert_eq!(exchange(&path, &request).await, Reply::Ring(vec!["SYSOP".into()]));
+        assert_eq!(seen.recv_timeout(std::time::Duration::from_secs(5)).expect("seen"), request);
+
+        let meta = std::fs::metadata(&path).expect("the socket file exists");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "owner-only");
+    }
+
+    #[tokio::test]
+    async fn during_maintenance_the_request_is_refused_and_never_sent() {
+        let root = scratch("admin-socket-maintenance").canonicalize().expect("scratch dir exists");
+        let path = socket_path(&root);
+        let (tx, seen, _rest) = fake_host(vec![Reply::Done]);
+        serve(path.clone(), tx, serving(false)).await.expect("bind");
+
+        let reply = exchange(&path, &Request::List).await;
+        assert_eq!(
+            reply,
+            Reply::Refused("The system is down for daily maintenance. Try again in a few minutes.".into())
+        );
+        assert!(
+            seen.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "nothing reached the host thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_host_thread_is_a_fault_the_client_can_read() {
+        let root = scratch("admin-socket-dead-host").canonicalize().expect("scratch dir exists");
+        let path = socket_path(&root);
+        let (tx, rx) = std::sync::mpsc::channel::<crate::msg::In>();
+        drop(rx);
+        serve(path.clone(), tx, serving(true)).await.expect("bind");
+
+        assert_eq!(
+            exchange(&path, &Request::List).await,
+            Reply::Faulted("Server error, try again later.".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_does_not_parse_is_a_fault_naming_why() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = scratch("admin-socket-bad-frame").canonicalize().expect("scratch dir exists");
+        let path = socket_path(&root);
+        let (tx, _seen, _rest) = fake_host(vec![]);
+        serve(path.clone(), tx, serving(true)).await.expect("bind");
+
+        let mut sock = tokio::net::UnixStream::connect(&path).await.expect("connect");
+        sock.write_all(b"mbbs-user 1\ncommand=purge\n\n").await.expect("send");
+        let mut got = Vec::new();
+        sock.read_to_end(&mut got).await.expect("read");
+        assert_eq!(parse_reply(&got), Parsed::Complete(Reply::Faulted("unknown command".into())));
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_file_is_replaced_and_a_live_one_is_refused() {
+        let root = scratch("admin-socket-stale").canonicalize().expect("scratch dir exists");
+        let path = socket_path(&root);
+        // Stale: a socket file nothing is listening on.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("a listener to abandon"));
+        assert!(path.exists(), "the abandoned socket file is still there");
+        let (tx, _seen, _rest) = fake_host(vec![Reply::Done]);
+        serve(path.clone(), tx.clone(), serving(true)).await.expect("a stale file is replaced");
+        assert_eq!(exchange(&path, &Request::List).await, Reply::Done);
+
+        // Live: a second server on the same root is refused.
+        let err = serve(path.clone(), tx, serving(true)).await.expect_err("a live socket is another server's");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
 }

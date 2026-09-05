@@ -393,6 +393,13 @@ async fn main() -> ExitCode {
     let serving: mbbs_server::host::Serving =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
+    // Captured before the match below moves `plan` apart: the admin socket
+    // binds under the same root the machine boots against, whichever ABI it
+    // turned out to be.
+    let root = match &plan {
+        Plan::Wg16 { root, .. } | Plan::Wg32 { root, .. } => root.clone(),
+    };
+
     // One machine per process. Its host thread builds its own `A::Cpu`
     // (`Boot::build`, called from `host::life`) -- `A::Cpu` is `!Send` and
     // never crosses into this `async fn`.
@@ -437,6 +444,7 @@ async fn main() -> ExitCode {
     let shutdown = tx.clone();
     let door_tx = tx.clone();
     let rlogin_tx = tx.clone();
+    let admin_tx = tx.clone();
 
     let addrs = match conn::serve_on(tx, &listeners, serving.clone()).await {
         Ok(addrs) => addrs,
@@ -468,6 +476,13 @@ async fn main() -> ExitCode {
         println!("mbbs-server: door socket at {}", path.display());
     }
 
+    let admin_socket = mbbs_server::admin::socket_path(&root);
+    if let Err(e) = mbbs_server::admin::serve(admin_socket.clone(), admin_tx, serving.clone()).await {
+        eprintln!("mbbs-server: failed to bind the admin socket {}: {e}", admin_socket.display());
+        return ExitCode::FAILURE;
+    }
+    println!("mbbs-server: mbbs-user socket at {}", admin_socket.display());
+
     // The accept loop and the host thread are already spawned; this task's
     // only remaining job is to keep the process alive for it, and to shut it
     // down in an orderly way when told to.
@@ -477,6 +492,7 @@ async fn main() -> ExitCode {
     if let Some(path) = &cli.listen_door {
         let _ = std::fs::remove_file(path);
     }
+    let _ = std::fs::remove_file(&admin_socket);
     ExitCode::SUCCESS
 }
 

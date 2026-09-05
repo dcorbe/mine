@@ -1561,6 +1561,10 @@ fn apply<A: Abi>(
             conns[chan.index()] = None;
             Ok(())
         }
+        In::Admin { request, reply } => {
+            let _ = reply.send(crate::admin::apply(host, machine, request));
+            Ok(())
+        }
         // Nothing to apply -- see `In::Alarm`'s own doc. It exists purely to
         // unblock `wake`'s `rx.recv()`, and this arm is the whole of how that
         // shows up here: nothing upstream singles it out any more --

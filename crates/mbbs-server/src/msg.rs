@@ -27,6 +27,18 @@ pub enum In {
     Disconnect {
         chan: Chan,
     },
+
+    /// One `mbbs-user` command that arrived over the admin socket
+    /// (`crate::admin::serve`). The host thread applies it with
+    /// `crate::admin::apply` against the account files it already has
+    /// open, and `reply` carries the answer back to the socket task. A
+    /// dropped `reply` is a client that went away, and is ignored the way
+    /// a dropped `Connect` reply is.
+    Admin {
+        request: crate::admin::Request,
+        reply: oneshot::Sender<crate::admin::Reply>,
+    },
+
     /// Shut this machine's module down and end the host thread.
     ///
     /// A message rather than an `AtomicBool` the driver polls, because the
