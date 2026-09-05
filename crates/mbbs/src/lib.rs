@@ -2208,6 +2208,80 @@ impl<A: Abi> Host<A> {
         resolved
     }
 
+    /// Resolve a claim, copy the account it names into `chan`'s `usracc`
+    /// slot, and connect the channel. Spec section 3.
+    ///
+    /// The vendor's `loadup` (`SIGNUP.C:897-935`) in this host's shape:
+    /// `loadacc` reads the record into the channel's slot first, and the
+    /// terminal defaults -- `dftans`/`stansi`, here
+    /// [`Host::connect_state`] -- are applied on top of it afterwards. That
+    /// order is the contract and this method's order is that order: the
+    /// wire's own ANSI flag, width and page length are what the caller is
+    /// actually looking at, and they must win over whatever the file
+    /// remembers from the last session on some other client.
+    ///
+    /// `Ok(Err(refusal))` leaves the channel exactly as it was -- nothing
+    /// copied, no session -- because the listener still owns it and says one
+    /// line to the caller. The record only reaches module memory once the
+    /// board has agreed to serve it.
+    ///
+    /// A [`Host::resolve_login`] fault is not a refusal: the account files
+    /// are the host's own, and a channel that cannot be told apart from a
+    /// stranger is a stop, not a "try again". It comes back as
+    /// `Ok(Ok(Some(Outcome::Stopped(..))))`, the same shape
+    /// [`Host::connect`] answers a poisoned machine with.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Host::connect`] refuses: no module has registered.
+    pub fn login(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        chan: Chan,
+        login: &accounts::Login,
+        terminal: accounts::Terminal,
+    ) -> io::Result<Result<Option<Outcome<A>>, accounts::Refusal>> {
+        let resolved = match self.resolve_login(machine, login, terminal) {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(refusal)) => return Ok(Err(refusal)),
+            Err(e) => {
+                let stop = self.shim_stop(machine, "login", ShimError::Failed(e))?;
+                return Ok(Ok(Some(stop)));
+            }
+        };
+        let accounts::Resolved { connection, record, position } = resolved;
+
+        // The whole record, at the account file's own record length -- which
+        // `open_accounts` checked against `sizeof(struct usracc)` for this
+        // ABI, so this is the slot's width and not a prefix of it. `curcls`,
+        // `flags`, `credat` and the module's own tail all reach the channel
+        // here or never.
+        let account = self.users().account(chan);
+        if let Err(e) = account.write(A::mem(machine), &record.bytes) {
+            // Half a record in the slot and no session: the logoff write-back
+            // must not push this back into the file as if the login had
+            // finished.
+            self.accounts
+                .as_mut()
+                .expect("resolve_login answered, so the account files are open")
+                .end(chan);
+            let stop = self.shim_stop(
+                machine,
+                "copying the account into the channel",
+                ShimError::Failed(e.to_string()),
+            )?;
+            return Ok(Ok(Some(stop)));
+        }
+
+        self.accounts
+            .as_mut()
+            .expect("resolve_login answered, so the account files are open")
+            .begin(chan, position);
+
+        self.connect(machine, module, chan, &connection).map(Ok)
+    }
+
     /// The file a module named, with the directory it is allowed to name
     /// stripped off.
     ///
@@ -5536,9 +5610,22 @@ impl<A: Abi> Host<A> {
         // channel has. T-LORD writes a Control-S ahead of every `<MORE>` it
         // paints itself and expects GSBL to consume it (`btucpc`); without
         // this it reached the wire, 27 times a session.
+        //
+        // **Only when the channel has none.** `loadup` does
+        // `if (usaptr->scnbrk == 0) usaptr->scnbrk=24;` (`SIGNUP.C:905-907`)
+        // -- the 24 is the default for an account that has never had a page
+        // length, not a reset of the one the account chose. A channel
+        // connected from a bare `Connection` still gets it, because its slot
+        // was zeroed by `rstchn`; a channel `Host::login` has just copied a
+        // record into keeps the record's own value.
         let at = A::ptr_offset(account, account_layout.scnbrk);
-        at.write(A::mem(machine), &[24])
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        let scnbrk = at
+            .resolve(A::mem_ref(machine), 1)
+            .map_err(|e| ShimError::Failed(e.to_string()))?[0];
+        if scnbrk == 0 {
+            at.write(A::mem(machine), &[24])
+                .map_err(|e| ShimError::Failed(e.to_string()))?;
+        }
         shims::screen::restore_screen(self, A::mem(machine), chan)?;
 
         // ...but leave screen pausing off by default. `rstrxf` above set the
@@ -6129,6 +6216,14 @@ impl<A: Abi> Host<A> {
         chan: Chan,
         vector: Vector,
     ) -> io::Result<Option<Outcome<A>>> {
+        // Before anything else, and before the module's own routine above
+        // all: `_LJNGAME_HUPROU` is free to clear the channel's account slot
+        // as part of saving its player, and a write-back that ran after it
+        // would store whatever it left behind. See [`Host::write_back`].
+        if let Some(stopped) = self.write_back(machine, chan)? {
+            return Ok(Some(stopped));
+        }
+
         // A listing has no one to finish for; `tshlst` has no `TSHHUP` arm.
         self.listings.remove(&chan);
         if let Err(e) = self.point_curusr(machine, chan) {
@@ -6221,6 +6316,87 @@ impl<A: Abi> Host<A> {
             return self.shim_stop(machine, "rstchn", e).map(Some);
         }
         Ok(outcome)
+    }
+
+    /// `curusr(usrnum); usaptr->usedat=today(); updacc();` --
+    /// `MAJORBBS.C:5304-5306`, the last thing a departing channel's account
+    /// gets. The slot as the session leaves it, stamped with today's date,
+    /// goes back to the record it was loaded from.
+    ///
+    /// **Only for a channel [`Host::login`] served.** A channel connected
+    /// from a bare [`Connection`] -- every fixture, and the door relay
+    /// before it resolves its claims here -- has no session and no position,
+    /// and there is nothing to write it back to. `Ok(None)` means "nothing
+    /// to do" as well as "done"; the `Some` is a stop.
+    ///
+    /// The position was remembered at login rather than looked up again by
+    /// userid, which is what makes this safe against the one thing a module
+    /// can do to the slot that a re-lookup could not survive: overwrite the
+    /// `userid` field. The vendor's `usaptr` is the same promise in pointer
+    /// form.
+    ///
+    /// This host's `curusr` equivalent, [`Host::point_curusr`], is not
+    /// needed first: the slot is addressed from `chan` and no global is
+    /// read, so this runs ahead of it and a channel whose pointing fails
+    /// still has its account saved.
+    fn write_back(&mut self, machine: &mut A::Cpu, chan: Chan) -> io::Result<Option<Outcome<A>>> {
+        let Some(accounts::Session { position }) =
+            self.accounts.as_ref().and_then(|a| a.session(chan))
+        else {
+            return Ok(None);
+        };
+
+        // Read before the destructure below: `clock` takes `&mut self`.
+        let today = match self.clock().civil().and_then(|now| now.dos_date()) {
+            Ok(today) => today,
+            Err(e) => {
+                return self
+                    .shim_stop(machine, "logoff account write", ShimError::Failed(e))
+                    .map(Some)
+            }
+        };
+
+        let stride = usize::from(self.users().account_stride());
+        let account = self.users().account(chan);
+        let bytes = match account.resolve(A::mem_ref(machine), stride) {
+            Ok(bytes) => bytes.to_vec(),
+            Err(e) => {
+                return self
+                    .shim_stop(
+                        machine,
+                        "logoff account write",
+                        ShimError::Failed(e.to_string()),
+                    )
+                    .map(Some)
+            }
+        };
+        let mut record = accounts::Usracc::from_bytes(bytes);
+        record.set_usedat(today);
+
+        let written = {
+            let Host { btrieve, accounts, .. } = self;
+            let accounts = accounts
+                .as_mut()
+                .expect("a session exists, so the account files are open");
+            btrieve
+                .block_mut(accounts.accbb)
+                .and_then(|block| {
+                    block.update(position, &record.bytes).map_err(|why| {
+                        format!("writing back the account {}: {why}", record.userid())
+                    })
+                })
+        };
+        if let Err(e) = written {
+            return self
+                .shim_stop(machine, "logoff account write", ShimError::Failed(e))
+                .map(Some);
+        }
+
+        self.accounts
+            .as_mut()
+            .expect("a session exists, so the account files are open")
+            .end(chan);
+        Ok(None)
     }
 
     /// `void alcvda(void)` -- give every channel its volatile data area.

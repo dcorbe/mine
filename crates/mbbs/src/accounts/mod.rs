@@ -244,9 +244,12 @@ pub struct Accounts<A: Abi> {
     #[allow(dead_code)]
     pub(crate) lock: std::fs::File,
     /// Each channel's account session, indexed by [`Chan::index`](crate::Chan::index).
-    // Written and read by `Host::login`/`Host::disconnect`, which do not
-    // exist yet. Comes off with them.
-    #[allow(dead_code)]
+    ///
+    /// One entry per channel this host was built with, so
+    /// [`begin`](Accounts::begin), [`session`](Accounts::session) and
+    /// [`end`](Accounts::end) index it directly: a `Chan` is minted from the
+    /// host's own [`Terms`](crate::Terms), so there is no channel this host
+    /// has and this vector does not.
     pub(crate) sessions: Vec<Option<Session>>,
     /// 30 bytes of module memory holding the userid `dlarou` is called with
     /// during the maintenance purge.
@@ -645,6 +648,30 @@ impl<A: Abi> Accounts<A> {
         self.write_ring(btrieve, &ring)?;
         Ok((position, record))
     }
+
+    /// Remember that `chan` is logged in as the account at `position`.
+    ///
+    /// The vendor keeps this in `usaptr`, the pointer `curusr` sets from the
+    /// channel number; this host keeps the position instead, because
+    /// `updacc` here is a positioned Btrieve update rather than a write
+    /// through a pointer into a table the engine owns.
+    pub(crate) fn begin(&mut self, chan: crate::Chan, position: u32) {
+        self.sessions[chan.index()] = Some(Session { position });
+    }
+
+    /// Which account `chan` is logged in as, if any. A channel connected
+    /// from a bare [`Connection`](crate::Connection) has none, and nothing
+    /// is written back for it.
+    pub(crate) fn session(&self, chan: crate::Chan) -> Option<Session> {
+        self.sessions[chan.index()]
+    }
+
+    /// Forget `chan`'s session. Called once the logoff write-back has run,
+    /// so that a second disconnect on the same channel cannot write the
+    /// record a third party has since been given.
+    pub(crate) fn end(&mut self, chan: crate::Chan) {
+        self.sessions[chan.index()] = None;
+    }
 }
 
 #[cfg(test)]
@@ -653,10 +680,14 @@ mod tests {
     use crate::abi::{Abi, Wg16};
     use crate::testing::{scratch, Fixture};
     use crate::Host;
+    use mbbs_machine::m16::FarPtr;
 
+    /// Two channels, not the `NTERMS` one a bare fixture gets: the login
+    /// path copies a record into the slot a `Chan` names, and a board with
+    /// one channel cannot tell that apart from always writing channel zero.
     fn board(name: &str) -> Fixture {
         let root = scratch(name);
-        Fixture::rooted(root)
+        Fixture::rooted_with_terms(root, crate::Terms::new(2))
     }
 
     /// A board whose pair is open, with the ring a new account gets.
@@ -764,6 +795,95 @@ mod tests {
             .expect("the key block")
             .delete(position)
             .expect("deleted");
+    }
+
+    /// Register a `struct module` whose entry points are these `(index,
+    /// vector)` pairs, and null everywhere else.
+    ///
+    /// [`Host::connect`] and [`Host::hangup`] both refuse a host no module
+    /// has registered with, and loading one is not registering it -- see
+    /// [`Fixture::minimal_module`]. Most of the login tests are about no
+    /// module routine at all, so they pass no entries and every call answers
+    /// "no call happened". `index` is `MAJORBBS.H:241-252`'s numbering after
+    /// `descrp`: 0 `lonrou`, 4 `lofrou`, 5 `huprou`.
+    ///
+    /// The same helper `lib.rs`'s test module calls `register_module_with`,
+    /// duplicated rather than shared because that one is private to that
+    /// module -- this crate's own convention for a fixture two test modules
+    /// need (see `crates/mbbs/src/heap.rs`'s test module doc comment).
+    fn register_module(f: &mut Fixture, entries: &[(usize, FarPtr)]) {
+        let mut bytes = b"MajorMUD".to_vec();
+        bytes.resize(25 + 9 * 4, 0);
+        for (n, at) in entries {
+            let field = 25 + n * 4;
+            bytes[field..field + 4].copy_from_slice(&at.to_bytes());
+        }
+        let block = f.bytes(&bytes, false);
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .expect("registered");
+    }
+
+    /// 16-bit code that stores each `mark` at its `at` and returns.
+    ///
+    /// `lib.rs`'s `marker_stub` with more than one store, and duplicated for
+    /// the same reason [`register_module`] is. `AX` is left alone -- nothing
+    /// here reads a return value, and `Machine::call` zeroes it anyway.
+    fn store_stub(writes: &[(FarPtr, u8)]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for (at, mark) in writes {
+            code.push(0xbb); // mov bx, <selector>
+            code.extend_from_slice(&at.selector.to_le_bytes());
+            code.extend_from_slice(&[0x8e, 0xc3]); // mov es, bx
+            code.extend_from_slice(&[0x26, 0xc6, 0x06]); // mov byte ptr es:[at], mark
+            code.extend_from_slice(&at.offset.to_le_bytes());
+            code.push(*mark);
+        }
+        code.push(0xcb); // retf
+        code
+    }
+
+    /// A pointer to one byte of a channel's account slot.
+    fn slot_at(f: &Fixture, chan: crate::Chan, offset: usize) -> FarPtr {
+        Wg16::ptr_offset(
+            f.host.users().account(chan),
+            u16::try_from(offset).expect("an offset inside a usracc"),
+        )
+    }
+
+    fn set_byte(f: &mut Fixture, userid: &str, at: usize, value: u8) {
+        amend(f, userid, |record| record.bytes[at] = value);
+    }
+
+    fn set_usedat(f: &mut Fixture, userid: &str, packed: u16) {
+        amend(f, userid, |record| record.set_usedat(packed));
+    }
+
+    /// The account record in a channel's `usracc` slot, read out of module
+    /// memory. What the module sees, not what the file holds.
+    fn slot(f: &Fixture, chan: crate::Chan) -> Vec<u8> {
+        let at = f.host.users().account(chan);
+        let stride = usize::from(f.host.users().account_stride());
+        mbbs_machine::ptr::ModulePtr::resolve(&at, Wg16::mem_ref(&f.machine), stride)
+            .expect("readable")
+            .to_vec()
+    }
+
+    /// Change one byte of a channel's slot, the way a module does during a
+    /// session.
+    fn write_slot_byte(f: &mut Fixture, chan: crate::Chan, offset: usize, value: u8) {
+        let at = slot_at(f, chan, offset);
+        mbbs_machine::ptr::ModulePtr::write(&at, Wg16::mem(&mut f.machine), &[value])
+            .expect("writable");
+    }
+
+    fn find(f: &mut Fixture, userid: &str) -> (u32, Usracc) {
+        find_opt(f, userid).expect("the account exists")
+    }
+
+    fn find_opt(f: &mut Fixture, userid: &str) -> Option<(u32, Usracc)> {
+        let Host { btrieve, accounts, .. } = &mut f.host;
+        let accounts = accounts.as_mut().expect("accounts are open");
+        accounts.find_account(btrieve, userid).expect("no engine fault")
     }
 
     #[test]
@@ -1184,6 +1304,184 @@ mod tests {
                 .unwrap()
                 .unwrap_err(),
             Refusal::Deleted
+        );
+    }
+
+    /// The whole login path, from a claim to a channel the module can serve.
+    ///
+    /// Channel 1, not 0: the record is copied to the slot the channel names,
+    /// and a copy that always wrote channel zero would pass on channel zero.
+    #[test]
+    fn login_copies_the_whole_record_into_the_channels_slot() {
+        let mut f = opened("login-copies");
+        signup(&mut f, "Dan", "hunter2");
+        set_curcls(&mut f, "Dan", "STAFF"); // a field connect_state never writes
+        register_module(&mut f, &[]);
+        let module = f.minimal_module();
+        let chan = f.host.users().terms().chan(1).expect("channel 1");
+        let out = f
+            .host
+            .login(
+                &mut f.machine,
+                &module,
+                chan,
+                &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+                Terminal { ansi: false, width: 132, height: 50 },
+            )
+            .expect("no io error")
+            .expect("accepted");
+        assert!(out.is_none(), "a minimal module has no lonrou");
+        let bytes = slot(&f, chan);
+        assert_eq!(
+            &bytes[at::CURCLS..at::CURCLS + 5],
+            b"STAFF",
+            "the record, not connect_state's four fields, landed on channel 1"
+        );
+        assert_eq!(bytes[at::ANSIFL], 0, "the wire's terminal facts overwrite the record's");
+        assert_eq!(bytes[at::SCNWID], 132);
+        assert_eq!(bytes[at::SCNBRK], 24, "zero scnbrk became 24");
+    }
+
+    /// `loadup`'s rule, `SIGNUP.C:905-907`: the 24 is a default for an
+    /// account that has never had a page length, not a reset of the one the
+    /// account chose.
+    #[test]
+    fn a_nonzero_scnbrk_survives_connect() {
+        let mut f = opened("login-scnbrk");
+        signup(&mut f, "Dan", "hunter2");
+        set_byte(&mut f, "Dan", at::SCNBRK, 40);
+        register_module(&mut f, &[]);
+        let module = f.minimal_module();
+        let chan = f.host.users().terms().chan(0).unwrap();
+        f.host
+            .login(
+                &mut f.machine,
+                &module,
+                chan,
+                &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+                term(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot(&f, chan)[at::SCNBRK], 40);
+    }
+
+    /// A refused claim is the listener's to answer; the channel is exactly
+    /// as it was, with nothing copied into it and no session to write back.
+    #[test]
+    fn a_refusal_leaves_the_channel_untouched() {
+        let mut f = opened("login-refused");
+        register_module(&mut f, &[]);
+        let module = f.minimal_module();
+        let chan = f.host.users().terms().chan(0).unwrap();
+        let r = f.host.login(
+            &mut f.machine,
+            &module,
+            chan,
+            &Login::Password { userid: "Nobody".into(), password: "x".into() },
+            term(),
+        )
+        .unwrap();
+        assert_eq!(r.unwrap_err(), Refusal::Unknown);
+        assert!(f.host.accounts().unwrap().sessions[0].is_none());
+        assert!(
+            slot(&f, chan).iter().all(|&b| b == 0),
+            "nothing was written into the channel's usracc"
+        );
+    }
+
+    /// `curusr(usrnum); usaptr->usedat=today(); updacc();`,
+    /// `MAJORBBS.C:5304-5306`. What the module left in the slot is what
+    /// reaches the file.
+    #[test]
+    fn hangup_stamps_usedat_and_writes_the_slot_back() {
+        let mut f = opened("login-hangup");
+        signup(&mut f, "Dan", "hunter2");
+        set_usedat(&mut f, "Dan", 0);
+        register_module(&mut f, &[]);
+        let module = f.minimal_module();
+        let chan = f.host.users().terms().chan(0).unwrap();
+        f.host
+            .login(
+                &mut f.machine,
+                &module,
+                chan,
+                &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+                term(),
+            )
+            .unwrap()
+            .unwrap();
+        // A module changed something in the account block during the session.
+        write_slot_byte(&mut f, chan, at::SCNBRK, 33);
+        f.host.hangup(&mut f.machine, &module, chan).expect("hung up");
+        let (_, rec) = find(&mut f, "Dan");
+        assert_ne!(rec.usedat(), 0, "usedat is today");
+        assert_eq!(rec.bytes[at::SCNBRK], 33, "updacc wrote the whole slot back");
+        assert!(f.host.accounts().unwrap().sessions[0].is_none());
+    }
+
+    /// The write-back belongs to the account layer, not to every channel: a
+    /// fixture's bare [`crate::Connection`] has no record and no position,
+    /// and a logoff that invented one would write a stranger into the file.
+    #[test]
+    fn a_bare_connection_never_writes_the_file() {
+        let mut f = opened("login-bare");
+        register_module(&mut f, &[]);
+        let module = f.minimal_module();
+        let chan = f.host.users().terms().chan(0).unwrap();
+        f.host
+            .connect(&mut f.machine, &module, chan, &crate::Connection::ansi("Fixture"))
+            .expect("connected");
+        f.host.hangup(&mut f.machine, &module, chan).expect("hung up");
+        assert!(
+            find_opt(&mut f, "Fixture").is_none(),
+            "no record was created or written for a fixture connection"
+        );
+    }
+
+    /// The account reaches the file before the module's own hangup routine
+    /// runs, not after: `_LJNGAME_HUPROU` saves its player and is free to
+    /// leave the channel's `usracc` however it likes, and a write-back that
+    /// ran afterwards would store that instead of the session.
+    #[test]
+    fn the_write_back_runs_before_the_modules_hangup_routine() {
+        let mut f = opened("login-huprou-order");
+        signup(&mut f, "Dan", "hunter2");
+        let module = f.minimal_module();
+        let chan = f.host.users().terms().chan(0).unwrap();
+
+        // A `huprou` that scribbles 99 over the slot's `scnbrk`, and stamps
+        // a byte of its own so that a routine which never ran cannot be
+        // mistaken for one whose writes came too late.
+        let ran = f.buffer(1);
+        let huprou = f.machine.code_ptr(0);
+        let stub = store_stub(&[(slot_at(&f, chan, at::SCNBRK), 99), (ran, 1)]);
+        register_module(&mut f, &[(5, huprou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+
+        f.host
+            .login(
+                &mut f.machine,
+                &module,
+                chan,
+                &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+                term(),
+            )
+            .unwrap()
+            .unwrap();
+        write_slot_byte(&mut f, chan, at::SCNBRK, 33);
+        f.host.hangup(&mut f.machine, &module, chan).expect("hung up");
+
+        assert_eq!(
+            f.machine.resolve(ran, 1).expect("the marker")[0],
+            1,
+            "huprou ran, so what it wrote is a real alternative to what the file holds"
+        );
+        let (_, rec) = find(&mut f, "Dan");
+        assert_eq!(
+            rec.bytes[at::SCNBRK],
+            33,
+            "the session's own value reached the file, not the one huprou left behind"
         );
     }
 }
