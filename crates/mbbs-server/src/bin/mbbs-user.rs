@@ -6,8 +6,9 @@
 //! `valuid`, the password bounds, the flags word, a ring's `RINGSZ` -- lives
 //! in `mbbs`'s account layer with the login path. This binary is the sysop's
 //! way in: it opens the same pair the server opens, through the same
-//! `Host::open_accounts`, under the same advisory lock, and calls the same
-//! `Host::account_*` methods a login calls into. It has no rules of its own.
+//! `Host::open_accounts`, under the same advisory lock, and hands the
+//! command to `mbbs_server::admin::apply`, the one implementation of these
+//! commands. It has no rules of its own.
 //!
 //! Three things it deliberately does not do:
 //!
@@ -43,8 +44,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use mbbs::abi::{Abi, Wg16, Wg32};
-use mbbs::accounts::{self, flags, Refusal};
+use mbbs::accounts::{self, flags};
 use mbbs::{Host, Terms};
+use mbbs_server::admin;
 use mbbs_server::host::build_wg32_cpu;
 
 /// What `master on` says every time, whatever the board.
@@ -229,24 +231,56 @@ fn run<A: Abi>(machine: &mut A::Cpu, root: &Path, command: &Command) -> Result<(
     host.open_accounts(machine, mbbs_server::conn::default_keys())
         .map_err(open_refusal)?;
 
-    match command {
-        Command::List => list(&mut host),
-        Command::Add { userid, password, keys } => {
-            let password = password_for(password.as_deref())?;
-            let ring = if keys.is_empty() {
-                mbbs_server::conn::default_keys()
-            } else {
-                keys.clone()
-            };
-            accept(userid, host.account_add(machine, userid, &password, &ring))
+    let request = request_for(command)?;
+    finish(command, admin::apply(&mut host, machine, request))
+}
+
+/// The argv command as a request, with the password prompted for and the
+/// default ring filled in, so that `admin::apply` sees no defaults.
+fn request_for(command: &Command) -> Result<admin::Request, Failure> {
+    Ok(match command {
+        Command::List => admin::Request::List,
+        Command::Add { userid, password, keys } => admin::Request::Add {
+            userid: userid.clone(),
+            password: password_for(password.as_deref())?,
+            keys: if keys.is_empty() { mbbs_server::conn::default_keys() } else { keys.clone() },
+        },
+        Command::Passwd { userid, password } => admin::Request::Passwd {
+            userid: userid.clone(),
+            password: password_for(password.as_deref())?,
+        },
+        Command::Keys { userid, add, remove } => admin::Request::Keys {
+            userid: userid.clone(),
+            add: add.clone(),
+            remove: remove.clone(),
+        },
+        Command::Master { userid, switch } => admin::Request::Master {
+            userid: userid.clone(),
+            on: *switch == Switch::On,
+        },
+        Command::Delete { userid } => admin::Request::Delete { userid: userid.clone() },
+    })
+}
+
+/// Print what a reply has to show and turn it into an exit code.
+///
+/// The only place this program writes to stdout, so that both transports
+/// print byte-for-byte the same thing.
+fn finish(command: &Command, reply: admin::Reply) -> Result<(), Failure> {
+    match reply {
+        admin::Reply::Done => {
+            if matches!(command, Command::Master { switch: Switch::On, .. }) {
+                eprintln!("mbbs-user: {MASTER_WARNING}");
+            }
+            Ok(())
         }
-        Command::Passwd { userid, password } => {
-            let password = password_for(password.as_deref())?;
-            accept(userid, host.account_set_password(userid, &password))
+        admin::Reply::Refused(line) => Err(Failure::refused(line)),
+        admin::Reply::Faulted(line) => Err(Failure::faulted(line)),
+        admin::Reply::Listed(rows) => list(&rows),
+        admin::Reply::Ring(ring) => {
+            println!("{}", if ring.is_empty() { "-".to_owned() } else { ring.join(" ") });
+            Ok(())
         }
-        Command::Keys { userid, add, remove } => keys(&mut host, userid, add, remove),
-        Command::Master { userid, switch } => master(&mut host, userid, *switch),
-        Command::Delete { userid } => accept(userid, host.account_tag_deleted(userid)),
     }
 }
 
@@ -264,52 +298,16 @@ fn open_refusal(e: io::Error) -> Failure {
     Failure::refused(e.to_string())
 }
 
-/// Turn one account-layer answer into an exit code.
-///
-/// `Ok(Err(refusal))` is the sysop's mistake and exits 1. `Err(fault)` is the
-/// engine or the files, and exits 2.
-fn accept(userid: &str, answer: Result<Result<(), Refusal>, String>) -> Result<(), Failure> {
-    match answer {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(refusal)) => Err(Failure::refused(refused(userid, refusal))),
-        Err(why) => Err(Failure::faulted(why)),
-    }
-}
-
-/// What each refusal is called on a sysop's terminal.
-///
-/// The listeners have their own vocabulary for these
-/// (`mbbs_server::conn::refusal_line`) and it is the wrong one here: a caller
-/// is told "No account by that name.", where a sysop is told which name. The
-/// last six arms cannot be reached from any command in this program -- they are a
-/// listener's answers to a claim -- and are spelled out anyway because
-/// `Refusal` is closed, so a new variant lands here as a compile error rather
-/// than as a wrong sentence.
-fn refused(userid: &str, refusal: Refusal) -> String {
-    match refusal {
-        Refusal::Unknown => format!("no account named {userid}"),
-        Refusal::Exists => format!("{userid} already has an account"),
-        Refusal::Invalid(why) => why.to_string(),
-        Refusal::BadPassword => format!("{userid}'s password does not match"),
-        Refusal::NoPassword => format!("{userid} has no password"),
-        Refusal::Deleted => format!("{userid} is tagged for deletion"),
-        Refusal::Suspended => format!("{userid} is suspended"),
-        Refusal::Full => "the board is full".to_owned(),
-        Refusal::Maintenance => "the board is in maintenance".to_owned(),
-    }
-}
-
 /// `list`: the whole account file, one row each, in key order.
-fn list<A: Abi>(host: &mut Host<A>) -> Result<(), Failure> {
-    let listed = host.account_list().map_err(Failure::faulted)?;
+fn list(rows: &[admin::Row]) -> Result<(), Failure> {
     let mut out = io::stdout().lock();
-    let mut row = |userid: &str, flags: &str, ring: &str| {
+    let mut row_out = |userid: &str, flags: &str, ring: &str| {
         let line = format!("{userid:<29} {flags:<9} {ring}");
         writeln!(out, "{}", line.trim_end())
     };
-    row("USERID", "FLAGS", "RING").map_err(|e| Failure::faulted(e.to_string()))?;
-    for (record, ring) in listed {
-        row(record.userid(), &spelled(record.flags()), &ring.join(" "))
+    row_out("USERID", "FLAGS", "RING").map_err(|e| Failure::faulted(e.to_string()))?;
+    for row in rows {
+        row_out(&row.userid, &spelled(row.flags), &row.ring.join(" "))
             .map_err(|e| Failure::faulted(e.to_string()))?;
     }
     Ok(())
@@ -335,90 +333,6 @@ fn spelled(word: u16) -> String {
     } else {
         named.join(",")
     }
-}
-
-/// `keys`: the removals first, then the additions, then the file.
-///
-/// Removals before additions so that `--remove SYSOP --add SYSOP` is a way to
-/// move a key to the end of the ring rather than a way to lose it, and so
-/// that the order does not depend on the order the two flags were typed in.
-///
-/// An added key has to be one word of at most `KEYSIZ - 1` characters, and
-/// anything else is refused before the ring is touched -- see the check
-/// itself for what a space or a long name would do to a stored ring.
-fn keys<A: Abi>(
-    host: &mut Host<A>,
-    userid: &str,
-    add: &[String],
-    remove: &[String],
-) -> Result<(), Failure> {
-    // Asked first: `account_ring` answers `None` both for an account with no
-    // ring record and for no account at all, and those are different
-    // sentences.
-    if host.account_find(userid).map_err(Failure::faulted)?.is_none() {
-        return Err(Failure::refused(refused(userid, Refusal::Unknown)));
-    }
-
-    // A key name is one word, short enough for `keys[KEYSIZ]`. A ring is
-    // stored space-separated and split on spaces when it is loaded, so a key
-    // with a space in it is two keys the moment it is read back, and one
-    // longer than `KEYSIZ - 1` is silently cut short by whatever reads it
-    // into that array. Both are refused here rather than written: the
-    // removal side needs no such check, since a name that cannot be stored
-    // cannot be on a ring to remove.
-    for key in add {
-        if key.is_empty()
-            || key.chars().any(char::is_whitespace)
-            || key.len() > accounts::KEYSIZ - 1
-        {
-            return Err(Failure::refused(format!(
-                "a key name is one word of at most {} characters",
-                accounts::KEYSIZ - 1
-            )));
-        }
-    }
-
-    // A `keys USERID` with neither flag is a question, and a question does
-    // not rewrite the record it is asking about: writing a ring is a delete
-    // and an insert (see `Accounts::write_ring`), which is not a thing to do
-    // to a file for no reason.
-    if !add.is_empty() || !remove.is_empty() {
-        let mut ring = ring_of(host, userid)?;
-        ring.retain(|key| !remove.iter().any(|gone| gone.eq_ignore_ascii_case(key)));
-        ring.extend(add.iter().map(|key| key.to_ascii_uppercase()));
-        accept(userid, host.account_write_ring(userid, &ring))?;
-    }
-
-    // Read back out of the file rather than printed from the ring just
-    // written: what the sysop is shown is what the next login will load.
-    let now = ring_of(host, userid)?;
-    println!("{}", if now.is_empty() { "-".to_owned() } else { now.join(" ") });
-    Ok(())
-}
-
-fn ring_of<A: Abi>(host: &mut Host<A>, userid: &str) -> Result<Vec<String>, Failure> {
-    Ok(host
-        .account_ring(userid)
-        .map_err(Failure::faulted)?
-        .map_or_else(Vec::new, |ring| ring.keys))
-}
-
-/// `master`: set or clear `HASMST`, and say what setting it means.
-fn master<A: Abi>(host: &mut Host<A>, userid: &str, switch: Switch) -> Result<(), Failure> {
-    let Some((_, record)) = host.account_find(userid).map_err(Failure::faulted)? else {
-        return Err(Failure::refused(refused(userid, Refusal::Unknown)));
-    };
-    // The whole word, with one bit changed: the other three are the sysop's
-    // and this command has no business touching them.
-    let word = match switch {
-        Switch::On => record.flags() | flags::HASMST,
-        Switch::Off => record.flags() & !flags::HASMST,
-    };
-    accept(userid, host.account_set_flags(userid, word))?;
-    if switch == Switch::On {
-        eprintln!("mbbs-user: {MASTER_WARNING}");
-    }
-    Ok(())
 }
 
 /// The password to write: the one given, or one typed twice at a terminal.
