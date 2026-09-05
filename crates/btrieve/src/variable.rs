@@ -1817,14 +1817,27 @@ impl<'a, S: PageSource> Space<'a, S> {
     ///
     /// # Where on the page it goes
     ///
-    /// Past the last fragment, unless a delete left a slot free
-    /// ([`reusable_slot`]) -- then **that** slot, with the fragments behind
-    /// it sliding up to make room and their entries rebased to match. The
-    /// fragment count does not move for a reuse: the array already has the
-    /// entry. Both branches are the engine's own allocator
+    /// Past the last fragment, unless the file is **version 5** and a delete
+    /// left a slot free ([`reusable_slot`]) -- then **that** slot, with the
+    /// fragments behind it sliding up to make room and their entries rebased
+    /// to match. The fragment count does not move for a reuse: the array
+    /// already has the entry. Both branches are the engine's own allocator
     /// (`W32MKDE_decompiled.c:19267`), and `v5_variable_delete.fixture`
     /// measured the reuse end to end -- see [`free_fragment`]'s doc comment
     /// for the recorded page.
+    ///
+    /// **A v6 file always appends, hole or no hole, and that is deliberate.**
+    /// The engine's allocator is one routine for both versions and does not
+    /// gate the reuse on the version, so this is not a claim that v6 behaves
+    /// differently -- it is that nothing has *recorded* v6 behaving either
+    /// way. `free_fragment_v6`'s interior branch leaves `0xffff` entries
+    /// behind, so the reuse would be reachable the moment a v6 delete were
+    /// followed by an insert, and the four committed v6 fixtures were
+    /// recorded against a host that appended. Reuse for v6 awaits a
+    /// recording of its own -- a v6 delete followed by an insert, the way
+    /// `v5_variable_delete.fixture` is for v5 -- and until then a v6 file
+    /// keeps exactly the placement its fixtures pin. The cost is a hole a v6
+    /// file does not fill, which is space, not correctness.
     ///
     /// [`Self::room_for`] still asks a page for `needed + 2` bytes even when
     /// it will reuse a slot and grow the array by nothing; the engine asks
@@ -1891,7 +1904,13 @@ impl<'a, S: PageSource> Space<'a, S> {
         // `v5_variable_delete.fixture` deletes fragment 0 of two and the
         // insert that follows lands back on fragment 0, with the survivor
         // still fragment 1 and the page still holding two.
-        let reused = reusable_slot(&page, fragments)?;
+        // Version 5 only -- see this function's own doc comment for why a v6
+        // file appends past a hole rather than filling it.
+        let reused = if self.version == Version::V5 {
+            reusable_slot(&page, fragments)?
+        } else {
+            None
+        };
         let at = match reused {
             None => boundary,
             Some(which) => {
@@ -3497,6 +3516,60 @@ mod tests {
         assert_eq!(entry(after, 2), Ok(0x2e), "the boundary, shifted with it");
         assert_eq!(&after[0x0c..0x2a], body.as_slice(), "the new body");
         assert_eq!(&after[0x2a..0x2e], survivor.as_slice(), "the survivor's bytes, moved up");
+    }
+
+    /// The version 6 half of the rule above: a v6 file **appends past a
+    /// hole** rather than filling it, and this is the test that says so.
+    ///
+    /// `free_fragment_v6`'s interior branch leaves `0xffff` behind, so the
+    /// reuse would be reachable for v6 the moment a delete were followed by
+    /// an insert -- and no recording pins what genuine Btrieve does there.
+    /// The four committed v6 fixtures were recorded against a host that
+    /// appended, and this keeps that until a v6 delete-then-insert recording
+    /// exists. Deliberately the same page shape as
+    /// [`tests::a_v5_insert_fills_the_slot_a_delete_freed_rather_than_appending`],
+    /// so the only difference between the two answers is the version.
+    #[test]
+    fn a_v6_insert_appends_past_a_freed_slot_rather_than_filling_it() {
+        let survivor = [V6_END.as_slice(), b"survivor".as_slice()].concat();
+        let mut five = page_v6(5, 512, &[&survivor]);
+        // What a v6 interior free leaves: the survivor is fragment 1, and
+        // fragment 0's entry is a hole.
+        set_fragment_count(&mut five, 2);
+        set_entry(&mut five, 2, FIRST_FRAGMENT + survivor.len() as u32).expect("boundary");
+        set_entry(&mut five, 1, FIRST_FRAGMENT).expect("the survivor");
+        set_entry(&mut five, 0, UNUSED).expect("the hole");
+        let boundary = FIRST_FRAGMENT + survivor.len() as u32;
+
+        let mut source = Scratch::new(512, Version::V6);
+        for _ in 0..4 {
+            source.claim(&blank_page(512, Version::V6)).expect("filler");
+        }
+        source.claim(&five).expect("the page under test");
+
+        let body = b"a new body".to_vec();
+        let mut space = Space::new(&mut source, Version::V6, Some(5));
+        let at = space.place(&body).expect("a body that fits the page it is offered");
+
+        assert_eq!(at, pointer(5, 2), "appended as a third fragment, not into the hole");
+        let after = &source.pages[5];
+        assert_eq!(fragment_count(after), 3, "appending grows the array");
+        assert_eq!(entry(after, 0), Ok(UNUSED), "the hole is left exactly where it was");
+        assert_eq!(entry(after, 1), Ok(FIRST_FRAGMENT), "the survivor did not move");
+        assert_eq!(entry(after, 2), Ok(boundary), "the new fragment starts at the old boundary");
+        assert_eq!(
+            entry(after, 3),
+            Ok(boundary + (POINTER + body.len()) as u32),
+            "the new boundary, past the new fragment and its leading pointer"
+        );
+        assert_eq!(
+            &after[FIRST_FRAGMENT as usize..boundary as usize],
+            survivor.as_slice(),
+            "the survivor's own bytes, untouched"
+        );
+        let at = boundary as usize;
+        assert_eq!(&after[at..at + POINTER], V6_END.as_slice(), "every v6 fragment leads with one");
+        assert_eq!(&after[at + POINTER..at + POINTER + body.len()], body.as_slice());
     }
 
     /// [`FilePages`] is what a real `Block::update` runs against -- every

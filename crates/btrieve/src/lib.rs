@@ -6646,6 +6646,33 @@ impl<M: Mem> Block<M> {
     /// recording it is measured against, is
     /// [`variable::free_fragment`]'s own doc comment.
     ///
+    /// **What "nothing written anywhere" does and does not cover.** It
+    /// covers a *refusal*: [`variable::free_fragment`] validates the page's
+    /// whole shape before it writes a byte, so a chained fragment, a page
+    /// this would empty, or a slot whose pointer names no such page leaves
+    /// the file exactly as it was. It does **not** cover a failure after
+    /// that free has landed. Two steps follow it, and either can fail on
+    /// its own -- [`pages::delete_record`], which zeros the slot and splices
+    /// it onto the record free list, and [`Self::write_v5_variable_fcr`],
+    /// which writes the variable free-space head back. A failure in either
+    /// (a write error, a full disk, a truncated file) leaves the fragment
+    /// already freed -- tombstoned and the page compacted -- while the
+    /// record's own slot still points at it, and nothing here rolls that
+    /// back. The record then reads a body that is no longer its own, or no
+    /// body at all.
+    ///
+    /// This is not new and not particular to v5: [`Self::delete_v6`] frees
+    /// its fragment before relocating the page and reindexing, and
+    /// [`Self::insert_inner`] places a body before writing the slot that
+    /// points at it, both with the same window between the two writes. The
+    /// ordering is deliberate in all three -- the alternative window (slot
+    /// first) leaves a *live* record pointing at fragments that were never
+    /// allocated, which is worse than a freed fragment nothing reaches --
+    /// and closing it properly needs the transaction machinery
+    /// [`Self::capture_for_journal`] already captures a pre-image for, not a
+    /// hand-rolled undo here. Said plainly rather than left to be inferred
+    /// from the ordering.
+    ///
     /// **v6 variable-length files delete** (Task 7): see
     /// [`Self::delete_v6`]'s own doc comment for the shape this closes and
     /// [`variable::free_fragment_v6`] for what is refused within that.
