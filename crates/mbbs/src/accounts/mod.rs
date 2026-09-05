@@ -601,11 +601,26 @@ impl<A: Abi> Accounts<A> {
     /// Write a brand-new account and its default ring, and answer the
     /// record.
     ///
-    /// The record is `SIGNUP.C:1204`'s, built by [`Usracc::new`]. Both
-    /// writes or neither is not on offer -- there is no transaction here --
-    /// so the account goes in first: an account with no ring is what
-    /// [`Accounts::load_keys`] already repairs on the next call, where a
-    /// ring with no account is a record nothing will ever look up again.
+    /// The record is `SIGNUP.C:1204`'s, built by [`Usracc::new`].
+    ///
+    /// **Two writes, two files, no transaction, and the account goes
+    /// first.** A crash between the two leaves an account with no ring: its
+    /// owner's next login gets a *blank* ring from
+    /// [`Accounts::load_keys`] -- not the default one this would have
+    /// written -- along with the console note that says so, and the sysop
+    /// puts the default ring back with the `mbbs-user` CLI. The other order
+    /// leaves a ring owned by an account that does not exist, which nothing
+    /// will ever look up and no login will ever report.
+    ///
+    /// The engine does have transactions --
+    /// [`Btrieve::begin`](crate::btrieve::Btrieve::begin),
+    /// [`end`](crate::btrieve::Btrieve::end) and
+    /// [`abort`](crate::btrieve::Btrieve::abort) -- and they are
+    /// deliberately not used here: these two writes go to two different
+    /// files, and what the real engine did with a transaction spanning two
+    /// files is unmeasured. Wrapping them in one on the strength of the
+    /// name would be a guess in the one place where being wrong loses an
+    /// account.
     ///
     /// # Errors
     ///
@@ -1137,5 +1152,38 @@ mod tests {
             )
             .expect_err("a host that never opened a pair cannot answer");
         assert_eq!(why, "accounts are not open");
+    }
+
+    /// `DELTAG` and `SUSPEN` are separate bits and an account can carry
+    /// both. Which of the two is reported is a rule, not an accident of
+    /// which arm happens to run first.
+    #[test]
+    fn deletion_is_reported_before_suspension_when_an_account_has_both() {
+        let mut f = opened("resolve-deleted-and-suspended");
+        signup(&mut f, "Dan", "hunter2");
+        set_flags(&mut f, "Dan", flags::DELTAG | flags::SUSPEN);
+        assert_eq!(
+            f.host
+                .resolve_login(
+                    &mut f.machine,
+                    &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+                    term()
+                )
+                .unwrap()
+                .unwrap_err(),
+            Refusal::Deleted,
+            "a deleted account is gone, not merely stopped"
+        );
+        assert_eq!(
+            f.host
+                .resolve_login(
+                    &mut f.machine,
+                    &Login::Trusted { userid: "Dan".into(), sysop: false },
+                    term()
+                )
+                .unwrap()
+                .unwrap_err(),
+            Refusal::Deleted
+        );
     }
 }
