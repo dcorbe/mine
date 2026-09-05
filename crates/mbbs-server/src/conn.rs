@@ -889,10 +889,25 @@ pub(crate) async fn pump(
                         return Ok(());
                     }
                 }
-                Some(Out::Close) | None => {
-                    // The host is shutting down the whole board (`Out::Close`,
-                    // sent to every connection on `Wait::Stop`) or has already
-                    // dropped this channel's sender. Either way there is
+                Some(Out::Close) => {
+                    // The host asked for this connection to close. That is
+                    // board shutdown (`Out::Close` to every channel), but it
+                    // is also a single channel handed back to the absent BBS
+                    // -- `go2mnu`, drained by `Host::drain_ended` -- and in
+                    // that case the host has done no cleanup yet: `hangup` is
+                    // what clears the account session, frees the pool channel,
+                    // and writes the record back. So tell it, exactly as the
+                    // read/write-failure arms do. The host guards a second
+                    // `Disconnect` for an already-freed channel, so the
+                    // shutdown case, where it has cleaned up already, is a
+                    // harmless no-op.
+                    let _ = writer.shutdown().await;
+                    let _ = host_tx.send(In::Disconnect { chan });
+                    return Ok(());
+                }
+                None => {
+                    // The host already dropped this channel's sender, which
+                    // it does only after it has run `hangup` itself. There is
                     // nobody left on the other end to tell.
                     let _ = writer.shutdown().await;
                     return Ok(());
@@ -1313,6 +1328,58 @@ mod tests {
             "pump must hand every Out::Bytes chunk to Stack::modern() before \
              writing it, not send the host's raw CP437 bytes unchanged"
         );
+    }
+
+    /// An `Out::Close` the host sends to one channel -- the way a module's
+    /// handback to the absent BBS (`go2mnu`, `Host::drain_ended`) closes a
+    /// single live connection -- must still tell the host the connection
+    /// ended, exactly as a client-initiated close does.
+    ///
+    /// Without the `In::Disconnect`, the host never runs `hangup` for that
+    /// channel, so the account session is never cleared (`account_online`
+    /// stays true after the caller is gone), the channel is never returned
+    /// to the pool, and the account record is never written back. The bug
+    /// was reported live: `mbbs-user keys beef --add SYSOP` refused with
+    /// "beef is online" after the player had exited the game.
+    #[tokio::test]
+    async fn out_close_tells_the_host_the_connection_ended() {
+        use crate::msg::{In, Out};
+        use crate::termcompat::Stack;
+        use std::sync::mpsc as std_mpsc;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        let (server, _peer) = listener.accept().await.expect("accept");
+        let (reader, writer) = server.into_split();
+
+        let (host_tx, host_rx) = std_mpsc::channel::<In>();
+        let (out_tx, out_rx) = mpsc::channel::<Out>(4);
+        let chan = mbbs::Terms::new(1).chan(0).expect("channel zero of one");
+
+        let pump_task = tokio::spawn(pump(reader, writer, host_tx, chan, out_rx, Stack::modern));
+
+        out_tx.send(Out::Close).await.expect("queue the close");
+
+        // The socket is shut down for the client...
+        let mut received = Vec::new();
+        client
+            .read_to_end(&mut received)
+            .await
+            .expect("read until pump closes the socket");
+        pump_task.await.expect("pump task did not panic").expect("pump exited cleanly");
+
+        // ...and the host was told, so it can hang the channel up. `In` holds
+        // senders and is not `Debug`, so match the one field that matters.
+        match host_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(In::Disconnect { chan: got }) => assert_eq!(got, chan),
+            Ok(_) => panic!("Out::Close sent the host a message other than In::Disconnect"),
+            Err(e) => panic!("Out::Close must send In::Disconnect so hangup runs; got {e:?}"),
+        }
     }
 
     /// Task 7's pin: telnet filtering must run before CP437 transcoding,
