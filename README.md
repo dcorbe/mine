@@ -116,7 +116,7 @@ Three ways in:
 
 | path | who decides | what happens |
 |---|---|---|
-| telnet (`--listen`, `--listen-raw`) | the caller | Asks for a user ID and a password. An unknown name is offered signup. Three refusals close the connection. |
+| telnet (`--listen`, `--listen-raw`) | the caller | Asks for a user ID and a password. NEW at the user ID prompt signs up. Ctrl-D leaves. Three refusals close the connection. |
 | rlogin (`--listen-rlogin`) | a fronting board | Takes the name the board sends and provisions it if new. No password crosses the wire, so bind it to a trusted network only. `--rlogin-name first` matches Synchronet's swap flag. |
 | door (`--listen-door`) | a fronting board | Same trust as rlogin, through `mbbs-door` and a DOOR32.SYS. `sysop=1` grants the sysop keys for that session only. |
 

@@ -1138,7 +1138,7 @@ async fn the_board_serves_again_after_a_kick_driven_stop_with_no_channel_connect
     // succeeds against the first life.
     let mut before = TcpStream::connect(addr).await.expect("connect before the stop");
     let mut before_buf = Vec::new();
-    read_until(&mut before, &mut before_buf, "Enter your user ID: ").await;
+    read_until(&mut before, &mut before_buf, "Enter your user ID, or NEW to sign up: ").await;
     drop(before);
 
     // Wait past the one-second kick, plus slack for the restart itself
@@ -1148,7 +1148,7 @@ async fn the_board_serves_again_after_a_kick_driven_stop_with_no_channel_connect
 
     // Without any operator action, the board is serving again. The claim is
     // the assertion; the prompt below is not. `handle` writes
-    // `Enter your user ID: ` before it ever speaks to the host thread, and
+    // `Enter your user ID, or NEW to sign up: ` before it ever speaks to the host thread, and
     // `serving` is not cleared by a fault stop, so reaching the prompt
     // proves only that the listener is still bound -- it would pass against
     // a host thread that had given up entirely. A `Connect` is answered by
@@ -1160,7 +1160,7 @@ async fn the_board_serves_again_after_a_kick_driven_stop_with_no_channel_connect
     // And the socket half still works against that life.
     let mut after = TcpStream::connect(addr).await.expect("connect after the restart");
     let mut after_buf = Vec::new();
-    read_until(&mut after, &mut after_buf, "Enter your user ID: ").await;
+    read_until(&mut after, &mut after_buf, "Enter your user ID, or NEW to sign up: ").await;
 }
 
 /// A channel connected *at the moment of the stop* is closed by it
@@ -1214,7 +1214,7 @@ async fn a_connected_channel_is_closed_by_the_stop_and_the_board_serves_again_af
 
     let mut after = TcpStream::connect(addr).await.expect("connect after the restart");
     let mut after_buf = Vec::new();
-    read_until(&mut after, &mut after_buf, "Enter your user ID: ").await;
+    read_until(&mut after, &mut after_buf, "Enter your user ID, or NEW to sign up: ").await;
 }
 
 /// The same stop, one layer out: a real telnet socket that has *logged in*
@@ -1229,10 +1229,10 @@ async fn a_connected_channel_is_closed_by_the_stop_and_the_board_serves_again_af
 /// do with the module stopping.
 ///
 /// The login is a **signup**, because a board built out of a synthetic
-/// module starts with an empty account file: `Dan` does not exist, the
-/// dialogue offers to create the account, and `Login::Signup` provisions
-/// it. The whole dialogue goes out in one write, `look\r` included, which
-/// also carries `conn`'s pipelining rule end to end against a real host.
+/// module starts with an empty account file: NEW at the user ID prompt
+/// chooses `Dan`, and `Login::Signup` provisions it. The whole dialogue
+/// goes out in one write, `look\r` included, which also carries `conn`'s
+/// pipelining rule end to end against a real host.
 ///
 /// **The close is not vacuous.** Every way that dialogue can end *without*
 /// a channel writes something first -- a refusal line, `Too many tries.`,
@@ -1258,9 +1258,9 @@ async fn a_logged_in_telnet_socket_is_closed_by_the_stop() {
 
     let mut sock = TcpStream::connect(addr).await.expect("connect");
     let mut got = Vec::new();
-    read_until(&mut sock, &mut got, "Enter your user ID: ").await;
+    read_until(&mut sock, &mut got, "Enter your user ID, or NEW to sign up: ").await;
 
-    sock.write_all(b"Dan\rhunter2\ry\rhunter2\rhunter2\rlook\r")
+    sock.write_all(b"new\rDan\rhunter2\rhunter2\rlook\r")
         .await
         .expect("write the whole signup dialogue");
     read_until(&mut sock, &mut got, "Enter it again: \r\n").await;
@@ -1570,7 +1570,7 @@ async fn the_board_serves_again_after_an_unimplemented_symbol_stop() {
 
     let mut before = TcpStream::connect(addr).await.expect("connect before the stop");
     let mut before_buf = Vec::new();
-    read_until(&mut before, &mut before_buf, "Enter your user ID: ").await;
+    read_until(&mut before, &mut before_buf, "Enter your user ID, or NEW to sign up: ").await;
     drop(before);
 
     tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -1584,7 +1584,7 @@ async fn the_board_serves_again_after_an_unimplemented_symbol_stop() {
 
     let mut after = TcpStream::connect(addr).await.expect("connect after the restart");
     let mut after_buf = Vec::new();
-    read_until(&mut after, &mut after_buf, "Enter your user ID: ").await;
+    read_until(&mut after, &mut after_buf, "Enter your user ID, or NEW to sign up: ").await;
 }
 
 /// Path 1 of the double-free defect fixed alongside this test (see

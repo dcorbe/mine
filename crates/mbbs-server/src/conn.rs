@@ -50,8 +50,8 @@
 //!
 //! **One `serve_on` call serves one machine.** A connection goes from telnet
 //! negotiation straight to the user-ID prompt -- nothing in between. What
-//! follows that prompt is [`login_dialogue`]: a password, and, for a name
-//! the board has never seen, the offer to create the account.
+//! follows that prompt is [`login_dialogue`]: a password, or NEW for a
+//! chosen user ID and a password typed twice.
 
 use std::borrow::Cow;
 use std::io;
@@ -139,20 +139,13 @@ pub(crate) const LOGIN_DEADLINE: Duration = Duration::from_secs(120);
 /// script can be read (and diffed) in one place: a caller's screen is a
 /// contract, and a prompt that quietly loses its trailing space is not the
 /// kind of change anybody notices in a diff of `login_dialogue`.
-const USERID_PROMPT: &[u8] = b"Enter your user ID: ";
+pub(crate) const USERID_PROMPT: &[u8] = b"Enter your user ID, or NEW to sign up: ";
 const PASSWORD_PROMPT: &[u8] = b"Enter your password: ";
-const CREATE_PROMPT: &[u8] = b"No account by that name. Create one? [y/n] ";
+const CHOOSE_ID_PROMPT: &[u8] = b"Choose a user ID: ";
 const CHOOSE_PROMPT: &[u8] = b"Choose a password (1 to 9 characters): ";
 const AGAIN_PROMPT: &[u8] = b"Enter it again: ";
 const MISMATCH_LINE: &[u8] = b"Passwords do not match.\r\n";
 const TOO_MANY_LINE: &[u8] = b"Too many tries.\r\n";
-
-/// What declining the offer to create an account says: nothing. The caller
-/// answered the question they were asked, so there is no refusal to report
-/// -- but the try is still counted (see [`login_dialogue`]), and going
-/// through [`refuse`] with this is what keeps counting in one place instead
-/// of two.
-const DECLINED_SILENTLY: &[u8] = b"";
 
 /// The one thing a listener says that is not about the caller at all: the
 /// host thread this process is built around is gone, so there is no board
@@ -422,13 +415,10 @@ async fn handle(
 ///
 /// - **What counts.** `refusals` is the only thing that stops a caller
 ///   guessing forever, so every way a try can end without a channel counts:
-///   a refusal the board answers with, a line the account record cannot
-///   hold, a signup whose two passwords differ, and declining the offer to
-///   create the account. The one thing that does not is an unknown name
-///   itself, which becomes that offer rather than a refusal -- but the
-///   answer to the offer is then counted either way, so a name the board
-///   has never heard of still costs exactly one try however the caller
-///   answers. The [`MAX_REFUSALS`]th counted try ends the connection.
+///   a refusal the board answers with, including a name it has never heard
+///   of; a line the account record cannot hold; and a signup whose two
+///   passwords differ. The [`MAX_REFUSALS`]th counted try ends the
+///   connection.
 /// - **`Full` and `Maintenance` end it instead of counting.** Neither is
 ///   anything the caller could have typed differently, so a retry would
 ///   only invite them to fail again -- and spending a caller's tries on the
@@ -439,16 +429,62 @@ async fn login_dialogue(
     writer: &mut OwnedWriteHalf,
     host_tx: &std_mpsc::Sender<In>,
 ) -> io::Result<Option<(Chan, mpsc::Receiver<Out>, Vec<u8>)>> {
-    use mbbs::Refusal as R;
     use mbbs::accounts::{PSWSIZ, UIDSIZ, validate_password, validate_userid};
 
     let mut refusals = 0usize;
 
     loop {
-        // Step 1: who is this?
-        let Some(userid) = read_line(reader, writer, USERID_PROMPT, true).await? else {
+        // Step 1: who is this, or NEW.
+        let Some(typed) = read_line(reader, writer, USERID_PROMPT, true).await? else {
             return Ok(None);
         };
+
+        if typed.trim().eq_ignore_ascii_case("new") {
+            // Step 4: a name of their own. The board still has the last word
+            // on it -- `new` itself is reserved there, and a taken name is
+            // `Exists` -- and either is a counted refusal at step 6.
+            let Some(userid) = read_line(reader, writer, CHOOSE_ID_PROMPT, true).await? else {
+                return Ok(None);
+            };
+            if let Some(refusal) = too_long(&userid, UIDSIZ - 1, validate_userid) {
+                if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            // Step 5: a new password, twice, neither echoed.
+            let Some(chosen) = read_line(reader, writer, CHOOSE_PROMPT, false).await? else {
+                return Ok(None);
+            };
+            if let Some(refusal) = too_long(&chosen, PSWSIZ - 1, validate_password) {
+                if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let Some(again) = read_line(reader, writer, AGAIN_PROMPT, false).await? else {
+                return Ok(None);
+            };
+            if again != chosen {
+                if refuse(reader, writer, &mut refusals, MISMATCH_LINE).await? {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            // Step 6: claim the new account.
+            let claim = Login::Signup { userid, password: chosen };
+            match claim_or_refuse(reader, writer, host_tx, claim, &mut refusals).await? {
+                Claimed::Channel(chan, out_rx) => {
+                    return Ok(Some((chan, out_rx, std::mem::take(&mut reader.pending))));
+                }
+                Claimed::Over => return Ok(None),
+                Claimed::Retry => continue,
+            }
+        }
+
+        let userid = typed;
         if let Some(refusal) = too_long(&userid, UIDSIZ - 1, validate_userid) {
             if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
                 return Ok(None);
@@ -468,91 +504,58 @@ async fn login_dialogue(
         }
 
         // Step 3: ask the board. It owns the account file, so it -- not
-        // this listener -- decides whether this is anybody.
-        let claim = Login::Password { userid: userid.clone(), password };
-        match claim_channel(host_tx, claim, TELNET_TERMINAL, writer).await? {
-            None => return Ok(None),
-            Some(Ok((chan, out_rx))) => {
+        // this listener -- decides whether this is anybody. An unknown name
+        // is a refusal like any other: NEW is the way to sign up.
+        let claim = Login::Password { userid, password };
+        match claim_or_refuse(reader, writer, host_tx, claim, &mut refusals).await? {
+            Claimed::Channel(chan, out_rx) => {
                 return Ok(Some((chan, out_rx, std::mem::take(&mut reader.pending))));
             }
-            // Not a refusal on the wire: an unknown name is the one answer
-            // this listener turns into an offer, so the caller sees the
-            // create prompt below instead of a goodbye.
-            Some(Err(R::Unknown)) => {}
-            Some(Err(refusal @ (R::Full | R::Maintenance))) => {
-                writer.write_all(&refusal_line(refusal)).await?;
-                writer.flush().await?;
-                return Ok(None);
-            }
-            Some(Err(refusal)) => {
-                if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
-                    return Ok(None);
-                }
-                continue;
-            }
+            Claimed::Over => return Ok(None),
+            Claimed::Retry => continue,
         }
+    }
+}
 
-        // Step 4: the offer. An empty line is an answer here, which is why
-        // this is the one prompt that does not re-ask on one (see
-        // `read_line`).
-        //
-        // Declining starts over and **counts**. Nothing was refused, so
-        // there is nothing to say -- `refuse` is given an empty line and
-        // writes none -- but the try is spent all the same: a name the
-        // board has never heard of, answered `n`, would otherwise be an
-        // unbounded loop over one socket, since an unknown name does not
-        // count on its own either.
-        let Some(answer) = prompt_once(reader, writer, CREATE_PROMPT, true).await? else {
-            return Ok(None);
-        };
-        let answer = answer.trim();
-        if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
-            if refuse(reader, writer, &mut refusals, DECLINED_SILENTLY).await? {
-                return Ok(None);
-            }
-            continue;
-        }
+/// How one claim ended, as the dialogue sees it.
+enum Claimed {
+    /// The board let them on.
+    Channel(Chan, mpsc::Receiver<Out>),
+    /// The connection is over: the host is gone, the board is full or in
+    /// maintenance, or that was the last try. Whoever is listening has
+    /// been told.
+    Over,
+    /// A counted refusal with tries left: back to the user ID prompt.
+    Retry,
+}
 
-        // Step 5: a new password, twice, neither echoed.
-        let Some(chosen) = read_line(reader, writer, CHOOSE_PROMPT, false).await? else {
-            return Ok(None);
-        };
-        if let Some(refusal) = too_long(&chosen, PSWSIZ - 1, validate_password) {
-            if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
-                return Ok(None);
-            }
-            continue;
+/// Send one claim and turn the board's answer into what the dialogue does
+/// next. The login claim and the signup claim end the same three ways, so
+/// both come through here.
+///
+/// `Full` and `Maintenance` end the connection instead of counting: neither
+/// is anything the caller could have typed differently.
+async fn claim_or_refuse(
+    reader: &mut Reader<'_>,
+    writer: &mut OwnedWriteHalf,
+    host_tx: &std_mpsc::Sender<In>,
+    claim: Login,
+    refusals: &mut usize,
+) -> io::Result<Claimed> {
+    use mbbs::Refusal as R;
+    match claim_channel(host_tx, claim, TELNET_TERMINAL, writer).await? {
+        None => Ok(Claimed::Over),
+        Some(Ok((chan, out_rx))) => Ok(Claimed::Channel(chan, out_rx)),
+        Some(Err(refusal @ (R::Full | R::Maintenance))) => {
+            writer.write_all(&refusal_line(refusal)).await?;
+            writer.flush().await?;
+            Ok(Claimed::Over)
         }
-        let Some(again) = read_line(reader, writer, AGAIN_PROMPT, false).await? else {
-            return Ok(None);
-        };
-        if again != chosen {
-            if refuse(reader, writer, &mut refusals, MISMATCH_LINE).await? {
-                return Ok(None);
+        Some(Err(refusal)) => {
+            if refuse(reader, writer, refusals, &refusal_line(refusal)).await? {
+                return Ok(Claimed::Over);
             }
-            continue;
-        }
-
-        // Step 6: claim the new account. The board still has the last word
-        // -- the name may be reserved, or somebody may have taken it
-        // between step 3 and here.
-        let claim = Login::Signup { userid, password: chosen };
-        match claim_channel(host_tx, claim, TELNET_TERMINAL, writer).await? {
-            None => return Ok(None),
-            Some(Ok((chan, out_rx))) => {
-                return Ok(Some((chan, out_rx, std::mem::take(&mut reader.pending))));
-            }
-            Some(Err(refusal @ (R::Full | R::Maintenance))) => {
-                writer.write_all(&refusal_line(refusal)).await?;
-                writer.flush().await?;
-                return Ok(None);
-            }
-            Some(Err(refusal)) => {
-                if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
-                    return Ok(None);
-                }
-                continue;
-            }
+            Ok(Claimed::Retry)
         }
     }
 }
@@ -761,10 +764,6 @@ impl<'a> Reader<'a> {
 /// bytes pipelined behind a bare Enter are discarded along with it -- this
 /// is the one corner this task does not chase, since it requires a user to
 /// type nothing and something in the same breath.
-///
-/// The one prompt that must not re-ask is the offer to create an account,
-/// where an empty line is an answer ("no"); it calls [`prompt_once`]
-/// directly.
 ///
 /// `echo` is what makes a password prompt a password prompt: with it off,
 /// nothing typed is written back -- not the characters ([`Edit::Echo`]) and
@@ -976,7 +975,7 @@ mod tests {
         let text = String::from_utf8_lossy(&received);
 
         assert!(
-            text.contains("Enter your user ID: "),
+            text.contains("Enter your user ID, or NEW to sign up: "),
             "the prompt must still appear -- the module hasn't even been asked \
              for yet when this is written: {text:?}"
         );
@@ -1008,7 +1007,7 @@ mod tests {
         let text = String::from_utf8_lossy(&received);
 
         assert!(text.contains("The system is down for daily maintenance."), "{text:?}");
-        assert!(!text.contains("Enter your user ID: "), "no prompt during maintenance: {text:?}");
+        assert!(!text.contains("Enter your user ID, or NEW to sign up: "), "no prompt during maintenance: {text:?}");
         assert!(
             matches!(rx.try_recv(), Err(std_mpsc::TryRecvError::Empty)),
             "no In::Connect may reach the host during maintenance"
@@ -1036,11 +1035,11 @@ mod tests {
         client.write_all(b"tester\rpw\r").await.expect("write the login");
 
         let mut got = Vec::new();
-        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", 2).await;
 
         assert!(
             String::from_utf8_lossy(&got)
-                .contains("That account is suspended.\r\nEnter your user ID: "),
+                .contains("That account is suspended.\r\nEnter your user ID, or NEW to sign up: "),
             "a refused caller is told which refusal it was, then asked again: {:?}",
             String::from_utf8_lossy(&got)
         );
@@ -1552,7 +1551,7 @@ mod tests {
     }
 
     /// Nothing precedes the user-ID prompt on the wire: telnet negotiation,
-    /// then `Enter your user ID: `. There is no machine to choose.
+    /// then `Enter your user ID, or NEW to sign up: `. There is no machine to choose.
     #[tokio::test]
     async fn the_first_prompt_is_the_user_id() {
         use crate::termcompat::Stack;
@@ -1571,14 +1570,14 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.expect("connect");
         let mut got = Vec::new();
         let mut buf = [0u8; 256];
-        while !got.ends_with(b"Enter your user ID: ") {
+        while !got.ends_with(b"Enter your user ID, or NEW to sign up: ") {
             let n = client.read(&mut buf).await.expect("read");
             assert!(n > 0, "closed before the prompt: {got:?}");
             got.extend_from_slice(&buf[..n]);
         }
         assert_eq!(
             got,
-            [IAC, WILL, OPT_SGA, IAC, WILL, OPT_ECHO].iter().copied().chain(b"Enter your user ID: ".iter().copied()).collect::<Vec<u8>>()
+            [IAC, WILL, OPT_SGA, IAC, WILL, OPT_ECHO].iter().copied().chain(b"Enter your user ID, or NEW to sign up: ".iter().copied()).collect::<Vec<u8>>()
         );
     }
 
@@ -1593,7 +1592,7 @@ mod tests {
     /// occurrences of `needle`. Panics on EOF or on the timeout rather than
     /// hanging the run.
     ///
-    /// The count is what makes a retry loop testable: `Enter your user ID: `
+    /// The count is what makes a retry loop testable: `Enter your user ID, or NEW to sign up: `
     /// appears once per try, so "the second prompt" is `count == 2` and
     /// nothing weaker.
     async fn read_until_nth(
@@ -1739,7 +1738,7 @@ mod tests {
         let mut got = Vec::new();
         // Two prompts: the one it answered, and the one the counted refusal
         // leaves it back at.
-        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", 2).await;
         let text = String::from_utf8_lossy(&got);
 
         assert!(
@@ -1780,7 +1779,7 @@ mod tests {
 
         let text = String::from_utf8_lossy(&got);
         assert!(
-            text.ends_with("Enter your user ID: "),
+            text.ends_with("Enter your user ID, or NEW to sign up: "),
             "the prompt, and not one word about the clock after it: {text:?}"
         );
         assert!(
@@ -1815,7 +1814,7 @@ mod tests {
         let text = String::from_utf8_lossy(&got);
 
         assert!(
-            text.contains("Enter your user ID: Dan\r\nEnter your password: \r\n"),
+            text.contains("Enter your user ID, or NEW to sign up: Dan\r\nEnter your password: \r\n"),
             "both prompts, in order, with the user ID echoed and the password not: {text:?}"
         );
         assert!(
@@ -1829,27 +1828,27 @@ mod tests {
         );
     }
 
-    /// An unknown user ID becomes an offer, not a goodbye: the caller is
-    /// asked whether to create the account, and answering `y` sends a
-    /// `Signup` claim with the password they chose twice.
+    /// NEW at the user ID prompt leads to a chosen name, two passwords, and
+    /// a `Signup` claim carrying the chosen name -- and a caller who types
+    /// the whole dialogue ahead sees the same screen as one who waits.
     ///
     /// The whole dialogue is written in one `write_all`, which also pins
-    /// the pipelining rule through four prompts: every line after the user
-    /// ID arrives in the same `read()` the user ID did, and the last one
-    /// (`look\r`) has to survive as `In::Input` once a channel exists.
+    /// the pipelining rule through four prompts: every line after `new`
+    /// arrives in the same `read()` it did, and the last one (`look\r`) has
+    /// to survive as `In::Input` once a channel exists.
     #[tokio::test]
-    async fn an_unknown_name_offers_signup_and_sends_the_signup_claim() {
+    async fn new_leads_to_a_chosen_name_and_sends_the_signup_claim() {
         use crate::msg::In;
         use tokio::io::AsyncWriteExt;
 
         let terms = mbbs::Terms::new(1);
         let chan = terms.chan(0).expect("channel 0");
-        let (host_tx, claims, rest) = fake_host(vec![Err(mbbs::Refusal::Unknown), Ok(chan)]);
+        let (host_tx, claims, rest) = fake_host(vec![Ok(chan)]);
         let addr = bind_dialogue(host_tx).await;
 
         let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         client
-            .write_all(b"Dan\rx\ry\rhunter2\rhunter2\rlook\r")
+            .write_all(b"new\rDan\rhunter2\rhunter2\rlook\r")
             .await
             .expect("write the whole dialogue at once");
 
@@ -1859,19 +1858,15 @@ mod tests {
 
         assert!(
             text.contains(
-                "Enter your password: \r\n\
-                 No account by that name. Create one? [y/n] y\r\n\
+                "Enter your user ID, or NEW to sign up: new\r\n\
+                 Choose a user ID: Dan\r\n\
                  Choose a password (1 to 9 characters): \r\n\
                  Enter it again: \r\n"
             ),
-            "the offer replaces the refusal line rather than following it, and \
-             neither chosen password is echoed: {text:?}"
+            "the chosen name is echoed and neither password is: {text:?}"
         );
+        assert!(!text.contains("Create one?"), "the offer is gone: {text:?}");
 
-        assert_eq!(
-            next_claim(&claims, "the first, unknown login"),
-            mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
-        );
         assert_eq!(
             next_claim(&claims, "the signup"),
             mbbs::Login::Signup { userid: "Dan".into(), password: "hunter2".into() }
@@ -1880,13 +1875,46 @@ mod tests {
         match rest.recv_timeout(DIALOGUE_TIMEOUT).expect("the pipelined line reached the host") {
             In::Input { chan: got_chan, bytes } => {
                 assert_eq!(got_chan, chan);
-                assert_eq!(
-                    bytes, b"look\r",
-                    "the bytes behind the accepted line survive the whole dialogue"
-                );
+                assert_eq!(bytes, b"look\r", "the bytes behind the accepted line survive the whole dialogue");
             }
             _ => panic!("expected In::Input carrying the pipelined line"),
         }
+    }
+
+    /// `new` is a word a caller types, not a token: any case, stray spaces
+    /// around it, and it is still the way in.
+    #[tokio::test]
+    async fn new_is_recognised_in_the_spellings_a_caller_will_type() {
+        use tokio::io::AsyncWriteExt;
+
+        for spelling in ["new", "NEW", "New", " new "] {
+            let (host_tx, _claims, _rest) = fake_host(vec![]);
+            let addr = bind_dialogue(host_tx).await;
+            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            client.write_all(format!("{spelling}\r").as_bytes()).await.expect("write");
+            let mut got = Vec::new();
+            read_until_nth(&mut client, &mut got, "Choose a user ID: ", 1).await;
+        }
+    }
+
+    /// A chosen name the board refuses -- here the reserved word itself --
+    /// is told in the board's own words, counts a try, and the dialogue
+    /// starts over at the user ID prompt.
+    #[tokio::test]
+    async fn a_refused_chosen_name_says_why_and_starts_over() {
+        use tokio::io::AsyncWriteExt;
+
+        let (host_tx, claims, _rest) = fake_host(vec![Err(mbbs::Refusal::Invalid("that user ID is reserved"))]);
+        let addr = bind_dialogue(host_tx).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"new\rnew\rpw\rpw\r").await.expect("write");
+        let mut got = Vec::new();
+        read_until_nth(&mut client, &mut got, "that user ID is reserved\r\n", 1).await;
+        read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", 2).await;
+        assert_eq!(
+            next_claim(&claims, "the signup"),
+            mbbs::Login::Signup { userid: "new".into(), password: "pw".into() }
+        );
     }
 
     /// Two different passwords at signup are refused on the spot, with no
@@ -1895,26 +1923,22 @@ mod tests {
     async fn mismatched_signup_passwords_return_to_the_user_id_prompt() {
         use tokio::io::AsyncWriteExt;
 
-        let (host_tx, claims, _rest) = fake_host(vec![Err(mbbs::Refusal::Unknown)]);
+        let (host_tx, claims, _rest) = fake_host(vec![]);
         let addr = bind_dialogue(host_tx).await;
 
         let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         client
-            .write_all(b"Dan\rx\ry\rone\rtwo\r")
+            .write_all(b"new\rDan\rone\rtwo\r")
             .await
             .expect("write the whole dialogue at once");
 
         let mut got = Vec::new();
-        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", 2).await;
         let text = String::from_utf8_lossy(&got);
 
         assert!(
-            text.contains("Enter it again: \r\nPasswords do not match.\r\nEnter your user ID: "),
+            text.contains("Enter it again: \r\nPasswords do not match.\r\nEnter your user ID, or NEW to sign up: "),
             "a mismatch says so and starts over: {text:?}"
-        );
-        assert_eq!(
-            next_claim(&claims, "the first, unknown login"),
-            mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
         );
         assert!(
             claims.try_recv().is_err(),
@@ -1940,7 +1964,7 @@ mod tests {
         let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let mut got = Vec::new();
         for try_number in 1..=super::MAX_REFUSALS {
-            read_until_nth(&mut client, &mut got, "Enter your user ID: ", try_number).await;
+            read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", try_number).await;
             client.write_all(b"Dan\rbad\r").await.expect("write one try");
             read_until_nth(&mut client, &mut got, "Invalid password.\r\n", try_number).await;
         }
@@ -1949,7 +1973,7 @@ mod tests {
         let text = String::from_utf8_lossy(&got);
         assert!(got.ends_with(b"Too many tries.\r\n"), "{text:?}");
         assert_eq!(
-            text.matches("Enter your user ID: ").count(),
+            text.matches("Enter your user ID, or NEW to sign up: ").count(),
             super::MAX_REFUSALS,
             "there is no fourth try: {text:?}"
         );
@@ -1984,7 +2008,7 @@ mod tests {
             .expect("write an overlong user ID");
 
         let mut got = Vec::new();
-        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", 2).await;
         let text = String::from_utf8_lossy(&got);
 
         assert!(
@@ -2050,15 +2074,11 @@ mod tests {
         );
     }
 
-    /// Declining the offer to create an account spends a try.
-    ///
-    /// An unknown name does not count on its own -- it becomes the offer --
-    /// so if the answer did not count either, `Dan`, a password, `n` would
-    /// be a dialogue with no ceiling: the same three lines over and over on
-    /// one socket, forever. Three declines here have to reach
-    /// `Too many tries.` exactly as three bad passwords do.
+    /// An unknown name is a refusal like any other now that NEW is the way
+    /// to sign up: it is told, it counts, and three of them reach `Too many
+    /// tries.` exactly as three bad passwords do.
     #[tokio::test]
-    async fn declining_the_signup_offer_counts_as_a_try() {
+    async fn an_unknown_name_is_told_and_counts_as_a_try() {
         use tokio::io::AsyncWriteExt;
 
         let (host_tx, claims, _rest) = fake_host(vec![
@@ -2071,64 +2091,24 @@ mod tests {
         let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let mut got = Vec::new();
         for try_number in 1..=super::MAX_REFUSALS {
-            read_until_nth(&mut client, &mut got, "Enter your user ID: ", try_number).await;
-            client.write_all(b"Dan\rx\rn\r").await.expect("write one try");
-            read_until_nth(&mut client, &mut got, "Create one? [y/n] n\r\n", try_number).await;
+            read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", try_number).await;
+            client.write_all(b"Dan\rx\r").await.expect("write one try");
+            read_until_nth(&mut client, &mut got, "No account by that name.\r\n", try_number).await;
         }
         read_to_close(&mut client, &mut got).await;
 
         let text = String::from_utf8_lossy(&got);
         assert!(got.ends_with(b"Too many tries.\r\n"), "{text:?}");
+        assert!(!text.contains("Create one?"), "no offer, ever: {text:?}");
         assert_eq!(
-            text.matches("Enter your user ID: ").count(),
+            text.matches("Enter your user ID, or NEW to sign up: ").count(),
             super::MAX_REFUSALS,
-            "declining is a spent try, so there is no fourth offer: {text:?}"
+            "an unknown name is a spent try, so there is no fourth prompt: {text:?}"
         );
         for round in 1..=super::MAX_REFUSALS {
             assert_eq!(
-                next_claim(&claims, &format!("decline {round}")),
+                next_claim(&claims, &format!("try {round}")),
                 mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
-            );
-        }
-    }
-
-    /// `yes` is a yes, and so is `Y` with a stray space; anything else
-    /// declines.
-    ///
-    /// The wire is a human typing, not a protocol: a caller who answers the
-    /// question in the obvious longer word should not have their try spent
-    /// on a spelling. Only the accepting side is worth pinning -- the
-    /// declining side is every other string there is, and
-    /// `declining_the_signup_offer_counts_as_a_try` covers what happens to
-    /// it.
-    #[tokio::test]
-    async fn yes_is_accepted_in_the_spellings_a_caller_will_type() {
-        use tokio::io::AsyncWriteExt;
-
-        for answer in ["y", "Y", "yes", "YES", "Yes", " y "] {
-            let terms = mbbs::Terms::new(1);
-            let chan = terms.chan(0).expect("channel 0");
-            let (host_tx, claims, _rest) =
-                fake_host(vec![Err(mbbs::Refusal::Unknown), Ok(chan)]);
-            let addr = bind_dialogue(host_tx).await;
-
-            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
-            client
-                .write_all(format!("Dan\rx\r{answer}\rhunter2\rhunter2\r").as_bytes())
-                .await
-                .expect("write the dialogue");
-
-            let mut got = Vec::new();
-            read_to_close(&mut client, &mut got).await;
-
-            assert_eq!(
-                next_claim(&claims, &format!("the first login before {answer:?}")),
-                mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
-            );
-            assert_eq!(
-                next_claim(&claims, &format!("the signup after {answer:?}")),
-                mbbs::Login::Signup { userid: "Dan".into(), password: "hunter2".into() },
-                "{answer:?} is a yes"
             );
         }
     }
@@ -2147,15 +2127,14 @@ mod tests {
     async fn local_length_refusals_and_mismatches_count_toward_the_limit() {
         use tokio::io::AsyncWriteExt;
 
-        let (host_tx, claims, _rest) =
-            fake_host(vec![Err(mbbs::Refusal::Unknown), Err(mbbs::Refusal::Unknown)]);
+        let (host_tx, claims, _rest) = fake_host(vec![]);
         let addr = bind_dialogue(host_tx).await;
 
         let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let mut got = Vec::new();
 
         // Try 1: a user ID the account record cannot hold.
-        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 1).await;
+        read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", 1).await;
         let overlong_id = "x".repeat(mbbs::accounts::UIDSIZ);
         client
             .write_all(format!("{overlong_id}\r").as_bytes())
@@ -2164,19 +2143,19 @@ mod tests {
         read_until_nth(&mut client, &mut got, "a user ID is at most 29 characters\r\n", 1).await;
 
         // Try 2: a chosen signup password it cannot hold either.
-        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", 2).await;
         let overlong_pw = "x".repeat(mbbs::accounts::PSWSIZ);
         client
-            .write_all(format!("Dan\rx\ry\r{overlong_pw}\r").as_bytes())
+            .write_all(format!("new\rDan\r{overlong_pw}\r").as_bytes())
             .await
             .expect("write an overlong chosen password");
         read_until_nth(&mut client, &mut got, "a password is at most 9 characters\r\n", 1).await;
 
         // Try 3: two signup passwords that differ. The third counted
         // refusal ends it.
-        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 3).await;
+        read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", 3).await;
         client
-            .write_all(b"Dan\rx\ry\rone\rtwo\r")
+            .write_all(b"new\rDan\rone\rtwo\r")
             .await
             .expect("write a mismatched pair");
         read_to_close(&mut client, &mut got).await;
@@ -2188,18 +2167,13 @@ mod tests {
         );
         assert!(got.ends_with(b"Too many tries.\r\n"), "{text:?}");
         assert_eq!(
-            text.matches("Enter your user ID: ").count(),
+            text.matches("Enter your user ID, or NEW to sign up: ").count(),
             super::MAX_REFUSALS,
             "three local refusals are three spent tries, no more and no fewer: {text:?}"
         );
-        // Only the two `Password` claims that opened tries 2 and 3 -- no
-        // signup claim ever went out, and try 1 spoke to nobody at all.
-        for round in 2..=3 {
-            assert_eq!(
-                next_claim(&claims, &format!("try {round}")),
-                mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
-            );
-        }
+        // None of the three reaches the board as a claim: try 1 never asks
+        // for a password, and tries 2 and 3 are both refused before a
+        // signup claim can be built.
         assert!(claims.try_recv().is_err(), "no claim may carry a line this listener refused");
     }
 
@@ -2217,7 +2191,7 @@ mod tests {
         let overlong = "x".repeat(mbbs::accounts::PSWSIZ);
         let mut got = Vec::new();
         for try_number in 1..=super::MAX_REFUSALS {
-            read_until_nth(&mut client, &mut got, "Enter your user ID: ", try_number).await;
+            read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", try_number).await;
             client
                 .write_all(format!("Dan\r{overlong}\r").as_bytes())
                 .await
@@ -2301,7 +2275,7 @@ mod tests {
             .expect("write two logins at once");
 
         let mut got = Vec::new();
-        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        read_until_nth(&mut client, &mut got, "Enter your user ID, or NEW to sign up: ", 2).await;
 
         assert_eq!(
             next_claim(&claims, "the first, refused login"),
@@ -2339,7 +2313,7 @@ mod tests {
 
         assert!(got.ends_with(b"All lines are busy.\r\n"), "{text:?}");
         assert_eq!(
-            text.matches("Enter your user ID: ").count(),
+            text.matches("Enter your user ID, or NEW to sign up: ").count(),
             1,
             "a full board is not the caller's mistake: there is no second prompt: {text:?}"
         );
