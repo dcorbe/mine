@@ -51,11 +51,12 @@
 //! **One `serve_on` call serves one machine.** A connection goes from telnet
 //! negotiation straight to the user-ID prompt -- nothing in between.
 
+use std::borrow::Cow;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
 
-use mbbs::{Chan, Connection};
+use mbbs::{Chan, Login, Terminal};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
@@ -95,30 +96,54 @@ pub(crate) const OUT_CHANNEL_BOUND: usize = 32;
 /// What a caller is told while maintenance is running.
 pub(crate) const MAINTENANCE_LINE: &[u8] = b"The system is down for daily maintenance. Try again in a few minutes.\r\n";
 
-/// The keys `crates/mbbs/tests/wccmmud.rs:3623` uses for a player who reaches
-/// the Realm. This is a *default*, not a policy: [`serve`]'s `keys` parameter
-/// is the actual seam, because who gets what keys is a login-backend decision
-/// this crate has no business making for its caller.
+/// The ring a new account is written with: what a player needs to reach the
+/// Realm and nothing more (`crates/mbbs/tests/wccmmud.rs:2450`).
 ///
-/// **`SYSOP` and `WCCSYSOP` are in here, and they grant the host's and
-/// MajorMUD's sysop command sets to every connection.** It is deliberate and
-/// it is not a permanent answer. This host
-/// is headless -- there is no logon, no `bbsusr.dat` and no `bbsk.dat`, so
-/// nothing upstream of a connection has an opinion about who anyone is yet
-/// (see [`mbbs::Connection::with_keys`]'s own doc on that seam). Until
-/// something does, a board with no sysop at all cannot reach MajorMUD's own
-/// diagnostics -- `sys configure show`, `sys list active_monsters` -- which
-/// are the only way to see the module's internal state from outside, and
-/// which this repository needed the moment monsters stopped respawning.
+/// This is not what a connection holds. It reaches [`mbbs::Host`] as
+/// [`crate::host::Boot::default_ring`] and is read exactly once per
+/// account, when a claim provisions one that does not exist yet; every
+/// later login for that account reads its ring out of the key file, where
+/// the sysop's own edits live. So changing this changes nothing for anyone
+/// who has logged in before.
 ///
-/// The board this serves listens on loopback. A deployment that faces anyone
-/// else must pass `--keys` and leave this out: the flag exists precisely so
-/// that this default never has to be the policy.
+/// `SYSOP` and `WCCSYSOP` used to be here, because a headless host with no
+/// accounts had no other way to reach MajorMUD's own diagnostics. There is
+/// a logon now: `Host::resolve_login` adds the sysop keys to a
+/// `Login::Trusted { sysop: true }` claim, which is what the BBS in front
+/// of the door says about its own sysop, and the `mbbs-user` CLI grants
+/// them to an account for good. Handing them to every caller is no longer
+/// the only way, so it is no longer the default.
 pub fn default_keys() -> Vec<String> {
-    ["DEMO", "NORMAL", "USER", "SYSOP", "WCCSYSOP"]
-        .into_iter()
-        .map(String::from)
-        .collect()
+    ["DEMO", "NORMAL", "USER"].into_iter().map(String::from).collect()
+}
+
+/// One line per refusal, for every listener -- telnet, the door, and
+/// rlogin. Spec section 5.
+///
+/// The whole vocabulary is here rather than at each call site so the three
+/// listeners cannot drift into three different wordings for the same
+/// answer, and so a new [`mbbs::Refusal`] cannot be added without this
+/// match refusing to compile.
+///
+/// `Cow`, because [`mbbs::Refusal::Invalid`] carries the reason the account
+/// layer wrote -- "a user ID is at most 29 characters", say -- and that is
+/// the only one that has to be built rather than pointed at.
+#[must_use]
+pub fn refusal_line(r: mbbs::Refusal) -> Cow<'static, [u8]> {
+    use mbbs::Refusal as R;
+    match r {
+        R::Unknown => Cow::Borrowed(b"No account by that name.\r\n"),
+        R::BadPassword => Cow::Borrowed(b"Invalid password.\r\n"),
+        R::NoPassword => {
+            Cow::Borrowed(b"That account has no password yet. Ask the sysop to set one.\r\n")
+        }
+        R::Exists => Cow::Borrowed(b"That user ID is taken.\r\n"),
+        R::Deleted => Cow::Borrowed(b"That account has been deleted.\r\n"),
+        R::Suspended => Cow::Borrowed(b"That account is suspended.\r\n"),
+        R::Full => Cow::Borrowed(b"All lines are busy.\r\n"),
+        R::Maintenance => Cow::Borrowed(MAINTENANCE_LINE),
+        R::Invalid(why) => Cow::Owned(format!("{why}\r\n").into_bytes()),
+    }
 }
 
 /// One address [`serve`]/[`serve_on`] binds, paired with the [`Stack`]
@@ -183,11 +208,10 @@ pub fn spawn_machine<A: mbbs::abi::Abi + 'static>(boot: Boot<A>) -> std_mpsc::Se
 /// integration test does.
 pub async fn serve<A: mbbs::abi::Abi + 'static>(
     boot: Boot<A>,
-    keys: Vec<String>,
     listeners: &[Listener<'_>],
 ) -> io::Result<Vec<SocketAddr>> {
     let serving = boot.serving.clone();
-    serve_on(spawn_machine(boot), keys, listeners, serving).await
+    serve_on(spawn_machine(boot), listeners, serving).await
 }
 
 /// Bind every listener in front of the one machine `host_tx` reaches.
@@ -197,13 +221,12 @@ pub async fn serve<A: mbbs::abi::Abi + 'static>(
 /// Does not block: every accept loop runs in its own spawned task.
 pub async fn serve_on(
     host_tx: std_mpsc::Sender<In>,
-    keys: Vec<String>,
     listeners: &[Listener<'_>],
     serving: crate::host::Serving,
 ) -> io::Result<Vec<SocketAddr>> {
     let mut bound = Vec::with_capacity(listeners.len());
     for &(addr, stack) in listeners {
-        bound.push(spawn_listener(addr, stack, host_tx.clone(), keys.clone(), serving.clone()).await?);
+        bound.push(spawn_listener(addr, stack, host_tx.clone(), serving.clone()).await?);
     }
     Ok(bound)
 }
@@ -216,7 +239,6 @@ async fn spawn_listener(
     addr: &str,
     stack: fn() -> Stack,
     host_tx: std_mpsc::Sender<In>,
-    keys: Vec<String>,
     serving: crate::host::Serving,
 ) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
@@ -232,10 +254,9 @@ async fn spawn_listener(
                 }
             };
             let host_tx = host_tx.clone();
-            let keys = keys.clone();
             let serving = serving.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(socket, host_tx, &keys, stack, serving).await {
+                if let Err(e) = handle(socket, host_tx, stack, serving).await {
                     eprintln!("mbbs-server: connection ended: {e}");
                 }
             });
@@ -255,7 +276,6 @@ async fn spawn_listener(
 async fn handle(
     socket: TcpStream,
     host_tx: std_mpsc::Sender<In>,
-    keys: &[String],
     stack: fn() -> Stack,
     serving: crate::host::Serving,
 ) -> io::Result<()> {
@@ -267,7 +287,7 @@ async fn handle(
     writer.flush().await?;
 
     if !serving.load(std::sync::atomic::Ordering::Relaxed) {
-        writer.write_all(MAINTENANCE_LINE).await?;
+        writer.write_all(&refusal_line(mbbs::Refusal::Maintenance)).await?;
         return Ok(());
     }
 
@@ -275,13 +295,22 @@ async fn handle(
         return Ok(()); // gone during login
     };
 
-    let who = Connection::ansi(&userid).with_keys(keys.iter());
+    // The claim, with no password behind it yet: the password prompt is the
+    // next task's, and this is the one seam it has to change. Until then
+    // every telnet login resolves against the account file and is refused,
+    // which is the honest answer for a listener that has not asked for a
+    // password.
+    let login = Login::Password { userid, password: String::new() };
+    // What the wire says, not what the account remembers: `Host::login`
+    // applies these on top of the record it loads.
+    let terminal = Terminal { ansi: true, width: 80, height: 24 };
 
     let (out_tx, out_rx) = mpsc::channel::<Out>(OUT_CHANNEL_BOUND);
     let (reply_tx, reply_rx) = oneshot::channel();
     if host_tx
         .send(In::Connect {
-            who,
+            login,
+            terminal,
             out: out_tx,
             reply: reply_tx,
         })
@@ -298,9 +327,9 @@ async fn handle(
 
     // This connection's process-wide identity for the rest of its life.
     let chan = match reply_rx.await {
-        Ok(Some(chan)) => chan,
-        Ok(None) => {
-            writer.write_all(b"All lines are busy.\r\n").await?;
+        Ok(Ok(chan)) => chan,
+        Ok(Err(refusal)) => {
+            writer.write_all(&refusal_line(refusal)).await?;
             return Ok(());
         }
         Err(_) => {
@@ -512,7 +541,7 @@ pub(crate) async fn pump(
 
 #[cfg(test)]
 mod tests {
-    use super::{Edit, IAC, LineEditor, OPT_ECHO, OPT_SGA, WILL, default_keys, handle, pump};
+    use super::{Edit, IAC, LineEditor, OPT_ECHO, OPT_SGA, WILL, default_keys, handle, pump, refusal_line};
 
     /// A dead host thread must not leave a fresh connection hanging forever.
     ///
@@ -548,9 +577,10 @@ mod tests {
             extension: None,
             maintenance_interval: crate::host::MAINTENANCE_INTERVAL,
             serving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            default_ring: default_keys(),
         };
 
-        let bound = super::serve(boot, default_keys(), &[("127.0.0.1:0", super::Stack::modern)])
+        let bound = super::serve(boot, &[("127.0.0.1:0", super::Stack::modern)])
             .await
             .expect("bind");
         let addr = bound[0];
@@ -587,7 +617,7 @@ mod tests {
 
         let (tx, rx) = std_mpsc::channel::<In>();
         let serving: crate::host::Serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let bound = super::serve_on(tx, default_keys(), &[("127.0.0.1:0", super::Stack::modern)], serving)
+        let bound = super::serve_on(tx, &[("127.0.0.1:0", super::Stack::modern)], serving)
             .await
             .expect("bind");
 
@@ -604,21 +634,68 @@ mod tests {
         );
     }
 
-    /// Two separate invariants, because the list has two separate reasons.
+    /// A refused claim reaches the caller as its own line and closes the
+    /// socket -- the whole of what a telnet caller is told, since there is
+    /// no channel to hand them.
     ///
+    /// The refusal is chosen for what only this path can prove: a fake host
+    /// answers `Err(Refusal::Suspended)`, so the bytes on the wire can only
+    /// have come from `handle` mapping the reply through
+    /// [`refusal_line`]. `Full` would not discriminate -- the old code
+    /// wrote that same line from a hardcoded string.
+    #[tokio::test]
+    async fn a_refused_login_prints_the_line_and_closes() {
+        use crate::msg::In;
+        use crate::termcompat::Stack;
+        use std::sync::mpsc as std_mpsc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (host_tx, host_rx) = std_mpsc::channel::<In>();
+
+        std::thread::spawn(move || {
+            for msg in host_rx {
+                if let In::Connect { reply, .. } = msg {
+                    let _ = reply.send(Err(mbbs::Refusal::Suspended));
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            let (server, _peer) = listener.accept().await.expect("accept");
+            let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let _ = handle(server, host_tx, Stack::modern, serving).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"tester\r").await.expect("write userid");
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.expect("read until the server closes");
+
+        assert!(
+            got.ends_with(b"That account is suspended.\r\n"),
+            "a refused caller is told which refusal it was, then closed: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
     /// `DEMO`/`NORMAL`/`USER` are what a player needs to reach the Realm and
     /// come from `crates/mbbs/tests/wccmmud.rs:2450`, which is the source of
     /// truth; they are checked by containment so that this test fails if the
-    /// fixture and the default ever drift apart. `SYSOP` and `WCCSYSOP` are
-    /// additions on top, checked separately because they are a deliberate
-    /// local-board choice rather than anything the fixture says -- see
-    /// [`default_keys`].
+    /// fixture and the default ever drift apart.
     ///
-    /// The length check is the third invariant: without it, containment would
-    /// let a fifth key in unnoticed, and a key nobody meant to grant is
-    /// exactly the thing this test exists to catch.
+    /// The sysop keys are checked for by name and must be absent. A ring is
+    /// written into a brand-new account and kept, so a sysop key that
+    /// slipped back into this list would not merely be granted to one
+    /// session -- it would be on the account's ring in `bbsk.dat`
+    /// afterwards, for every later login, whatever this function then said.
+    ///
+    /// The length check is the third invariant: without it, containment
+    /// would let a fourth key in unnoticed.
     #[test]
-    fn default_keys_holds_the_realm_fixture_plus_the_sysop_keys_and_nothing_else() {
+    fn default_keys_is_the_realm_ring_and_grants_no_sysop_key() {
         let keys = default_keys();
 
         for needed in ["DEMO", "NORMAL", "USER"] {
@@ -630,13 +707,49 @@ mod tests {
         }
         for sysop in ["SYSOP", "WCCSYSOP"] {
             assert!(
-                keys.iter().any(|k| k == sysop),
-                "the sysop keys are deliberate -- the host's and MajorMUD's own \
-                 diagnostics are unreachable without them on a headless host: \
-                 {sysop} is missing from {keys:?}"
+                !keys.iter().any(|k| k == sysop),
+                "a new account's ring is written to the key file and kept: {sysop} \
+                 in {keys:?} would grant it to that account for good"
             );
         }
-        assert_eq!(keys.len(), 5, "no key nobody meant to grant: {keys:?}");
+        assert_eq!(keys.len(), 3, "no key nobody meant to grant: {keys:?}");
+    }
+
+    /// One line per refusal, all distinct, all CRLF-terminated, and
+    /// `Invalid` carrying the account layer's own words.
+    ///
+    /// Distinctness is the assertion that matters: nine arms mapping to a
+    /// shared "Login failed." would be a listener that cannot tell a caller
+    /// which of nine things went wrong, and a copy-paste in the middle of
+    /// the match is exactly how that happens.
+    #[test]
+    fn every_refusal_has_its_own_line() {
+        use mbbs::Refusal as R;
+        let all = [
+            R::Unknown,
+            R::BadPassword,
+            R::NoPassword,
+            R::Exists,
+            R::Deleted,
+            R::Suspended,
+            R::Full,
+            R::Maintenance,
+            R::Invalid("a user ID is required"),
+        ];
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        for refusal in all {
+            let line = refusal_line(refusal).into_owned();
+            assert!(line.ends_with(b"\r\n"), "{refusal:?} is not a wire line: {line:?}");
+            assert!(!seen.contains(&line), "{refusal:?} repeats another refusal's line: {line:?}");
+            seen.push(line);
+        }
+        assert_eq!(refusal_line(R::Full).as_ref(), b"All lines are busy.\r\n");
+        assert_eq!(refusal_line(R::Maintenance).as_ref(), super::MAINTENANCE_LINE);
+        assert_eq!(
+            refusal_line(R::Invalid("that user ID is reserved")).as_ref(),
+            b"that user ID is reserved\r\n",
+            "Invalid says the account layer's own reason, not a generic line"
+        );
     }
 
     /// Typing builds the line and echoes every printable byte back.
@@ -891,7 +1004,7 @@ mod tests {
         tokio::spawn(async move {
             let (server, _peer) = listener.accept().await.expect("accept");
             let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let _ = handle(server, host_tx, &[], super::Stack::modern, serving).await;
+            let _ = handle(server, host_tx, super::Stack::modern, serving).await;
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
@@ -912,11 +1025,21 @@ mod tests {
             let connect = host_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("In::Connect never arrived");
-            let In::Connect { reply, .. } = connect else {
+            let In::Connect { login, terminal, reply, .. } = connect else {
                 panic!("expected In::Connect first, got a different In variant");
             };
+            // The claim this listener sends today: the user ID it read, and
+            // an empty password because it has not asked for one yet. Task
+            // 12's password prompt is a change to this one line of `handle`
+            // and to this assertion.
+            assert_eq!(
+                login,
+                mbbs::Login::Password { userid: "tester".into(), password: String::new() },
+                "a telnet caller is a Password claim, never a trusted one"
+            );
+            assert_eq!(terminal, mbbs::Terminal { ansi: true, width: 80, height: 24 });
             let chan = terms.chan(0).expect("channel 0");
-            let _ = reply.send(Some(chan));
+            let _ = reply.send(Ok(chan));
             let input = host_rx.recv_timeout(Duration::from_secs(5)).expect(
                 "In::Input for the pipelined leftover never arrived -- it was dropped",
             );
@@ -994,7 +1117,7 @@ mod tests {
                 if let In::Connect { out, reply, .. } = msg {
                     let chan = terms.chan(next).expect("channel in range");
                     next += 1;
-                    let _ = reply.send(Some(chan));
+                    let _ = reply.send(Ok(chan));
                     // blocking_send: this is a plain std::thread, not a
                     // tokio task, so there is no async context to violate.
                     let _ = out.blocking_send(Out::Bytes(host_chunk.clone()));
@@ -1007,7 +1130,6 @@ mod tests {
 
         let bound = super::serve_on(
             host_tx.clone(),
-            default_keys(),
             &[("127.0.0.1:0", Stack::modern as fn() -> Stack), ("127.0.0.1:0", Stack::raw)],
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         )
@@ -1097,11 +1219,11 @@ mod tests {
             extension: None,
             maintenance_interval: crate::host::MAINTENANCE_INTERVAL,
             serving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            default_ring: default_keys(),
         };
 
         let bound = super::serve(
             boot,
-            default_keys(),
             &[
                 ("127.0.0.1:0", Stack::modern as fn() -> Stack),
                 ("127.0.0.1:0", Stack::modern),
@@ -1141,7 +1263,7 @@ mod tests {
         tokio::spawn(async move {
             let (server, _peer) = listener.accept().await.expect("accept");
             let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let _ = handle(server, host_tx, &[], Stack::modern, serving).await;
+            let _ = handle(server, host_tx, Stack::modern, serving).await;
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");

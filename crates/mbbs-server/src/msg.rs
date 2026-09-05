@@ -1,15 +1,24 @@
 //! What crosses the boundary between the async edge and the host thread.
 
-use mbbs::{Chan, Connection};
+use mbbs::{Chan, Login, Refusal, Terminal};
 use tokio::sync::{mpsc, oneshot};
 
 /// Into the host thread. One queue for every connection, because the host
 /// thread has to be able to block on exactly one thing.
 pub enum In {
+    /// A caller asking to be let on, with what the listener claims about
+    /// who they are and what they are looking at.
+    ///
+    /// The listener sends a *claim*, never a decision: it is the host that
+    /// reads the account file, so it is the host that says who this is and
+    /// which keys they hold. `reply` carries that answer back -- a `Chan`
+    /// the caller now owns, or the one [`Refusal`] the listener turns into
+    /// one line on the wire (`crate::conn::refusal_line`).
     Connect {
-        who: Connection,
+        login: Login,
+        terminal: Terminal,
         out: mpsc::Sender<Out>,
-        reply: oneshot::Sender<Option<Chan>>,
+        reply: oneshot::Sender<Result<Chan, Refusal>>,
     },
     Input {
         chan: Chan,

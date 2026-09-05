@@ -4,9 +4,11 @@
 //! A session opens with one header -- `mbbs-door 1`, then `key=value`
 //! lines, then a blank line -- and everything after the blank line is the
 //! session's bytes, raw CP437 with no telnet framing (`Stack::door`). The
-//! header carries who the caller is and what the BBS decided about them;
-//! this host holds no accounts and no security levels, only keys, and the
-//! relay has already reduced the BBS's level to `sysop=0|1`.
+//! header carries who the caller is and what the BBS decided about them:
+//! this door has no authentication of its own, and the relay has already
+//! reduced the BBS's level to `sysop=0|1`. The name it carries becomes a
+//! `Login::Trusted` claim, and the host provisions an account for it in the
+//! board's own account file the first time it is seen.
 //!
 //! See `docs/superpowers/specs/2026-08-29-sbbs-door-design.md`.
 
@@ -15,7 +17,6 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 
-use mbbs::Connection;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
@@ -31,14 +32,6 @@ pub const PROTOCOL: &str = "mbbs-door 1";
 /// The most header a session may send before its blank line. A relay is a
 /// few short lines; anything longer is not a relay.
 pub const MAX_HEADER: usize = 1024;
-
-/// What a player needs to run MajorMUD at all (`crates/mbbs/tests/wccmmud.rs:2450`).
-pub const PLAYER_KEYS: [&str; 3] = ["DEMO", "NORMAL", "USER"];
-
-/// What a sysop can do inside it. Granted only when the BBS says the
-/// caller is a sysop -- the relay decides that from the BBS's own level
-/// scale, which this host never sees.
-pub const SYSOP_KEYS: [&str; 2] = ["SYSOP", "WCCSYSOP"];
 
 /// The header, parsed. `node` is informational: logged, never acted on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,22 +156,24 @@ fn dimension(value: &str) -> Option<u8> {
     value.parse::<u8>().ok().filter(|&n| n > 0)
 }
 
-/// The keys a door session holds. Fixed, and independent of `--keys`.
-pub fn keys(sysop: bool) -> Vec<&'static str> {
-    let mut keys = PLAYER_KEYS.to_vec();
-    if sysop {
-        keys.extend(SYSOP_KEYS);
-    }
-    keys
-}
-
-/// The `Connection` a header describes. `Connection` truncates `userid` to
-/// `UIDSIZ` itself.
-pub fn connection(h: &Handshake) -> Connection {
-    let mut c = if h.ansi { Connection::ansi(&h.user) } else { Connection::line_mode(&h.user) };
-    c.width = h.cols;
-    c.height = h.rows;
-    c.with_keys(keys(h.sysop))
+/// The claim and the terminal a header describes.
+///
+/// [`mbbs::Login::Trusted`] because the BBS in front of this door has
+/// already authenticated the caller -- that is the whole point of a door --
+/// so there is no password here to check and none to ask for. The host
+/// looks the name up in its own account file and provisions one the first
+/// time it sees it, with [`crate::host::Boot::default_ring`]'s ring.
+///
+/// The ring is not built here any more, and neither is the sysop grant:
+/// `Host::resolve_login` adds `SYSOP`/`WCCSYSOP` to a `Trusted` claim whose
+/// `sysop` is set, which is the same rule this function used to apply, in
+/// the one place that can also see what the account file already says.
+#[must_use]
+pub fn login(h: &Handshake) -> (mbbs::Login, mbbs::Terminal) {
+    (
+        mbbs::Login::Trusted { userid: h.user.clone(), sysop: h.sysop },
+        mbbs::Terminal { ansi: h.ansi, width: h.cols, height: h.rows },
+    )
 }
 
 /// Bind `path` and spawn its accept loop; returns as soon as it is bound.
@@ -273,23 +268,24 @@ async fn session(stream: UnixStream, tx: std_mpsc::Sender<In>, serving: crate::h
     );
 
     if !serving.load(std::sync::atomic::Ordering::Relaxed) {
-        writer.write_all(conn::MAINTENANCE_LINE).await?;
+        writer.write_all(&conn::refusal_line(mbbs::Refusal::Maintenance)).await?;
         return Ok(());
     }
 
     let (out_tx, out_rx) = mpsc::channel::<Out>(OUT_CHANNEL_BOUND);
     let (reply_tx, reply_rx) = oneshot::channel();
+    let (claim, terminal) = login(&handshake);
     if tx
-        .send(In::Connect { who: connection(&handshake), out: out_tx, reply: reply_tx })
+        .send(In::Connect { login: claim, terminal, out: out_tx, reply: reply_tx })
         .is_err()
     {
         writer.write_all(b"Server error, try again later.\r\n").await?;
         return Ok(());
     }
     let chan = match reply_rx.await {
-        Ok(Some(chan)) => chan,
-        Ok(None) => {
-            writer.write_all(b"All lines are busy.\r\n").await?;
+        Ok(Ok(chan)) => chan,
+        Ok(Err(refusal)) => {
+            writer.write_all(&conn::refusal_line(refusal)).await?;
             return Ok(());
         }
         Err(_) => {
@@ -398,25 +394,20 @@ mod tests {
         assert_eq!(parse(&buf), Parse::Invalid("header too long"));
     }
 
+    /// The header becomes a `Trusted` claim and the terminal facts beside
+    /// it. The ring is not here at all any more: the host writes a new
+    /// account's ring and `Host::resolve_login` adds the sysop keys to a
+    /// `Trusted { sysop: true }` claim.
     #[test]
-    fn the_key_rule_is_exactly_the_spec() {
-        assert_eq!(keys(false), vec!["DEMO", "NORMAL", "USER"]);
-        assert_eq!(keys(true), vec!["DEMO", "NORMAL", "USER", "SYSOP", "WCCSYSOP"]);
-    }
-
-    #[test]
-    fn a_connection_carries_the_handshake_into_the_host() {
+    fn the_handshake_becomes_a_trusted_claim_and_a_terminal() {
         let h = Handshake { user: "Dan".into(), sysop: false, ansi: false, node: None, rows: 25, cols: 132 };
-        let c = connection(&h);
-        assert_eq!(c.userid, "Dan");
-        assert!(!c.ansi);
-        assert_eq!((c.width, c.height), (132, 25));
-        assert!(c.keys.evaluate("USER"));
-        assert!(!c.keys.evaluate("SYSOP"));
+        let (claim, terminal) = login(&h);
+        assert_eq!(claim, mbbs::Login::Trusted { userid: "Dan".into(), sysop: false });
+        assert_eq!(terminal, mbbs::Terminal { ansi: false, width: 132, height: 25 });
 
-        let c = connection(&Handshake { sysop: true, ansi: true, ..h });
-        assert!(c.ansi);
-        assert!(c.keys.evaluate("SYSOP") && c.keys.evaluate("WCCSYSOP"));
+        let (claim, terminal) = login(&Handshake { sysop: true, ansi: true, ..h });
+        assert_eq!(claim, mbbs::Login::Trusted { userid: "Dan".into(), sysop: true });
+        assert!(terminal.ansi);
     }
 
     use crate::msg::{In, Out};
@@ -468,20 +459,25 @@ mod tests {
         assert_eq!(got, b"mbbs-door: not an mbbs-door 1 header\r\n");
     }
 
+    /// What the fake host below captures off every `In::Connect` it
+    /// answers: the claim, the terminal, and the sender it was handed.
+    type Claimed = (mbbs::Login, mbbs::Terminal, tokio::sync::mpsc::Sender<Out>);
+
     /// A fake host thread: answers the first `Connect` as told, then hands
-    /// the test the `Out` sender it was given and every later message.
+    /// the test the claim it saw, the `Out` sender it was given, and every
+    /// later message.
     fn fake_host(
-        reply_with: Option<mbbs::Chan>,
-    ) -> (std_mpsc::Sender<In>, std_mpsc::Receiver<(mbbs::Connection, tokio::sync::mpsc::Sender<Out>)>, std_mpsc::Receiver<In>) {
+        reply_with: Result<mbbs::Chan, mbbs::Refusal>,
+    ) -> (std_mpsc::Sender<In>, std_mpsc::Receiver<Claimed>, std_mpsc::Receiver<In>) {
         let (tx, rx) = std_mpsc::channel::<In>();
         let (connected_tx, connected_rx) = std_mpsc::channel();
         let (rest_tx, rest_rx) = std_mpsc::channel();
         std::thread::spawn(move || {
             for msg in rx {
                 match msg {
-                    In::Connect { who, out, reply } => {
+                    In::Connect { login, terminal, out, reply } => {
                         let _ = reply.send(reply_with);
-                        let _ = connected_tx.send((who, out));
+                        let _ = connected_tx.send((login, terminal, out));
                     }
                     other => {
                         let _ = rest_tx.send(other);
@@ -495,7 +491,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_board_tells_the_relay_and_closes() {
         let path = socket_path("door-full");
-        let (tx, _connected, _rest) = fake_host(None);
+        let (tx, _connected, _rest) = fake_host(Err(mbbs::Refusal::Full));
         serve(path.clone(), tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
             .await
             .expect("bind");
@@ -503,6 +499,24 @@ mod tests {
         let mut sock = UnixStream::connect(&path).await.expect("connect");
         sock.write_all(b"mbbs-door 1\nuser=Dan\n\n").await.expect("write");
         assert_eq!(read_to_end(&mut sock).await, b"All lines are busy.\r\n");
+    }
+
+    /// Every refusal reaches the relay as its own line and nothing else --
+    /// the same [`conn::refusal_line`] every other listener writes.
+    /// `Suspended` rather than `Full` because `Full` is the one refusal the
+    /// door already had a line for before a claim existed at all, so it
+    /// cannot tell the shared table apart from the old hardcoded string.
+    #[tokio::test]
+    async fn a_refused_door_session_prints_the_line_and_closes() {
+        let path = socket_path("door-refused");
+        let (tx, _connected, _rest) = fake_host(Err(mbbs::Refusal::Suspended));
+        serve(path.clone(), tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+            .await
+            .expect("bind");
+
+        let mut sock = UnixStream::connect(&path).await.expect("connect");
+        sock.write_all(b"mbbs-door 1\nuser=Dan\n\n").await.expect("write");
+        assert_eq!(read_to_end(&mut sock).await, b"That account is suspended.\r\n");
     }
 
     #[tokio::test]
@@ -519,14 +533,14 @@ mod tests {
     }
 
     /// The whole prelude, then the wire: the host sees the handshake's
-    /// `Connection`; the session's bytes flow both ways with no telnet
+    /// claim; the session's bytes flow both ways with no telnet
     /// framing and no transcoding; bytes pipelined behind the header are
     /// the session's first input.
     #[tokio::test]
     async fn a_session_connects_with_the_handshake_and_pumps_raw_cp437() {
         let path = socket_path("door-session");
         let chan = mbbs::Terms::new(1).chan(0).expect("channel zero");
-        let (tx, connected, rest) = fake_host(Some(chan));
+        let (tx, connected, rest) = fake_host(Ok(chan));
         serve(path.clone(), tx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
             .await
             .expect("bind");
@@ -536,13 +550,16 @@ mod tests {
             .await
             .expect("write");
 
-        let (who, out) = tokio::task::spawn_blocking(move || connected.recv_timeout(Duration::from_secs(5)))
+        let (claim, terminal, out) = tokio::task::spawn_blocking(move || connected.recv_timeout(Duration::from_secs(5)))
             .await
             .expect("join")
             .expect("the host saw a Connect");
-        assert_eq!(who.userid, "Dan");
-        assert_eq!((who.width, who.height), (132, 25));
-        assert!(who.keys.evaluate("SYSOP"));
+        assert_eq!(
+            claim,
+            mbbs::Login::Trusted { userid: "Dan".into(), sysop: true },
+            "the relay has already authenticated the caller, so the door claims Trusted"
+        );
+        assert_eq!((terminal.width, terminal.height), (132, 25));
 
         // `std_mpsc::Receiver` is not `Sync`, so it cannot be borrowed into
         // `spawn_blocking`; share it behind a mutex and move clones in.

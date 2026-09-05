@@ -16,14 +16,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 
 use mbbs::abi::Wg16;
-use mbbs::{Chan, Connection};
-use mbbs_server::conn::{self, default_keys};
+use mbbs::{Chan, Login, Refusal, Terminal};
+use mbbs_server::conn;
 use mbbs_server::host::Boot;
 use mbbs_server::msg::{In, Out};
 
@@ -53,26 +53,6 @@ async fn read_until(stream: &mut TcpStream, acc: &mut Vec<u8>, needle: &str) {
             ),
         };
         acc.extend_from_slice(&buf[..n]);
-    }
-}
-
-/// Reads until the socket closes, or `budget` elapses -- whichever comes
-/// first -- and says which. Used to observe `Out::Close` (a clean EOF)
-/// without hanging forever if a bug ever left the socket open instead.
-async fn read_until_closed(stream: &mut TcpStream, acc: &mut Vec<u8>, budget: Duration) -> bool {
-    let deadline = Instant::now() + budget;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        let mut buf = [0u8; 4096];
-        match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
-            Ok(Ok(0)) => return true,
-            Ok(Ok(n)) => acc.extend_from_slice(&buf[..n]),
-            Ok(Err(_)) => return true,
-            Err(_) => return false,
-        }
     }
 }
 
@@ -747,6 +727,7 @@ fn boot_many(modules: Vec<PathBuf>, root_name: &str, terms: u16) -> Boot<Wg16> {
         extension: None,
         maintenance_interval: mbbs_server::host::MAINTENANCE_INTERVAL,
         serving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        default_ring: vec!["DEMO".into()],
     }
 }
 
@@ -799,11 +780,19 @@ fn real_bell(
 /// its lifetime: dropping it closes the connection's `Sender<Out>` from the
 /// other end (letting a caller reproduce `flush`'s send-failure path on
 /// purpose), keeping it alive does not.
-async fn connect_raw(tx: &std::sync::mpsc::Sender<In>, who: &str) -> (Option<Chan>, Receiver<Out>) {
+///
+/// The claim is [`Login::Trusted`], the door's claim: a board built out of
+/// a synthetic module has no accounts and nobody to type a password, and
+/// `Trusted` is the one claim that provisions the account it names rather
+/// than refusing an unknown one. What these tests are about is the pool,
+/// the restart loop and maintenance, so the login has to succeed for the
+/// same reason it used to be a bare `Connection`.
+async fn connect_raw(tx: &std::sync::mpsc::Sender<In>, who: &str) -> (Result<Chan, Refusal>, Receiver<Out>) {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Out>(32);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send(In::Connect {
-        who: Connection::ansi(who).with_keys(std::iter::empty::<&str>()),
+        login: Login::Trusted { userid: who.to_string(), sysop: false },
+        terminal: Terminal { ansi: true, width: 80, height: 24 },
         out: out_tx,
         reply: reply_tx,
     })
@@ -853,20 +842,22 @@ async fn connect_two_at_once(
     tx: &std::sync::mpsc::Sender<In>,
     who_a: &str,
     who_b: &str,
-) -> ((Option<Chan>, Receiver<Out>), (Option<Chan>, Receiver<Out>)) {
+) -> ((Result<Chan, Refusal>, Receiver<Out>), (Result<Chan, Refusal>, Receiver<Out>)) {
     let (out_tx_a, out_rx_a) = tokio::sync::mpsc::channel::<Out>(32);
     let (reply_tx_a, reply_rx_a) = tokio::sync::oneshot::channel();
     let (out_tx_b, out_rx_b) = tokio::sync::mpsc::channel::<Out>(32);
     let (reply_tx_b, reply_rx_b) = tokio::sync::oneshot::channel();
 
     tx.send(In::Connect {
-        who: Connection::ansi(who_a).with_keys(std::iter::empty::<&str>()),
+        login: Login::Trusted { userid: who_a.to_string(), sysop: false },
+        terminal: Terminal { ansi: true, width: 80, height: 24 },
         out: out_tx_a,
         reply: reply_tx_a,
     })
     .expect("host thread is alive");
     tx.send(In::Connect {
-        who: Connection::ansi(who_b).with_keys(std::iter::empty::<&str>()),
+        login: Login::Trusted { userid: who_b.to_string(), sysop: false },
+        terminal: Terminal { ansi: true, width: 80, height: 24 },
         out: out_tx_b,
         reply: reply_tx_b,
     })
@@ -1134,7 +1125,7 @@ async fn the_board_serves_again_after_a_kick_driven_stop_with_no_channel_connect
     );
     let boot = boot(module, "mbbs-server-host-supervisor-kick-fault-root", 1);
 
-    let addr = conn::serve(boot, default_keys(), &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)])
+    let addr = conn::serve(boot, &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)])
         .await
         .expect("bind 127.0.0.1:0")[0];
 
@@ -1162,6 +1153,16 @@ async fn the_board_serves_again_after_a_kick_driven_stop_with_no_channel_connect
 /// socket is closed, not silently abandoned), and a fresh connection made
 /// afterwards reaches a live board again -- the two acceptance halves the
 /// plan asks for explicitly, both against the same restart.
+///
+/// The connected half is driven over the raw `In` channel ([`connect_raw`])
+/// rather than through a real socket. A telnet caller cannot hold a channel
+/// on this board any more: `conn::handle` sends a `Password` claim with an
+/// empty password (there is no password prompt until the task after this
+/// one), so every telnet login here is refused and the socket closes at
+/// once -- which would look like a close that had nothing to do with the
+/// module stopping. The listener is still bound and still used, for the
+/// reconnect half, which is about the board serving again and nothing
+/// else.
 #[tokio::test]
 async fn a_connected_socket_is_closed_by_the_stop_and_a_new_one_reconnects_after() {
     let module = module_file(
@@ -1169,32 +1170,119 @@ async fn a_connected_socket_is_closed_by_the_stop_and_a_new_one_reconnects_after
         &builder::faults_one_second_after_boot(),
     );
     let boot = boot(module, "mbbs-server-host-supervisor-connected-fault-root", 2);
+    let serving = boot.serving.clone();
+    let tx = conn::spawn_machine(boot);
+    let addr = conn::serve_on(
+        tx.clone(),
+        &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)],
+        serving,
+    )
+    .await
+    .expect("bind 127.0.0.1:0")[0];
 
-    let addr = conn::serve(boot, default_keys(), &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)])
-        .await
-        .expect("bind 127.0.0.1:0")[0];
-
-    let mut sock = TcpStream::connect(addr).await.expect("connect");
-    let mut buf = Vec::new();
-    read_until(&mut sock, &mut buf, "Enter your user ID: ").await;
-    // Log in far enough to hold a channel open across the stop -- this
-    // module registers no `lonrou`, so `Host::connect` answers with no
-    // module call at all and the login prompt above is the last thing this
-    // socket will ever see from the module; what matters here is that the
-    // channel exists and is connected when the kick fires.
-    sock.write_all(b"tester\r").await.expect("write userid");
+    // A channel held open across the stop. This module registers no
+    // `lonrou`, so the login is the whole of what the module sees; what
+    // matters here is that the channel exists and is connected when the
+    // kick fires.
+    let (chan, mut out) = connect_raw(&tx, "tester").await;
+    chan.expect("the first life serves a channel");
 
     // The kick fires the module's `HLT` about a second after boot; give the
     // stop and the flush it triggers (`Out::Close` to every open channel,
     // `host.rs`'s `life`) generous room.
-    let closed = read_until_closed(&mut sock, &mut buf, Duration::from_secs(5)).await;
-    assert!(closed, "a connection open when the module stops must have its socket closed");
+    wait_for_close(&mut out, "a connection open when the module stops").await;
 
     // And the board is serving again, unattended: a fresh connection after
     // the restart reaches a live login prompt.
     let mut after = TcpStream::connect(addr).await.expect("connect after the restart");
     let mut after_buf = Vec::new();
     read_until(&mut after, &mut after_buf, "Enter your user ID: ").await;
+}
+
+/// A one-term board hands its only channel to the first caller and tells
+/// the second `Refusal::Full` -- the pool's refusal, not the account
+/// layer's, and the one refusal `Host::login` itself can never produce.
+#[tokio::test]
+async fn a_second_caller_when_full_is_told_full() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-full",
+        &builder::boots_and_runs_forever(),
+    );
+    let tx = conn::spawn_machine(boot(module, "mbbs-server-host-supervisor-full-root", 1));
+
+    let (first, _out_a) = connect_raw(&tx, "first").await;
+    first.expect("the only channel goes to the first caller");
+
+    let (second, _out_b) = connect_raw(&tx, "second").await;
+    assert_eq!(second, Err(Refusal::Full), "a one-term board has nothing left to give");
+}
+
+/// Two refused claims in a row do not cost the board its channels: the
+/// refusal path gives the channel back to the pool, so a third caller the
+/// board *can* serve still gets one.
+///
+/// A one-term board, so a single leaked channel is the difference between
+/// serving and `Full`. `"new"` is a reserved user ID
+/// (`accounts::validate_userid`), which is what makes a `Trusted` claim --
+/// the claim that otherwise provisions whatever account it names -- refuse
+/// at all.
+#[tokio::test]
+async fn a_refused_claim_gives_the_channel_back() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-refusal-gives-back",
+        &builder::boots_and_runs_forever(),
+    );
+    let tx = conn::spawn_machine(boot(module, "mbbs-server-host-supervisor-refusal-gives-back-root", 1));
+
+    for round in 0..2 {
+        let (refused, _out) = connect_raw(&tx, "new").await;
+        assert!(
+            matches!(refused, Err(Refusal::Invalid(_))),
+            "round {round}: a reserved user ID is refused: {refused:?}"
+        );
+    }
+
+    let (chan, _out) = connect_raw(&tx, "welcome").await;
+    chan.expect(
+        "two refusals must have given the one channel back both times -- a Full here \
+         means the refusal path leaked it",
+    );
+}
+
+/// The board opens its account files at boot, creating them when the root
+/// has none. These modules are NE, so the pair is `Wg16`'s: `bbsusr.dat`
+/// and `bbsk.dat`.
+///
+/// `boot`'s root comes from `mbbs::testing::scratch`, which wipes and
+/// recreates the directory, so the two files cannot be left over from an
+/// earlier run -- the assertion before the boot says so out loud, because
+/// without it this test would pass against a stale pair no code created.
+#[tokio::test]
+async fn a_board_boots_with_a_fresh_account_pair() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-account-pair",
+        &builder::boots_and_runs_forever(),
+    );
+    let config = boot(module, "mbbs-server-host-supervisor-account-pair-root", 1);
+    let root = config.root.clone();
+    assert!(
+        !root.join("bbsusr.dat").exists() && !root.join("bbsk.dat").exists(),
+        "a scratch root starts empty: anything found below was created by this boot"
+    );
+
+    let _tx = conn::spawn_machine(config);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if root.join("bbsusr.dat").exists() && root.join("bbsk.dat").exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no account pair appeared under {} within 5s -- life never opened them",
+        root.display()
+    );
 }
 
 /// A module that stops on every single life is a crash loop, and
@@ -1373,7 +1461,7 @@ async fn the_board_serves_again_after_an_unimplemented_symbol_stop() {
     );
     let boot = boot(module, "mbbs-server-host-supervisor-unimplemented-fault-root", 1);
 
-    let addr = conn::serve(boot, default_keys(), &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)])
+    let addr = conn::serve(boot, &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)])
         .await
         .expect("bind 127.0.0.1:0")[0];
 
@@ -1455,13 +1543,13 @@ async fn a_duplicate_disconnect_after_a_send_failure_does_not_let_two_clients_sh
     // anything else to land in between.
     let ((chan_b, _out_rx_b), (chan_c, _out_rx_c)) = connect_two_at_once(&tx, "conn-b", "conn-c").await;
 
-    assert!(chan_b.is_some(), "the freed channel must be takeable once");
-    assert!(
-        chan_c.is_none(),
+    assert!(chan_b.is_ok(), "the freed channel must be takeable once");
+    assert_eq!(
+        chan_c,
+        Err(Refusal::Full),
         "and only once -- a second successful connect on a one-channel \
          board means the duplicate Disconnect doubled the free list, and \
-         chan_b and chan_c would be the same Chan sharing one real channel: \
-         {chan_c:?}"
+         chan_b and chan_c would be the same Chan sharing one real channel"
     );
 
     drop(tx);
@@ -1555,11 +1643,12 @@ async fn a_stale_message_from_a_dead_life_does_not_corrupt_the_new_lifes_pool() 
     // life's legitimately empty `Pool`) and make this assertion flaky rather
     // than wrong.
     let ((b, out_rx_b), (c, out_rx_c)) = connect_two_at_once(&tx, "later-life-b", "later-life-c").await;
-    assert!(b.is_some(), "the current life's channel must still be takeable");
-    assert!(
-        c.is_none(),
+    assert!(b.is_ok(), "the current life's channel must still be takeable");
+    assert_eq!(
+        c,
+        Err(Refusal::Full),
         "and only once -- a second successful connect means the stale \
-         Disconnect doubled the current life's free list: {c:?}"
+         Disconnect doubled the current life's free list"
     );
     drop(out_rx_b);
     drop(out_rx_c);
@@ -1752,14 +1841,14 @@ async fn a_maintain_closes_a_connected_channel_and_the_next_life_serves() {
     let tx = conn::spawn_machine(boot(module, "mbbs-server-host-supervisor-maintain-root", 1));
 
     let (chan, mut out) = connect_raw(&tx, "before").await;
-    assert!(chan.is_some(), "the first life serves the only channel");
+    assert!(chan.is_ok(), "the first life serves the only channel");
 
     tx.send(In::Maintain).expect("the host thread is alive");
 
     wait_for_close(&mut out, "maintenance").await;
 
     let (chan, _out) = connect_raw(&tx, "after").await;
-    assert!(chan.is_some(), "the life after maintenance serves the channel again");
+    assert!(chan.is_ok(), "the life after maintenance serves the channel again");
 }
 
 /// The deadline fires without any message from outside: a two-second
@@ -1777,14 +1866,14 @@ async fn maintenance_fires_on_its_own_at_the_deadline() {
     let tx = conn::spawn_machine(boot);
 
     let (chan, mut out) = connect_raw(&tx, "before").await;
-    assert!(chan.is_some());
+    assert!(chan.is_ok());
 
     let started = Instant::now();
     wait_for_close(&mut out, "the timed maintenance deadline").await;
     assert!(started.elapsed() >= Duration::from_secs(1), "the deadline fired early: {:?}", started.elapsed());
 
     let (chan, _out) = connect_raw(&tx, "after").await;
-    assert!(chan.is_some(), "the life after the timed maintenance serves again");
+    assert!(chan.is_ok(), "the life after the timed maintenance serves again");
 }
 
 /// A maintenance reload is not a stop. `MAX_RESTARTS` is five, so six
@@ -1809,7 +1898,7 @@ async fn six_maintenances_in_a_row_leave_the_board_serving() {
 
     for round in 0..6 {
         let (chan, mut out) = connect_raw(&tx, "probe").await;
-        assert!(chan.is_some(), "round {round}: the board must be serving before each maintenance");
+        assert!(chan.is_ok(), "round {round}: the board must be serving before each maintenance");
         tx.send(In::Maintain).expect("the host thread is alive");
         // Wait for this probe's hangup before the next connect. The Close is
         // sent inside the teardown, so a Connect sent after it cannot share
@@ -1818,7 +1907,7 @@ async fn six_maintenances_in_a_row_leave_the_board_serving() {
     }
 
     let (chan, _out) = connect_raw(&tx, "final").await;
-    assert!(chan.is_some(), "after six maintenances the board still serves");
+    assert!(chan.is_ok(), "after six maintenances the board still serves");
 }
 
 /// Slot 6 is what maintenance dispatches. The only thing this module's
@@ -1838,7 +1927,7 @@ async fn maintenance_runs_the_modules_mcurou() {
     let tx = conn::spawn_machine(boot);
 
     let (chan, mut out) = connect_raw(&tx, "before").await;
-    assert!(chan.is_some());
+    assert!(chan.is_ok());
     tx.send(In::Maintain).expect("alive");
     // Wait for this probe's hangup before the next connect. The Close is
     // sent inside the teardown, so a Connect sent after it cannot share a
@@ -1847,7 +1936,7 @@ async fn maintenance_runs_the_modules_mcurou() {
 
     // Answered only once the next life is polling, so maintenance is over.
     let (chan, _out2) = connect_raw(&tx, "after").await;
-    assert!(chan.is_some());
+    assert!(chan.is_ok());
 
     let text = std::fs::read_to_string(&survey_path).expect("the survey file must exist");
     assert!(
@@ -1868,7 +1957,7 @@ async fn a_stop_inside_mcurou_counts_against_the_restart_policy() {
 
     for round in 0..5 {
         let (chan, mut out) = connect_raw(&tx, "probe").await;
-        assert!(chan.is_some(), "round {round}: still serving after {round} stop(s)");
+        assert!(chan.is_ok(), "round {round}: still serving after {round} stop(s)");
         tx.send(In::Maintain).expect("alive");
         // Same synchronisation as `six_maintenances_in_a_row_leave_the_board_serving`:
         // wait for this round's hangup before the next connect, so a
@@ -1877,7 +1966,7 @@ async fn a_stop_inside_mcurou_counts_against_the_restart_policy() {
         wait_for_close(&mut out, &format!("round {round}: maintenance")).await;
     }
     let (chan, _out) = connect_raw(&tx, "probe").await;
-    assert!(chan.is_some(), "the fifth stop is still survived");
+    assert!(chan.is_ok(), "the fifth stop is still survived");
     tx.send(In::Maintain).expect("alive");
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1908,7 +1997,7 @@ async fn serving_is_cleared_by_maintenance_and_set_again_after_the_reboot() {
     let tx = conn::spawn_machine(boot);
 
     let (chan, mut out) = connect_raw(&tx, "before").await;
-    assert!(chan.is_some());
+    assert!(chan.is_ok());
     assert!(serving.load(Ordering::Relaxed), "life sets serving once booted");
 
     tx.send(In::Maintain).expect("alive");
@@ -1919,6 +2008,6 @@ async fn serving_is_cleared_by_maintenance_and_set_again_after_the_reboot() {
     );
 
     let (chan, _out) = connect_raw(&tx, "after").await;
-    assert!(chan.is_some());
+    assert!(chan.is_ok());
     assert!(serving.load(Ordering::Relaxed), "serving again once the next life booted");
 }

@@ -138,11 +138,14 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SYSCYC_HZ)]
     syscyc: u32,
 
-    /// The keys every caller holds. A key is MajorBBS's unit of
+    /// The ring a new account is written with. A key is MajorBBS's unit of
     /// entitlement: a module asks `haskey` before it lets a caller into a
-    /// game, a menu or a sysop command, and the sysop of a period board
-    /// granted keys per account. This host has no accounts, so one set is
-    /// handed to every connection. Comma-separated; a key may not be empty.
+    /// game, a menu or a sysop command. This board has accounts, so this is
+    /// read once per account -- when a login provisions one that does not
+    /// exist yet -- and every later login for that account reads its ring
+    /// out of the key file instead. Changing this does not change what
+    /// anyone who has logged in before holds; the `mbbs-user` CLI edits an
+    /// existing ring. Comma-separated; a key may not be empty.
     /// [default: DEMO,NORMAL,USER]
     #[arg(long, value_delimiter = ',', value_parser = parse_key)]
     keys: Vec<String>,
@@ -366,7 +369,7 @@ async fn main() -> ExitCode {
     let listeners = listeners(&cli);
 
     let terms = Terms::new(cli.terms);
-    let keys = if cli.keys.is_empty() {
+    let default_ring = if cli.keys.is_empty() {
         default_keys()
     } else {
         cli.keys.clone()
@@ -425,6 +428,7 @@ async fn main() -> ExitCode {
             extension: cli.scripts.clone().map(build_lua_extension),
             maintenance_interval: mbbs_server::host::MAINTENANCE_INTERVAL,
             serving: serving.clone(),
+            default_ring: default_ring.clone(),
         }),
         Plan::Wg32 { modules, root } => conn::spawn_machine(Boot::<Wg32> {
             build: Box::new(build_wg32_cpu()),
@@ -442,12 +446,13 @@ async fn main() -> ExitCode {
             extension: cli.scripts.clone().map(build_lua_extension),
             maintenance_interval: mbbs_server::host::MAINTENANCE_INTERVAL,
             serving: serving.clone(),
+            default_ring: default_ring.clone(),
         }),
     };
     let shutdown = tx.clone();
     let door_tx = tx.clone();
 
-    let addrs = match conn::serve_on(tx, keys, &listeners, serving.clone()).await {
+    let addrs = match conn::serve_on(tx, &listeners, serving.clone()).await {
         Ok(addrs) => addrs,
         Err(e) => {
             eprintln!("mbbs-server: failed to start: {e}");

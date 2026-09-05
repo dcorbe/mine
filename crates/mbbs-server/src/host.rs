@@ -313,6 +313,16 @@ pub struct Boot<A: Abi> {
     /// The flag the accept paths read. `life` sets it true once booted,
     /// `tear_down` sets it false at the start of maintenance.
     pub serving: Serving,
+    /// The key ring a brand-new account is written with.
+    ///
+    /// Handed to [`mbbs::Host::open_accounts`] at every life's boot, and
+    /// read from there exactly once per account: when a claim provisions
+    /// one that does not exist yet. It is not what a *connection* holds --
+    /// an existing account's ring comes out of the key file, and a
+    /// `Login::Trusted { sysop: true }` claim gets the sysop keys added by
+    /// `Host::resolve_login` -- so changing this changes nothing for anyone
+    /// who has logged in before.
+    pub default_ring: Vec<String>,
 }
 
 /// What one wake yielded.
@@ -1069,6 +1079,17 @@ fn life<A: Abi>(
     // the sum every module actually needs.
     host.finish_init(&mut machine)?;
 
+    // The account and key files, opened (or created) once the module's own
+    // init is over and before the first channel can be served. After
+    // `finish_init` rather than beside `open_genbb` above because this
+    // publishes `accbb` into module memory and reserves a scratch buffer
+    // from the host heap, and `alcvda`'s allocation inside `finish_init`
+    // must not be sharing that turn. A board that cannot read its accounts
+    // is not a board -- `open_accounts`' own doc says why this is an error
+    // return and `open_genbb`'s console note is not -- so `?` here ends the
+    // life before anything connects.
+    host.open_accounts(&mut machine, boot.default_ring.clone())?;
+
     // 3. Build and install this life's own extension, on this thread, the
     //    way `boot.build` builds this life's own `A::Cpu` above -- see
     //    `Boot::extension`'s own doc for why this cannot be handed in
@@ -1431,17 +1452,32 @@ fn apply<A: Abi>(
     msg: In,
 ) -> io::Result<()> {
     match msg {
-        In::Connect { who, out, reply } => {
+        In::Connect { login, terminal, out, reply } => {
             let Some(chan) = pool.take() else {
                 // All lines busy. Whoever is waiting on `reply` is the only
                 // audience -- if they are already gone (the connection task
                 // died before we got here) there is nobody left to tell.
-                let _ = reply.send(None);
+                let _ = reply.send(Err(mbbs::Refusal::Full));
                 return Ok(());
             };
-            host.connect(machine, module, chan, &who)?;
-            conns[chan.index()] = Some(out);
-            let _ = reply.send(Some(chan));
+            // The channel `pool.take` just handed over is free by
+            // construction -- nothing has connected on it in this life, or
+            // it was given back at hangup -- so this can never log a second
+            // account into a channel that already holds one.
+            match host.login(machine, module, chan, &login, terminal)? {
+                Ok(_outcome) => {
+                    conns[chan.index()] = Some(out);
+                    let _ = reply.send(Ok(chan));
+                }
+                Err(refusal) => {
+                    // A refusal leaves the channel exactly as it was
+                    // (`Host::login`'s own contract), so it goes straight
+                    // back on the free list. Forgetting this would cost the
+                    // board a channel per refused caller.
+                    pool.give_back(chan);
+                    let _ = reply.send(Err(refusal));
+                }
+            }
             Ok(())
         }
         In::Input { chan, bytes } => {
