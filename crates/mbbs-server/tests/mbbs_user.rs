@@ -1,0 +1,335 @@
+//! The `mbbs-user` CLI, end to end, against a real account pair.
+//!
+//! `cargo test -p mbbs-server --test mbbs_user`
+//!
+//! Every test here runs the shipped binary as a child process against a
+//! scratch board, because the exit code and the one stderr line *are* the
+//! contract a sysop and a script see. The pair itself is created the only
+//! way this codebase creates one -- `Host::open_accounts` on a
+//! [`mbbs::testing::Fixture`] -- and the fixture is then dropped, which
+//! releases the advisory lock the host holds for its life. A live board
+//! keeps that lock, and [`a_held_lock_refuses`] is the test that proves the
+//! CLI refuses to edit under one.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+
+use mbbs::accounts::{flags, Login, Terminal};
+use mbbs::testing::{scratch, Fixture};
+
+/// One test at a time.
+///
+/// Not for the files -- every test has its own scratch board -- but for the
+/// advisory lock. A `Command` this file runs forks before it execs, and the
+/// child inherits every descriptor the parent had open at the fork, including
+/// the `flock`ed one a [`Fixture`] is holding on some *other* test's account
+/// file. `O_CLOEXEC` closes it at the exec a moment later, but until then that
+/// duplicate keeps the lock alive after the owning thread has dropped its own
+/// copy -- so a test that drops a fixture and immediately takes the lock
+/// itself ([`a_held_lock_refuses`]) saw `WouldBlock` from a lock nobody owned,
+/// about once in eight runs. Running the tests one at a time closes the
+/// window: no fixture is ever dropped while another test is forking.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold [`ONE_AT_A_TIME`] for the rest of the test. A poisoned mutex is a
+/// test that already failed, and is no reason to fail the rest.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A scratch board with an empty `Wg16` pair and no accounts in it.
+///
+/// The fixture is dropped before this returns: its `Accounts` holds the
+/// `flock` on `bbsusr.dat`, and every test below runs a binary that takes
+/// the same lock.
+fn board(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let mut f = Fixture::rooted(root.clone());
+    f.host
+        .open_accounts(&mut f.machine, mbbs_server::conn::default_keys())
+        .expect("a fresh board gets its pair created");
+    drop(f);
+    root
+}
+
+/// Run the CLI against `root`. Stdin is `/dev/null`, so a password prompt
+/// cannot reach for the terminal `cargo test` was started from.
+fn run(root: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_mbbs-user"))
+        .arg("--root")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the CLI ran")
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// One `list` row, whitespace collapsed: `"Dan - DEMO NORMAL USER"`.
+///
+/// The real row is column-aligned, and asserting on the padding would make
+/// every test here a test of the column widths. The row is found by its
+/// first field, which is why no userid in this file contains a space.
+fn row(out: &Output, userid: &str) -> String {
+    let text = stdout(out);
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(userid))
+        .unwrap_or_else(|| panic!("no row for {userid} in:\n{text}"));
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Set an account's whole flags word through the library, the way a test
+/// arranges a state the CLI has no command for (`UNDAXS`).
+fn set_flags(root: &Path, userid: &str, word: u16) {
+    let mut f = Fixture::rooted(root.to_path_buf());
+    f.host
+        .open_accounts(&mut f.machine, mbbs_server::conn::default_keys())
+        .expect("the pair opens");
+    f.host
+        .account_set_flags(userid, word)
+        .expect("no engine fault")
+        .expect("the account exists");
+}
+
+#[test]
+fn add_then_list_shows_the_ring_and_no_flags() {
+    let _serial = serial();
+    let root = board("mbbs-user-add");
+
+    let added = run(&root, &["add", "Dan", "--password", "hunter2"]);
+    assert!(added.status.success(), "{}", stderr(&added));
+    assert_eq!(stderr(&added), "", "a successful add says nothing");
+
+    let listed = run(&root, &["list"]);
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert!(
+        stdout(&listed).starts_with("USERID"),
+        "the listing has a header:\n{}",
+        stdout(&listed)
+    );
+    assert_eq!(row(&listed, "Dan"), "Dan - DEMO NORMAL USER");
+}
+
+#[test]
+fn master_on_sets_the_flag_and_warns() {
+    let _serial = serial();
+    let root = board("mbbs-user-master");
+    assert!(run(&root, &["add", "Dan", "--password", "hunter2"]).status.success());
+
+    let on = run(&root, &["master", "Dan", "on"]);
+    assert_eq!(on.status.code(), Some(0), "{}", stderr(&on));
+    assert!(
+        stderr(&on).contains("note: the master flag"),
+        "the warning is said: {}",
+        stderr(&on)
+    );
+    assert_eq!(row(&run(&root, &["list"]), "Dan"), "Dan MASTER DEMO NORMAL USER");
+
+    let off = run(&root, &["master", "Dan", "off"]);
+    assert_eq!(off.status.code(), Some(0), "{}", stderr(&off));
+    assert_eq!(stderr(&off), "", "turning it off warns about nothing");
+    assert_eq!(row(&run(&root, &["list"]), "Dan"), "Dan - DEMO NORMAL USER");
+}
+
+#[test]
+fn keys_add_and_remove_rewrite_the_ring() {
+    let _serial = serial();
+    let root = board("mbbs-user-keys");
+    assert!(run(&root, &["add", "Dan", "--password", "hunter2"]).status.success());
+
+    let keyed = run(&root, &["keys", "Dan", "--add", "sysop", "--remove", "DEMO"]);
+    assert_eq!(keyed.status.code(), Some(0), "{}", stderr(&keyed));
+    assert!(
+        stdout(&keyed).contains("NORMAL USER SYSOP"),
+        "the resulting ring is printed: {}",
+        stdout(&keyed)
+    );
+
+    // The file's own order, read back by a second process: removes first,
+    // then the additions on the end, and a lower-case `--add` stored upper.
+    assert_eq!(row(&run(&root, &["list"]), "Dan"), "Dan - NORMAL USER SYSOP");
+
+    // With neither flag it is a question, and the answer is the same ring.
+    let asked = run(&root, &["keys", "Dan"]);
+    assert_eq!(asked.status.code(), Some(0), "{}", stderr(&asked));
+    assert_eq!(stdout(&asked), "NORMAL USER SYSOP\n");
+    assert_eq!(row(&run(&root, &["list"]), "Dan"), "Dan - NORMAL USER SYSOP");
+}
+
+#[test]
+fn delete_tags_and_refuses_undeletable() {
+    let _serial = serial();
+    let root = board("mbbs-user-delete");
+    assert!(run(&root, &["add", "Dan", "--password", "hunter2"]).status.success());
+
+    let deleted = run(&root, &["delete", "Dan"]);
+    assert_eq!(deleted.status.code(), Some(0), "{}", stderr(&deleted));
+
+    // Tagged, not gone: the maintenance purge is what removes the record.
+    assert_eq!(row(&run(&root, &["list"]), "Dan"), "Dan DELETED DEMO NORMAL USER");
+
+    set_flags(&root, "Dan", flags::UNDAXS);
+    let refused = run(&root, &["delete", "Dan"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert_eq!(stderr(&refused), "mbbs-user: that account cannot be deleted\n");
+    assert_eq!(row(&run(&root, &["list"]), "Dan"), "Dan UNDAXS DEMO NORMAL USER");
+}
+
+#[test]
+fn passwd_changes_what_the_host_accepts() {
+    let _serial = serial();
+    let root = board("mbbs-user-passwd");
+    assert!(run(&root, &["add", "Dan", "--password", "hunter2"]).status.success());
+
+    let changed = run(&root, &["passwd", "Dan", "--password", "newpw"]);
+    assert_eq!(changed.status.code(), Some(0), "{}", stderr(&changed));
+
+    let mut f = Fixture::rooted(root.clone());
+    f.host
+        .open_accounts(&mut f.machine, mbbs_server::conn::default_keys())
+        .expect("the pair opens");
+    let terminal = Terminal { ansi: true, width: 80, height: 24 };
+
+    let now = f
+        .host
+        .resolve_login(
+            &mut f.machine,
+            &Login::Password { userid: "Dan".into(), password: "newpw".into() },
+            terminal,
+        )
+        .expect("no engine fault");
+    assert!(now.is_ok(), "the new password logs in: {now:?}");
+
+    let before = f
+        .host
+        .resolve_login(
+            &mut f.machine,
+            &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+            terminal,
+        )
+        .expect("no engine fault");
+    assert_eq!(before.unwrap_err(), mbbs::Refusal::BadPassword);
+}
+
+#[test]
+fn no_pair_and_two_pairs_refuse_with_the_named_lines() {
+    let _serial = serial();
+    let bare = scratch("mbbs-user-no-pair");
+    let refused = run(&bare, &["list"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert_eq!(
+        stderr(&refused),
+        format!(
+            "mbbs-user: no account files in {}; boot mbbs-server once to create them\n",
+            bare.display()
+        )
+    );
+
+    let both = board("mbbs-user-two-pairs");
+    std::fs::write(both.join("wgsusr2.dat"), b"").expect("a second generation's account file");
+    let confused = run(&both, &["list"]);
+    assert_eq!(confused.status.code(), Some(1), "{}", stderr(&confused));
+    assert_eq!(
+        stderr(&confused),
+        "mbbs-user: both bbsusr.dat and wgsusr2.dat are here; a board has one pair\n"
+    );
+}
+
+#[test]
+fn a_held_lock_refuses() {
+    let _serial = serial();
+    let root = board("mbbs-user-locked");
+    let held = mbbs::accounts::lock_file(&root.join("bbsusr.dat")).expect("the lock is free");
+
+    let refused = run(&root, &["list"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("stop it first"),
+        "the running board is named: {}",
+        stderr(&refused)
+    );
+
+    drop(held);
+    assert_eq!(run(&root, &["list"]).status.code(), Some(0));
+}
+
+#[test]
+fn a_password_cannot_be_prompted_for_without_a_terminal() {
+    let _serial = serial();
+    let root = board("mbbs-user-no-tty");
+
+    let refused = run(&root, &["add", "Dan"]);
+    assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
+    assert_eq!(
+        stderr(&refused),
+        "mbbs-user: --password is required when stdin is not a terminal\n"
+    );
+
+    // And nothing was written on the way to refusing.
+    assert_eq!(stdout(&run(&root, &["list"])).lines().count(), 1);
+}
+
+#[test]
+fn an_unknown_user_is_refused_by_every_command_that_names_one() {
+    let _serial = serial();
+    let root = board("mbbs-user-unknown");
+
+    for args in [
+        vec!["passwd", "Nobody", "--password", "hunter2"],
+        vec!["keys", "Nobody", "--add", "SYSOP"],
+        vec!["master", "Nobody", "on"],
+        vec!["delete", "Nobody"],
+    ] {
+        let refused = run(&root, &args);
+        assert_eq!(refused.status.code(), Some(1), "{args:?}: {}", stderr(&refused));
+        assert_eq!(stderr(&refused), "mbbs-user: no account named Nobody\n", "{args:?}");
+    }
+
+    let twice = run(&root, &["add", "Dan", "--password", "hunter2"]);
+    assert!(twice.status.success(), "{}", stderr(&twice));
+    let again = run(&root, &["add", "Dan", "--password", "hunter2"]);
+    assert_eq!(again.status.code(), Some(1), "{}", stderr(&again));
+    assert_eq!(stderr(&again), "mbbs-user: Dan already has an account\n");
+}
+
+#[test]
+fn a_board_with_half_a_pair_gets_the_hosts_own_refusal() {
+    let _serial = serial();
+
+    // The account file alone, under the host that owns that name.
+    let root = board("mbbs-user-half-wg16");
+    std::fs::remove_file(root.join("bbsk.dat")).expect("the key file goes");
+    let refused = run(&root, &["list"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert_eq!(
+        stderr(&refused),
+        "mbbs-user: bbsusr.dat exists but bbsk.dat does not; a board has both or neither\n",
+        "the host's own sentence, not a second copy of it in the CLI"
+    );
+    assert!(!root.join("bbsk.dat").exists(), "and nothing was created to make the pair whole");
+
+    // An empty `wgsusr2.dat` is enough to pick the other generation, which is
+    // the only thing in this file that builds a 32-bit machine at all -- the
+    // refusal proves `run::<Wg32>` runs, not just that it compiles.
+    let other = scratch("mbbs-user-half-wg32");
+    std::fs::write(other.join("wgsusr2.dat"), b"").expect("a lone Worldgroup 3 account file");
+    let refused = run(&other, &["list"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert_eq!(
+        stderr(&refused),
+        "mbbs-user: wgsusr2.dat exists but wgskey2.dat does not; a board has both or neither\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(&other).expect("the board directory").count(),
+        1,
+        "and nothing was created there either"
+    );
+}
