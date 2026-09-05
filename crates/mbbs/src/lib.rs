@@ -2164,6 +2164,50 @@ impl<A: Abi> Host<A> {
         self.accounts.as_ref()
     }
 
+    /// What a listener's claim resolves to: an account, its key ring, and
+    /// the [`Connection`] to hand [`Host::connect`]. Spec section 3.
+    ///
+    /// Everything here happens in
+    /// [`Accounts::resolve`](accounts::Accounts::resolve); this is the
+    /// wrapper that reads the date, lends the account layer the host's
+    /// Btrieve session, and moves the console notes `loadkeys` produced onto
+    /// the host's own channel. The notes are drained whatever the outcome:
+    /// an engine failure after a blank ring was written is still a blank
+    /// ring the sysop needs to know about.
+    ///
+    /// The machine is unused today and taken anyway, because the step that
+    /// copies the resolved record into a channel's `usracc` slot writes
+    /// module memory: a caller that has resolved a claim without a machine
+    /// to hand has nothing it can do with the answer.
+    ///
+    /// # Errors
+    ///
+    /// The host's clock not knowing the date, the account files not being
+    /// open, or whatever the Btrieve engine refused -- all three are faults
+    /// the caller turns into a shim stop. A claim the *board* refuses is
+    /// `Ok(Err(refusal))` instead, and the listener says one line and keeps
+    /// the channel.
+    pub fn resolve_login(
+        &mut self,
+        _machine: &mut A::Cpu,
+        login: &accounts::Login,
+        terminal: accounts::Terminal,
+    ) -> Result<Result<accounts::Resolved, accounts::Refusal>, String> {
+        // Read before the destructure below: `clock` takes `&mut self`.
+        let today = self.clock().civil()?.dos_date()?;
+
+        let mut notes = Vec::new();
+        let resolved = {
+            let Host { btrieve, accounts, .. } = self;
+            let accounts = accounts.as_mut().ok_or("accounts are not open")?;
+            accounts.resolve(btrieve, login, terminal, today, &mut notes)
+        };
+        for note in notes {
+            self.note(note);
+        }
+        resolved
+    }
+
     /// The file a module named, with the directory it is allowed to name
     /// stripped off.
     ///
