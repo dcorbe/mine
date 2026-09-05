@@ -638,15 +638,26 @@ fn tear_down<A: Abi>(
     if mode == Teardown::Maintenance {
         let mut dispatched = 0;
         match host.cleanup(machine, module, &mut dispatched) {
-            Ok(None) => eprintln!("mbbs-server: maintenance: {dispatched} module(s) cleaned up"),
-            Ok(Some(poison)) => {
+            Ok(Ok(cleaned)) => eprintln!(
+                "mbbs-server: maintenance: {} account(s) purged ({} dlarou call(s)), \
+                 {dispatched} module(s) cleaned up",
+                cleaned.purged, cleaned.dlarou_calls
+            ),
+            // Either sweep can be the one that stopped: the purge runs every
+            // module's `dlarou` before `cleanup` sweeps `mcurou`, and
+            // `dispatched` counts only the second, so a stop with
+            // `dispatched` at 0 is not proof it was the `mcurou`.
+            Ok(Err(poison)) => {
                 eprintln!(
-                    "mbbs-server: maintenance: a module stopped during its own mcurou after \
-                     {dispatched} cleaned up: {poison:?}"
+                    "mbbs-server: maintenance: a module stopped during its own dlarou or \
+                     mcurou after {dispatched} cleaned up: {poison:?}"
                 );
                 poisoned = Some(poison);
             }
-            Err(e) => eprintln!("mbbs-server: maintenance: mcurou sweep failed after {dispatched}: {e}"),
+            // Not the sweep's failure by default: the purge reads and writes
+            // two Btrieve files before a single vector is called, and `e`
+            // carries which of them refused.
+            Err(e) => eprintln!("mbbs-server: maintenance: cleanup failed after {dispatched} cleaned up: {e}"),
         }
     }
 

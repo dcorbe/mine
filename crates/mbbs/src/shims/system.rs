@@ -2758,12 +2758,12 @@ mod tests {
         f.machine.load_code(&[0xcb]).expect("a retf fits");
 
         let mut dispatched = 0;
-        let stopped = f
+        let cleaned = f
             .host
             .cleanup(&mut f.machine, &module, &mut dispatched)
             .expect("cleanup ran");
 
-        assert!(stopped.is_none(), "a retf cleanup routine returns, it does not stop: {stopped:?}");
+        assert!(cleaned.is_ok(), "a retf cleanup routine returns, it does not stop: {cleaned:?}");
         assert_eq!(dispatched, 1, "exactly the one module's mcurou, and only entry 6");
     }
 
@@ -2788,12 +2788,12 @@ mod tests {
         f.machine.set_budget(std::time::Duration::from_millis(20));
 
         let mut dispatched = 0;
-        let stopped = f
+        let cleaned = f
             .host
             .cleanup(&mut f.machine, &module, &mut dispatched)
             .expect("cleanup ran");
 
-        assert!(stopped.is_none(), "the sweep must not be bounded by the call budget: {stopped:?}");
+        assert!(cleaned.is_ok(), "the sweep must not be bounded by the call budget: {cleaned:?}");
         assert_eq!(dispatched, 1);
         assert_eq!(
             f.machine.budget(),
@@ -2813,12 +2813,12 @@ mod tests {
         f.invoke(register_module, &Fixture::far(block)).expect("registered");
 
         let mut dispatched = 0;
-        let stopped = f
+        let cleaned = f
             .host
             .cleanup(&mut f.machine, &module, &mut dispatched)
             .expect("cleanup ran");
 
-        assert!(stopped.is_none());
+        assert!(cleaned.is_ok());
         assert_eq!(dispatched, 0, "a null mcurou is skipped, not dispatched");
     }
 
@@ -2839,7 +2839,8 @@ mod tests {
         let mut dispatched = 0;
         f.host
             .cleanup(&mut f.machine, &module, &mut dispatched)
-            .expect("cleanup ran");
+            .expect("cleanup ran")
+            .expect("nothing stopped");
 
         let clingo = f.host.globals().word_mem(f.machine.mem(), "clingo").expect("clingo");
         assert_eq!(clingo, 0, "cleanup must write clingo=0 before sweeping");
@@ -2872,21 +2873,35 @@ mod tests {
             .expect("accepted");
     }
 
-    /// Set one account's flags word in the file, the way the `mbbs-user` CLI
-    /// does: read the record, change it, write it back at the same position.
-    fn set_account_flags(f: &mut Fixture, userid: &str, flags: u16) {
+    /// Change one account record in the file, the way the `mbbs-user` CLI
+    /// will: read it, change it, write it back at the same position. A
+    /// `usracc` is fixed-length, so this is an in-place update.
+    fn amend_account(f: &mut Fixture, userid: &str, change: impl FnOnce(&mut crate::accounts::Usracc)) {
         let Host { btrieve, accounts, .. } = &mut f.host;
         let accounts = accounts.as_mut().expect("accounts are open");
         let (position, mut record) = accounts
             .find_account(btrieve, userid)
             .expect("no engine fault")
             .expect("the account exists");
-        record.set_flags(flags);
+        change(&mut record);
         btrieve
             .block_mut(accounts.accbb)
             .expect("the account block")
             .update(position, &record.bytes)
             .expect("written back");
+    }
+
+    fn set_account_flags(f: &mut Fixture, userid: &str, flags: u16) {
+        amend_account(f, userid, |record| record.set_flags(flags));
+    }
+
+    /// `usracc.creds` has no setter -- only the audit line reads it -- so
+    /// this writes the four bytes the way a module's `addcrd` would.
+    fn set_account_creds(f: &mut Fixture, userid: &str, creds: i32) {
+        amend_account(f, userid, |record| {
+            let at = crate::accounts::record::at::CREDS;
+            record.bytes[at..at + 4].copy_from_slice(&creds.to_le_bytes());
+        });
     }
 
     /// What the account file holds for `userid`, read back through the
@@ -2978,6 +2993,7 @@ mod tests {
             signup(&mut f, who);
         }
         set_account_flags(&mut f, "Gone", flags::DELTAG);
+        set_account_creds(&mut f, "Gone", 7);
         set_account_flags(&mut f, "Locked", flags::DELTAG | flags::UNDAXS);
 
         let seen = f.buffer(2);
@@ -2998,16 +3014,18 @@ mod tests {
         f.machine.load_code(&code).expect("both stubs fit");
 
         let mut dispatched = 0;
-        let stopped = f
+        let cleaned = f
             .host
             .cleanup(&mut f.machine, &module, &mut dispatched)
-            .expect("cleanup ran");
+            .expect("cleanup ran")
+            .expect("a retf dlarou returns, it does not stop");
 
-        assert!(stopped.is_none(), "a retf dlarou returns, it does not stop: {stopped:?}");
         assert_eq!(
-            dispatched, 2,
-            "one dlarou for the one purged account, then the one mcurou"
+            cleaned,
+            crate::Cleaned { purged: 1, dlarou_calls: 1 },
+            "one account purged, one dlarou call for it"
         );
+        assert_eq!(dispatched, 1, "and `dispatched` is still only the mcurou sweep");
         assert_eq!(read_byte(&f, mark), 1, "the cleanup sweep ran after the purge");
         let scratch = f.host.accounts().expect("accounts are open").userid_scratch;
         assert_eq!(
@@ -3022,17 +3040,10 @@ mod tests {
         assert!(find_ring(&mut f, "Gone").is_none(), "its key ring went with it");
         assert!(find_ring(&mut f, "Keep").is_some());
         assert!(find_ring(&mut f, "Locked").is_some());
-        let announced: Vec<&String> = f
-            .host
-            .notes()
-            .iter()
-            .filter(|line| line.starts_with("USER ACCOUNT DELETED"))
-            .collect();
-        assert_eq!(announced.len(), 1, "one account was deleted, so one line: {announced:?}");
         assert_eq!(
-            announced[0].trim_end(),
-            "USER ACCOUNT DELETED User-ID: Gone",
-            "the console hears which account went"
+            f.host.audit(),
+            ["USER ACCOUNT DELETED: User-ID: Gone                          (Had 7 credits)"],
+            "the audit trail hears which account went, and what it was holding"
         );
     }
 
@@ -3066,30 +3077,28 @@ mod tests {
         f.machine.load_code(&[0xcb]).expect("a retf fits");
 
         let mut dispatched = 0;
-        let stopped = f
+        let cleaned = f
             .host
             .cleanup(&mut f.machine, &module, &mut dispatched)
-            .expect("cleanup ran");
+            .expect("cleanup ran")
+            .expect("nothing stopped");
 
-        assert!(stopped.is_none(), "{stopped:?}");
-        assert_eq!(dispatched, 2, "one dlarou per purged account");
+        assert_eq!(
+            cleaned,
+            crate::Cleaned { purged: 2, dlarou_calls: 2 },
+            "one dlarou per purged account"
+        );
+        assert_eq!(dispatched, 0, "the module has no mcurou");
         assert!(find_account(&mut f, "Gone1").is_none());
         assert!(find_account(&mut f, "Gone2").is_none(), "the walk did not stop at the first");
         assert!(find_account(&mut f, "Keep").is_some());
         assert!(find_ring(&mut f, "Gone1").is_none());
         assert!(find_ring(&mut f, "Gone2").is_none());
-        let announced: Vec<String> = f
-            .host
-            .notes()
-            .iter()
-            .filter(|line| line.starts_with("USER ACCOUNT DELETED"))
-            .map(|line| line.trim_end().to_owned())
-            .collect();
         assert_eq!(
-            announced,
+            f.host.audit(),
             [
-                "USER ACCOUNT DELETED User-ID: Gone1",
-                "USER ACCOUNT DELETED User-ID: Gone2"
+                "USER ACCOUNT DELETED: User-ID: Gone1                         (Had 0 credits)",
+                "USER ACCOUNT DELETED: User-ID: Gone2                         (Had 0 credits)"
             ],
             "one line each, in the order the file holds them"
         );
@@ -3133,13 +3142,13 @@ mod tests {
         f.machine.load_code(&code).expect("both stubs fit");
 
         let mut dispatched = 0;
-        let stopped = f
+        let cleaned = f
             .host
             .cleanup(&mut f.machine, &module, &mut dispatched)
             .expect("cleanup ran");
 
-        assert!(stopped.is_some(), "a faulting dlarou poisons the machine");
-        assert_eq!(dispatched, 0, "a routine that stopped is not a routine that ran");
+        assert!(cleaned.is_err(), "a faulting dlarou poisons the machine: {cleaned:?}");
+        assert_eq!(dispatched, 0, "the mcurou sweep never started");
         assert_eq!(read_byte(&f, mark), 0, "mcurou must not be swept after a stop");
         assert!(find_account(&mut f, "Gone").is_none(), "lowdel deletes the account first");
         assert!(find_ring(&mut f, "Gone").is_some(), "and the ring only after dlarou");

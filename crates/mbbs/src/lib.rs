@@ -410,6 +410,23 @@ pub enum Wait {
 /// **Not a control input.** Nothing branches on this; it exists so an
 /// operator can size `--polls-per-second` against measurement instead of
 /// against the 512 that has never been calibrated.
+/// What [`Host::cleanup`]'s account purge did, so a driver can say it.
+///
+/// The `mcurou` sweep's own count stays in `cleanup`'s `dispatched`
+/// out-parameter, where every existing caller already reads it. These two
+/// are the purge's, and they are separate numbers on purpose: a maintenance
+/// log that folded a module's `dlarou` call into the "modules cleaned up"
+/// total would name the wrong routine when one of them stops the machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cleaned {
+    /// Accounts deleted -- every record `DELTAG`-tagged and not `UNDAXS`.
+    pub purged: usize,
+    /// `dlarou` vectors actually called: one per purged account per module
+    /// that supplies one, so zero on a board whose modules all null entry 7
+    /// even when accounts were purged.
+    pub dlarou_calls: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PollCensus {
     /// Poll dispatches counted.
@@ -6055,6 +6072,12 @@ impl<A: Abi> Host<A> {
     /// boot's purge finds the ring by its own owner name -- see
     /// [`Host::cleanup`], which does not go on to the `mcurou` sweep.
     ///
+    /// Each deletion is one audit line, the vendor's own `shocst`
+    /// (`ACCOUNT.C:1352-1353`) through
+    /// [`shocst_line`](crate::shims::system::shocst_line), so it lands in
+    /// [`Host::audit`] beside every other `shocst` this host records rather
+    /// than on the console channel.
+    ///
     /// A host whose account files are not open purges nothing and says so
     /// with a count of zero. That is every fixture and every board built
     /// before the account layer existed.
@@ -6134,9 +6157,17 @@ impl<A: Abi> Host<A> {
                     })?;
             }
 
-            // `shocst("USER ACCOUNT DELETED","User-ID: %-29.29s",...)`,
-            // `ACCOUNT.C:1352-1353`.
-            self.note(format!("USER ACCOUNT DELETED User-ID: {userid:<29}"));
+            // `ACCOUNT.C:1352-1353`:
+            // `shocst("USER ACCOUNT DELETED",
+            //         "User-ID: %-29s (Had %ld credits)",userid,acctmp.creds)`
+            // The balance comes off the record this purge collected before
+            // the delete, which is the same `acctmp` the vendor prints.
+            let creds = record.creds();
+            crate::shims::system::shocst_line(
+                self,
+                "USER ACCOUNT DELETED",
+                &format!("User-ID: {userid:<29} (Had {creds} credits)"),
+            );
         }
         Ok(Ok(tagged.len()))
     }
@@ -6158,6 +6189,10 @@ impl<A: Abi> Host<A> {
     /// poison from here with the sweep not run at all -- the same rule the
     /// sweep already keeps between two modules.
     ///
+    /// Answers a [`Cleaned`] saying what the purge did, so a driver's log can
+    /// tell a `dlarou` call from an `mcurou` one; `dispatched` goes on
+    /// counting only the `mcurou` sweep, as it always has.
+    ///
     /// # Errors
     ///
     /// If a registration's `struct module` no longer names memory the module
@@ -6167,16 +6202,25 @@ impl<A: Abi> Host<A> {
         machine: &mut A::Cpu,
         module: &A::Module,
         dispatched: &mut usize,
-    ) -> io::Result<Option<A::Poison>> {
+    ) -> io::Result<Result<Cleaned, A::Poison>> {
         /// `mcurou`'s position in `struct module` after `descrp`.
         const MCUROU: usize = 6;
         // LINGO.H:41, and `midnit`'s `clingo=0` before each call.
         let mem = A::mem(machine);
         self.globals().write_int_mem(mem, "clingo", 0)?;
-        if let Err(poison) = self.purge_accounts(machine, module, dispatched)? {
-            return Ok(Some(poison));
+
+        // The purge's own counter. `dispatched` stays what every caller
+        // already reads it as -- how many modules were cleaned up -- so a
+        // driver's log cannot report a `dlarou` call as an `mcurou` one.
+        let mut dlarou_calls = 0;
+        let purged = match self.purge_accounts(machine, module, &mut dlarou_calls)? {
+            Ok(purged) => purged,
+            Err(poison) => return Ok(Err(poison)),
+        };
+        if let Some(poison) = self.sweep(machine, module, MCUROU, &[], dispatched)? {
+            return Ok(Err(poison));
         }
-        self.sweep(machine, module, MCUROU, &[], dispatched)
+        Ok(Ok(Cleaned { purged, dlarou_calls }))
     }
 
     /// Call entry `slot` of every registered module from index 1 with `args`,

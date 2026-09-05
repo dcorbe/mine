@@ -94,6 +94,10 @@ pub mod at {
     pub const PRMCLS: usize = 0xf0;
     /// `curcls[KEYSIZ]`, `UStructs.h:44`.
     pub const CURCLS: usize = 0x100;
+    /// `creds`, `UStructs.h:48`: a `LONG`, four bytes. `curcls` ends at
+    /// `0x110`; the eight bytes between are the two `daily`/`totlims`
+    /// counters this host does not read.
+    pub const CREDS: usize = 0x118;
 }
 
 /// The bytes of one account record, at one ABI's stride (338 or 304).
@@ -156,6 +160,17 @@ impl Usracc {
 
     pub fn curcls(&self) -> &str {
         field_str(&self.bytes[at::CURCLS..at::CURCLS + KEYSIZ])
+    }
+
+    /// `creds`, the account's credit balance. `UStructs.h:48` declares it a
+    /// `LONG`, which is signed: a user can go overdrawn, and `ACCOUNT.C`'s
+    /// own audit lines print it with `%ld`.
+    pub fn creds(&self) -> i32 {
+        i32::from_le_bytes(
+            self.bytes[at::CREDS..at::CREDS + 4]
+                .try_into()
+                .expect("four bytes"),
+        )
     }
 
     pub fn usedat(&self) -> u16 {
@@ -337,6 +352,21 @@ mod tests {
         assert_eq!(u.flags(), 0);
         assert_eq!(u.curcls(), "");
         assert!(u.bytes[at::FLAGS + 2..].iter().all(|&b| b == 0), "nothing past flags is written except the class fields, which are empty");
+    }
+
+    /// `creds` is a signed `LONG` at `0x118`, read little-endian.
+    ///
+    /// The offset is written out rather than taken from [`at::CREDS`]: a
+    /// test that poked the field through the same constant the accessor
+    /// reads would pass at any offset, which is the whole failure this test
+    /// exists to catch.
+    #[test]
+    fn creds_is_a_signed_long_at_its_own_offset() {
+        let mut u = Usracc::new(338, "Dan", "x", Terminal { ansi: true, width: 80, height: 24 }, 1);
+        assert_eq!(u.creds(), 0, "a new account has none");
+        u.bytes[0x118..0x11c].copy_from_slice(&(-1234i32).to_le_bytes());
+        assert_eq!(u.creds(), -1234, "overdrawn reads back negative, not as 4293966062");
+        assert_eq!(&u.bytes[0x110..0x118], &[0; 8], "nothing between curcls and creds moved");
     }
 
     #[test]
