@@ -17,4 +17,5 @@ pub mod host;
 pub mod iac;
 pub mod msg;
 pub mod pool;
+pub mod rlogin;
 pub mod termcompat;

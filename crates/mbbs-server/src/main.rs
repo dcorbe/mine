@@ -12,6 +12,7 @@ use mbbs_machine::Format;
 use mbbs_server::conn::{self, Listener, default_keys};
 use mbbs_server::host::{Boot, ExtensionBuilder};
 use mbbs_server::msg::In;
+use mbbs_server::rlogin::{self, NameField};
 use mbbs_server::termcompat::Stack;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:2323";
@@ -110,6 +111,22 @@ struct Cli {
     /// port at all.
     #[arg(long)]
     listen_raw: Vec<String>,
+
+    /// Address to bind for rlogin: a port a fronting board's gateway
+    /// connects to on a caller's behalf. The protocol has no password
+    /// field, so this listener trusts the name the handshake carries and
+    /// provisions an account for a name it has not seen before -- bind it
+    /// to a network only trusted callers can reach, as with the door
+    /// socket, never a public interface. Repeatable; no default, since a
+    /// board with no gateway in front of it need not open this port at all.
+    #[arg(long)]
+    listen_rlogin: Vec<String>,
+
+    /// Which of the rlogin handshake's two names is the user ID: the
+    /// second (the default, a gateway's real-name field) or the first (its
+    /// alias field). `first` matches Synchronet's own swap flag.
+    #[arg(long, value_enum, default_value_t = NameField::Second)]
+    rlogin_name: NameField,
 
     /// Path of a Unix-domain socket for BBS door sessions (`mbbs-door`
     /// connects here on a caller's behalf). No default: a board with two
@@ -451,6 +468,7 @@ async fn main() -> ExitCode {
     };
     let shutdown = tx.clone();
     let door_tx = tx.clone();
+    let rlogin_tx = tx.clone();
 
     let addrs = match conn::serve_on(tx, &listeners, serving.clone()).await {
         Ok(addrs) => addrs,
@@ -462,6 +480,16 @@ async fn main() -> ExitCode {
 
     for addr in &addrs {
         println!("mbbs-server: listening on {addr}");
+    }
+
+    for addr in &cli.listen_rlogin {
+        match rlogin::serve(addr, cli.rlogin_name, rlogin_tx.clone(), serving.clone()).await {
+            Ok(bound) => println!("mbbs-server: rlogin listening on {bound}"),
+            Err(e) => {
+                eprintln!("mbbs-server: failed to bind the rlogin address {addr}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     if let Some(path) = &cli.listen_door {
@@ -570,7 +598,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Cli, DEFAULT_POLLS_PER_SECOND, Plan,
+        Cli, DEFAULT_POLLS_PER_SECOND, NameField, Plan,
         build_lua_extension, listeners, plan,
     };
 
@@ -683,6 +711,45 @@ mod tests {
             vec!["127.0.0.1:2323".to_string()],
             "--listen keeps its own default even when only --listen-raw is given"
         );
+    }
+
+    /// `--listen-rlogin` is repeatable and has no default -- an rlogin port
+    /// trusts whatever name the fronting board sends, so it is opened only
+    /// when a sysop asks for one. The name field it reads is the second by
+    /// default, which is what Synchronet's gateway puts the real name in.
+    #[test]
+    fn listen_rlogin_is_repeatable_and_rlogin_name_defaults_to_second() {
+        let cli = Cli::try_parse_from(args(&[
+            "--module",
+            "W.DLL",
+            "--root",
+            "tmp",
+            "--listen-rlogin",
+            "127.0.0.1:2513",
+            "--listen-rlogin",
+            "127.0.0.1:2514",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            cli.listen_rlogin,
+            vec!["127.0.0.1:2513".to_string(), "127.0.0.1:2514".to_string()]
+        );
+        assert_eq!(cli.rlogin_name, NameField::Second);
+
+        let plain = Cli::try_parse_from(args(&["--module", "W.DLL", "--root", "tmp"])).expect("parses");
+        assert!(plain.listen_rlogin.is_empty(), "no default rlogin port");
+        assert_eq!(plain.rlogin_name, NameField::Second);
+
+        let first = Cli::try_parse_from(args(&[
+            "--module",
+            "W.DLL",
+            "--root",
+            "tmp",
+            "--rlogin-name",
+            "first",
+        ]))
+        .expect("parses");
+        assert_eq!(first.rlogin_name, NameField::First, "--rlogin-name first matches Synchronet's swap flag");
     }
 
     /// `--listen-raw` alone, with no `--listen` on the command line at all,
