@@ -6079,7 +6079,7 @@ impl<M: Mem> Block<M> {
         // the variable page claimed above is past that, so the count it
         // wrote is one or more too low until this puts the real one back.
         if let Some((pages_after, head)) = variable {
-            self.write_v5_variable_fcr(pages_after, head).map_err(|why| BtvError {
+            self.write_v5_variable_fcr(Some(pages_after), head).map_err(|why| BtvError {
                 file: name.clone(),
                 why,
             })?;
@@ -6184,23 +6184,87 @@ impl<M: Mem> Block<M> {
         Ok((slot_bytes, Some((source.pages(), head))))
     }
 
-    /// Write the two file control record fields a v5 variable-length insert
-    /// changes that `pages::write_record` does not: the file's page count
-    /// (`pages::fcr::PAGES`) and the free-space chain's head
-    /// ([`variable::set_v5_head`]).
+    /// Free the fragment behind the version 5 variable-length record at
+    /// `position`, and answer with the free-space chain's head afterwards.
+    ///
+    /// The pointer is read off the slot on disk, between `reclen` and
+    /// `physical`, exactly where [`Self::rewrite_variable`] reads it and
+    /// where [`Self::place_v5_body`] wrote it -- not off the in-memory
+    /// model, whose record bytes are the fixed part followed by the body the
+    /// chain was already followed to build, with no pointer in them.
+    ///
+    /// The page goes through [`variable::V5Pages`] rather than
+    /// [`variable::FilePages`] so the page's modification stamp is carried
+    /// forward: genuine Btrieve's own delete bumps it, and
+    /// [`variable::free_fragment`]'s doc comment has the recorded byte that
+    /// says so.
+    ///
+    /// # Errors
+    ///
+    /// If the slot or the control record cannot be read, or
+    /// [`variable::free_fragment`] refuses the fragment's shape -- a chained
+    /// fragment, or the last one on its page. See its own doc comment.
+    fn free_v5_fragment(&self, position: u32) -> Result<Option<u32>, BtvError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let fail = |why: String| BtvError {
+            file: self.name.clone(),
+            why,
+        };
+
+        let reclen = usize::from(self.geometry.reclen);
+        let mut slot = vec![0u8; usize::from(self.geometry.physical)];
+        {
+            let mut file = open_for_read(&self.path)
+                .map_err(|e| fail(format!("{}: {e}", self.path.display())))?;
+            file.seek(SeekFrom::Start(u64::from(position)))
+                .and_then(|_| file.read_exact(&mut slot))
+                .map_err(|e| {
+                    fail(format!("{}: reading position {position}: {e}", self.path.display()))
+                })?;
+        }
+        let pointer = variable::Pointer::decode([
+            slot[reclen],
+            slot[reclen + 1],
+            slot[reclen + 2],
+            slot[reclen + 3],
+        ]);
+
+        let fcr = self.read_control_record().map_err(&fail)?;
+        let was = variable::v5_head_of(&fcr);
+        let mut source =
+            variable::V5Pages::new(&self.path, self.geometry.page, self.geometry.pages);
+        variable::free_fragment(&mut source, pointer, was).map_err(|why| {
+            fail(format!("freeing the fragment of the record at {position}: {why}"))
+        })
+    }
+
+    /// Write the file control record fields a v5 variable-length write
+    /// changes that `pages::write_record` and `pages::delete_record` do not:
+    /// the free-space chain's head ([`variable::set_v5_head`]), and -- for
+    /// an insert -- the file's page count (`pages::fcr::PAGES`).
     ///
     /// `pages::write_record` writes `PAGES` too, from the data page it may
     /// have appended, and it has no way to know a variable page was appended
-    /// past that -- so this runs after it and overwrites the field rather
-    /// than adding to it.
+    /// past that -- so an insert runs this after it and overwrites the field
+    /// rather than adding to it. A delete passes `None`: it never adds or
+    /// releases a page ([`variable::free_fragment`] refuses the one shape
+    /// that would), so it has no page count to write and no business
+    /// rewriting the one already on disk.
     ///
     /// # Errors
     ///
     /// If the control record cannot be read or written back.
-    fn write_v5_variable_fcr(&self, pages_after: u32, head: Option<u32>) -> Result<(), String> {
+    fn write_v5_variable_fcr(
+        &self,
+        pages_after: Option<u32>,
+        head: Option<u32>,
+    ) -> Result<(), String> {
         let mut fcr = self.read_control_record()?;
-        fcr[pages::fcr::PAGES..pages::fcr::PAGES + 4]
-            .copy_from_slice(&pages::to_long(pages_after));
+        if let Some(pages_after) = pages_after {
+            fcr[pages::fcr::PAGES..pages::fcr::PAGES + 4]
+                .copy_from_slice(&pages::to_long(pages_after));
+        }
         variable::set_v5_head(&mut fcr, head)?;
 
         use std::io::{Seek, SeekFrom, Write};
@@ -6547,12 +6611,12 @@ impl<M: Mem> Block<M> {
     /// # Errors
     ///
     /// If this block is open `RONLBV` (status 46, see
-    /// [`Self::refuse_if_read_only`]), the records cannot be read, the file
-    /// holds variable-length records and is version 5 (see
-    /// [`Self::delete_v6`]'s own doc comment for what a version 6
-    /// variable-length file still refuses), `position` holds no record, the
-    /// file cannot be written, or [`Self::verify_write`] finds the write
-    /// did not do what it claims.
+    /// [`Self::refuse_if_read_only`]), the records cannot be read,
+    /// `position` holds no record, the record's own fragment is one
+    /// [`variable::free_fragment`] (version 5) or
+    /// [`variable::free_fragment_v6`] refuses -- a chained one, or the last
+    /// on its page -- the file cannot be written, or [`Self::verify_write`]
+    /// finds the write did not do what it claims.
     pub fn delete(&mut self, position: u32) -> Result<(), BtvError> {
         self.refuse_if_read_only()?;
         let result = self.delete_inner(position);
@@ -6569,17 +6633,18 @@ impl<M: Mem> Block<M> {
     /// deleting whatever happens to sit at an unverified offset would erase
     /// bytes that were never a record at all.
     ///
-    /// **v5 variable-length files still refuse.** A variable-length record's
-    /// fragment lives on a separate page, reached through the four-byte
-    /// pointer between `reclen` and `physical` in its slot (see
-    /// [`Self::update`]'s doc comment and [`Self::rewrite_variable`]).
-    /// Measured (`tools/btrieve-oracle/delprobe.c`,
-    /// `docs/delete-oracle-answer.md`): a genuine delete of a variable-length
-    /// record succeeds at the API level (status 0) on the real engine, but
-    /// what it does to a v5 fragment chain was not traced byte-for-byte, and
-    /// v5's own write-side allocator (`variable::Space`) has only ever been
-    /// proven for insert, not a delete-side free -- so this host refuses v5
-    /// rather than guess.
+    /// **A v5 variable-length record's fragment is freed first**, before a
+    /// byte of the slot that points at it is touched -- the same ordering
+    /// [`Self::delete_v6`] uses, and for the same reason: a shape this host
+    /// refuses must leave nothing written anywhere. The pointer is read off
+    /// the slot on disk, between `reclen` and `physical` (see
+    /// [`Self::update`]'s doc comment and [`Self::rewrite_variable`]),
+    /// [`Self::free_v5_fragment`] hands it to [`variable::free_fragment`],
+    /// and the free-space chain's head that answers goes back into the
+    /// control record through [`Self::write_v5_variable_fcr`] once the slot
+    /// itself is gone. What that does to the fragment page, and the
+    /// recording it is measured against, is
+    /// [`variable::free_fragment`]'s own doc comment.
     ///
     /// **v6 variable-length files delete** (Task 7): see
     /// [`Self::delete_v6`]'s own doc comment for the shape this closes and
@@ -6626,21 +6691,6 @@ impl<M: Mem> Block<M> {
             self.writable()?;
         }
         let name = self.name.clone();
-
-        if self.geometry.variable && self.geometry.version != Version::V6 {
-            return Err(BtvError {
-                file: name,
-                why: format!(
-                    "holds variable-length records up to {} bytes, and this host does \
-                     not delete them for Btrieve 5 -- a variable-length record's \
-                     fragment lives on a separate page reached through the pointer \
-                     behind its fixed part, and the write-side allocator this needs \
-                     (`variable::Space`) has only ever been proven for insert, not a \
-                     delete-side free, for v5 (v6 deletes -- see `Self::delete_v6`)",
-                    self.geometry.reclen
-                ),
-            });
-        }
 
         // Existence check -- the fast path asks the page cache directly by
         // position (`Self::v6_record_bytes_at`) rather than needing
@@ -6695,10 +6745,34 @@ impl<M: Mem> Block<M> {
         // rather than at the top of the function.
         self.capture_for_journal()?;
 
+        // A variable-length record's own fragment is freed **before** a byte
+        // of the slot that points at it is touched -- the same ordering
+        // `Self::delete_v6` uses, and for the same reason: a shape this host
+        // refuses must leave nothing written anywhere.
+        let variable_head = if self.geometry.variable {
+            Some(self.free_v5_fragment(position)?)
+        } else {
+            None
+        };
+
         pages::delete_record(&self.path, layout, position, count).map_err(|why| BtvError {
             file: name.clone(),
             why,
         })?;
+
+        // After the slot, because `pages::delete_record` reads and rewrites
+        // the whole control record for the record count and the free list --
+        // the same ordering `Self::insert_inner` keeps around
+        // `pages::write_record` for the same field. `None` for the page
+        // count: a delete never adds or releases a page (`free_fragment`
+        // refuses the one shape that would), so there is nothing to write
+        // there.
+        if let Some(head) = variable_head {
+            self.write_v5_variable_fcr(None, head).map_err(|why| BtvError {
+                file: name.clone(),
+                why,
+            })?;
+        }
 
         self.records
             .as_mut()
@@ -13789,20 +13863,248 @@ mod tests {
     // see `Block::delete`'s and `pages::delete_record`'s doc comments for the
     // raw probe output each test below is reproducing.
 
+    /// A `Block` over a freshly created version 5 variable-length file,
+    /// shaped like the one `v5_variable_delete.fixture` was recorded
+    /// against: a 31-byte fixed part, 1,024-byte pages, one unique zstring
+    /// key over the first 30 bytes. `create` builds it and `Geometry::read`
+    /// and `keys::parse` read back what it built, so nothing here
+    /// hand-writes a header the way [`seed_variable`] does -- these tests
+    /// are about what this host's own writes do to its own file.
+    fn create_v5_variable(tag: &str) -> (PathBuf, Block<Flat>) {
+        const NAME: &str = "KEYSDEL.DAT";
+        let path = crate::testing::scratch(tag).join(NAME);
+        let spec = FileSpec {
+            record_length: 31,
+            page_size: 1024,
+            keys: vec![KeySpec {
+                segments: vec![SegmentSpec {
+                    offset: 0,
+                    length: 30,
+                    kind: 0x0b, // zstring
+                    descending: false,
+                }],
+                duplicates: false,
+                modifiable: false,
+                acs: false,
+            }],
+            acs: None,
+            variable: true,
+        };
+        create(&path, &spec).expect("creates a variable-length v5 file");
+
+        let geometry = Geometry::read(NAME, &path).expect("reads its own geometry back");
+        assert!(geometry.variable && geometry.version == Version::V5);
+        let fcr = std::fs::read(&path).expect("readable");
+        let keys = keys::parse(NAME, &fcr, geometry.keys, &[]).expect("its own key definition");
+
+        let mut block = block(path.clone());
+        block.name = NAME.to_owned();
+        block.geometry = geometry;
+        block.keys = keys;
+        block.maxlen = geometry.reclen;
+        (path, block)
+    }
+
+    /// One record of [`create_v5_variable`]'s file: a 30-byte zstring key,
+    /// the 31st byte of the fixed part, and a body past it.
+    fn variable_record(key: &str, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 31];
+        bytes[..key.len()].copy_from_slice(key.as_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    /// Where the record at `position` says its body is: the four bytes
+    /// between `reclen` and `physical`, read off the file rather than out of
+    /// the model, and decoded the way `variable::Pointer` documents --
+    /// `[high][low][mid][fragment]`.
+    fn body_pointer(path: &Path, position: u32, reclen: usize) -> (u32, u8) {
+        let bytes = std::fs::read(path).expect("readable");
+        let at = position as usize + reclen;
+        let p = &bytes[at..at + 4];
+        (
+            u32::from(p[0]) << 16 | u32::from(p[1]) | u32::from(p[2]) << 8,
+            p[3],
+        )
+    }
+
+    /// Entry `which` of a `len`-byte variable page: two bytes at
+    /// `len - 2 * (which + 1)`, the array that grows down from the end.
+    fn page_entry(page: &[u8], which: usize) -> u16 {
+        let at = page.len() - 2 * (which + 1);
+        u16::from_le_bytes([page[at], page[at + 1]])
+    }
+
+    /// This replaces `delete_refuses_a_variable_length_file`, which asserted
+    /// `e.why.contains("variable-length")` from a scratch directory named
+    /// `block-delete-refuses-variable-length` -- the path inside `e.why`
+    /// satisfied the assertion by itself, so the test could not fail. Its
+    /// premise is gone anyway: a version 5 variable-length file deletes now.
+    ///
+    /// What is asserted instead is the fragment page's own bytes, measured
+    /// from `v5_variable_delete.fixture` (see `variable::free_fragment`'s
+    /// doc comment): the freed entry is tombstoned, the survivor slides down
+    /// to `0x0c`, every entry after the freed one is rebased, the fragment
+    /// count does not move, the vacated bytes are zeroed, and the page's
+    /// modification stamp counts this write.
     #[test]
-    fn delete_refuses_a_variable_length_file() {
-        let dir = crate::testing::scratch("block-delete-refuses-variable-length");
-        let path = seed_variable(&dir);
-        let mut block = block_variable(path.clone());
-        let before = std::fs::read(&path).expect("read the fixture");
+    fn delete_frees_a_v5_variable_length_records_fragment() {
+        let (path, mut block) = create_v5_variable("block-delete-frees-a-fragment");
+        let sysop = variable_record("Sysop", b"EMO NORMAL SYSOP\0");
+        let test = variable_record("Test", b"EMO\0");
+        let first = block.insert(&sysop).expect("the first record goes in");
+        block.insert(&test).expect("the second record goes in");
 
-        let e = block
-            .delete(64 + 6)
-            .expect_err("a variable-length file refuses delete, the same as insert and update");
-        assert!(e.why.contains("variable-length"), "{e}");
+        let (number, fragment) = body_pointer(&path, first, 31);
+        assert_eq!(fragment, 0, "the first body is fragment 0 of its page");
+        assert_eq!(
+            body_pointer(&path, block.records().expect("loaded").positions()[1], 31),
+            (number, 1),
+            "both bodies are on one page, the second behind the first"
+        );
 
-        let after = std::fs::read(&path).expect("read back");
-        assert_eq!(after, before, "a refused delete must not touch the file");
+        // The two control-record fields a variable-length write owns, read
+        // before the delete so the assertion below is against real bytes
+        // rather than against what this host thinks it wrote.
+        const VARIABLE_HEAD: std::ops::Range<usize> = 0x38..0x3c;
+        let before = std::fs::read(&path).expect("read the file before the delete");
+        let pages_before = before[pages::fcr::PAGES..pages::fcr::PAGES + 4].to_vec();
+        let head_before = before[VARIABLE_HEAD].to_vec();
+
+        block.delete(first).expect("a v5 variable-length record deletes");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            &bytes[pages::fcr::PAGES..pages::fcr::PAGES + 4],
+            pages_before.as_slice(),
+            "a delete claims and releases no page, so it writes no page count"
+        );
+        assert_eq!(
+            &bytes[VARIABLE_HEAD],
+            head_before.as_slice(),
+            "the page was already on the free-space chain, so the head does not move"
+        );
+        assert_eq!(bytes.len(), before.len(), "and the file does not grow");
+
+        let page = &bytes[number as usize * 1024..][..1024];
+        assert_eq!(
+            u16::from_le_bytes([page[0x0a], page[0x0b]]),
+            2,
+            "an interior free leaves the fragment count alone"
+        );
+        assert_eq!(page_entry(page, 0), 0xffff, "the freed entry is tombstoned in place");
+        assert_eq!(page_entry(page, 1), 0x0c, "the survivor slid down to where the header ends");
+        assert_eq!(page_entry(page, 2), 0x10, "the new free-space boundary");
+        assert_eq!(&page[0x0c..0x10], b"EMO\0", "the survivor's own body, shifted down");
+        assert!(
+            page[0x10..0x21].iter().all(|b| *b == 0),
+            "the bytes the shift vacated are zeroed: {:02x?}",
+            &page[0x10..0x21]
+        );
+        assert_eq!(
+            u16::from_le_bytes([page[0x04], page[0x05]]),
+            2,
+            "the third write of this page: two inserts and this delete"
+        );
+
+        // And off disk, with the cache dropped: one whole record left.
+        block.records = None;
+        let after = block.records().expect("a fresh read from disk");
+        assert_eq!(after.len(), 1, "one record survives the delete");
+        assert_eq!(
+            after.physical(0).expect("the survivor").bytes,
+            test,
+            "the survivor's fixed part and its body, both whole"
+        );
+    }
+
+    /// The check a block a real module opened runs after every write in a
+    /// debug build (`Block::verify_writes`, `crate::verify::written`): the
+    /// file is re-read into a model and re-emitted from that model alone,
+    /// and the result compared to the bytes on disk. A tombstoned entry and
+    /// a compacted fragment page are exactly the shapes that would show up
+    /// here as a field this crate cannot account for, so this asserts the
+    /// delete leaves a file the total reader and the total emitter still
+    /// agree on -- before, after, and after the re-insert.
+    #[test]
+    fn a_v5_variable_delete_leaves_a_file_the_write_verifier_accepts() {
+        let (path, mut block) = create_v5_variable("block-delete-verifies-a-v5-variable-file");
+        let first = block
+            .insert(&variable_record("Sysop", b"EMO NORMAL SYSOP\0"))
+            .expect("the first record goes in");
+        block.insert(&variable_record("Test", b"EMO\0")).expect("the second");
+        assert_eq!(crate::verify::written(&path), Ok(()), "after the inserts");
+
+        block.delete(first).expect("a v5 variable-length record deletes");
+        assert_eq!(crate::verify::written(&path), Ok(()), "after the delete");
+
+        block
+            .insert(&variable_record("Testy", b"EMO NORMAL MODERATE MASS_MAIL\0"))
+            .expect("a longer record into the freed slot");
+        assert_eq!(crate::verify::written(&path), Ok(()), "after the re-insert");
+    }
+
+    /// A delete followed by an insert of a *longer* record -- the
+    /// length-changing rewrite an account layer needs, which
+    /// `Block::update` still refuses on its own (it only rewrites a
+    /// same-length fragment in place).
+    ///
+    /// The freed fragment's slot is reused rather than appended past:
+    /// `v5_variable_delete.fixture`'s own sequence and its own resulting
+    /// page, down to the entry offsets. No page is claimed for it either.
+    #[test]
+    fn a_v5_delete_then_a_longer_insert_reuses_the_freed_fragment_slot() {
+        let (path, mut block) = create_v5_variable("block-delete-then-longer-insert");
+        let sysop = variable_record("Sysop", b"EMO NORMAL SYSOP\0");
+        let test = variable_record("Test", b"EMO\0");
+        let first = block.insert(&sysop).expect("the first record goes in");
+        block.insert(&test).expect("the second record goes in");
+        let (number, _) = body_pointer(&path, first, 31);
+        let pages_before = block.geometry.pages;
+
+        block.delete(first).expect("a v5 variable-length record deletes");
+
+        let testy = variable_record("Testy", b"EMO NORMAL MODERATE MASS_MAIL\0");
+        let third = block.insert(&testy).expect("a longer record takes the freed space");
+
+        assert_eq!(
+            body_pointer(&path, third, 31),
+            (number, 0),
+            "the longer body took the freed slot on the same page"
+        );
+        assert_eq!(
+            block.geometry.pages, pages_before,
+            "reusing the slot claimed no page: {} pages before, {} after",
+            pages_before, block.geometry.pages
+        );
+
+        let bytes = std::fs::read(&path).expect("read back");
+        let page = &bytes[number as usize * 1024..][..1024];
+        assert_eq!(
+            u16::from_le_bytes([page[0x0a], page[0x0b]]),
+            2,
+            "two fragments, not three -- the array did not grow"
+        );
+        assert_eq!(page_entry(page, 0), 0x0c, "the new body starts where the header ends");
+        assert_eq!(page_entry(page, 1), 0x2a, "the survivor, shifted up by the new body");
+        assert_eq!(page_entry(page, 2), 0x2e, "the boundary, shifted with it");
+        assert_eq!(&page[0x0c..0x2a], b"EMO NORMAL MODERATE MASS_MAIL\0", "the new body");
+        assert_eq!(&page[0x2a..0x2e], b"EMO\0", "the survivor's body, moved up");
+        assert_eq!(
+            u16::from_le_bytes([page[0x04], page[0x05]]),
+            3,
+            "the fourth write of this page: two inserts, a delete and this insert"
+        );
+
+        // Both records, whole, off disk.
+        block.records = None;
+        let after = block.records().expect("a fresh read from disk");
+        let mut records: Vec<Vec<u8>> =
+            (0..after.len()).map(|i| after.physical(i).expect("live").bytes.clone()).collect();
+        records.sort();
+        let mut wanted = vec![test, testy];
+        wanted.sort();
+        assert_eq!(records, wanted, "both records read back with their bodies");
     }
 
     /// `position` is a module's word for a file offset, not a slot this layer

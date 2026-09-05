@@ -395,23 +395,21 @@ struct Pending {
 
 /// Every scenario this engine stops partway through, and why.
 ///
-/// One entry today. `v5_variable_delete`'s call 4 is a `B_DELETE` against a
-/// version 5 variable-length record, and freeing a v5 fragment is the other
-/// half of the allocator this crate has only ever proven for insert -- the
-/// engine says so and refuses rather than unlinking a chain it cannot put
-/// back. This list is what keeps the rest of that fixture honest: calls 0
-/// through 3 are replayed and diffed like any other, the refusal itself is
-/// asserted, and the moment a v5 delete lands this test fails on the entry
-/// having gone stale rather than quietly passing on it.
+/// **Empty, and that is the point.** Its one entry was
+/// `v5_variable_delete`'s call 4, a `B_DELETE` against a version 5
+/// variable-length record: this engine had no answer at all, and the entry
+/// asserted the refusal's own wording and the call it landed on so that the
+/// rest of the fixture stayed honest. The v5 delete has landed
+/// (`variable::free_fragment`), the fixture replays to its last call, and
+/// the entry is gone -- which the `(None, Some(p))` arm below would have
+/// failed the test over had it been left behind.
 ///
-/// It is not a way to park a fixture. Nothing is skipped except the calls
-/// past the refusal and the two whole-file comparisons, which cannot mean
-/// anything for a scenario that never finished.
-const PENDING: &[Pending] = &[Pending {
-    fixture: "v5_variable_delete",
-    call: 4,
-    refusal: "does not delete them for Btrieve 5",
-}];
+/// The mechanism stays. It is not a way to park a fixture: nothing is
+/// skipped except the calls past a refusal and the two whole-file
+/// comparisons, which cannot mean anything for a scenario that never
+/// finished, and an entry that stops being needed fails this test rather
+/// than passing quietly.
+const PENDING: &[Pending] = &[];
 
 /// The prefix of every fixture whose resulting file this replay compares to
 /// genuine Btrieve's as **bytes**, not only as records.

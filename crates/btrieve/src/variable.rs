@@ -1062,6 +1062,237 @@ pub(crate) fn free_fragment_v6<P: PagesMut>(
     Ok(new_head)
 }
 
+/// Free a single, unchained **version 5** fragment: the delete-side
+/// counterpart of [`rewrite_fragment_in_place`], and the v5 sibling of
+/// [`free_fragment_v6`].
+///
+/// # What genuine Btrieve does, which this follows
+///
+/// Two sources, and they agree.
+///
+/// **The recording.** `crates/btrieve-oracle/fixtures/v5_variable_delete.
+/// fixture` is genuine Pervasive Btrieve 6.15 driven over the wire against a
+/// version 5, variable-length file this crate's own [`super::create`] wrote
+/// (31-byte fixed part, 1,024-byte pages): insert `Sysop` (body
+/// `"EMO NORMAL SYSOP\0"`, 17 bytes), insert `Test` (body `"EMO\0"`, 4
+/// bytes), get `Sysop`, **delete it**, get `Sysop` again (status 4, gone),
+/// insert `Testy` (body `"EMO NORMAL MODERATE MASS_MAIL\0"`, 30 bytes),
+/// close. The transcript carries the file as it stood after the *last* call,
+/// so the intermediate state is inferred from those final bytes plus the
+/// insert rules [`V5Pages`] measured -- said so explicitly below, fact by
+/// fact.
+///
+/// Its variable page 5 (file offset `0x1400`) ends up:
+///
+/// ```text
+/// 0x1400  00 00 05 00   PAGE_NUMBER = 5
+/// 0x1404  03 00         modification stamp = 3
+/// 0x1406  ff 00 ff ff   FREE_CHAIN = FreeChain::Last, unchanged by the delete
+/// 0x140a  02 00         FRAGMENT_COUNT = 2
+/// 0x140c  "EMO NORMAL MODERATE MASS_MAIL\0"   fragment 0, 30 bytes, to 0x142a
+/// 0x142a  "EMO\0"                             fragment 1,  4 bytes, to 0x142e
+/// 0x17fa  2e 00 2a 00 0c 00                   entry 2, entry 1, entry 0
+/// ```
+///
+/// and the two surviving records' own pointers read `00 05 00 00` at
+/// `0x1025` (`Testy` -> page 5, fragment **0**) and `00 05 00 01` at
+/// `0x1048` (`Test` -> page 5, fragment **1**).
+///
+/// So, **measured** from those bytes:
+///
+/// - the page's fragment count did **not** drop: 2 before the delete, 2
+///   after the re-insert;
+/// - the surviving record kept fragment index **1**, and the re-inserted one
+///   took index **0** -- the freed slot was **reused**, not appended past
+///   the end;
+/// - the free chain at `0x1406` and the control record's own head at
+///   [`super::format::fcr::at::VARIABLE_HIGHEST`] (`0x3a`, still `05 00`)
+///   were untouched: the page was already on the chain and stayed where it
+///   was;
+/// - the modification stamp reads **3** for a page written four times
+///   (claim+first fragment, second fragment, the delete, the re-insert).
+///   That settles the reading [`V5Pages`] had to choose from insert-only
+///   evidence: the stamp is a **counter bumped on every write**, not
+///   `fragments - 1` (which would read 1 here). The delete is one write of
+///   the page, and the rule needs no delete-side special case.
+///
+/// **Inferred** -- the state between the delete and the re-insert, which no
+/// recorded byte shows directly:
+///
+/// - entry 0 became the freed-slot sentinel `0xffff` ([`UNUSED`]). It is the
+///   only way index 0 can be vacant while index 1 stays occupied, which the
+///   two records' own pointers above require.
+/// - the page was **compacted**: the surviving fragment moved down over the
+///   freed one, to `0x0c`, and its entry was rebased from `0x1d` to `0x0c`.
+///   Two independent arguments, and no third reading survives either. First,
+///   this crate's own status 54 rule ([`fragment`], the engine's
+///   `W32MKDE_decompiled.c:19035`): the **first live entry** of a variable
+///   page must name [`FIRST_FRAGMENT`], and after the delete entry 0 is a
+///   freed slot, so entry 1 has to be `0x0c` or the engine would refuse its
+///   own file. Second, the engine's allocator (`FUN_00420da0` at
+///   `W32MKDE_decompiled.c:19267`) starts a fragment that reuses a freed
+///   slot at *the offset the next live entry currently holds*
+///   (`*puVar16 = uVar2 & 0x7fff`, `uVar2` being that entry) -- and the
+///   re-insert put `Testy` at `0x0c`, so the next live entry read `0x0c`
+///   just before it, not the `0x1d` an uncompacted page would have left.
+///
+/// **The engine's own routine**, which is where the rest of the rules below
+/// come from: `FUN_004217a0` at `W32MKDE_decompiled.c:19737` is the
+/// microkernel's fragment free, and it is one routine for both file
+/// versions. In order, it:
+///
+/// 1. shifts everything between the freed fragment's end and the free-space
+///    boundary down over the freed fragment (`uVar7 = uVar9 - uVar10`, then
+///    the copy loop), and **zeroes** the `length` bytes that leaves at the
+///    top of the used area (the second loop, storing `0`);
+/// 2. for an **interior** slot (`local_25 != count - 1`): writes `0xffff`
+///    over the freed entry and subtracts the freed length from every entry
+///    after it up to and including the boundary, **skipping** entries that
+///    are already `0xffff` (`if (*puVar5 != 0xffff)`). The fragment count
+///    does not move. This is the branch the recording above exercises;
+/// 3. for a **trailing** slot: the freed entry becomes the new boundary
+///    (`(uVar10 & 0x7fff) - local_24`, which is the value it already held),
+///    the old boundary entry is zeroed, and the count drops by one -- then
+///    the same collapse repeats while the entry *before* it is `0xffff`, so
+///    a run of freed slots at the end of the array goes away with it;
+/// 4. rejoins the write-side free-space chain at the head if the page was
+///    off it and now has room ([`is_roomy`]), exactly as
+///    [`free_fragment_v6`] and [`Space::reoffer`] already do.
+///
+/// # What is refused, and why
+///
+/// - **A chained fragment** ([`Fragment::continued`], the v5 entry's
+///   `0x8000` bit). Freeing every hop of a chain is a walk this host has not
+///   measured -- the same standard [`free_fragment_v6`] holds itself to.
+/// - **Emptying the page.** The engine's answer is to release the page
+///   altogether (`FUN_00418dc0`, reached when the count hits zero), and a v5
+///   file has no measured way to release a physical page: nothing in
+///   [`super::pages::fcr`] holds a free *page* list for v5 (`fcr::FREE`
+///   holds record slots -- see [`V5Pages`]), and a page left reporting zero
+///   fragments is one [`Header::read`] refuses to open again. Refused rather
+///   than guessed, which is also why the count that would result is worked
+///   out before a byte is written.
+///
+/// # What is written
+///
+/// One page, once -- which is what the modification stamp above requires.
+/// The header past [`FREE_CHAIN`], every fragment before the freed one, and
+/// every entry the rules above do not name are read and never written.
+///
+/// # Errors
+///
+/// If any of the checks above fails, or the page cannot be read or written
+/// back.
+///
+/// # Returns
+///
+/// The write-side free-space chain's head after this call, for the caller to
+/// write back to [`super::format::fcr::at::VARIABLE_HIGHEST`] through
+/// [`set_v5_head`] -- `head` unchanged unless this page just joined the
+/// chain, the same threading [`Space::head`] does for the insert side.
+pub(crate) fn free_fragment<P: PagesMut>(
+    pages: &mut P,
+    pointer: Pointer,
+    head: Option<u32>,
+) -> Result<Option<u32>, String> {
+    let page = pages.page(pointer.page)?.to_vec();
+    let header = Header::read(&page, pointer.page, Version::V5)?;
+
+    let found = fragment(&page, pointer.fragment, header, Version::V5)
+        .map_err(|why| format!("page {}: {why}", pointer.page))?;
+
+    if found.continued {
+        return Err(format!(
+            "page {}: fragment {} continues onto another page, and freeing a chain \
+             that spans more than one page is not implemented",
+            pointer.page, pointer.fragment
+        ));
+    }
+
+    let which = u32::from(pointer.fragment);
+    let fragments = u32::from(header.fragments);
+
+    // How many entries this free takes out of the array: one for the
+    // fragment itself, plus the run of already-freed slots the engine's
+    // trailing branch collapses along with it. Zero for an interior free,
+    // whose array keeps every entry it has.
+    let collapsed = if which + 1 == fragments {
+        let mut collapsed = 1;
+        while collapsed <= which && entry(&page, which - collapsed)? == UNUSED {
+            collapsed += 1;
+        }
+        collapsed
+    } else {
+        0
+    };
+    if fragments == collapsed {
+        return Err(format!(
+            "page {}: freeing fragment {} would leave the page holding no fragments at \
+             all, and releasing a v5 page is not implemented -- see this function's own \
+             doc comment",
+            pointer.page, pointer.fragment
+        ));
+    }
+
+    let mut rewritten = page;
+    let boundary = entry(&rewritten, fragments)? as usize;
+    if boundary == UNUSED as usize {
+        return Err(format!(
+            "page {}'s entry {fragments} is free, so nothing says where its fragments end",
+            pointer.page
+        ));
+    }
+
+    // Close the gap, and zero what that leaves behind at the top of the used
+    // area. A trailing free moves nothing and zeroes the fragment itself.
+    rewritten.copy_within(found.at + found.length..boundary, found.at);
+    rewritten[boundary - found.length..boundary].fill(0);
+
+    let length = found.length as i32;
+    if collapsed == 0 {
+        for i in (which + 1)..=fragments {
+            move_entry(&mut rewritten, i, -length)?;
+        }
+        set_entry(&mut rewritten, which, UNUSED)?;
+    } else {
+        // Highest index first, the order the engine's own loop takes them
+        // in: each step zeroes the entry above the one it is dropping, so
+        // going the other way would write the new boundary into an entry a
+        // later step has to zero and leave it there.
+        let new_boundary = (boundary - found.length) as u32;
+        for i in ((which + 1 - collapsed)..=which).rev() {
+            set_entry(&mut rewritten, i + 1, 0)?;
+            set_entry(&mut rewritten, i, new_boundary)?;
+        }
+        set_fragment_count(
+            &mut rewritten,
+            header.fragments - collapsed as u16,
+        );
+    }
+
+    // Rejoin the write-side free-space chain if this page just gained real
+    // room and was not already reachable from it -- `free_fragment_v6`'s own
+    // comment on the LIFO the oracle ladder measured applies unchanged, and
+    // a page already on the chain (as the recording's page 5 is) keeps its
+    // place and its successor.
+    let after = Header::read(&rewritten, pointer.page, Version::V5)?;
+    let new_head = if after.free_chain == FreeChain::Off && is_roomy(&rewritten, after)? {
+        set_chain(
+            &mut rewritten,
+            match head {
+                Some(next) => FreeChain::Next(next),
+                None => FreeChain::Last,
+            },
+        );
+        Some(pointer.page)
+    } else {
+        head
+    };
+
+    pages.write_page(pointer.page, &rewritten)?;
+    Ok(new_head)
+}
+
 /// [`PagesMut`] over an actual file on disk, addressed by page number.
 ///
 /// A file handle is opened fresh for each [`Pages::page`] or
@@ -1468,6 +1699,61 @@ fn set_entry(page: &mut [u8], which: u32, offset: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Move entry `which`'s offset by `delta` bytes, leaving a freed slot
+/// exactly as it is and carrying [`Entry::continued`]'s `0x8000` bit
+/// through.
+///
+/// Both sides of a v5 variable page's bookkeeping need this: freeing a
+/// fragment slides every entry after it *down* by the freed length, and
+/// reusing a freed slot slides every entry after it *up* by the new
+/// fragment's length. The engine does both by adding to the raw entry word
+/// (`W32MKDE_decompiled.c:19267` and `:19737`), so a continued fragment's
+/// bit survives the arithmetic; going through [`set_entry`] instead would
+/// write the offset back without it and quietly break a chain this crate
+/// refuses to touch but does not have to corrupt.
+///
+/// # Errors
+///
+/// If the entry is outside the page, or the move would put the offset
+/// outside the `0..0x8000` a fifteen-bit entry can name.
+fn move_entry(page: &mut [u8], which: u32, delta: i32) -> Result<(), String> {
+    const CONTINUED: u16 = 0x8000;
+    let at = entry_at(page.len() as u32, which)?;
+    let raw = u16::from_le_bytes([page[at], page[at + 1]]);
+    if u32::from(raw) == UNUSED {
+        return Ok(());
+    }
+    let offset = i64::from(raw & !CONTINUED) + i64::from(delta);
+    let offset = u16::try_from(offset).ok().filter(|o| *o < CONTINUED).ok_or_else(|| {
+        format!(
+            "moving entry {which} by {delta} bytes puts it at {offset}, which no              fifteen-bit entry can name"
+        )
+    })?;
+    page[at..at + 2].copy_from_slice(&(offset | (raw & CONTINUED)).to_le_bytes());
+    Ok(())
+}
+
+/// The first entry a new fragment may be given, or `None` when the page
+/// offers none and the fragment has to be appended past the last one.
+///
+/// The engine's own scan (`W32MKDE_decompiled.c:19267`, `FUN_00420da0`'s
+/// `LAB_00421075`): walk the array from entry 0, and take the first entry
+/// that is a freed slot ([`UNUSED`]) **and** is followed by one that is not.
+/// A freed slot followed by another freed slot is passed over, which is why
+/// this is the engine's condition rather than "the first `0xffff`".
+///
+/// # Errors
+///
+/// If an entry is outside the page.
+fn reusable_slot(page: &[u8], fragments: u16) -> Result<Option<u32>, String> {
+    for which in 0..u32::from(fragments) {
+        if entry(page, which)? == UNUSED && entry(page, which + 1)? != UNUSED {
+            return Ok(Some(which));
+        }
+    }
+    Ok(None)
+}
+
 /// How many fragments a page says it holds, read without a [`Header`].
 fn fragment_count(page: &[u8]) -> u16 {
     u16::from_le_bytes([page[FRAGMENT_COUNT], page[FRAGMENT_COUNT + 1]])
@@ -1529,6 +1815,26 @@ impl<'a, S: PageSource> Space<'a, S> {
     /// fragment carries them only when continued, and says so with the
     /// entry's `0x8000` bit.
     ///
+    /// # Where on the page it goes
+    ///
+    /// Past the last fragment, unless a delete left a slot free
+    /// ([`reusable_slot`]) -- then **that** slot, with the fragments behind
+    /// it sliding up to make room and their entries rebased to match. The
+    /// fragment count does not move for a reuse: the array already has the
+    /// entry. Both branches are the engine's own allocator
+    /// (`W32MKDE_decompiled.c:19267`), and `v5_variable_delete.fixture`
+    /// measured the reuse end to end -- see [`free_fragment`]'s doc comment
+    /// for the recorded page.
+    ///
+    /// [`Self::room_for`] still asks a page for `needed + 2` bytes even when
+    /// it will reuse a slot and grow the array by nothing; the engine asks
+    /// for `needed` there (`param_3 <= piVar7`, the reuse branch, against
+    /// `piVar8 = piVar7 - 2` for the append). The difference is two bytes
+    /// and one direction: this can claim a fresh page where the engine
+    /// would have squeezed the fragment onto the offered one. No recording
+    /// reaches that boundary, so it is left conservative rather than
+    /// tightened on a guess.
+    ///
     /// # Errors
     ///
     /// If the body needs more room than one page can give -- splitting is not
@@ -1560,18 +1866,44 @@ impl<'a, S: PageSource> Space<'a, S> {
         // instead would hand `reoffer` a page claiming to be logical 0.
         let mut page = self.source.page(number)?.to_vec();
 
-        // Where this fragment goes is where the last entry already says the
-        // fragments end -- entry `i` names fragment `i`'s start, so the array
-        // has one more entry than the page has fragments and the extra one is
-        // the free-space boundary.
+        // Entry `i` names fragment `i`'s start, so the array has one more
+        // entry than the page has fragments and the extra one is the
+        // free-space boundary -- where an appended fragment goes.
         let fragments = fragment_count(&page);
-        let at = entry(&page, u32::from(fragments))? as usize;
-        if at == UNUSED as usize {
+        let boundary = entry(&page, u32::from(fragments))? as usize;
+        if boundary == UNUSED as usize {
             return Err(format!(
                 "page {number}'s entry {fragments} is free, so nothing says where its \
                  fragments end"
             ));
         }
+
+        // A slot a delete freed is filled before the end of the page is: the
+        // new fragment starts where the next live fragment starts today, and
+        // everything from there to the boundary slides up to make room for
+        // it. `reusable_slot` is the engine's own scan, and this is the
+        // branch of its allocator that answers it
+        // (`W32MKDE_decompiled.c:19267`, `FUN_00420da0`'s `else` at
+        // `LAB_00421146`): the count does not move, because the array
+        // already has the entry this fragment needs.
+        //
+        // `free_fragment`'s own doc comment has the recording that pins it:
+        // `v5_variable_delete.fixture` deletes fragment 0 of two and the
+        // insert that follows lands back on fragment 0, with the survivor
+        // still fragment 1 and the page still holding two.
+        let reused = reusable_slot(&page, fragments)?;
+        let at = match reused {
+            None => boundary,
+            Some(which) => {
+                let next = entry(&page, which + 1)? as usize;
+                page.copy_within(next..boundary, next + needed);
+                for i in (which + 1)..=u32::from(fragments) {
+                    move_entry(&mut page, i, needed as i32)?;
+                }
+                set_entry(&mut page, which, next as u32)?;
+                next
+            }
+        };
 
         if leads {
             let end = Pointer {
@@ -1584,15 +1916,17 @@ impl<'a, S: PageSource> Space<'a, S> {
             page[at..at + needed].copy_from_slice(body);
         }
 
-        set_fragment_count(&mut page, fragments + 1);
-        set_entry(&mut page, u32::from(fragments) + 1, (at + needed) as u32)?;
+        if reused.is_none() {
+            set_fragment_count(&mut page, fragments + 1);
+            set_entry(&mut page, u32::from(fragments) + 1, (at + needed) as u32)?;
+        }
 
         self.reoffer(number, &mut page, fresh)?;
         self.source.write_page(number, &page)?;
 
         Ok(Pointer {
             page: number,
-            fragment: fragments as u8,
+            fragment: reused.unwrap_or(u32::from(fragments)) as u8,
         })
     }
 
@@ -2944,6 +3278,225 @@ mod tests {
              own first delete would produce, because nothing distinguishes this page from \
              one that always held two fragments"
         );
+    }
+
+
+    // `free_fragment` -- the version 5 delete. Every number below is
+    // `v5_variable_delete.fixture`'s own; see that function's doc comment
+    // for the recorded bytes and for which parts of the intermediate state
+    // are inferred from them.
+
+    /// The fixture's own delete, reproduced on a page built by hand: page 5
+    /// of a 1,024-byte file holding `Sysop`'s 17-byte body and `Test`'s
+    /// 4-byte one, with the first freed.
+    ///
+    /// The freed entry becomes `0xffff` in place, the survivor slides down
+    /// to `0x0c` (which is what keeps the page's *first live* entry at
+    /// `FIRST_FRAGMENT` -- the engine's own status 54 rule), every entry
+    /// after the freed one is rebased by its length, the fragment count does
+    /// not move, and the bytes the shift vacated are zeroed.
+    #[test]
+    fn freeing_an_interior_v5_fragment_compacts_the_page_and_tombstones_its_entry() {
+        let sysop = b"EMO NORMAL SYSOP\0".to_vec();
+        let test = b"EMO\0".to_vec();
+        assert_eq!(sysop.len(), 17);
+        assert_eq!(test.len(), 4);
+
+        let five = page(5, 1024, &[(&sysop, false), (&test, false)]);
+        assert_eq!(entry(&five, 0), Ok(0x0c));
+        assert_eq!(entry(&five, 1), Ok(0x1d));
+        assert_eq!(entry(&five, 2), Ok(0x21));
+
+        let mut pages = Held(vec![blank(1024), blank(1024), blank(1024), blank(1024), blank(1024), five]);
+
+        let head = free_fragment(&mut pages, pointer(5, 0), Some(5))
+            .expect("an unchained fragment with a sibling after it");
+        assert_eq!(head, Some(5), "the page was already on the chain and stays where it is");
+
+        let after = &pages.0[5];
+        assert_eq!(fragment_count(after), 2, "an interior free leaves the count alone");
+        assert_eq!(entry(after, 0), Ok(UNUSED), "the freed entry, tombstoned in place");
+        assert_eq!(entry(after, 1), Ok(0x0c), "0x1d - 17: the survivor is now the first live entry");
+        assert_eq!(entry(after, 2), Ok(0x10), "0x21 - 17: the new free-space boundary");
+        assert_eq!(&after[0x0c..0x10], test.as_slice(), "the survivor's bytes, shifted down");
+        assert!(
+            after[0x10..0x21].iter().all(|b| *b == 0),
+            "the bytes the shift vacated are zeroed, not left stale: {:02x?}",
+            &after[0x10..0x21]
+        );
+        // The page still reads as a variable page, which the status 54 rule
+        // is what would otherwise refuse.
+        let header = Header::read(after, 5, Version::V5).expect("still a readable page");
+        let survivor = fragment(after, 1, header, Version::V5).expect("still findable");
+        assert_eq!(&after[survivor.at..survivor.at + survivor.length], test.as_slice());
+    }
+
+    /// Freeing the *last* fragment of a page drops the entry and the count
+    /// rather than leaving a trailing `0xffff`, and zeroes the fragment's own
+    /// bytes. `W32MKDE_decompiled.c:19737`'s trailing branch; no recording
+    /// reaches it, so this is the engine's text rather than measured bytes.
+    #[test]
+    fn freeing_the_last_v5_fragment_drops_its_entry_and_the_count() {
+        let first = b"EMO NORMAL SYSOP\0".to_vec();
+        let last = b"EMO\0".to_vec();
+        let five = page(5, 256, &[(&first, false), (&last, false)]);
+        let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), five]);
+
+        free_fragment(&mut pages, pointer(5, 1), None).expect("the last of two, unchained");
+
+        let after = &pages.0[5];
+        assert_eq!(fragment_count(after), 1, "the trailing slot is dropped, not tombstoned");
+        assert_eq!(entry(after, 0), Ok(FIRST_FRAGMENT), "fragment 0's entry, untouched");
+        assert_eq!(
+            entry(after, 1),
+            Ok(FIRST_FRAGMENT + first.len() as u32),
+            "the new boundary is where the freed fragment used to start"
+        );
+        assert_eq!(entry(after, 2), Ok(0), "the old boundary entry is zeroed");
+        assert_eq!(&after[0x0c..0x0c + first.len()], first.as_slice(), "the survivor, untouched");
+        assert!(
+            after[0x0c + first.len()..0x0c + first.len() + last.len()].iter().all(|b| *b == 0),
+            "the freed fragment's own bytes are zeroed"
+        );
+    }
+
+    /// The trailing branch's own collapse: a page whose middle slot was
+    /// already tombstoned loses both entries when the fragment behind it is
+    /// freed, because the engine repeats the drop while the entry before the
+    /// one it just took is `0xffff` (`W32MKDE_decompiled.c:19737`).
+    #[test]
+    fn freeing_a_trailing_v5_fragment_collapses_the_freed_slots_before_it() {
+        let a = vec![0xa1u8; 20];
+        let b = vec![0xb1u8; 10];
+        let c = vec![0xc1u8; 6];
+        let five = page(5, 256, &[(&a, false), (&b, false), (&c, false)]);
+        let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), five]);
+
+        free_fragment(&mut pages, pointer(5, 1), None).expect("interior");
+        assert_eq!(entry(&pages.0[5], 1), Ok(UNUSED), "the middle slot is a hole now");
+        assert_eq!(fragment_count(&pages.0[5]), 3);
+
+        free_fragment(&mut pages, pointer(5, 2), None).expect("trailing, with a hole before it");
+
+        let after = &pages.0[5];
+        assert_eq!(fragment_count(after), 1, "both the freed slot and the hole before it go");
+        assert_eq!(entry(after, 0), Ok(FIRST_FRAGMENT), "fragment 0's entry, untouched");
+        assert_eq!(
+            entry(after, 1),
+            Ok(FIRST_FRAGMENT + a.len() as u32),
+            "the boundary, back to where fragment 0 ends"
+        );
+        assert_eq!(entry(after, 2), Ok(0), "the entries past the new boundary are zeroed");
+        assert_eq!(entry(after, 3), Ok(0), "both of them");
+        assert_eq!(&after[0x0c..0x0c + a.len()], a.as_slice(), "the survivor, untouched");
+    }
+
+    /// The page would be left holding nothing, and releasing a v5 page is
+    /// not implemented -- refused before a byte is written, not after.
+    #[test]
+    fn freeing_the_only_v5_fragment_on_a_page_is_refused() {
+        let only = vec![0x5au8; 40];
+        let five = page(5, 256, &[(&only, false)]);
+        let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), five.clone()]);
+
+        let e = free_fragment(&mut pages, pointer(5, 0), None)
+            .expect_err("the page would report no fragments at all");
+        assert!(e.contains("no fragments at all"), "{e}");
+        assert_eq!(pages.0[5], five, "a refused free writes nothing");
+    }
+
+    /// Same refusal when the tombstones before a trailing fragment would
+    /// take the count to zero with it.
+    #[test]
+    fn freeing_a_trailing_v5_fragment_that_would_empty_the_page_is_refused() {
+        let a = vec![0xa1u8; 20];
+        let b = vec![0xb1u8; 10];
+        let five = page(5, 256, &[(&a, false), (&b, false)]);
+        let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), five]);
+
+        free_fragment(&mut pages, pointer(5, 0), None).expect("interior");
+        let holed = pages.0[5].clone();
+
+        let e = free_fragment(&mut pages, pointer(5, 1), None)
+            .expect_err("the hole before it collapses too, leaving nothing");
+        assert!(e.contains("no fragments at all"), "{e}");
+        assert_eq!(pages.0[5], holed, "a refused free writes nothing");
+    }
+
+    /// A chained fragment is refused, the same way the v6 free and both
+    /// in-place rewrites refuse one: freeing every hop is a walk this host
+    /// has not measured.
+    #[test]
+    fn freeing_a_chained_v5_fragment_is_refused() {
+        let chained = [pointer(6, 0).encode().as_slice(), &[0x11u8; 12]].concat();
+        let plain = vec![0x22u8; 8];
+        let five = page(5, 256, &[(&chained, true), (&plain, false)]);
+        let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), five.clone()]);
+
+        let e = free_fragment(&mut pages, pointer(5, 0), None)
+            .expect_err("a chain that spans pages is refused");
+        assert!(e.contains("continues onto another page"), "{e}");
+        assert_eq!(pages.0[5], five, "a refused free writes nothing");
+    }
+
+    /// A page that is off the free-space chain and gains real room by a
+    /// delete joins the chain at the head, the same threading
+    /// `free_fragment_v6` does and `Space::reoffer` does for the insert
+    /// side.
+    #[test]
+    fn a_freed_v5_page_with_room_rejoins_the_free_space_chain_at_the_head() {
+        let a = vec![0xa1u8; 100];
+        let b = vec![0xb1u8; 100];
+        let mut five = page(5, 256, &[(&a, false), (&b, false)]);
+        set_chain(&mut five, FreeChain::Off);
+        let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), five]);
+
+        let head = free_fragment(&mut pages, pointer(5, 0), Some(3))
+            .expect("an unchained interior fragment");
+
+        assert_eq!(head, Some(5), "the page this delete gave room to is the new head");
+        let after = Header::read(&pages.0[5], 5, Version::V5).expect("readable");
+        assert_eq!(after.free_chain, FreeChain::Next(3), "the old head follows it");
+    }
+
+    /// The other half of the fixture's delete: the insert that follows fills
+    /// the slot the delete freed rather than appending past the last
+    /// fragment. `v5_variable_delete.fixture`'s own numbers -- a 30-byte
+    /// body into a page whose entry 0 is a hole and whose fragment 1 is
+    /// `"EMO\0"` at `0x0c` -- and the answer is genuine Btrieve's own page:
+    /// two fragments, entries `0x0c, 0x2a, 0x2e`, the new body first.
+    #[test]
+    fn a_v5_insert_fills_the_slot_a_delete_freed_rather_than_appending() {
+        let survivor = b"EMO\0".to_vec();
+        let mut five = page(5, 1024, &[(&survivor, false)]);
+        // What the fixture's delete leaves: the survivor is fragment 1, and
+        // fragment 0's entry is a hole. Built by hand rather than by calling
+        // `free_fragment`, so this test fails on its own if `place` stops
+        // reusing the slot even when the free side is right.
+        set_fragment_count(&mut five, 2);
+        set_entry(&mut five, 2, FIRST_FRAGMENT + survivor.len() as u32).expect("boundary");
+        set_entry(&mut five, 1, FIRST_FRAGMENT).expect("the survivor");
+        set_entry(&mut five, 0, UNUSED).expect("the hole");
+
+        let mut source = Scratch::new(1024, Version::V5);
+        for _ in 0..4 {
+            source.claim(&blank_page(1024, Version::V5)).expect("filler");
+        }
+        source.claim(&five).expect("the page under test");
+
+        let body = b"EMO NORMAL MODERATE MASS_MAIL\0".to_vec();
+        assert_eq!(body.len(), 30);
+        let mut space = Space::new(&mut source, Version::V5, Some(5));
+        let at = space.place(&body).expect("a body that fits the page it is offered");
+
+        assert_eq!(at, pointer(5, 0), "the freed slot, not a third fragment");
+        let after = &source.pages[5];
+        assert_eq!(fragment_count(after), 2, "reusing a slot does not grow the array");
+        assert_eq!(entry(after, 0), Ok(0x0c), "the new fragment starts where the header ends");
+        assert_eq!(entry(after, 1), Ok(0x2a), "the survivor, shifted up by the new body");
+        assert_eq!(entry(after, 2), Ok(0x2e), "the boundary, shifted with it");
+        assert_eq!(&after[0x0c..0x2a], body.as_slice(), "the new body");
+        assert_eq!(&after[0x2a..0x2e], survivor.as_slice(), "the survivor's bytes, moved up");
     }
 
     /// [`FilePages`] is what a real `Block::update` runs against -- every
