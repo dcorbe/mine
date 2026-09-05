@@ -457,6 +457,38 @@ fn entry_at(len: u32, which: u32) -> Result<usize, String> {
         .ok_or_else(|| format!("entry {which} is before the start of a {len}-byte page"))
 }
 
+/// The bytes a compaction moves: everything from the end of the fragment
+/// being taken out up to `boundary`, where the page's fragments end.
+///
+/// Answers the two offsets a caller needs -- where the moved run starts, and
+/// where the used area ends once `length` bytes have gone -- or refuses.
+///
+/// # Why this is a refusal and not arithmetic
+///
+/// A page's entry array is supposed to be monotonic: entry `i` names where
+/// fragment `i` starts, so every entry is at or past the one before it and
+/// the last one is the boundary. A page whose array is *not* monotonic --
+/// corruption, or a file some other engine wrote in a shape this one has not
+/// measured -- makes `at + length` land past `boundary`, and then
+/// `copy_within` panics on an inverted range and `boundary - length`
+/// underflows. Both take the whole board down on a file that could simply
+/// have been refused: this crate's callers all turn a `String` into a
+/// `BtvError` the module sees, and a panic is not an error the module sees.
+///
+/// # Errors
+///
+/// If the fragment ends past `boundary`, naming the page and both offsets.
+fn compaction(page: u32, at: usize, length: usize, boundary: usize) -> Result<(usize, usize), String> {
+    let end = at + length;
+    match boundary.checked_sub(length) {
+        Some(shrunk) if end <= boundary => Ok((end, shrunk)),
+        _ => Err(format!(
+            "page {page}: a fragment at {at} runs {length} bytes, past the {boundary} where \
+             this page's fragments end -- its entry array is not in order"
+        )),
+    }
+}
+
 /// Find fragment `which` in `page`.
 ///
 /// Three things are checked, and all three are the engine's own
@@ -1052,10 +1084,21 @@ pub(crate) fn free_fragment_v6<P: PagesMut>(
             }
         }
         let old_boundary = entry(&rewritten, fragments)? as usize;
-        rewritten.copy_within(found.at + found.length..old_boundary, found.at);
+        let (from, _) = compaction(pointer.page, found.at, found.length, old_boundary)?;
+        rewritten.copy_within(from..old_boundary, found.at);
         for i in (which + 1)..=fragments {
             let old = entry(&rewritten, i)?;
-            set_entry(&mut rewritten, i, old - found.length as u32)?;
+            // Same refusal as `compaction`'s, one entry at a time: an entry
+            // nearer the start of the page than the fragment being taken out
+            // would underflow here rather than move.
+            let moved = old.checked_sub(found.length as u32).ok_or_else(|| {
+                format!(
+                    "logical page {}: entry {i} names offset {old}, before the {} bytes \
+                     freed at {} -- its entry array is not in order",
+                    pointer.page, found.length, found.at
+                )
+            })?;
+            set_entry(&mut rewritten, i, moved)?;
         }
         set_entry(&mut rewritten, which, UNUSED)?;
     }
@@ -1338,8 +1381,9 @@ pub(crate) fn free_fragment<P: PagesMut>(
 
     // Close the gap, and zero what that leaves behind at the top of the used
     // area. A trailing free moves nothing and zeroes the fragment itself.
-    rewritten.copy_within(found.at + found.length..boundary, found.at);
-    rewritten[boundary - found.length..boundary].fill(0);
+    let (from, shrunk) = compaction(pointer.page, found.at, found.length, boundary)?;
+    rewritten.copy_within(from..boundary, found.at);
+    rewritten[shrunk..boundary].fill(0);
 
     let length = found.length as i32;
     if collapsed == 0 {
@@ -1352,7 +1396,7 @@ pub(crate) fn free_fragment<P: PagesMut>(
         // in: each step zeroes the entry above the one it is dropping, so
         // going the other way would write the new boundary into an entry a
         // later step has to zero and leave it there.
-        let new_boundary = (boundary - found.length) as u32;
+        let new_boundary = shrunk as u32;
         for i in ((which + 1 - collapsed)..=which).rev() {
             set_entry(&mut rewritten, i + 1, 0)?;
             set_entry(&mut rewritten, i, new_boundary)?;
@@ -1715,14 +1759,25 @@ impl<'a> V5Pages<'a> {
     /// pins.
     fn stamped(&mut self, number: u32, page: &mut [u8]) -> Result<(), String> {
         const STAMP: usize = 0x04;
+        /// Bit 15 of the word at [`STAMP`] is not part of the counter: it is
+        /// the data-page flag [`super::pages::Header`] reads and writes
+        /// (`pages.rs`'s `decode`/`encode`, `flags & 0x8000`). Writing a
+        /// counter of `0x8000` over the whole word would set that flag on a
+        /// page that is not a data page, and a counter that wrapped past
+        /// `0x7fff` would clear it on one that is -- either way the page
+        /// changes kind because it was written often enough, which nothing
+        /// in the format says should happen.
+        const DATA: u16 = 0x8000;
+        const COUNTER: u16 = 0x7fff;
         let stamp = if self.claimed == Some(number) {
             self.claimed = None;
             0
         } else {
             let on_disk = self.file.page(number)?;
-            u16::from_le_bytes([on_disk[STAMP], on_disk[STAMP + 1]]).wrapping_add(1)
+            (u16::from_le_bytes([on_disk[STAMP], on_disk[STAMP + 1]]) & COUNTER).wrapping_add(1)
         };
-        page[STAMP..STAMP + 2].copy_from_slice(&stamp.to_le_bytes());
+        let data = u16::from_le_bytes([page[STAMP], page[STAMP + 1]]) & DATA;
+        page[STAMP..STAMP + 2].copy_from_slice(&(data | (stamp & COUNTER)).to_le_bytes());
         Ok(())
     }
 }
@@ -2044,6 +2099,17 @@ impl<'a, S: PageSource> Space<'a, S> {
             None => boundary,
             Some(which) => {
                 let next = entry(&page, which + 1)? as usize;
+                // The same inverted range `compaction` refuses on the delete
+                // side, seen from the insert side: the run being slid up
+                // starts at `next` and ends at the boundary, and a page whose
+                // entry array is out of order would panic here instead.
+                if next > boundary {
+                    return Err(format!(
+                        "page {number}: entry {} names offset {next}, past the {boundary} \
+                         where this page's fragments end -- its entry array is not in order",
+                        which + 1
+                    ));
+                }
                 page.copy_within(next..boundary, next + needed);
                 for i in (which + 1)..=u32::from(fragments) {
                     move_entry(&mut page, i, needed as i32)?;
@@ -3291,6 +3357,84 @@ mod tests {
         assert_eq!(pages.0[6], before, "a refused free must not touch the page");
     }
 
+    /// A page whose entry array is out of order is refused, not panicked on.
+    ///
+    /// Entry 2 -- the boundary that says where the page's fragments end --
+    /// names an offset *before* entry 1, so fragment 0's derived length runs
+    /// past it. `copy_within` on that inverted range panics, and the
+    /// `boundary - length` right after it underflows; either one takes the
+    /// whole board down over one bad page. Built by hand because no correct
+    /// writer produces this array, which is the point: it is what a corrupt
+    /// file, or one some other engine wrote in a shape this one has not
+    /// measured, looks like from here.
+    #[test]
+    fn a_v5_free_on_an_out_of_order_entry_array_is_refused() {
+        let mut one = page(1, 64, &[(&[0xaa; 28], false), (&[0xbb; 8], false)]);
+        assert_eq!((entry(&one, 0), entry(&one, 1), entry(&one, 2)), (Ok(12), Ok(40), Ok(48)));
+        set_entry(&mut one, 2, 20).expect("entry 2 exists");
+
+        let mut pages = Held(vec![blank(64), one]);
+        let before = pages.0[1].clone();
+
+        let e = free_fragment(&mut pages, pointer(1, 0), None)
+            .expect_err("fragment 0 ends at 40 and the page's fragments end at 20");
+        assert!(e.contains("page 1"), "{e}");
+        assert!(e.contains("at 12"), "the fragment's own offset: {e}");
+        assert!(e.contains("20"), "the boundary it runs past: {e}");
+        assert!(e.contains("not in order"), "{e}");
+        assert_eq!(pages.0[1], before, "a refused free must not touch the page");
+    }
+
+    /// The same out-of-order array on the version 6 side of the same
+    /// compaction. See [`a_v5_free_on_an_out_of_order_entry_array_is_refused`].
+    #[test]
+    fn a_v6_free_on_an_out_of_order_entry_array_is_refused() {
+        let frag0 = [V6_END.as_slice(), &[0xa1u8; 24]].concat();
+        let frag1 = [V6_END.as_slice(), &[0xb1u8; 8]].concat();
+        let frag2 = [V6_END.as_slice(), &[0xc1u8; 8]].concat();
+        let mut one = page_v6(1, 128, &[&frag0, &frag1, &frag2]);
+        assert_eq!((entry(&one, 1), entry(&one, 3)), (Ok(40), Ok(64)));
+        set_entry(&mut one, 3, 20).expect("entry 3 exists");
+
+        let mut pages = Held(vec![blank(128), one]);
+        let before = pages.0[1].clone();
+
+        let e = free_fragment_v6(&mut pages, Pointer { page: 1, fragment: 0 }, None)
+            .expect_err("fragment 0 ends at 40 and the page's fragments end at 20");
+        assert!(e.contains("page 1"), "{e}");
+        assert!(e.contains("at 12"), "the fragment's own offset: {e}");
+        assert!(e.contains("20"), "the boundary it runs past: {e}");
+        assert!(e.contains("not in order"), "{e}");
+        assert_eq!(pages.0[1], before, "a refused free must not touch the page");
+    }
+
+    /// And the insert side of the same shape: `Space::place` filling a slot a
+    /// delete freed slides everything from the next fragment up to the
+    /// boundary, and an array where the next fragment starts *past* the
+    /// boundary would panic in the same `copy_within`.
+    #[test]
+    fn placing_into_a_reused_slot_on_an_out_of_order_page_is_refused() {
+        let mut one = page(1, 128, &[(&[0xaa; 8], false), (&[0xbb; 8], false)]);
+        assert_eq!((entry(&one, 0), entry(&one, 1), entry(&one, 2)), (Ok(12), Ok(20), Ok(28)));
+        // Fragment 0's slot freed, as a delete would leave it, and a
+        // boundary that contradicts entry 1.
+        set_entry(&mut one, 0, UNUSED).expect("entry 0 exists");
+        set_entry(&mut one, 2, 16).expect("entry 2 exists");
+
+        let mut source = Scratch::new(128, Version::V5);
+        source.pages.push(one);
+        let before = source.pages[1].clone();
+
+        let e = Space::new(&mut source, Version::V5, Some(1))
+            .place(&[0xcc; 8])
+            .expect_err("entry 1 is at 20 and the boundary is at 16");
+        assert!(e.contains("page 1"), "{e}");
+        assert!(e.contains("20"), "the entry that is out of place: {e}");
+        assert!(e.contains("16"), "the boundary it is past: {e}");
+        assert!(e.contains("not in order"), "{e}");
+        assert_eq!(source.pages[1], before, "a refused place must not touch the page");
+    }
+
     /// **The Critical review finding, made concrete.** `Self::insert_v6`
     /// (`lib.rs`) has called [`Space::place`] for every v6 variable-length
     /// insert since before this task -- so a page a delete gives real room
@@ -3841,6 +3985,39 @@ mod tests {
             NO_PAGE,
             "a page with no fragments on it yet is not offered to anyone"
         );
+    }
+
+    /// The modification stamp is fifteen bits, and the sixteenth is the
+    /// data-page flag `pages::Header` reads (`flags & 0x8000`). A page
+    /// already stamped `0x7fff` must wrap to zero rather than carry into
+    /// that bit, and the bit itself must read back exactly as the page being
+    /// written carried it -- both values, because a mask that dropped the
+    /// flag altogether would pass the `false` case on its own.
+    #[test]
+    fn the_v5_stamp_wraps_without_touching_the_data_page_flag() {
+        const STAMP: usize = 0x04;
+        let dir = crate::testing::scratch("variable-v5-stamp-wrap");
+
+        for data in [false, true] {
+            let path = dir.join(if data { "DATA.DAT" } else { "INDEX.DAT" });
+            let flag: u16 = if data { 0x8000 } else { 0 };
+            // Page 0 stands in for the control record; page 1 is the one
+            // written, already stamped at the top of the counter's range.
+            let mut file = vec![0u8; 128];
+            file[64 + STAMP..64 + STAMP + 2].copy_from_slice(&(flag | 0x7fff).to_le_bytes());
+            std::fs::write(&path, &file).expect("write the fixture");
+
+            let mut page = file[64..].to_vec();
+            page[FIRST_FRAGMENT as usize] = 0x11;
+            V5Pages::new(&path, 64, 2)
+                .write_page(1, &page)
+                .expect("the page is inside the file");
+
+            let after = std::fs::read(&path).expect("read back");
+            let word = u16::from_le_bytes([after[64 + STAMP], after[64 + STAMP + 1]]);
+            assert_eq!(word & 0x7fff, 0, "0x7fff + 1 wraps to zero within the counter");
+            assert_eq!(word & 0x8000, flag, "the data-page flag is not the counter's to write");
+        }
     }
 
     /// The v5 free-space head reads and writes at `0x3a`, with `0xffff`

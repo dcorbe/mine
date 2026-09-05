@@ -6000,7 +6000,8 @@ impl<M: Mem> Block<M> {
         // length of its fixed part, not of the record, and cutting the buffer
         // down to it is exactly the silent truncation this used to refuse the
         // whole write to avoid. What is past `reclen` is the record's body,
-        // and `Self::insert_v6` puts it on a variable page.
+        // and it goes on a variable page of its own: `Self::insert_v6` for a
+        // version 6 file, `Self::place_v5_body` for a version 5 one.
         let bytes = if self.geometry.variable {
             let reclen = usize::from(self.geometry.reclen);
             if bytes.len() < reclen {
@@ -6614,9 +6615,13 @@ impl<M: Mem> Block<M> {
     /// [`Self::refuse_if_read_only`]), the records cannot be read,
     /// `position` holds no record, the record's own fragment is one
     /// [`variable::free_fragment`] (version 5) or
-    /// [`variable::free_fragment_v6`] refuses -- a chained one, or the last
-    /// on its page -- the file cannot be written, or [`Self::verify_write`]
-    /// finds the write did not do what it claims.
+    /// [`variable::free_fragment_v6`] refuses -- a chained one on either
+    /// version, and on version 6 also the only fragment on its page or one
+    /// whose compaction would pass an earlier freed slot, neither of which
+    /// any version 6 recording reaches; version 5 frees the last fragment
+    /// on a page and leaves the page empty, which is measured -- the file
+    /// cannot be written, or [`Self::verify_write`] finds the write did not
+    /// do what it claims.
     pub fn delete(&mut self, position: u32) -> Result<(), BtvError> {
         self.refuse_if_read_only()?;
         let result = self.delete_inner(position);
@@ -6791,8 +6796,12 @@ impl<M: Mem> Block<M> {
         // the whole control record for the record count and the free list --
         // the same ordering `Self::insert_inner` keeps around
         // `pages::write_record` for the same field. `None` for the page
-        // count: a delete never adds or releases a page (`free_fragment`
-        // refuses the one shape that would), so there is nothing to write
+        // count: a delete never adds a page, and it never takes one out of
+        // the file either. `free_fragment` can empty a variable page now --
+        // freeing the last fragment on one is measured, see its own doc
+        // comment -- but genuine leaves that page where it is, blank and on
+        // the free-space chain, rather than shortening the file. So the page
+        // count is the same number afterwards and there is nothing to write
         // there.
         if let Some(head) = variable_head {
             self.write_v5_variable_fcr(None, head).map_err(|why| BtvError {

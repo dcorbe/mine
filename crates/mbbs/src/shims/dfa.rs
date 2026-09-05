@@ -1409,11 +1409,14 @@ pub fn dfaVirgin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
 /// # What this engine cannot represent
 ///
 /// [`crate::btrieve::FileSpec`] has no `flags` field and always
-/// pre-allocates exactly one data page -- so a nonzero `fs.flags`
-/// (`DFACF_VARIABLE`/`BLANKTRUNC`/`COMPRESS`/`KEYONLY`/`FREESPACE*`) or an
+/// pre-allocates exactly one data page -- so a nonzero `fs.flags` or an
 /// `fs.nPreAllocate` other than `0`/`1` is refused before anything is
 /// written, rather than silently creating a file with a shape the module
-/// did not ask for. A segment's `DFASF_ALTCOLLATE` bit is refused the same
+/// did not ask for. `FileSpec::variable` does now express what
+/// `DFACF_VARIABLE` asks for, but which bit of this word carries it has not
+/// been measured against a real `dfaCreate` call, and
+/// `BLANKTRUNC`/`COMPRESS`/`KEYONLY`/`FREESPACE*` have no representation at
+/// all -- so the whole word is refused rather than half of it decoded. A segment's `DFASF_ALTCOLLATE` bit is refused the same
 /// way: this host has no alternate collating sequence file to read one
 /// from either.
 ///
@@ -1491,9 +1494,10 @@ fn decode_create_buffer(bytes: &[u8]) -> Result<crate::btrieve::FileSpec, ShimEr
 
     if flags != 0 {
         return Err(ShimError::Failed(format!(
-            "create flags {flags:#06x} -- this engine's FileSpec has no representation for \
-             DFACF_VARIABLE/BLANKTRUNC/COMPRESS/KEYONLY/FREESPACE*, so any nonzero flags \
-             word is refused rather than silently ignored"
+            "create flags {flags:#06x} -- this shim maps no bit of this word onto a \
+             FileSpec field: which bit is DFACF_VARIABLE is not measured, and \
+             BLANKTRUNC/COMPRESS/KEYONLY/FREESPACE* have no representation at all, so \
+             any nonzero flags word is refused rather than silently ignored"
         )));
     }
     if n_pre_allocate > 1 {
@@ -1667,9 +1671,10 @@ pub fn dfaCreateSpec<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<a
 
     if flags != 0 {
         return Err(ShimError::Failed(format!(
-            "dfaCreateSpec({name}) with flags {flags:#010x} -- this engine's FileSpec has \
-             no representation for DFACF_VARIABLE/BLANKTRUNC/COMPRESS/KEYONLY/FREESPACE*, \
-             so any nonzero flags word is refused"
+            "dfaCreateSpec({name}) with flags {flags:#010x} -- this shim maps no bit of \
+             this word onto a FileSpec field: which bit is DFACF_VARIABLE is not \
+             measured, and BLANKTRUNC/COMPRESS/KEYONLY/FREESPACE* have no representation \
+             at all, so any nonzero flags word is refused"
         )));
     }
     if n_pre_allocate > 1 {
@@ -2942,8 +2947,9 @@ mod tests {
 
     #[test]
     fn dfacreate_refuses_nonzero_flags() {
-        // This engine's FileSpec has no representation for
-        // DFACF_VARIABLE/BLANKTRUNC/COMPRESS/KEYONLY/FREESPACE*.
+        // This shim maps no bit of the flags word onto a FileSpec field:
+        // which bit is DFACF_VARIABLE is not measured, and
+        // BLANKTRUNC/COMPRESS/KEYONLY/FREESPACE* have no representation.
         let dir = crate::testing::scratch("dfa-create-refuses-flags");
         let mut f = Fixture::rooted(dir);
         let filnam = f.text("BAD.DAT");

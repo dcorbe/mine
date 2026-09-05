@@ -221,6 +221,19 @@ mod attrs {
 /// file against on the way in.
 const MIN_PAGE: u16 = 512;
 
+/// Largest page length this writes. Version 5's own maximum, and every page
+/// size measured anywhere in this repository is one of the four multiples of
+/// 512 up to it: 512 (`DUPKEY30.DAT`), 1024 (the kit's `BBSK.DAT` and
+/// `BBSUSR.DAT`, and `FRAG1024.DAT`), 2048 (`PP2048.DAT`) and 4096
+/// (`WCCMP002.DAT`).
+///
+/// It is a refusal rather than a clamp because of what one byte of the file
+/// control record can hold: [`fcr::VARIABLE_PAGE_CAPACITY`] is a single byte
+/// carrying `page_size / 20`, which is 204 at 4,096 and overflows a `u8`
+/// somewhere past 5,100. Refusing here is what makes that `as u8` lossless
+/// rather than a silent truncation on a file nobody could read back.
+const MAX_PAGE: u16 = 4096;
+
 /// Bytes of file control record this module fills in below `KEYS_BASE`.
 /// Same offsets as [`super::at`]/[`super::pages::fcr`]; re-stated locally so
 /// this module's byte-builder reads as one self-contained table rather than
@@ -512,6 +525,14 @@ fn validate(spec: &FileSpec) -> Result<(u16, u16), String> {
     if spec.page_size < MIN_PAGE || !spec.page_size.is_multiple_of(MIN_PAGE) {
         return Err(format!(
             "a page length of {}, which is not a multiple of {MIN_PAGE}",
+            spec.page_size
+        ));
+    }
+    if spec.page_size > MAX_PAGE {
+        return Err(format!(
+            "a page length of {}, more than the {MAX_PAGE} a version 5 file may have -- \
+             see MAX_PAGE for the measured sizes and for the one control-record byte \
+             that cannot hold a larger page's own capacity",
             spec.page_size
         ));
     }
@@ -1088,6 +1109,36 @@ mod tests {
         let err = create(&path, &spec).expect_err("refuses");
         assert!(err.why.contains("no keys"), "{}", err.why);
         assert!(!path.exists(), "nothing should have been written");
+    }
+
+    /// 4,096 is version 5's largest page, and the one control-record byte
+    /// that carries a variable file's page capacity (`page_size / 20`) can
+    /// hold nothing bigger. Both ends of the boundary, because a check
+    /// written with the wrong comparison passes one of them.
+    #[test]
+    fn create_refuses_a_page_larger_than_version_5_allows() {
+        let path = scratch("page-too-big.dat");
+        let err = create(&path, &single_key_spec(12, 4608, false)).expect_err("refuses");
+        assert!(err.why.contains("more than the 4096"), "{}", err.why);
+        assert!(!path.exists(), "nothing should have been written");
+
+        let ok = scratch("page-at-the-limit.dat");
+        create(&ok, &single_key_spec(12, MAX_PAGE, false)).expect("4096 is legal");
+        let bytes = std::fs::read(&ok).expect("reads back");
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), MAX_PAGE, "page size");
+    }
+
+    /// The variable-page capacity byte at the largest page this writes: 204,
+    /// which is `4096 / 20` and fits a `u8` -- what the [`MAX_PAGE`] refusal
+    /// above is what makes true.
+    #[test]
+    fn the_variable_page_capacity_byte_fits_at_the_largest_page() {
+        let path = scratch("variable-capacity-at-max.dat");
+        let mut spec = single_key_spec(12, MAX_PAGE, false);
+        spec.variable = true;
+        create(&path, &spec).expect("creates");
+        let bytes = std::fs::read(&path).expect("reads back");
+        assert_eq!(bytes[fcr::VARIABLE_PAGE_CAPACITY], 204, "4096 / 20, not truncated");
     }
 
     #[test]
