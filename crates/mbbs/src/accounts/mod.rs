@@ -933,6 +933,26 @@ impl<A: Abi> Host<A> {
         accounts.find_account(btrieve, userid)
     }
 
+    /// Whether anyone is logged in as `userid` right now.
+    ///
+    /// By record position, not by name: a session remembers the position
+    /// of the record it loaded ([`Session::position`]), and that position
+    /// is exactly what the logoff write-back will overwrite. An edit to the
+    /// file while a session holds its position is undone at that logoff,
+    /// which is why `mbbs-user` asks this before it edits.
+    ///
+    /// # Errors
+    ///
+    /// The account files not being open, or whatever the engine refused.
+    pub fn account_online(&mut self, userid: &str) -> Result<bool, String> {
+        let Host { btrieve, accounts, .. } = self;
+        let accounts = accounts.as_ref().ok_or("accounts are not open")?;
+        let Some((position, _)) = accounts.find_account(btrieve, userid)? else {
+            return Ok(false);
+        };
+        Ok(accounts.sessions.iter().flatten().any(|session| session.position == position))
+    }
+
     /// Add one account with `ring`, the way a signup adds one.
     ///
     /// The same three checks a `Login::Signup` gets -- [`validate_userid`],
@@ -1943,6 +1963,38 @@ mod tests {
         assert_ne!(rec.usedat(), 0, "usedat is today");
         assert_eq!(rec.bytes[at::SCNBRK], 33, "updacc wrote the whole slot back");
         assert!(f.host.accounts().unwrap().sessions[0].is_none());
+    }
+
+    /// `account_online` follows the session's record position, not the
+    /// name typed: a second account on the board does not make the first
+    /// look online, and the answer goes back to `false` once the caller
+    /// has logged off and the write-back has run.
+    #[test]
+    fn account_online_follows_the_session_not_the_name() {
+        let mut f = opened("account-online");
+        signup(&mut f, "Dan", "hunter2");
+        signup(&mut f, "Beef", "beef1");
+        assert_eq!(f.host.account_online("Nobody"), Ok(false), "no such account");
+        assert_eq!(f.host.account_online("Dan"), Ok(false), "nobody has logged in yet");
+
+        let module = f.registered_module();
+        let chan = f.host.users().terms().chan(1).expect("channel 1");
+        f.host
+            .login(
+                &mut f.machine,
+                &module,
+                chan,
+                &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+                term(),
+            )
+            .expect("no io error")
+            .expect("accepted");
+
+        assert_eq!(f.host.account_online("dan"), Ok(true), "case-insensitive, like every lookup");
+        assert_eq!(f.host.account_online("Beef"), Ok(false), "a different account is not online");
+
+        f.host.hangup(&mut f.machine, &module, chan).expect("hung up");
+        assert_eq!(f.host.account_online("Dan"), Ok(false), "logged off");
     }
 
     /// The write-back belongs to the account layer, not to every channel: a

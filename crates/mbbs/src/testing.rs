@@ -307,6 +307,21 @@ impl Fixture<Wg16> {
             .load(&mut self.machine, &minimal_module_bytes())
             .expect("a minimal module loads")
     }
+
+    /// [`minimal_module`](Self::minimal_module) with a module registered
+    /// first, so that [`Host::login`](crate::Host::login) and
+    /// [`Host::hangup`](crate::Host::hangup) have a module to enter and
+    /// leave. The registered block is `struct module` with the name
+    /// `MajorMUD` and every vector null: nothing runs at logon or logoff,
+    /// which is what a test of the account layer wants.
+    pub fn registered_module(&mut self) -> mbbs_machine::m16::Module {
+        let mut bytes = b"MajorMUD".to_vec();
+        bytes.resize(25 + 9 * 4, 0);
+        let block = self.bytes(&bytes, false);
+        self.invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .expect("a module registers");
+        self.minimal_module()
+    }
 }
 
 /// An inert one-section PE32 image, just parseable enough for
