@@ -164,6 +164,35 @@ fn keys_add_and_remove_rewrite_the_ring() {
     assert_eq!(row(&run(&root, &["list"]), "Dan"), "Dan - NORMAL USER SYSOP");
 }
 
+/// A ring is stored space-separated and read back by splitting on spaces, so
+/// a key with a space in it is two keys the next time it is loaded, and one
+/// longer than `KEYSIZ - 1` is cut short by whatever reads it into that
+/// array. Both are refused with exit 1, and the ring on disk is untouched.
+#[test]
+fn keys_add_refuses_a_name_that_is_not_one_short_word() {
+    let _serial = serial();
+    let root = board("mbbs-user-keys-bad");
+    assert!(run(&root, &["add", "Dan", "--password", "hunter2"]).status.success());
+    let before = row(&run(&root, &["list"]), "Dan");
+
+    for bad in ["TWO WORDS", "SIXTEENCHARSXXXX"] {
+        let out = run(&root, &["keys", "Dan", "--add", bad]);
+        assert_eq!(out.status.code(), Some(1), "{bad}: {}", stderr(&out));
+        assert_eq!(
+            stderr(&out),
+            "mbbs-user: a key name is one word of at most 15 characters\n",
+            "{bad}"
+        );
+        assert_eq!(row(&run(&root, &["list"]), "Dan"), before, "{bad}: the ring is untouched");
+    }
+
+    // Fifteen is the longest that is allowed, so the boundary is a rule and
+    // not an off-by-one.
+    let ok = run(&root, &["keys", "Dan", "--add", "FIFTEENCHARSXXX"]);
+    assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
+    assert!(stdout(&ok).contains("FIFTEENCHARSXXX"), "{}", stdout(&ok));
+}
+
 #[test]
 fn delete_tags_and_refuses_undeletable() {
     let _serial = serial();

@@ -342,6 +342,10 @@ fn spelled(word: u16) -> String {
 /// Removals before additions so that `--remove SYSOP --add SYSOP` is a way to
 /// move a key to the end of the ring rather than a way to lose it, and so
 /// that the order does not depend on the order the two flags were typed in.
+///
+/// An added key has to be one word of at most `KEYSIZ - 1` characters, and
+/// anything else is refused before the ring is touched -- see the check
+/// itself for what a space or a long name would do to a stored ring.
 fn keys<A: Abi>(
     host: &mut Host<A>,
     userid: &str,
@@ -353,6 +357,25 @@ fn keys<A: Abi>(
     // sentences.
     if host.account_find(userid).map_err(Failure::faulted)?.is_none() {
         return Err(Failure::refused(refused(userid, Refusal::Unknown)));
+    }
+
+    // A key name is one word, short enough for `keys[KEYSIZ]`. A ring is
+    // stored space-separated and split on spaces when it is loaded, so a key
+    // with a space in it is two keys the moment it is read back, and one
+    // longer than `KEYSIZ - 1` is silently cut short by whatever reads it
+    // into that array. Both are refused here rather than written: the
+    // removal side needs no such check, since a name that cannot be stored
+    // cannot be on a ring to remove.
+    for key in add {
+        if key.is_empty()
+            || key.chars().any(char::is_whitespace)
+            || key.len() > accounts::KEYSIZ - 1
+        {
+            return Err(Failure::refused(format!(
+                "a key name is one word of at most {} characters",
+                accounts::KEYSIZ - 1
+            )));
+        }
     }
 
     // A `keys USERID` with neither flag is a question, and a question does

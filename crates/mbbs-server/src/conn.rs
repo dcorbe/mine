@@ -57,6 +57,7 @@ use std::borrow::Cow;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 
 use mbbs::{Chan, Login, Terminal};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -98,6 +99,39 @@ pub(crate) const OUT_CHANNEL_BOUND: usize = 32;
 /// How many refusals a caller earns before the connection ends. Spec
 /// section 2.
 pub(crate) const MAX_REFUSALS: usize = 3;
+
+/// The longest line the login dialogue will accumulate, in bytes.
+///
+/// Spec section 5 bounds the *fields*: 29 bytes of user ID, 9 of password,
+/// and anything longer is refused rather than truncated. This bounds the
+/// **buffer**, which is a different question -- a client that never sends a
+/// terminator has not typed a field at all, and [`LineEditor`] would grow
+/// its `Vec` for as long as bytes keep arriving. 256 is well past every
+/// field the dialogue reads and small enough that a hostile client holding
+/// a socket open costs a quarter of a kilobyte instead of whatever it feels
+/// like sending.
+///
+/// Reaching it is not itself the refusal: the editor stops accumulating and
+/// the line, still over every field limit by an order of magnitude, is
+/// refused by [`too_long`] with the account layer's own words when it
+/// completes. That is deliberate -- one refusal vocabulary, spoken in one
+/// place, whatever made the line too long.
+const LINE_CAP: usize = 256;
+
+/// How long a caller has to get through the login dialogue.
+///
+/// Spec section 5 gives the rlogin handshake a deadline
+/// ([`crate::rlogin::HANDSHAKE_DEADLINE`]) and left telnet without one, so a
+/// client that connected and said nothing held a task, a socket and the
+/// filter behind it for as long as the process lived. Two minutes is
+/// generous for a human typing two short lines and finite for everything
+/// else.
+///
+/// One deadline for the whole dialogue rather than one per prompt, the same
+/// choice `rlogin::session` made and for the same reason: a client dribbling
+/// a byte at a time would reset a per-read timeout forever, which is the
+/// shape of hang this exists to prevent.
+pub(crate) const LOGIN_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The login dialogue, word for word. Spec section 2.
 ///
@@ -262,9 +296,23 @@ pub async fn serve_on(
     listeners: &[Listener<'_>],
     serving: crate::host::Serving,
 ) -> io::Result<Vec<SocketAddr>> {
+    serve_on_with_deadline(host_tx, listeners, serving, LOGIN_DEADLINE).await
+}
+
+/// [`serve_on`] with the login deadline injected, for the test that has to
+/// watch it expire without waiting [`LOGIN_DEADLINE`] to do it. The same
+/// seam, for the same reason, as `rlogin::serve_with_deadline`.
+pub(crate) async fn serve_on_with_deadline(
+    host_tx: std_mpsc::Sender<In>,
+    listeners: &[Listener<'_>],
+    serving: crate::host::Serving,
+    deadline: Duration,
+) -> io::Result<Vec<SocketAddr>> {
     let mut bound = Vec::with_capacity(listeners.len());
     for &(addr, stack) in listeners {
-        bound.push(spawn_listener(addr, stack, host_tx.clone(), serving.clone()).await?);
+        bound.push(
+            spawn_listener(addr, stack, host_tx.clone(), serving.clone(), deadline).await?,
+        );
     }
     Ok(bound)
 }
@@ -278,6 +326,7 @@ async fn spawn_listener(
     stack: fn() -> Stack,
     host_tx: std_mpsc::Sender<In>,
     serving: crate::host::Serving,
+    deadline: Duration,
 ) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -294,7 +343,7 @@ async fn spawn_listener(
             let host_tx = host_tx.clone();
             let serving = serving.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(socket, host_tx, stack, serving).await {
+                if let Err(e) = handle(socket, host_tx, stack, serving, deadline).await {
                     eprintln!("mbbs-server: connection ended: {e}");
                 }
             });
@@ -316,6 +365,7 @@ async fn handle(
     host_tx: std_mpsc::Sender<In>,
     stack: fn() -> Stack,
     serving: crate::host::Serving,
+    deadline: Duration,
 ) -> io::Result<()> {
     let (mut socket_reader, mut writer) = socket.into_split();
 
@@ -330,9 +380,17 @@ async fn handle(
     }
 
     let mut reader = Reader::new(&mut socket_reader);
-    let Some((chan, out_rx, leftover)) =
-        login_dialogue(&mut reader, &mut writer, &host_tx).await?
+    // Nothing is written when the deadline expires and nothing is owed: a
+    // caller who has not finished logging in is not owed an explanation of a
+    // clock, and there is no way to tell a stalled client from a program
+    // that opened a socket and forgot about it. Same answer, same reasons,
+    // as `rlogin::session`'s handshake deadline.
+    let Ok(dialogue) =
+        tokio::time::timeout(deadline, login_dialogue(&mut reader, &mut writer, &host_tx)).await
     else {
+        return Ok(());
+    };
+    let Some((chan, out_rx, leftover)) = dialogue? else {
         // Refused, out of tries, or gone. Whoever is still on the other end
         // has already been told which.
         return Ok(());
@@ -650,6 +708,13 @@ impl LineEditor {
                     Edit::None
                 }
             }
+            // At the cap the byte is dropped and not echoed: echoing a
+            // character the line did not keep would put it on the caller's
+            // screen and not in the line, which is the one outcome worse
+            // than refusing. The line is already far past every field limit
+            // `too_long` checks, so it is refused with the host's own words
+            // the moment a terminator arrives. See [`LINE_CAP`].
+            _ if self.line.len() >= LINE_CAP => Edit::None,
             b @ 0x20..=0x7e => {
                 self.line.push(b);
                 Edit::Echo(b)
@@ -852,7 +917,10 @@ pub(crate) async fn pump(
 
 #[cfg(test)]
 mod tests {
-    use super::{Edit, IAC, LineEditor, OPT_ECHO, OPT_SGA, WILL, default_keys, handle, pump, refusal_line};
+    use super::{
+    Edit, IAC, LINE_CAP, LOGIN_DEADLINE, LineEditor, OPT_ECHO, OPT_SGA, WILL, default_keys, handle,
+    pump, refusal_line,
+};
 
     /// A dead host thread must not leave a fresh connection hanging forever.
     ///
@@ -1059,6 +1127,33 @@ mod tests {
         match editor.feed(b'\r') {
             Edit::Done(line) => assert_eq!(line, "rangerdan"),
             _ => panic!("CR must terminate the line"),
+        }
+    }
+
+    /// At [`LINE_CAP`] the editor stops accumulating and stops echoing, and
+    /// the line it hands back is exactly the cap -- not the cap plus
+    /// whatever kept arriving. Backspace and the terminator still work
+    /// there, which is what keeps a capped line a line and not a dead
+    /// prompt.
+    #[test]
+    fn the_line_stops_growing_at_the_cap() {
+        let mut editor = LineEditor::default();
+        for _ in 0..LINE_CAP {
+            assert!(matches!(editor.feed(b'x'), Edit::Echo(b'x')));
+        }
+        for _ in 0..64 {
+            assert!(
+                matches!(editor.feed(b'y'), Edit::None),
+                "past the cap a byte is neither kept nor echoed"
+            );
+        }
+        assert!(matches!(editor.feed(0x08), Edit::Erase), "backspace still erases at the cap");
+        match editor.feed(b'\r') {
+            Edit::Done(line) => {
+                assert_eq!(line.len(), LINE_CAP - 1, "the cap, less the one backspace erased");
+                assert!(line.bytes().all(|b| b == b'x'), "and nothing from past it");
+            }
+            _ => panic!("CR must terminate a capped line"),
         }
     }
 
@@ -1470,7 +1565,7 @@ mod tests {
         tokio::spawn(async move {
             let (server, _peer) = listener.accept().await.expect("accept");
             let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let _ = handle(server, host_tx, Stack::modern, serving).await;
+            let _ = handle(server, host_tx, Stack::modern, serving, LOGIN_DEADLINE).await;
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
@@ -1597,12 +1692,102 @@ mod tests {
         .expect("bind the telnet listener")[0]
     }
 
+    /// [`bind_dialogue`] with the login deadline injected.
+    async fn bind_dialogue_with_deadline(
+        host_tx: std::sync::mpsc::Sender<crate::msg::In>,
+        deadline: std::time::Duration,
+    ) -> std::net::SocketAddr {
+        use crate::termcompat::Stack;
+        super::serve_on_with_deadline(
+            host_tx,
+            &[("127.0.0.1:0", Stack::modern as fn() -> Stack)],
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            deadline,
+        )
+        .await
+        .expect("bind the telnet listener")[0]
+    }
+
     /// The next claim the fake host saw, or a panic naming what was waited
     /// for.
     fn next_claim(claims: &std::sync::mpsc::Receiver<mbbs::Login>, what: &str) -> mbbs::Login {
         claims
             .recv_timeout(DIALOGUE_TIMEOUT)
             .unwrap_or_else(|e| panic!("no claim reached the host for {what}: {e}"))
+    }
+
+    /// A line nobody could have meant is bounded, refused with the account
+    /// layer's own words, and costs the caller a try -- and the board never
+    /// hears about it.
+    ///
+    /// 300 printable bytes with no terminator, then a carriage return.
+    /// [`LINE_CAP`] stops the buffer at 256 and the refusal comes from
+    /// `validate_userid` through [`too_long`], which is what makes this one
+    /// refusal vocabulary rather than a second one invented at the listener.
+    #[tokio::test]
+    async fn an_over_long_line_is_refused_and_never_reaches_the_board() {
+        use tokio::io::AsyncWriteExt;
+
+        let (host_tx, claims, rest) = fake_host(vec![]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut line = vec![b'x'; 300];
+        line.push(b'\r');
+        client.write_all(&line).await.expect("write the over-long line");
+
+        let mut got = Vec::new();
+        // Two prompts: the one it answered, and the one the counted refusal
+        // leaves it back at.
+        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        let text = String::from_utf8_lossy(&got);
+
+        assert!(
+            text.contains("a user ID is at most 29 characters\r\n"),
+            "the account layer's own words, not the listener's: {text:?}"
+        );
+        assert_eq!(
+            text.matches("a user ID is at most 29 characters").count(),
+            1,
+            "one line, and one counted try: {text:?}"
+        );
+        assert!(
+            !text.contains(&"x".repeat(257)),
+            "the echo stops at the cap rather than following the caller: {text:?}"
+        );
+        assert!(
+            matches!(claims.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "a line the record cannot hold is never asked about"
+        );
+        assert!(matches!(rest.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    }
+
+    /// A caller who connects and says nothing is closed after the deadline,
+    /// and told nothing: there is no way to tell a stalled human from a
+    /// program that opened a socket and forgot, and a clock is not something
+    /// to announce. The deadline here is 100ms and the read below is bounded
+    /// at 2s, so a listener that ignored the injected value and used
+    /// [`LOGIN_DEADLINE`] fails this rather than passing slowly.
+    #[tokio::test]
+    async fn a_silent_caller_is_closed_after_the_login_deadline() {
+        let (host_tx, claims, rest) = fake_host(vec![]);
+        let addr =
+            bind_dialogue_with_deadline(host_tx, std::time::Duration::from_millis(100)).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut got = Vec::new();
+        read_to_close(&mut client, &mut got).await;
+
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.ends_with("Enter your user ID: "),
+            "the prompt, and not one word about the clock after it: {text:?}"
+        );
+        assert!(
+            matches!(claims.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "nothing reached the host"
+        );
+        assert!(matches!(rest.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
     }
 
     /// A telnet caller is asked for a password, and not one byte of it is
