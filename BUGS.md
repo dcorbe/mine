@@ -299,3 +299,47 @@ will not match one the real engine created from scratch.
 genuine engine to accept it. `create`'s data page was measured against
 MajorMUD's shipped `.VIR` files, which the vendor's own tools wrote, not
 against a virgin file the engine itself created.
+
+---
+
+## 11. A version 6 key file can stop the board on a ring rewrite
+
+**Symptom.** None yet on this board, because every account pair here was
+created by `Host::open_accounts` and this host's `btrieve::create` writes
+version 5. A genuine Worldgroup 3 board's `wgskey2.dat` is a version 6 file,
+and dropping one into a board directory is a supported thing to do. On such a
+pair, two ordinary operations can take the whole board down: replacing a key
+ring, which is a delete followed by an insert because a ring's length changes,
+and the nightly purge, which deletes a departing user's keyrec. A Btrieve
+fault on the account path is `shim_stop`, so the failure is the board
+stopping, not a ring going missing.
+
+**Measured.** `variable::free_fragment_v6` refuses two shapes outright, each
+with its own test: freeing the only fragment on a page
+(`freeing_the_only_fragment_on_a_page_is_refused`), because the page would
+then report zero fragments and `Header::read` refuses that for version 6; and
+compacting past an entry an earlier free already vacated
+(`freeing_past_an_already_freed_entry_is_refused`). Both refuse because no
+recording in `crates/btrieve-oracle/fixtures` reaches them -- every version 6
+delete the oracle ladder measured left at least one fragment behind, and none
+of them deleted twice from one page. `Space::place` fills a freed slot on
+version 5 only, for the same reason, so a version 6 file also grows rather
+than reusing what a delete gave back. A one-keyrec key file is exactly the
+first case: the ring is the only fragment on its page.
+
+`Host::open_accounts` says so at boot, once, through `accounts::version_note`
+-- a console line naming the file, not a refusal, because refusing would
+refuse the very boards this exists to serve.
+
+**What it costs.** A board running on a vendor key file works until the first
+ring rewrite or the first purge of a keyrec, and then stops. Reading and
+adding accounts are unaffected: inserts and lookups have measured version 6
+paths.
+
+**Not done.** Three recordings against genuine Pervasive Btrieve 6.15 over a
+version 6 variable-length file, in the shape the existing fixtures use:
+freeing the only fragment on a page, freeing a fragment with an already-freed
+entry between it and the page's boundary, and an insert onto a page holding a
+freed slot, to settle whether version 6 reuses the slot the way version 5
+does or appends past it. Until those exist the refusals stay, because a
+guessed answer here writes a file neither engine can read back.

@@ -139,6 +139,89 @@ pub fn key_spec() -> btrieve::FileSpec {
     }
 }
 
+/// Why `keys` is not the one key both account files have to be indexed by,
+/// or `None` when it is.
+///
+/// Spec section 3: "a key 0 unlike the measured one refuses boot with the
+/// path and the mismatch". The measurement is the kit's own `BBSUSR.DAT` and
+/// `BBSK.DAT` -- one segment, 30 bytes at offset 0, ZSTRING, unique, and
+/// collated through `ALLCAPS` -- and [`userid_key`] is what this host writes
+/// when it creates a pair itself.
+///
+/// # Why every one of those five matters
+///
+/// Every lookup this layer makes is an acquire-equal on key 0 with a userid
+/// NUL-padded to 30 bytes. A key at a different offset or length reads the
+/// wrong bytes of the record; a non-text key compares them as a number; a
+/// duplicate-permitting key lets two accounts hold one name; and a key with
+/// no ACS is case-sensitive, which would make `Dan` and `dan` two accounts
+/// on a board whose vendor compares userids with `sameas` everywhere. None
+/// of the five fails loudly at the first login: each one silently serves the
+/// wrong record, or none.
+pub(crate) fn wrong_userid_key(file: &str, keys: &[btrieve::Key]) -> Option<String> {
+    let needed = "this host needs a 30-byte ZSTRING at offset 0 under an ACS";
+    let Some(key) = keys.first() else {
+        return Some(format!("{file} key 0 is absent -- the file declares no keys; {needed}"));
+    };
+
+    let mut wrong: Vec<String> = Vec::new();
+    match key.segments.as_slice() {
+        [only] => {
+            if only.offset != 0 {
+                wrong.push(format!("at offset {}", only.offset));
+            }
+            if usize::from(only.length) != KLSTOF {
+                wrong.push(format!("{} bytes long", only.length));
+            }
+            if only.kind != btrieve::keys::Kind::Text {
+                wrong.push(format!("compared as {:?}, not as text", only.kind));
+            }
+        }
+        many => wrong.push(format!("{} segments", many.len())),
+    }
+    if key.duplicates {
+        wrong.push("duplicate-permitting".to_owned());
+    }
+    if key.acs.is_none() {
+        wrong.push("not under an ACS".to_owned());
+    }
+
+    if wrong.is_empty() {
+        return None;
+    }
+    Some(format!("{file} key 0 is {}; {needed}", wrong.join(", ")))
+}
+
+/// What a sysop needs to hear about a key file that is not version 5, or
+/// `None` for one that is.
+///
+/// A genuine Worldgroup 3 board's `wgskey2.dat` is a version 6 file, so this
+/// is a console note and not a boot refusal: refusing it would refuse the
+/// boards this host exists to serve. What it warns about is BUGS.md entry
+/// 11. A ring is the variable tail of a keyrec, replacing one is a delete
+/// followed by an insert, and version 6's delete side refuses two shapes
+/// this repository has no recording for -- freeing the only fragment on a
+/// page, and compacting past an entry an earlier free already vacated.
+/// Either refusal reaches the host as a Btrieve fault on the account path,
+/// which is `shim_stop`, which is the board down.
+///
+/// A separate function rather than a `match` inside
+/// [`Host::open_accounts`](crate::Host::open_accounts) because that is the
+/// only way this sentence is testable at all: `btrieve::create` writes
+/// version 5 files and nothing else, so no test in this repository can hand
+/// the boot path a version 6 pair to open.
+pub(crate) fn version_note(key_file: &str, version: btrieve::Version) -> Option<String> {
+    let number = match version {
+        btrieve::Version::V5 => return None,
+        btrieve::Version::V6 => 6,
+    };
+    Some(format!(
+        "{key_file} is a version {number} file: a ring rewrite or a purge that frees the \
+         only fragment on a page, or frees past an earlier hole, is refused by this engine \
+         and stops the board; record a version 6 scenario before relying on it"
+    ))
+}
+
 /// A board holding one of the two files and not the other, said in the one
 /// sentence that names both.
 ///
@@ -1309,6 +1392,87 @@ mod tests {
             err.to_string()
                 .contains("304-byte records; this host's usracc is 338"),
             "{err}"
+        );
+    }
+
+    /// A pair whose account file is keyed case-sensitively is refused before
+    /// a channel is served. Without the `ALLCAPS` sequence every lookup is a
+    /// byte comparison, so `Dan` and `dan` would be two accounts on a board
+    /// whose whole vendor codebase compares userids with `sameas`.
+    ///
+    /// The file's table and the key's flag go together because
+    /// `create::validate` refuses a key that collates through a table the
+    /// file does not carry -- which is the same refusal, one layer down, on
+    /// a file that has not been written yet.
+    #[test]
+    fn an_account_file_keyed_without_an_acs_refuses_before_serving() {
+        let mut f = board("accounts-no-acs");
+        let mut spec = super::account_spec(338);
+        spec.acs = None;
+        spec.keys[0].acs = false;
+        btrieve::create(&f.host.root.join("bbsusr.dat"), &spec).expect("an ACS-less account file");
+        btrieve::create(&f.host.root.join("bbsk.dat"), &super::key_spec()).expect("key file");
+        let err = f
+            .host
+            .open_accounts(&mut f.machine, vec![])
+            .expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("bbsusr.dat key 0"), "{text}");
+        assert!(text.contains("not under an ACS"), "{text}");
+        assert!(f.host.accounts().is_none(), "a refused pair is not an open one");
+    }
+
+    /// The same check on the *key* file, and on a different field: a 29-byte
+    /// key 0 reads 29 of the 30 bytes a userid is padded to, so two rings
+    /// whose owners differ only in the last character are one ring.
+    #[test]
+    fn a_key_file_whose_key_is_the_wrong_length_refuses_before_serving() {
+        let mut f = board("accounts-short-key");
+        btrieve::create(&f.host.root.join("bbsusr.dat"), &super::account_spec(338))
+            .expect("account file");
+        let mut spec = super::key_spec();
+        spec.keys[0].segments[0].length = 29;
+        btrieve::create(&f.host.root.join("bbsk.dat"), &spec).expect("a short-keyed key file");
+        let err = f
+            .host
+            .open_accounts(&mut f.machine, vec![])
+            .expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("bbsk.dat key 0"), "{text}");
+        assert!(text.contains("29 bytes long"), "{text}");
+        assert!(f.host.accounts().is_none(), "a refused pair is not an open one");
+    }
+
+    /// The version 6 warning, tested where it can be: on the function that
+    /// produces it. `btrieve::create` writes version 5 files only, so no
+    /// test here can hand `Host::open_accounts` a version 6 pair to open and
+    /// read the note off the host -- the boot path's own call is one line
+    /// beside the geometry it reads. BUGS.md entry 11 is the standing record
+    /// of what is still unmeasured.
+    #[test]
+    fn a_version_6_key_file_is_warned_about_and_a_version_5_one_is_not() {
+        assert_eq!(super::version_note("wgskey2.dat", btrieve::Version::V5), None);
+        let note = super::version_note("wgskey2.dat", btrieve::Version::V6)
+            .expect("a version 6 key file is worth a line");
+        assert!(note.contains("wgskey2.dat is a version 6 file"), "{note}");
+        assert!(note.contains("stops the board"), "{note}");
+    }
+
+    /// And the pair this host creates for itself is version 5, which is why
+    /// a live board sees no such note.
+    #[test]
+    fn a_created_pair_draws_no_version_warning() {
+        let mut f = board("accounts-version-note");
+        f.host
+            .open_accounts(&mut f.machine, vec![])
+            .expect("opened");
+        let keys = btrieve::Geometry::read("bbsk.dat", &f.host.root.join("bbsk.dat"))
+            .expect("readable");
+        assert_eq!(keys.version, btrieve::Version::V5);
+        assert!(
+            !f.host.notes().iter().any(|note| note.contains("is a version")),
+            "{:?}",
+            f.host.notes()
         );
     }
 

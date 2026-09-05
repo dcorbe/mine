@@ -284,6 +284,9 @@ fn is_allowed_userid_byte(b: u8) -> bool {
 
 /// `valuid`, `SIGNUP.C:568`, with `fulalw` and `digalw` on and the length
 /// bounds this host uses: 1 to `UIDSIZ` - 1 bytes.
+///
+/// One rule here is not `valuid`'s: a trailing space is refused. See the
+/// check itself for why.
 pub fn validate_userid(userid: &str) -> Result<(), Refusal> {
     if userid.is_empty() {
         return Err(Refusal::Invalid("a user ID is required"));
@@ -306,6 +309,15 @@ pub fn validate_userid(userid: &str) -> Result<(), Refusal> {
 
     if bytes.windows(2).any(|w| w[0] == b' ' && w[1] == b' ') {
         return Err(Refusal::Invalid("a user ID may not contain two spaces in a row"));
+    }
+
+    // A userid is stored NUL-padded to 30 bytes and key 0 is a ZSTRING, so
+    // the bytes after the terminator are not part of the value -- but the
+    // ones before it are. `"Dan "` and `"Dan"` would be two separate
+    // accounts, indistinguishable on any screen that prints them, and the
+    // one with the space is the one nobody can type deliberately.
+    if bytes.last() == Some(&b' ') {
+        return Err(Refusal::Invalid("a user ID may not end with a space"));
     }
 
     if ["new", "the", "off", "all"].iter().any(|reserved| userid.eq_ignore_ascii_case(reserved)) {
@@ -430,6 +442,19 @@ mod tests {
         assert!(validate_userid("Dan\tCorbe").is_err());
         assert!(validate_userid("New").is_err());
         assert!(validate_userid("off").is_err());
+    }
+
+    /// `"Dan "` and `"Dan"` must not be two accounts. A trailing space is
+    /// invisible wherever a userid is printed, and it is the one difference
+    /// a caller cannot deliberately type at a prompt that trims nothing.
+    #[test]
+    fn a_userid_may_not_end_with_a_space() {
+        assert_eq!(
+            validate_userid("Dan "),
+            Err(Refusal::Invalid("a user ID may not end with a space"))
+        );
+        assert_eq!(validate_userid("Dan"), Ok(()), "the same name without it is fine");
+        assert_eq!(validate_userid("Dan Corbe"), Ok(()), "an interior space still is");
     }
 
     #[test]

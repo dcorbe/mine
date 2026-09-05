@@ -2056,7 +2056,9 @@ impl<A: Abi> Host<A> {
     /// is there, which is a Worldgroup 3 board being served by a `Wg16` host
     /// or the reverse; if the account file's record length is not this ABI's
     /// `sizeof(struct usracc)`; if the key file is not variable-length or its
-    /// fixed head is not 31 bytes; if another process holds the advisory lock
+    /// fixed head is not 31 bytes; if either file's key 0 is not the one both
+    /// are indexed by ([`accounts::wrong_userid_key`]); if another process
+    /// holds the advisory lock
     /// ([`accounts::lock_file`]); or if creating, reading or opening either
     /// file fails.
     pub fn open_accounts(
@@ -2127,6 +2129,12 @@ impl<A: Abi> Host<A> {
             )));
         }
 
+        // A note and not a refusal: see `accounts::version_note`, and BUGS.md
+        // entry 11 for what it costs.
+        if let Some(warning) = accounts::version_note(key_file, keys_geometry.version) {
+            self.note(warning);
+        }
+
         // `maxlen` is the biggest record the caller intends to handle, which
         // is not the file's own `reclen` -- see `Host::open_genbb`. A usracc
         // is exactly its stride; a keyrec grows to `RINGSZ`.
@@ -2148,6 +2156,26 @@ impl<A: Abi> Host<A> {
                 .map_err(io::Error::other)?;
             (accbb, keysbb)
         };
+
+        // Key 0 is checked here and not before the open because this is where
+        // the definitions are parsed: `Geometry::read` counts the keys and
+        // `Btrieve::open` is what turns them into `Key`s. A block that fails
+        // the check is closed again in the same breath, so nothing is ever
+        // published, nothing is stored on `self`, and no channel can reach
+        // it -- the same "never becomes a live block that serves" property
+        // the record-length refusal above has by never opening at all.
+        for (at, file) in [(accbb, account_file), (keysbb, key_file)] {
+            let why = match self.btrieve.block(at) {
+                Ok(block) => accounts::wrong_userid_key(file, block.keys()),
+                Err(e) => Some(e),
+            };
+            let Some(why) = why else { continue };
+            let Host { btrieve, heap, .. } = self;
+            let mem = A::mem(machine);
+            let _ = btrieve.close(mem, heap, accbb);
+            let _ = btrieve.close(mem, heap, keysbb);
+            return Err(io::Error::other(why));
+        }
 
         // Reserved before `accbb` is published so that a failure here cannot
         // leave a module reading a global this host has no `Accounts` for.
