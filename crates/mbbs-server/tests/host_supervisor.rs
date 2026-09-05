@@ -1124,10 +1124,15 @@ async fn the_board_serves_again_after_a_kick_driven_stop_with_no_channel_connect
         &builder::faults_one_second_after_boot(),
     );
     let boot = boot(module, "mbbs-server-host-supervisor-kick-fault-root", 1);
-
-    let addr = conn::serve(boot, &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)])
-        .await
-        .expect("bind 127.0.0.1:0")[0];
+    let serving = boot.serving.clone();
+    let tx = conn::spawn_machine(boot);
+    let addr = conn::serve_on(
+        tx.clone(),
+        &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)],
+        serving,
+    )
+    .await
+    .expect("bind 127.0.0.1:0")[0];
 
     // Before the kick has had a chance to fire: an ordinary connection
     // succeeds against the first life.
@@ -1141,30 +1146,40 @@ async fn the_board_serves_again_after_a_kick_driven_stop_with_no_channel_connect
     // so this is generous, not tight).
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
-    // Without any operator action, the board is serving again: a brand new
-    // connection against the *second* life succeeds the same way the first
-    // one did.
+    // Without any operator action, the board is serving again. The claim is
+    // the assertion; the prompt below is not. `handle` writes
+    // `Enter your user ID: ` before it ever speaks to the host thread, and
+    // `serving` is not cleared by a fault stop, so reaching the prompt
+    // proves only that the listener is still bound -- it would pass against
+    // a host thread that had given up entirely. A `Connect` is answered by
+    // the driver loop and by nothing else, so a `Chan` coming back can only
+    // mean the second life booted and is polling.
+    let (chan, _out) = connect_raw(&tx, "again").await;
+    chan.expect("the restarted life serves a channel");
+
+    // And the socket half still works against that life.
     let mut after = TcpStream::connect(addr).await.expect("connect after the restart");
     let mut after_buf = Vec::new();
     read_until(&mut after, &mut after_buf, "Enter your user ID: ").await;
 }
 
-/// A connection open *at the moment of the stop* gets `Out::Close` (its
-/// socket is closed, not silently abandoned), and a fresh connection made
-/// afterwards reaches a live board again -- the two acceptance halves the
-/// plan asks for explicitly, both against the same restart.
+/// A channel connected *at the moment of the stop* is closed by it
+/// (`Out::Close`, not silently abandoned), and the life that follows serves
+/// a fresh claim -- the two acceptance halves the plan asks for, both
+/// against the same restart.
 ///
-/// The connected half is driven over the raw `In` channel ([`connect_raw`])
-/// rather than through a real socket. A telnet caller cannot hold a channel
-/// on this board any more: `conn::handle` sends a `Password` claim with an
-/// empty password (there is no password prompt until the task after this
-/// one), so every telnet login here is refused and the socket closes at
-/// once -- which would look like a close that had nothing to do with the
-/// module stopping. The listener is still bound and still used, for the
-/// reconnect half, which is about the board serving again and nothing
-/// else.
+/// Both halves run over the raw `In` channel ([`connect_raw`],
+/// [`wait_for_close`]), so what this proves is the CHANNEL closing, not a
+/// socket receiving FIN. A telnet caller cannot hold a channel on this
+/// board today: `conn::handle` sends a `Password` claim with an empty
+/// password (there is no password prompt until Task 12), so every telnet
+/// login here is refused and the socket closes at once -- which would look
+/// like a close that had nothing to do with the module stopping. The
+/// socket-level half comes back once a telnet login can succeed. The
+/// listener is still bound here, and the prompt read at the end is the
+/// weaker check of the two: see the comment beside it.
 #[tokio::test]
-async fn a_connected_socket_is_closed_by_the_stop_and_a_new_one_reconnects_after() {
+async fn a_connected_channel_is_closed_by_the_stop_and_the_board_serves_again_after() {
     let module = module_file(
         "mbbs-server-host-supervisor-connected-fault",
         &builder::faults_one_second_after_boot(),
@@ -1192,8 +1207,14 @@ async fn a_connected_socket_is_closed_by_the_stop_and_a_new_one_reconnects_after
     // `host.rs`'s `life`) generous room.
     wait_for_close(&mut out, "a connection open when the module stops").await;
 
-    // And the board is serving again, unattended: a fresh connection after
-    // the restart reaches a live login prompt.
+    // And the board is serving again, unattended. The claim is the
+    // assertion: `handle` writes the prompt before it ever speaks to the
+    // host thread and `serving` is not cleared by a fault stop, so the
+    // prompt alone would also be reached on a board whose second life never
+    // booted. Only the driver loop answers a `Connect`.
+    let (chan, _out) = connect_raw(&tx, "again").await;
+    chan.expect("the restarted life serves a channel");
+
     let mut after = TcpStream::connect(addr).await.expect("connect after the restart");
     let mut after_buf = Vec::new();
     read_until(&mut after, &mut after_buf, "Enter your user ID: ").await;
@@ -1460,10 +1481,15 @@ async fn the_board_serves_again_after_an_unimplemented_symbol_stop() {
         &builder::faults_via_unimplemented_symbol_one_second_after_boot(),
     );
     let boot = boot(module, "mbbs-server-host-supervisor-unimplemented-fault-root", 1);
-
-    let addr = conn::serve(boot, &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)])
-        .await
-        .expect("bind 127.0.0.1:0")[0];
+    let serving = boot.serving.clone();
+    let tx = conn::spawn_machine(boot);
+    let addr = conn::serve_on(
+        tx.clone(),
+        &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)],
+        serving,
+    )
+    .await
+    .expect("bind 127.0.0.1:0")[0];
 
     let mut before = TcpStream::connect(addr).await.expect("connect before the stop");
     let mut before_buf = Vec::new();
@@ -1471,6 +1497,13 @@ async fn the_board_serves_again_after_an_unimplemented_symbol_stop() {
     drop(before);
 
     tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // The claim, not the prompt, is what says the life after an
+    // `Unimplemented` stop actually booted -- see
+    // `the_board_serves_again_after_a_kick_driven_stop_with_no_channel_connected`
+    // for why the prompt on its own would pass against a dead host thread.
+    let (chan, _out) = connect_raw(&tx, "again").await;
+    chan.expect("the restarted life serves a channel");
 
     let mut after = TcpStream::connect(addr).await.expect("connect after the restart");
     let mut after_buf = Vec::new();
