@@ -24,6 +24,7 @@ use std::path::Path;
 
 use crate::abi::Abi;
 use crate::btrieve::{AbiMem, Btrieve, Op};
+use crate::Host;
 
 /// One host generation's files, and what a refusal calls it.
 ///
@@ -409,8 +410,51 @@ impl<A: Abi> Accounts<A> {
         &self,
         btrieve: &mut Btrieve<AbiMem<A>>,
     ) -> Result<Vec<(u32, Usracc)>, String> {
+        self.walk(btrieve, |account| {
+            // Named rather than called twice, and not `flags`: that is the
+            // module the two constants come out of.
+            let word = account.flags();
+            word & flags::DELTAG != 0 && word & flags::UNDAXS == 0
+        })
+    }
+
+    /// Every account in the file, in key order, and where each sits.
+    ///
+    /// What `mbbs-user list` prints. Unfiltered, so a board's whole account
+    /// file is in memory at once -- 338 bytes per user, which is a megabyte
+    /// for three thousand of them and is the price of showing a sysop the
+    /// board in one screen.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the engine refused.
+    pub(crate) fn every_account(
+        &self,
+        btrieve: &mut Btrieve<AbiMem<A>>,
+    ) -> Result<Vec<(u32, Usracc)>, String> {
+        self.walk(btrieve, |_| true)
+    }
+
+    /// The account file in key order, keeping the records `keep` accepts.
+    ///
+    /// One walk, two callers: the maintenance purge's filtered scan and the
+    /// CLI's unfiltered one. The filter runs *during* the walk rather than
+    /// after it so that the purge's memory cost stays what it was -- the
+    /// tagged accounts, not every account.
+    ///
+    /// **The whole walk finishes before the caller changes anything.** A
+    /// delete moves the cursor this walk is standing on, so a loop that
+    /// deleted as it went would skip records or read a position that no
+    /// longer names one. That is the reason this answers a `Vec` rather than
+    /// taking a callback that may write, and it is why
+    /// [`Host::purge_accounts`](crate::Host::purge_accounts) is two passes.
+    fn walk(
+        &self,
+        btrieve: &mut Btrieve<AbiMem<A>>,
+        keep: impl Fn(&Usracc) -> bool,
+    ) -> Result<Vec<(u32, Usracc)>, String> {
         let block = btrieve.block_mut(self.accbb)?;
-        let mut tagged = Vec::new();
+        let mut found = Vec::new();
         let mut op = Op::Lowest;
         while block
             .query(0, op, &[0u8; UIDSIZ])
@@ -421,15 +465,33 @@ impl<A: Abi> Accounts<A> {
             })?;
             let position = record.position;
             let account = Usracc::from_bytes(record.bytes);
-            // Named rather than called twice, and not `flags`: that is the
-            // module the two constants come out of.
-            let word = account.flags();
-            if word & flags::DELTAG != 0 && word & flags::UNDAXS == 0 {
-                tagged.push((position, account));
+            if keep(&account) {
+                found.push((position, account));
             }
             op = Op::Next;
         }
-        Ok(tagged)
+        Ok(found)
+    }
+
+    /// Write `record` back over the one at `position`.
+    ///
+    /// A `usracc` is fixed-length, so this is an in-place update and not the
+    /// delete-then-insert [`Accounts::write_ring`] has to do. `position`
+    /// comes from the [`Accounts::find_account`] that produced the record.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the engine refused.
+    pub(crate) fn update_account(
+        &self,
+        btrieve: &mut Btrieve<AbiMem<A>>,
+        position: u32,
+        record: &Usracc,
+    ) -> Result<(), String> {
+        btrieve
+            .block_mut(self.accbb)?
+            .update(position, &record.bytes)
+            .map_err(|why| format!("writing the account {}: {why}", record.userid()))
     }
 
     /// The key ring `owner` owns, and where it sits.
@@ -605,7 +667,7 @@ impl<A: Abi> Accounts<A> {
                 if self.find_account(btrieve, userid)?.is_some() {
                     return Ok(Err(Refusal::Exists));
                 }
-                self.provision(btrieve, userid, password, terminal, today)?
+                self.provision(btrieve, userid, password, &self.default_ring, terminal, today)?
             }
             Login::Trusted { userid, .. } => {
                 if let Err(refusal) = validate_userid(userid) {
@@ -623,7 +685,9 @@ impl<A: Abi> Accounts<A> {
                     // what makes a later `Password` claim against it answer
                     // `NoPassword` rather than letting anyone in who guesses
                     // the empty string.
-                    None => self.provision(btrieve, userid, "", terminal, today)?,
+                    None => {
+                        self.provision(btrieve, userid, "", &self.default_ring, terminal, today)?
+                    }
                 }
             }
         };
@@ -645,8 +709,13 @@ impl<A: Abi> Accounts<A> {
         Ok(Ok(Resolved { connection, record, position }))
     }
 
-    /// Write a brand-new account and its default ring, and answer the
+    /// Write a brand-new account and the ring `keys` names, and answer the
     /// record.
+    ///
+    /// `keys` is the board's default ring for a signup and whatever the sysop
+    /// asked for from the `mbbs-user` CLI. It is a parameter rather than
+    /// `self.default_ring` so that both ways of creating an account write one
+    /// shape of record through one path.
     ///
     /// The record is `SIGNUP.C:1204`'s, built by [`Usracc::new`].
     ///
@@ -677,6 +746,7 @@ impl<A: Abi> Accounts<A> {
         btrieve: &mut Btrieve<AbiMem<A>>,
         userid: &str,
         password: &str,
+        keys: &[String],
         terminal: Terminal,
         today: u16,
     ) -> Result<(u32, Usracc), String> {
@@ -687,7 +757,7 @@ impl<A: Abi> Accounts<A> {
             // `UIDSIZ`. Taking it from here rather than from `userid` is what
             // keeps the ring findable by the name the account file holds.
             owner: record.userid().to_string(),
-            keys: self.default_ring.clone(),
+            keys: keys.to_vec(),
         };
         self.write_ring(btrieve, &ring)?;
         Ok((position, record))
@@ -715,6 +785,253 @@ impl<A: Abi> Accounts<A> {
     /// record a third party has since been given.
     pub(crate) fn end(&mut self, chan: crate::Chan) {
         self.sessions[chan.index()] = None;
+    }
+}
+
+/// The terminal a `usracc` the sysop created is given: 80 by 24, ANSI on.
+///
+/// A signup takes these from the caller's own wire; an account the CLI
+/// creates has no caller, so it gets the shape almost every client of this
+/// era presents and the one every fixture in this crate uses. Nothing rests
+/// on the guess: [`Host::login`](crate::Host::login) applies the real
+/// terminal over the record the moment its owner first calls in, and the
+/// logoff write-back puts that back in the file.
+const SYSOP_MADE: Terminal = Terminal { ansi: true, width: 80, height: 24 };
+
+/// What the `mbbs-user` CLI does to the two files. Spec section 4.
+///
+/// Each of these is a thin wrapper over the [`Accounts`] methods above: it
+/// destructures the host once -- `let Host { btrieve, accounts, .. } = self`
+/// -- so that the account layer can borrow the Btrieve session and the
+/// account handle at the same time, and does nothing else the login path
+/// does not already do. The rules live in [`Accounts`] and are shared with
+/// the login path by construction; a CLI that grew its own copy of
+/// "validate, then look up, then write" is exactly the drift this shape
+/// exists to prevent.
+///
+/// **`Ok(Err(refusal))` is the sysop's mistake and `Err(String)` is the
+/// board's**, the same split [`Host::resolve_login`](crate::Host::resolve_login)
+/// makes: an unknown userid is one line and exit 1, where a Btrieve failure
+/// is the tool saying it could not do the job at all.
+impl<A: Abi> Host<A> {
+    /// Every account in the file, in key order, each with the ring it owns.
+    ///
+    /// An account with no ring of its own lists an empty one. Unlike
+    /// [`Accounts::load_keys`], nothing is written to repair it: a sysop
+    /// listing the board must not change it, and the missing ring is written
+    /// on that user's next login, where the console note that says so
+    /// belongs.
+    ///
+    /// # Errors
+    ///
+    /// The account files not being open, or whatever the engine refused.
+    pub fn account_list(&mut self) -> Result<Vec<(Usracc, Vec<String>)>, String> {
+        let Host { btrieve, accounts, .. } = self;
+        let accounts = accounts.as_ref().ok_or("accounts are not open")?;
+        let found = accounts.every_account(btrieve)?;
+        let mut listed = Vec::with_capacity(found.len());
+        for (_, record) in found {
+            let ring = accounts
+                .find_ring(btrieve, record.userid())?
+                .map_or_else(Vec::new, |(_, ring)| ring.keys);
+            listed.push((record, ring));
+        }
+        Ok(listed)
+    }
+
+    /// The account record for `userid`, and where it sits.
+    ///
+    /// # Errors
+    ///
+    /// The account files not being open, or whatever the engine refused.
+    pub fn account_find(&mut self, userid: &str) -> Result<Option<(u32, Usracc)>, String> {
+        let Host { btrieve, accounts, .. } = self;
+        let accounts = accounts.as_ref().ok_or("accounts are not open")?;
+        accounts.find_account(btrieve, userid)
+    }
+
+    /// Add one account with `ring`, the way a signup adds one.
+    ///
+    /// The same three checks a `Login::Signup` gets -- [`validate_userid`],
+    /// [`validate_password`], then [`Refusal::Exists`] -- and then
+    /// `Accounts::provision`, which is the one place an account and its ring
+    /// are written. A sysop's `add` and a caller's signup therefore cannot
+    /// leave two differently shaped records in the file.
+    ///
+    /// The machine is unused and taken anyway, for the reason
+    /// [`Host::resolve_login`](crate::Host::resolve_login) takes one: every
+    /// other way into this database needs one, and a caller holding a `Host`
+    /// without its machine has a host it cannot run.
+    ///
+    /// # Errors
+    ///
+    /// The host's clock not knowing the date, the account files not being
+    /// open, or whatever the engine refused.
+    pub fn account_add(
+        &mut self,
+        _machine: &mut A::Cpu,
+        userid: &str,
+        password: &str,
+        ring: &[String],
+    ) -> Result<Result<(), Refusal>, String> {
+        // Read before the destructure below: `clock` takes `&mut self`.
+        let today = self.clock().civil()?.dos_date()?;
+
+        let Host { btrieve, accounts, .. } = self;
+        let accounts = accounts.as_ref().ok_or("accounts are not open")?;
+        if let Err(refusal) = validate_userid(userid) {
+            return Ok(Err(refusal));
+        }
+        if let Err(refusal) = validate_password(password) {
+            return Ok(Err(refusal));
+        }
+        if accounts.find_account(btrieve, userid)?.is_some() {
+            return Ok(Err(Refusal::Exists));
+        }
+        accounts.provision(btrieve, userid, password, ring, SYSOP_MADE, today)?;
+        Ok(Ok(()))
+    }
+
+    /// Set `userid`'s password.
+    ///
+    /// The account is looked up before the password is validated, because
+    /// the account is what the sysop named: "no account named Fred" is the
+    /// more useful answer to `passwd Fred` than a complaint about the
+    /// password they typed for a user who does not exist.
+    ///
+    /// # Errors
+    ///
+    /// The account files not being open, or whatever the engine refused.
+    pub fn account_set_password(
+        &mut self,
+        userid: &str,
+        password: &str,
+    ) -> Result<Result<(), Refusal>, String> {
+        let Host { btrieve, accounts, .. } = self;
+        let accounts = accounts.as_ref().ok_or("accounts are not open")?;
+        let Some((position, mut record)) = accounts.find_account(btrieve, userid)? else {
+            return Ok(Err(Refusal::Unknown));
+        };
+        if let Err(refusal) = validate_password(password) {
+            return Ok(Err(refusal));
+        }
+        record.set_password(password);
+        accounts.update_account(btrieve, position, &record)?;
+        Ok(Ok(()))
+    }
+
+    /// Set `userid`'s whole `flags` word.
+    ///
+    /// The whole word, not one bit: `usracc.flags` is four named bits in one
+    /// `USHORT` (`USRACC.H:64-68`) and a caller that wants to change one
+    /// reads the record with [`Host::account_find`] first. A bit-at-a-time
+    /// API here would need a second lookup per bit and would still leave the
+    /// read-modify-write to the caller.
+    ///
+    /// # Errors
+    ///
+    /// The account files not being open, or whatever the engine refused.
+    pub fn account_set_flags(
+        &mut self,
+        userid: &str,
+        flags: u16,
+    ) -> Result<Result<(), Refusal>, String> {
+        let Host { btrieve, accounts, .. } = self;
+        let accounts = accounts.as_ref().ok_or("accounts are not open")?;
+        let Some((position, mut record)) = accounts.find_account(btrieve, userid)? else {
+            return Ok(Err(Refusal::Unknown));
+        };
+        record.set_flags(flags);
+        accounts.update_account(btrieve, position, &record)?;
+        Ok(Ok(()))
+    }
+
+    /// The ring `userid` owns, if the key file holds one.
+    ///
+    /// `None` is a user with no ring record at all, which is not the same as
+    /// a user whose ring is empty -- the first is repaired at that user's
+    /// next login, the second is a deliberately blank ring.
+    ///
+    /// # Errors
+    ///
+    /// The account files not being open, or whatever the engine refused.
+    pub fn account_ring(&mut self, userid: &str) -> Result<Option<Keyrec>, String> {
+        let Host { btrieve, accounts, .. } = self;
+        let accounts = accounts.as_ref().ok_or("accounts are not open")?;
+        Ok(accounts.find_ring(btrieve, userid)?.map(|(_, ring)| ring))
+    }
+
+    /// Replace `userid`'s ring with `keys`.
+    ///
+    /// The keys are upper-cased and duplicates dropped, first spelling wins,
+    /// and the order the caller gave is otherwise kept -- `LOCKNKEY.C` reads
+    /// a ring as a space-separated list and compares each name with `sameas`,
+    /// so case is not information and a repeated key is only wasted room in
+    /// a `RINGSZ`-bounded record.
+    ///
+    /// A ring that does not fit is [`Refusal::Invalid`] rather than an
+    /// engine error: the sysop typed too many keys, which is a mistake to
+    /// report, not a board failure.
+    ///
+    /// # Errors
+    ///
+    /// The account files not being open, or whatever the engine refused.
+    pub fn account_write_ring(
+        &mut self,
+        userid: &str,
+        keys: &[String],
+    ) -> Result<Result<(), Refusal>, String> {
+        let Host { btrieve, accounts, .. } = self;
+        let accounts = accounts.as_ref().ok_or("accounts are not open")?;
+        let Some((_, record)) = accounts.find_account(btrieve, userid)? else {
+            return Ok(Err(Refusal::Unknown));
+        };
+
+        let mut wanted: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let key = key.to_ascii_uppercase();
+            if !wanted.contains(&key) {
+                wanted.push(key);
+            }
+        }
+
+        // The record's own spelling of the owner, for the reason
+        // `Accounts::provision` takes it from there: it is the name the
+        // account file holds, and so the name the ring is found by.
+        let ring = Keyrec { owner: record.userid().to_string(), keys: wanted };
+        if let Err(refusal) = ring.to_bytes() {
+            return Ok(Err(refusal));
+        }
+        accounts.write_ring(btrieve, &ring)?;
+        Ok(Ok(()))
+    }
+
+    /// Tag `userid` for deletion. The maintenance purge is what removes the
+    /// record.
+    ///
+    /// `DELTAG` alone, exactly as the vendor's own account editor sets it:
+    /// the account stops being usable at once ([`standing`] refuses every
+    /// claim against it) and `accmcu`'s nightly scan
+    /// ([`Host::purge_accounts`](crate::Host::purge_accounts)) deletes it and
+    /// tells every module. An `UNDAXS` account is refused instead of tagged,
+    /// because the purge would skip it anyway and a tag nothing will ever act
+    /// on is a lie to the sysop who set it.
+    ///
+    /// # Errors
+    ///
+    /// The account files not being open, or whatever the engine refused.
+    pub fn account_tag_deleted(&mut self, userid: &str) -> Result<Result<(), Refusal>, String> {
+        let Host { btrieve, accounts, .. } = self;
+        let accounts = accounts.as_ref().ok_or("accounts are not open")?;
+        let Some((position, mut record)) = accounts.find_account(btrieve, userid)? else {
+            return Ok(Err(Refusal::Unknown));
+        };
+        if record.flags() & flags::UNDAXS != 0 {
+            return Ok(Err(Refusal::Invalid("that account cannot be deleted")));
+        }
+        record.set_flags(record.flags() | flags::DELTAG);
+        accounts.update_account(btrieve, position, &record)?;
+        Ok(Ok(()))
     }
 }
 
@@ -1565,5 +1882,219 @@ mod tests {
         assert_eq!(rec.userid(), "Dan", "the account is still the one that logged in");
         assert_eq!(rec.usedat(), 0, "the refused update wrote nothing at all");
         assert!(find_opt(&mut f, "Ran").is_none(), "and no account was created under the scribble");
+    }
+    // The `mbbs-user` wrappers. One test each: the rules they call into are
+    // tested above, so what these pin is that each wrapper reaches the right
+    // one and hands back what the file then holds. The CLI's own integration
+    // tests (`crates/mbbs-server/tests/mbbs_user.rs`) drive the commands.
+
+    #[test]
+    fn account_list_gives_every_account_in_key_order_with_its_own_ring() {
+        let mut f = opened("accounts-cli-list");
+        signup(&mut f, "Dan", "hunter2");
+        signup(&mut f, "Ann", "hunter2");
+        write_ring(&mut f, "Ann", &["SYSOP"]);
+        delete_ring(&mut f, "Dan");
+
+        let listed = f.host.account_list().expect("no engine fault");
+        let named: Vec<(&str, Vec<String>)> = listed
+            .iter()
+            .map(|(record, ring)| (record.userid(), ring.clone()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("Ann", vec!["SYSOP".to_string()]),
+                ("Dan", Vec::new()),
+            ],
+            "key order, each with the ring the file holds"
+        );
+
+        // Listing repaired nothing: `Dan` still has no ring record, and the
+        // sysop's next `list` says the same thing.
+        assert!(rings(&mut f).iter().all(|ring| ring.owner != "Dan"));
+    }
+
+    #[test]
+    fn account_find_answers_the_record_the_file_holds() {
+        let mut f = opened("accounts-cli-find");
+        signup(&mut f, "Dan", "hunter2");
+
+        let (position, record) = f
+            .host
+            .account_find("dan")
+            .expect("no engine fault")
+            .expect("found case-insensitively, as the ACS collates");
+        assert_eq!(record.userid(), "Dan");
+        assert_eq!((position, record), find(&mut f, "Dan"));
+        assert!(f.host.account_find("Nobody").expect("no engine fault").is_none());
+    }
+
+    #[test]
+    fn account_add_writes_an_account_and_the_ring_it_was_given() {
+        let mut f = opened("accounts-cli-add");
+
+        f.host
+            .account_add(&mut f.machine, "Dan", "hunter2", &["SYSOP".to_string()])
+            .expect("no engine fault")
+            .expect("accepted");
+
+        let (_, record) = find(&mut f, "Dan");
+        assert_eq!(record.password(), "hunter2");
+        assert_eq!(read_ring(&mut f, "Dan").keys, vec!["SYSOP".to_string()]);
+
+        // The signup rules, not a second set of them.
+        assert_eq!(
+            f.host
+                .account_add(&mut f.machine, "Dan", "hunter2", &[])
+                .expect("no engine fault"),
+            Err(Refusal::Exists)
+        );
+        assert_eq!(
+            f.host
+                .account_add(&mut f.machine, "&Staff", "hunter2", &[])
+                .expect("no engine fault"),
+            Err(Refusal::Invalid("a user ID must start with a letter or digit"))
+        );
+        assert_eq!(
+            f.host
+                .account_add(&mut f.machine, "Ann", "", &[])
+                .expect("no engine fault"),
+            Err(Refusal::Invalid("a password is required"))
+        );
+    }
+
+    #[test]
+    fn account_set_password_changes_what_a_login_accepts() {
+        let mut f = opened("accounts-cli-passwd");
+        signup(&mut f, "Dan", "hunter2");
+
+        f.host
+            .account_set_password("Dan", "newpw")
+            .expect("no engine fault")
+            .expect("accepted");
+
+        assert_eq!(find(&mut f, "Dan").1.password(), "newpw");
+        let refused = f
+            .host
+            .resolve_login(
+                &mut f.machine,
+                &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+                term(),
+            )
+            .expect("no engine fault");
+        assert_eq!(refused.unwrap_err(), Refusal::BadPassword);
+
+        assert_eq!(
+            f.host.account_set_password("Nobody", "newpw").expect("no engine fault"),
+            Err(Refusal::Unknown)
+        );
+        assert_eq!(
+            f.host.account_set_password("Dan", "").expect("no engine fault"),
+            Err(Refusal::Invalid("a password is required"))
+        );
+    }
+
+    #[test]
+    fn account_set_flags_writes_the_whole_word() {
+        let mut f = opened("accounts-cli-flags");
+        signup(&mut f, "Dan", "hunter2");
+
+        f.host
+            .account_set_flags("Dan", flags::HASMST | flags::UNDAXS)
+            .expect("no engine fault")
+            .expect("accepted");
+        assert_eq!(find(&mut f, "Dan").1.flags(), flags::HASMST | flags::UNDAXS);
+
+        f.host.account_set_flags("Dan", 0).expect("no engine fault").expect("accepted");
+        assert_eq!(find(&mut f, "Dan").1.flags(), 0, "the whole word, so a bit can be cleared");
+
+        assert_eq!(
+            f.host.account_set_flags("Nobody", flags::HASMST).expect("no engine fault"),
+            Err(Refusal::Unknown)
+        );
+    }
+
+    #[test]
+    fn account_ring_tells_a_blank_ring_apart_from_no_ring_at_all() {
+        let mut f = opened("accounts-cli-ring");
+        signup(&mut f, "Dan", "hunter2");
+
+        let ring = f.host.account_ring("Dan").expect("no engine fault").expect("a ring");
+        assert_eq!(ring.owner, "Dan");
+        assert_eq!(ring.keys, vec!["DEMO", "NORMAL", "USER"]);
+
+        write_ring(&mut f, "Dan", &[]);
+        assert_eq!(
+            f.host.account_ring("Dan").expect("no engine fault").expect("a blank ring").keys,
+            Vec::<String>::new()
+        );
+
+        delete_ring(&mut f, "Dan");
+        assert!(f.host.account_ring("Dan").expect("no engine fault").is_none());
+    }
+
+    #[test]
+    fn account_write_ring_uppercases_and_deduplicates_but_keeps_the_order() {
+        let mut f = opened("accounts-cli-write-ring");
+        signup(&mut f, "Dan", "hunter2");
+
+        f.host
+            .account_write_ring(
+                "dan",
+                &["sysop".into(), "NORMAL".into(), "SysOp".into()],
+            )
+            .expect("no engine fault")
+            .expect("accepted");
+
+        let ring = read_ring(&mut f, "Dan");
+        assert_eq!(ring.owner, "Dan", "the account file's spelling, not the caller's");
+        assert_eq!(ring.keys, vec!["SYSOP", "NORMAL"]);
+        assert_eq!(rings(&mut f).len(), 1, "replaced, not added beside");
+
+        assert_eq!(
+            f.host.account_write_ring("Nobody", &[]).expect("no engine fault"),
+            Err(Refusal::Unknown)
+        );
+
+        // A ring the sysop typed that cannot fit is a refusal, not a fault.
+        let too_many: Vec<String> = (0..200).map(|n| format!("KEY{n:04}")).collect();
+        assert_eq!(
+            f.host.account_write_ring("Dan", &too_many).expect("no engine fault"),
+            Err(Refusal::Invalid("ring longer than RINGSZ"))
+        );
+        assert_eq!(read_ring(&mut f, "Dan").keys, vec!["SYSOP", "NORMAL"], "and wrote nothing");
+    }
+
+    #[test]
+    fn account_tag_deleted_sets_deltag_and_refuses_an_undeletable_account() {
+        let mut f = opened("accounts-cli-delete");
+        signup(&mut f, "Dan", "hunter2");
+
+        f.host.account_tag_deleted("Dan").expect("no engine fault").expect("accepted");
+        let (_, record) = find(&mut f, "Dan");
+        assert_eq!(record.flags(), flags::DELTAG, "tagged, and the record is still there");
+
+        let refused = f
+            .host
+            .resolve_login(
+                &mut f.machine,
+                &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+                term(),
+            )
+            .expect("no engine fault");
+        assert_eq!(refused.unwrap_err(), Refusal::Deleted);
+
+        set_flags(&mut f, "Dan", flags::UNDAXS);
+        assert_eq!(
+            f.host.account_tag_deleted("Dan").expect("no engine fault"),
+            Err(Refusal::Invalid("that account cannot be deleted"))
+        );
+        assert_eq!(find(&mut f, "Dan").1.flags(), flags::UNDAXS, "and left the flags alone");
+
+        assert_eq!(
+            f.host.account_tag_deleted("Nobody").expect("no engine fault"),
+            Err(Refusal::Unknown)
+        );
     }
 }
