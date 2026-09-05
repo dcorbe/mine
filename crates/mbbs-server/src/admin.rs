@@ -302,6 +302,22 @@ pub fn socket_path(root: &Path) -> PathBuf {
 /// answers on it, and is removed; one that answers is another live server
 /// on the same root, and this one refuses to start rather than steal it.
 ///
+/// `bind` and `set_permissions` cannot be one atomic step, and the board
+/// root is typically `0755`, so a plain bind-then-chmod at `path` itself
+/// would leave the well-known name `mbbs-user.sock` briefly reachable at
+/// whatever mode the listening process's ordinary umask gives it. Instead
+/// this binds under a name in the same directory that nothing else is told
+/// about, narrows that file to `0600`, and only then renames it onto
+/// `path` -- a rename keeps the file's mode, so nothing ever appears at the
+/// name a client would connect to before it is already `0600`.
+///
+/// This does not touch the process umask. `umask` is one setting shared by
+/// every thread in the process, not scoped to this call, and narrowing it
+/// around the bind raced this very crate's own test binary: a concurrent
+/// test's scratch directory, created by an unrelated thread mid-window,
+/// came out with the narrowed mode baked in and unreadable ever after. A
+/// rename needs no such process-wide state.
+///
 /// Does not block: the accept loop runs in its own spawned task.
 pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>, serving: crate::host::Serving) -> io::Result<()> {
     match std::fs::symlink_metadata(&path) {
@@ -323,8 +339,30 @@ pub async fn serve(path: PathBuf, tx: std_mpsc::Sender<In>, serving: crate::host
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    // `AF_UNIX` paths are capped at `sockaddr_un::sun_path`'s length --
+    // 108 bytes on Linux, null included -- so the temporary name stays as
+    // close to `path`'s own length as it can: no process ID, just enough of
+    // a change that it cannot collide with a real socket name. A `path`
+    // already near the limit is what a deeply nested test scratch directory
+    // looks like, and this fix must not be the reason one stops binding.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(".{SOCKET_NAME}.tmp"));
+    let _ = std::fs::remove_file(&tmp); // a leftover from a killed process
+    let listener = match UnixListener::bind(&tmp) {
+        Ok(listener) => listener,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    if let Err(e) = std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
