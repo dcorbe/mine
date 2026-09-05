@@ -1580,6 +1580,14 @@ pub struct Host<A: Abi> {
     /// `fseusr[usrnum]` (`EDITFSE.H`), Rust-side because no module ever
     /// addresses it. Indexed by [`Chan::index`], like [`Fsd::sessions`](fsd::bbs::Fsd::sessions).
     pub(crate) editor_sessions: Vec<Option<shims::editor::Session<A>>>,
+
+    /// The account database, once [`Host::open_accounts`] has opened it.
+    ///
+    /// `None` is the supported default: a `Host` a test builds has no
+    /// account files under its root and connects channels from a bare
+    /// [`Connection`] instead, exactly as it did before this existed. Only a
+    /// board's own startup opens the pair.
+    pub(crate) accounts: Option<accounts::Accounts<A>>,
 }
 
 /// What `poll` does with a status.
@@ -1869,6 +1877,7 @@ impl<A: Abi> Host<A> {
             editor_state: None,
             syscyc_tail: None,
             editor_sessions: vec![None; usize::from(terms.count())],
+            accounts: None,
         };
 
         // `clock()` counts from here. Set after construction because
@@ -2003,6 +2012,156 @@ impl<A: Abi> Host<A> {
         if let Err(e) = self.globals.write_mem(A::mem(machine), "genbb", &A::ptr_to_bytes(block)) {
             self.note(format!("genbb was opened but could not be published: {e}"));
         }
+    }
+
+    /// Open the board's account and key files, creating them if it has none,
+    /// and publish `accbb`.
+    ///
+    /// Spec section 3 "Open or create". Which two files this is depends on
+    /// the ABI and nothing else -- see [`accounts::file_names`]. A board with
+    /// both is opened, a board with neither has both created with the shape
+    /// measured off a genuine MajorBBS 6 pair, and a board with one of the
+    /// two is refused by name, because the alternative is serving callers
+    /// out of an account file whose rings all silently went missing.
+    ///
+    /// # Why this is an error return and [`Host::open_genbb`] is a note
+    ///
+    /// A board that cannot keep a demo clock is still a board. A board that
+    /// cannot read its accounts is not: every channel that connects would be
+    /// refused, or worse, served an account that is not the caller's. So
+    /// every refusal here names the file and the mismatch, and it happens
+    /// before the first channel is served rather than at the first login.
+    ///
+    /// # Errors
+    ///
+    /// If this host already has the pair open; if the board has one of the
+    /// two files without the other; if the *other* generation's account file
+    /// is there, which is a Worldgroup 3 board being served by a `Wg16` host
+    /// or the reverse; if the account file's record length is not this ABI's
+    /// `sizeof(struct usracc)`; if the key file is not variable-length or its
+    /// fixed head is not 31 bytes; if another process holds the advisory lock
+    /// ([`accounts::lock_file`]); or if creating, reading or opening either
+    /// file fails.
+    pub fn open_accounts(
+        &mut self,
+        machine: &mut A::Cpu,
+        default_ring: Vec<String>,
+    ) -> io::Result<()> {
+        if self.accounts.is_some() {
+            return Err(io::Error::other(
+                "this host's account files are already open",
+            ));
+        }
+        let (account_file, key_file) = accounts::file_names::<A>();
+        let (this, other) = accounts::generations::<A>();
+
+        // Before the half-pair check, not after: the other generation's
+        // account file sitting alone under this root is a board built for the
+        // other host, not half of this one's pair. Saying "bbsusr.dat does
+        // not exist" to a sysop looking at a directory full of Worldgroup 3
+        // files would send them off to create a second, empty database, and
+        // running the check later than this creates that database first.
+        if self.find(other.account).is_some() {
+            return Err(io::Error::other(format!(
+                "{} belongs to a {} board; this host is {}",
+                other.account, other.name, this.name
+            )));
+        }
+
+        let stride = users::AccountLayout::of::<A>().stride;
+        let (account, keys) = match (self.find(account_file), self.find(key_file)) {
+            (Some(account), Some(keys)) => (account, keys),
+            (Some(_), None) => return Err(accounts::half_a_pair(account_file, key_file)),
+            (None, Some(_)) => return Err(accounts::half_a_pair(key_file, account_file)),
+            (None, None) => {
+                let pair = accounts::create_pair(&self.root, stride, (account_file, key_file))?;
+                self.note(format!(
+                    "this board had no accounts: created {account_file} and {key_file} under {}",
+                    self.root.display()
+                ));
+                pair
+            }
+        };
+
+        // Held for the life of the host, so the CLI cannot edit an account
+        // out from under a running board. Taken before anything is read.
+        let lock = accounts::lock_file(&account)?;
+
+        let account_geometry = btrieve::Geometry::read(account_file, &account)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if account_geometry.reclen != stride {
+            return Err(io::Error::other(format!(
+                "{account_file} has {}-byte records; this host's usracc is {stride}",
+                account_geometry.reclen
+            )));
+        }
+        let keys_geometry = btrieve::Geometry::read(key_file, &keys)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if !keys_geometry.variable {
+            return Err(io::Error::other(format!(
+                "{key_file} holds fixed-length records; a key ring is a keyrec's variable tail"
+            )));
+        }
+        if keys_geometry.reclen != accounts::KEYREC {
+            return Err(io::Error::other(format!(
+                "{key_file} has {}-byte records; a keyrec's fixed head is {}",
+                keys_geometry.reclen,
+                accounts::KEYREC
+            )));
+        }
+
+        // `maxlen` is the biggest record the caller intends to handle, which
+        // is not the file's own `reclen` -- see `Host::open_genbb`. A usracc
+        // is exactly its stride; a keyrec grows to `RINGSZ`.
+        let (accbb, keysbb) = {
+            let Host { btrieve, heap, .. } = self;
+            let mem = A::mem(machine);
+            let accbb = btrieve
+                .open(mem, heap, account_file, &account, account_geometry, stride)
+                .map_err(io::Error::other)?;
+            let keysbb = btrieve
+                .open(
+                    mem,
+                    heap,
+                    key_file,
+                    &keys,
+                    keys_geometry,
+                    accounts::RINGSZ as u16,
+                )
+                .map_err(io::Error::other)?;
+            (accbb, keysbb)
+        };
+
+        // Reserved before `accbb` is published so that a failure here cannot
+        // leave a module reading a global this host has no `Accounts` for.
+        let userid_scratch = self
+            .heap
+            .reserve(A::mem(machine), accounts::UIDSIZ as u16)
+            .map_err(io::Error::other)?;
+
+        // `MAJORBBS.H:156` -- `EXPBBS BTVFILE *accbb`. MajorMUD imports it,
+        // calls `setbtv(accbb)` and does its own get-equal on key 0 for the
+        // defunct-user check. The key file gets no global: `LOCKNKEY.C` keeps
+        // its own block file-local and exports nothing.
+        self.globals
+            .write_mem(A::mem(machine), "accbb", &A::ptr_to_bytes(accbb))?;
+
+        self.accounts = Some(accounts::Accounts {
+            accbb,
+            keysbb,
+            stride,
+            default_ring,
+            lock,
+            sessions: vec![None; usize::from(self.users.terms().count())],
+            userid_scratch,
+        });
+        Ok(())
+    }
+
+    /// The account database, if [`Host::open_accounts`] has opened it.
+    #[must_use]
+    pub fn accounts(&self) -> Option<&accounts::Accounts<A>> {
+        self.accounts.as_ref()
     }
 
     /// The file a module named, with the directory it is allowed to name
