@@ -80,6 +80,7 @@ pub mod survey;
 #[doc(hidden)]
 pub mod testing;
 pub mod textvar;
+pub mod accounts;
 pub mod users;
 
 use std::collections::{HashMap, HashSet};
@@ -87,6 +88,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub use accounts::{Login, Refusal, Terminal};
 pub use chan::{Chan, Terms};
 pub use clock::{Civil, Clock};
 pub use exports::Exports;
