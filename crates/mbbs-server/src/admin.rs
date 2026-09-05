@@ -53,6 +53,226 @@ pub enum Reply {
     Ring(Vec<String>),
 }
 
+/// The frame's first line. The `1` is the protocol version: a peer that
+/// speaks a later one is refused rather than half-understood.
+pub const PROTOCOL: &str = "mbbs-user 1";
+
+/// The most a frame either side may send before its blank line. A request
+/// is a handful of short lines, and a reply lists at most a small board.
+pub const MAX_FRAME: usize = 1024;
+
+/// What looking at the bytes so far came to. `Incomplete` asks for more;
+/// `Invalid` is final and names why, in words a caller can be shown.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Parsed<T> {
+    Complete(T),
+    Incomplete,
+    Invalid(String),
+}
+
+/// Split one frame into its `key=value` lines. The shared half of
+/// [`parse_request`] and [`parse_reply`].
+fn lines(buf: &[u8]) -> Parsed<Vec<(&str, &str)>> {
+    let Some(first_newline) = buf.iter().position(|&b| b == b'\n') else {
+        return if buf.len() >= MAX_FRAME {
+            Parsed::Invalid("frame too long".into())
+        } else {
+            Parsed::Incomplete
+        };
+    };
+    if std::str::from_utf8(&buf[..first_newline]) != Ok(PROTOCOL) {
+        return Parsed::Invalid("not an mbbs-user 1 frame".into());
+    }
+    let end = match buf.windows(2).position(|w| w == b"\n\n") {
+        Some(i) => i + 2,
+        None if buf.len() >= MAX_FRAME => return Parsed::Invalid("frame too long".into()),
+        None => return Parsed::Incomplete,
+    };
+    if end > MAX_FRAME {
+        return Parsed::Invalid("frame too long".into());
+    }
+    let Ok(text) = std::str::from_utf8(&buf[..end]) else {
+        return Parsed::Invalid("frame is not UTF-8".into());
+    };
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some(pair) = line.split_once('=') else {
+            return Parsed::Invalid("bad line".into());
+        };
+        out.push(pair);
+    }
+    Parsed::Complete(out)
+}
+
+/// A frame from `lines`: the protocol line, each pair, the blank line.
+/// `Err` names a value that cannot be one line.
+///
+/// `row` is the one value this file builds itself, with a literal tab
+/// between its three fields: that tab is a separator, not a stray control
+/// character passed through from a sysop, so it is let through here and
+/// nowhere else.
+fn frame(pairs: &[(&str, &str)]) -> Result<Vec<u8>, String> {
+    let mut out = format!("{PROTOCOL}\n");
+    for (key, value) in pairs {
+        if value.chars().any(|c| c.is_control() && !(*key == "row" && c == '\t')) {
+            return Err(format!("{key} contains a control character and cannot be sent"));
+        }
+        out.push_str(key);
+        out.push('=');
+        out.push_str(value);
+        out.push('\n');
+    }
+    out.push('\n');
+    Ok(out.into_bytes())
+}
+
+/// Encode a request. `Err` for a value with a control character in it: a
+/// newline would end the line early and a tab is a row separator on the
+/// way back, so neither is sent.
+pub fn encode_request(request: &Request) -> Result<Vec<u8>, String> {
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    match request {
+        Request::Add { userid, password, keys } => {
+            pairs.push(("command", "add"));
+            pairs.push(("userid", userid));
+            pairs.push(("password", password));
+            pairs.extend(keys.iter().map(|k| ("keys", k.as_str())));
+        }
+        Request::Passwd { userid, password } => {
+            pairs.push(("command", "passwd"));
+            pairs.push(("userid", userid));
+            pairs.push(("password", password));
+        }
+        Request::Keys { userid, add, remove } => {
+            pairs.push(("command", "keys"));
+            pairs.push(("userid", userid));
+            pairs.extend(add.iter().map(|k| ("add", k.as_str())));
+            pairs.extend(remove.iter().map(|k| ("remove", k.as_str())));
+        }
+        Request::Master { userid, on } => {
+            pairs.push(("command", "master"));
+            pairs.push(("userid", userid));
+            pairs.push(("on", if *on { "1" } else { "0" }));
+        }
+        Request::List => pairs.push(("command", "list")),
+        Request::Delete { userid } => {
+            pairs.push(("command", "delete"));
+            pairs.push(("userid", userid));
+        }
+    }
+    frame(&pairs)
+}
+
+/// Parse a request from the front of `buf`.
+pub fn parse_request(buf: &[u8]) -> Parsed<Request> {
+    let pairs = match lines(buf) {
+        Parsed::Complete(pairs) => pairs,
+        Parsed::Incomplete => return Parsed::Incomplete,
+        Parsed::Invalid(why) => return Parsed::Invalid(why),
+    };
+    let one = |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string());
+    let many = |key: &str| -> Vec<String> {
+        pairs.iter().filter(|(k, _)| *k == key).map(|(_, v)| v.to_string()).collect()
+    };
+    let Some(command) = one("command") else {
+        return Parsed::Invalid("no command".into());
+    };
+    let userid = || one("userid").ok_or_else(|| "no userid".to_string());
+    let password = || one("password").ok_or_else(|| "no password".to_string());
+    let request = match command.as_str() {
+        "list" => Ok(Request::List),
+        "add" => userid().and_then(|userid| {
+            password().map(|password| Request::Add { userid, password, keys: many("keys") })
+        }),
+        "passwd" => userid().and_then(|userid| password().map(|password| Request::Passwd { userid, password })),
+        "keys" => userid().map(|userid| Request::Keys { userid, add: many("add"), remove: many("remove") }),
+        "master" => userid().and_then(|userid| match one("on").as_deref() {
+            Some("1") => Ok(Request::Master { userid, on: true }),
+            Some("0") => Ok(Request::Master { userid, on: false }),
+            Some(_) => Err("bad on".to_string()),
+            None => Err("no on".to_string()),
+        }),
+        "delete" => userid().map(|userid| Request::Delete { userid }),
+        _ => Err("unknown command".to_string()),
+    };
+    match request {
+        Ok(request) => Parsed::Complete(request),
+        Err(why) => Parsed::Invalid(why),
+    }
+}
+
+/// Encode a reply. Infallible: every value a reply carries was either
+/// validated on the way into the file or is this program's own sentence.
+/// A userid may hold a space and a key name may not hold whitespace, so a
+/// tab separates a row's fields.
+pub fn encode_reply(reply: &Reply) -> Vec<u8> {
+    let owned: Vec<(&str, String)> = match reply {
+        Reply::Done => vec![("status", "ok".into())],
+        Reply::Refused(message) => vec![("status", "refused".into()), ("message", message.clone())],
+        Reply::Faulted(message) => vec![("status", "faulted".into()), ("message", message.clone())],
+        Reply::Listed(rows) => {
+            let mut out = vec![("status", "ok".into()), ("rows", rows.len().to_string())];
+            out.extend(rows.iter().map(|row| {
+                ("row", format!("{}\t{}\t{}", row.userid, row.flags, row.ring.join(" ")))
+            }));
+            out
+        }
+        Reply::Ring(ring) => vec![("status", "ok".into()), ("ring", ring.join(" "))],
+    };
+    let pairs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    frame(&pairs).unwrap_or_else(|why| {
+        // A message with a control character in it came from the engine or
+        // the files. Say that instead of sending a frame that will not parse.
+        let fallback = [("status", "faulted"), ("message", why.as_str())];
+        frame(&fallback).expect("two plain sentences encode")
+    })
+}
+
+/// Parse a reply from the front of `buf`.
+pub fn parse_reply(buf: &[u8]) -> Parsed<Reply> {
+    let pairs = match lines(buf) {
+        Parsed::Complete(pairs) => pairs,
+        Parsed::Incomplete => return Parsed::Incomplete,
+        Parsed::Invalid(why) => return Parsed::Invalid(why),
+    };
+    let one = |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+    let message = || one("message").unwrap_or("").to_string();
+    match one("status") {
+        Some("refused") => Parsed::Complete(Reply::Refused(message())),
+        Some("faulted") => Parsed::Complete(Reply::Faulted(message())),
+        Some("ok") => {
+            if let Some(ring) = one("ring") {
+                return Parsed::Complete(Reply::Ring(split_ring(ring)));
+            }
+            let listing = one("rows").is_some() || pairs.iter().any(|(k, _)| *k == "row");
+            if !listing {
+                return Parsed::Complete(Reply::Done);
+            }
+            let mut rows = Vec::new();
+            for (_, value) in pairs.iter().filter(|(k, _)| *k == "row") {
+                let mut fields = value.splitn(3, '\t');
+                let (Some(userid), Some(flags), Some(ring)) = (fields.next(), fields.next(), fields.next()) else {
+                    return Parsed::Invalid("bad row".into());
+                };
+                let Ok(flags) = flags.parse::<u16>() else {
+                    return Parsed::Invalid("bad row".into());
+                };
+                rows.push(Row { userid: userid.to_string(), flags, ring: split_ring(ring) });
+            }
+            Parsed::Complete(Reply::Listed(rows))
+        }
+        _ => Parsed::Invalid("bad status".into()),
+    }
+}
+
+/// A space-separated ring back into keys. Empty is no keys, not one empty key.
+fn split_ring(ring: &str) -> Vec<String> {
+    ring.split(' ').filter(|k| !k.is_empty()).map(str::to_string).collect()
+}
+
 /// Apply one request to the host that has the account files open.
 ///
 /// The one place the commands are implemented. `mbbs-user` calls this
@@ -441,5 +661,116 @@ mod tests {
             | Request::Add { userid, .. } => userid,
             Request::List => "",
         }
+    }
+
+    fn every_request() -> Vec<Request> {
+        vec![
+            Request::Add {
+                userid: "Dan Corbe".into(),
+                password: "hunter2".into(),
+                keys: vec!["DEMO".into(), "NORMAL".into()],
+            },
+            Request::Add { userid: "Beef".into(), password: "b".into(), keys: vec![] },
+            Request::Passwd { userid: "Dan".into(), password: "x=y".into() },
+            Request::Keys {
+                userid: "Dan".into(),
+                add: vec!["SYSOP".into(), "WCCSYSOP".into()],
+                remove: vec!["DEMO".into()],
+            },
+            Request::Keys { userid: "Dan".into(), add: vec![], remove: vec![] },
+            Request::Master { userid: "Dan".into(), on: true },
+            Request::Master { userid: "Dan".into(), on: false },
+            Request::List,
+            Request::Delete { userid: "Dan".into() },
+        ]
+    }
+
+    fn every_reply() -> Vec<Reply> {
+        vec![
+            Reply::Done,
+            Reply::Refused("Dan is online".into()),
+            Reply::Faulted("writing the account Dan: status 2".into()),
+            Reply::Listed(vec![]),
+            Reply::Listed(vec![
+                Row { userid: "Dan Corbe".into(), flags: 0, ring: vec!["DEMO".into(), "NORMAL".into()] },
+                Row { userid: "Beef".into(), flags: 0x8003, ring: vec![] },
+            ]),
+            Reply::Ring(vec![]),
+            Reply::Ring(vec!["NORMAL".into(), "USER".into()]),
+        ]
+    }
+
+    #[test]
+    fn every_request_round_trips() {
+        for request in every_request() {
+            let bytes = encode_request(&request).expect("encodes");
+            assert!(bytes.starts_with(b"mbbs-user 1\n"), "{request:?}: {bytes:?}");
+            assert!(bytes.ends_with(b"\n\n"), "{request:?}: {bytes:?}");
+            match parse_request(&bytes) {
+                Parsed::Complete(back) => assert_eq!(back, request),
+                other => panic!("{request:?} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_reply_round_trips() {
+        for reply in every_reply() {
+            let bytes = encode_reply(&reply);
+            match parse_reply(&bytes) {
+                Parsed::Complete(back) => assert_eq!(back, reply),
+                other => panic!("{reply:?} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_with_a_control_character_is_not_sent() {
+        for bad in ["a\nb", "a\rb", "a\tb", "a\x7fb", "\x1b[2J"] {
+            let request = Request::Passwd { userid: "Dan".into(), password: bad.into() };
+            assert!(encode_request(&request).is_err(), "{bad:?} must be refused before it is sent");
+        }
+    }
+
+    #[test]
+    fn a_frame_is_incomplete_until_its_blank_line_and_too_long_past_the_cap() {
+        assert!(matches!(parse_request(b""), Parsed::Incomplete));
+        assert!(matches!(parse_request(b"mbbs-user 1\ncommand=list\n"), Parsed::Incomplete));
+        assert!(matches!(parse_request(b"mbbs-user 1\ncommand=list\n\n"), Parsed::Complete(Request::List)));
+        let long = vec![b'x'; MAX_FRAME];
+        assert_eq!(parse_request(&long), Parsed::Invalid("frame too long".into()));
+        let mut padded = b"mbbs-user 1\n".to_vec();
+        padded.extend(std::iter::repeat_n(b'k', MAX_FRAME));
+        padded.extend_from_slice(b"=v\n\n");
+        assert_eq!(parse_request(&padded), Parsed::Invalid("frame too long".into()));
+    }
+
+    #[test]
+    fn each_request_parse_refusal_is_named() {
+        let cases: [(&[u8], &str); 8] = [
+            (b"GET / HTTP/1.0\r\n\r\n", "not an mbbs-user 1 frame"),
+            (b"mbbs-door 1\nuser=Dan\n\n", "not an mbbs-user 1 frame"),
+            (b"mbbs-user 1\nnonsense\n\n", "bad line"),
+            (b"mbbs-user 1\nuserid=Dan\n\n", "no command"),
+            (b"mbbs-user 1\ncommand=purge\n\n", "unknown command"),
+            (b"mbbs-user 1\ncommand=passwd\npassword=x\n\n", "no userid"),
+            (b"mbbs-user 1\ncommand=add\nuserid=Dan\n\n", "no password"),
+            (b"mbbs-user 1\ncommand=master\nuserid=Dan\non=yes\n\n", "bad on"),
+        ];
+        for (bytes, why) in cases {
+            assert_eq!(parse_request(bytes), Parsed::Invalid(why.into()), "{:?}", String::from_utf8_lossy(bytes));
+        }
+        assert_eq!(
+            parse_request(b"mbbs-user 1\ncommand=master\nuserid=Dan\n\n"),
+            Parsed::Invalid("no on".into())
+        );
+    }
+
+    #[test]
+    fn each_reply_parse_refusal_is_named() {
+        assert_eq!(parse_reply(b"mbbs-user 1\nstatus=maybe\n\n"), Parsed::Invalid("bad status".into()));
+        assert_eq!(parse_reply(b"mbbs-user 1\nstatus=ok\nrow=Dan\t0\n\n"), Parsed::Invalid("bad row".into()));
+        assert_eq!(parse_reply(b"mbbs-user 1\nstatus=ok\nrow=Dan\tlots\tDEMO\n\n"), Parsed::Invalid("bad row".into()));
+        assert_eq!(parse_reply(b"mbbs-user 1\nstatus=ok\nrow=Dan\t0\tDEMO\n\n"), Parsed::Complete(Reply::Listed(vec![Row { userid: "Dan".into(), flags: 0, ring: vec!["DEMO".into()] }])));
     }
 }
