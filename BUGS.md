@@ -275,3 +275,27 @@ dispatches being `ptrtile` is `_GET_ROOM_DATA`'s own hash probing, not
 something this host introduced. See `docs/2026-08-14-ptrtile-hot-path.md`,
 with the correction that its `Ended::Bound` spin diagnosis was wrong: `Bound`
 was unreachable at the budgets it was measuring.
+
+## 10. Genuine Btrieve does not use the empty data page our v5 `create` pre-allocates
+
+**Symptom.** A v5 file written by `btrieve::create` and then maintained by
+genuine Pervasive Btrieve 6.15 is not byte-identical to the same sequence
+run through this engine. The first difference is at page 0 offset 0x10, the
+free chain: genuine ignores the empty data page `create` pre-allocates,
+appends a data page of its own, and threads its slots onto `fcr::FREE`. Our
+engine fills the pre-allocated page.
+
+**Measured.** 2026-09-04, `crates/btrieve/tests/differential.rs`, replaying
+`v5_variable_insert.fixture` against genuine's transcript. The variable
+pages and the variable FCR fields match genuine byte for byte apart from
+each page's own number; only the fixed-length allocator diverges. The
+whole-file diff is recorded in that test's `BYTE_COMPARED` doc comment.
+
+**What it costs.** Interoperability only. Both engines read either layout,
+so no data is lost. A file this host created and a real board then wrote to
+will not match one the real engine created from scratch.
+
+**Not done.** Measuring what a virgin v5 data page must look like for the
+genuine engine to accept it. `create`'s data page was measured against
+MajorMUD's shipped `.VIR` files, which the vendor's own tools wrote, not
+against a virgin file the engine itself created.

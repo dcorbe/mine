@@ -63,6 +63,7 @@ routine this host does not serve stops at startup with the routine named.
 | Full-screen forms | Works, in both line mode and ANSI full-screen mode. |
 | Btrieve | Works. Modules read and write their data files through a complete record manager. |
 | BBS doors | Works. A real BBS can hang a module as a door through the relay binary. |
+| Accounts | Works. MajorBBS's own account and key files, telnet login and signup, rlogin, and a sysop CLI. |
 | Scripting | Works. Lua scripts can add commands a module never had. |
 | Host API | Partial. Each new module tends to import something not yet implemented. |
 
@@ -90,12 +91,58 @@ Useful flags:
 | `--module P` | Repeatable. The first is the one a caller enters; the rest are add-ons whose exports the first can reach. NE or PE decides which machine boots. |
 | `--listen-raw ADDR` | A second port for period clients (SyncTERM and the like) that already speak CP437/ANSI.SYS. |
 | `--listen-door PATH` | A Unix socket for door sessions; `mbbs-door` connects here on a BBS caller's behalf. |
+| `--listen-rlogin ADDR` | An rlogin port for callers a fronting board already authenticated. See [Logging in](#logging-in). |
+| `--keys A,B` | The ring a new account is written with. Default `DEMO,NORMAL,USER`. |
 | `--terms N` | Channel count. Default 2. |
 | `--bturno DIGITS` | The board's eight-digit registration number. Modules key their licensing on it. |
 | `--syscyc HZ` | How often the idle `syscyc` vector fires. Some modules step their world from it. |
 | `--scripts DIR` | Lua scripts to load above the module. |
 
 `--help` documents the rest.
+
+## Logging in
+
+The host keeps MajorBBS's own account and key files in the board directory,
+so a live pair from a period board can be dropped in and used as it is. A
+board without one gets an empty pair on first boot. Which names it uses
+follows the module's format:
+
+| module | account file | key file |
+|---|---|---|
+| 16-bit NE (MajorBBS 6, Worldgroup 2) | `bbsusr.dat` | `bbsk.dat` |
+| 32-bit PE (Worldgroup 3) | `wgsusr2.dat` | `wgskey2.dat` |
+
+Three ways in:
+
+| path | who decides | what happens |
+|---|---|---|
+| telnet (`--listen`, `--listen-raw`) | the caller | Asks for a user ID and a password. An unknown name is offered signup. Three refusals close the connection. |
+| rlogin (`--listen-rlogin`) | a fronting board | Takes the name the board sends and provisions it if new. No password crosses the wire, so bind it to a trusted network only. `--rlogin-name first` matches Synchronet's swap flag. |
+| door (`--listen-door`) | a fronting board | Same trust as rlogin, through `mbbs-door` and a DOOR32.SYS. `sysop=1` grants the sysop keys for that session only. |
+
+Every new account gets the ring `--keys` names, default `DEMO,NORMAL,USER`.
+Sysop keys come from an account's own ring or the door's session grant, never
+from the default. Names are validated the way MajorBBS's own signup validates
+them: letters, digits, spaces and a few punctuation marks, at most 29
+characters, no leading space or punctuation.
+
+The telnet port is not a hardened public login: passwords travel in the
+clear, as MajorBBS stored them, and nothing rate-limits connections.
+
+`mbbs-user` administers the files with the server stopped:
+
+```sh
+./target/release/mbbs-user --root /path/to/board-data list
+./target/release/mbbs-user --root /path/to/board-data add Dan --password secret
+./target/release/mbbs-user --root /path/to/board-data keys Dan --add SYSOP --add WCCSYSOP
+./target/release/mbbs-user --root /path/to/board-data delete Dan
+```
+
+`delete` only tags the account. The nightly maintenance run, or `SIGUSR1`,
+purges tagged accounts and calls every module's own delete-account routine,
+so MajorMUD removes the character too. `master` sets the MASTER flag, which
+holds every lock including MajorMUD's negative ones; a sysop who plays wants
+SYSOP and WCCSYSOP in the ring instead.
 
 ## How it works
 
