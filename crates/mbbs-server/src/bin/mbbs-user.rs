@@ -16,9 +16,12 @@
 //!   `mbbs-server` once. A tool that created them would happily lay a second,
 //!   empty database beside a board whose real one is a typo away in the path
 //!   the sysop gave, and the sysop would find out at the first login.
-//! - **It never edits a running board.** `Host::open_accounts` takes the
-//!   `flock` the server holds for its whole life, so an edit while the board
-//!   is up is refused before anything is read.
+//! - **It never opens the files a running board has open.** A running
+//!   `mbbs-server` binds `<root>/mbbs-user.sock`, and a command sent there
+//!   is applied by the board itself, against the files it already holds.
+//!   Only when no server answers does this program open the pair, and the
+//!   `flock` `Host::open_accounts` takes is then a second line of defence,
+//!   for a server built before the socket existed.
 //! - **`delete` tags, it does not remove.** `DELTAG` is what the vendor's own
 //!   account editor sets; the maintenance purge is what deletes the record and
 //!   tells every module about it (`dlarou`), and only it can do that.
@@ -31,6 +34,10 @@
 //! mbbs-user --root DIR list
 //! mbbs-user --root DIR delete USERID
 //! ```
+//!
+//! An account someone is logged in as cannot be edited (`passwd`, `keys`,
+//! `master`, `delete`): the logoff write-back would undo it. The refusal is
+//! `USERID is online`, exit 1.
 //!
 //! Exit 0 is done, exit 1 is a refusal (a userid nothing knows, a name
 //! already taken, an account that may not be deleted, a board with no pair or
@@ -151,18 +158,28 @@ fn main() -> ExitCode {
     }
 }
 
-/// Which host this board wants, then that host.
+/// The socket if the board is up, the files if it is not.
+///
+/// The socket is tried first because a running board holds the account
+/// file's lock, and a sysop who can see their board is up should not be
+/// told to stop it. `generation` runs either way: a root with no pair has
+/// no board to be up.
 fn dispatch(root: &Path, command: &Command) -> Result<(), Failure> {
-    match generation(root)? {
+    let which = generation(root)?;
+    let request = request_for(command)?;
+    if let Some(reply) = admin::send(&admin::socket_path(root), &request).map_err(Failure::faulted)? {
+        return finish(command, reply);
+    }
+    match which {
         Which::Wg16 => {
             let mut machine = mbbs_machine::m16::Machine::new()
                 .map_err(|e| Failure::faulted(format!("building a 16-bit machine: {e}")))?;
-            run::<Wg16>(&mut machine, root, command)
+            run::<Wg16>(&mut machine, root, command, request)
         }
         Which::Wg32 => {
             let mut machine = build_wg32_cpu()()
                 .map_err(|e| Failure::faulted(format!("building a 32-bit machine: {e}")))?;
-            run::<Wg32>(&mut machine, root, command)
+            run::<Wg32>(&mut machine, root, command, request)
         }
     }
 }
@@ -219,7 +236,12 @@ fn present(root: &Path, name: &str) -> bool {
 /// `finish_init`, then `open_accounts` -- with one channel, because nothing
 /// here connects one. No module is loaded: every method below reads and
 /// writes the two files and touches no module memory.
-fn run<A: Abi>(machine: &mut A::Cpu, root: &Path, command: &Command) -> Result<(), Failure> {
+fn run<A: Abi>(
+    machine: &mut A::Cpu,
+    root: &Path,
+    command: &Command,
+    request: admin::Request,
+) -> Result<(), Failure> {
     let mut host = Host::<A>::new(machine, root.to_path_buf(), Terms::new(1))
         .map_err(|e| Failure::faulted(format!("opening the board at {}: {e}", root.display())))?;
     host.finish_init(machine)
@@ -231,7 +253,6 @@ fn run<A: Abi>(machine: &mut A::Cpu, root: &Path, command: &Command) -> Result<(
     host.open_accounts(machine, mbbs_server::conn::default_keys())
         .map_err(open_refusal)?;
 
-    let request = request_for(command)?;
     finish(command, admin::apply(&mut host, machine, request))
 }
 

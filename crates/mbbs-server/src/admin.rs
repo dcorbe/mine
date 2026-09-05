@@ -69,8 +69,9 @@ pub enum Reply {
 pub const PROTOCOL: &str = "mbbs-user 1";
 
 /// The most a frame either side may send before its blank line. A request
-/// is a handful of short lines, and a reply lists at most a small board.
-pub const MAX_FRAME: usize = 1024;
+/// is a handful of short lines; a reply lists a whole board, at about fifty
+/// bytes a row.
+pub const MAX_FRAME: usize = 65536;
 
 /// What looking at the bytes so far came to. `Incomplete` asks for more;
 /// `Invalid` is final and names why, in words a caller can be shown.
@@ -386,6 +387,48 @@ async fn session(stream: UnixStream, tx: std_mpsc::Sender<In>, serving: crate::h
     };
     writer.write_all(&encode_reply(&reply)).await?;
     Ok(())
+}
+
+/// The client half: hand `request` to the server behind `path`, if there is
+/// one.
+///
+/// `Ok(None)` is "no server here": no file, a file that is not a socket, or
+/// a socket file nothing answers on (a dead server's leftover). The caller
+/// then opens the files itself. `Err` is a server that was there and could
+/// not be talked to: a value that cannot be sent, a write that failed, a
+/// reply that ended early or did not parse.
+pub fn send(path: &Path, request: &Request) -> Result<Option<Reply>, String> {
+    use std::io::{Read, Write};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("looking at {}: {e}", path.display())),
+    }
+    let mut sock = match std::os::unix::net::UnixStream::connect(path) {
+        Ok(sock) => sock,
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => return Ok(None),
+        Err(e) => return Err(format!("connecting to {}: {e}", path.display())),
+    };
+    let bytes = encode_request(request)?;
+    sock.write_all(&bytes).map_err(|e| format!("sending to mbbs-server: {e}"))?;
+
+    let mut got = Vec::with_capacity(256);
+    loop {
+        match parse_reply(&got) {
+            Parsed::Complete(reply) => return Ok(Some(reply)),
+            Parsed::Invalid(why) => return Err(format!("mbbs-server answered something this mbbs-user cannot read: {why}")),
+            Parsed::Incomplete => {
+                let mut chunk = [0u8; 256];
+                let n = sock.read(&mut chunk).map_err(|e| format!("reading mbbs-server's reply: {e}"))?;
+                if n == 0 {
+                    return Err("mbbs-server closed the socket before it answered".into());
+                }
+                got.extend_from_slice(&chunk[..n]);
+            }
+        }
+    }
 }
 
 /// A listener's wire line as a sentence: the `\r\n` off the end.

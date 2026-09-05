@@ -14,8 +14,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use mbbs::abi::Wg16;
 use mbbs::accounts::{flags, Login, Terminal};
 use mbbs::testing::{scratch, Fixture};
+use mbbs_server::admin;
+use mbbs_server::msg::{In, Out};
 
 /// One test at a time.
 ///
@@ -97,6 +100,206 @@ fn set_flags(root: &Path, userid: &str, word: u16) {
         .account_set_flags(userid, word)
         .expect("no engine fault")
         .expect("the account exists");
+}
+
+/// What the stand-in host thread did, so a test can wait for it.
+#[derive(Debug, PartialEq, Eq)]
+enum Happened {
+    LoggedIn,
+    Refused,
+    HungUp,
+    Applied,
+}
+
+/// A stand-in for `mbbs-server`'s host thread over a real account pair:
+/// logs `In::Connect` callers in with `Host::login`, hangs them up on
+/// `In::Disconnect`, and answers `In::Admin` with `admin::apply`. Built on
+/// its own thread because a 16-bit machine cannot cross one.
+fn live_board(root: PathBuf) -> (std::sync::mpsc::Sender<In>, std::sync::mpsc::Receiver<Happened>) {
+    let (tx, rx) = std::sync::mpsc::channel::<In>();
+    let (happened_tx, happened_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let terms = mbbs::Terms::new(2);
+        let mut f = Fixture::<Wg16>::rooted_with_terms(root, terms);
+        f.host
+            .open_accounts(&mut f.machine, mbbs_server::conn::default_keys())
+            .expect("the pair opens");
+        let module = f.registered_module();
+        let mut outs: Vec<Option<tokio::sync::mpsc::Sender<Out>>> = vec![None; 2];
+        ready_tx.send(()).expect("the test is waiting");
+        for msg in rx {
+            match msg {
+                In::Connect { login, terminal, out, reply } => {
+                    let chan = terms.chan(0).expect("channel 0");
+                    match f.host.login(&mut f.machine, &module, chan, &login, terminal).expect("no io error") {
+                        Ok(_) => {
+                            outs[0] = Some(out);
+                            let _ = reply.send(Ok(chan));
+                            let _ = happened_tx.send(Happened::LoggedIn);
+                        }
+                        Err(refusal) => {
+                            let _ = reply.send(Err(refusal));
+                            let _ = happened_tx.send(Happened::Refused);
+                        }
+                    }
+                }
+                In::Disconnect { chan } => {
+                    if outs[chan.index()].take().is_some() {
+                        f.host.hangup(&mut f.machine, &module, chan).expect("hung up");
+                        let _ = happened_tx.send(Happened::HungUp);
+                    }
+                }
+                In::Admin { request, reply } => {
+                    let _ = reply.send(admin::apply(&mut f.host, &mut f.machine, request));
+                    let _ = happened_tx.send(Happened::Applied);
+                }
+                In::Input { .. } | In::Alarm | In::Maintain => {}
+                In::Shutdown { done } => {
+                    drop(done);
+                    break;
+                }
+            }
+        }
+    });
+    ready_rx.recv().expect("the board came up");
+    (tx, happened_rx)
+}
+
+fn expect(happened: &std::sync::mpsc::Receiver<Happened>, what: Happened) {
+    assert_eq!(
+        happened.recv_timeout(std::time::Duration::from_secs(10)).expect("the board did something"),
+        what
+    );
+}
+
+/// Run the CLI off the runtime's blocking pool, so the socket task keeps
+/// being driven while the child runs.
+async fn run_live(root: &Path, args: &[&str]) -> Output {
+    let root = root.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run(&root, &args)
+    })
+    .await
+    .expect("the CLI ran")
+}
+
+/// Connect to the telnet listener and answer the login dialogue.
+async fn telnet_login(addr: std::net::SocketAddr, userid: &str, password: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    sock.write_all(format!("{userid}\r{password}\r").as_bytes()).await.expect("login");
+    sock
+}
+
+// Multi-thread: `expect` blocks the calling OS thread on a std channel, and
+// under a current-thread runtime that thread *is* the runtime, so the
+// telnet accept loop and login dialogue this test waits on would never get
+// to run. `run_live`'s `spawn_blocking` needs the same thing for the same
+// reason. `_serial` is a std `MutexGuard` held across the awaits below, which
+// is exactly what it is for: it serialises the whole test body, on this
+// runtime's own worker threads, against every other test in the binary.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn against_a_running_board_add_goes_over_the_socket_and_the_account_can_log_in() {
+    let _serial = serial();
+    let root = scratch("mbbs-user-live-add").canonicalize().expect("scratch dir exists");
+    let (tx, happened) = live_board(root.clone());
+    let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    admin::serve(admin::socket_path(&root), tx.clone(), serving.clone()).await.expect("admin socket");
+    let addr = mbbs_server::conn::serve_on(
+        tx.clone(),
+        &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern as fn() -> mbbs_server::termcompat::Stack)],
+        serving,
+    )
+    .await
+    .expect("telnet")[0];
+
+    // The board holds the lock. The direct path would be refused, so a
+    // success here is the socket path.
+    let added = run_live(&root, &["add", "Dan", "--password", "hunter2"]).await;
+    assert_eq!(added.status.code(), Some(0), "{}", stderr(&added));
+    assert_eq!(stderr(&added), "");
+    expect(&happened, Happened::Applied);
+
+    let listed = run_live(&root, &["list"]).await;
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert_eq!(row(&listed, "Dan"), "Dan - DEMO NORMAL USER");
+    expect(&happened, Happened::Applied);
+
+    let sock = telnet_login(addr, "Dan", "hunter2").await;
+    expect(&happened, Happened::LoggedIn);
+    drop(sock);
+    expect(&happened, Happened::HungUp);
+
+    let bad = telnet_login(addr, "Dan", "wrong").await;
+    expect(&happened, Happened::Refused);
+    drop(bad);
+    let _ = tx.send(In::Shutdown { done: tokio::sync::oneshot::channel().0 });
+}
+
+// See the comment on the previous test for why this needs a multi-thread
+// runtime and holds `_serial` across its awaits.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn passwd_for_an_online_account_is_refused_and_lands_after_logoff() {
+    let _serial = serial();
+    let root = scratch("mbbs-user-live-online").canonicalize().expect("scratch dir exists");
+    let (tx, happened) = live_board(root.clone());
+    let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    admin::serve(admin::socket_path(&root), tx.clone(), serving.clone()).await.expect("admin socket");
+    let addr = mbbs_server::conn::serve_on(
+        tx.clone(),
+        &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern as fn() -> mbbs_server::termcompat::Stack)],
+        serving,
+    )
+    .await
+    .expect("telnet")[0];
+
+    assert_eq!(run_live(&root, &["add", "Dan", "--password", "hunter2"]).await.status.code(), Some(0));
+    expect(&happened, Happened::Applied);
+
+    let sock = telnet_login(addr, "Dan", "hunter2").await;
+    expect(&happened, Happened::LoggedIn);
+
+    let refused = run_live(&root, &["passwd", "Dan", "--password", "newpw"]).await;
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert_eq!(stderr(&refused), "mbbs-user: Dan is online\n");
+    expect(&happened, Happened::Applied);
+
+    drop(sock);
+    expect(&happened, Happened::HungUp);
+
+    // The old password still works: nothing was written under the session.
+    let old = telnet_login(addr, "Dan", "hunter2").await;
+    expect(&happened, Happened::LoggedIn);
+    drop(old);
+    expect(&happened, Happened::HungUp);
+
+    let landed = run_live(&root, &["passwd", "Dan", "--password", "newpw"]).await;
+    assert_eq!(landed.status.code(), Some(0), "{}", stderr(&landed));
+    expect(&happened, Happened::Applied);
+
+    let new = telnet_login(addr, "Dan", "newpw").await;
+    expect(&happened, Happened::LoggedIn);
+    drop(new);
+    expect(&happened, Happened::HungUp);
+    let _ = tx.send(In::Shutdown { done: tokio::sync::oneshot::channel().0 });
+}
+
+/// A socket file nothing answers on is a dead server's. The CLI falls
+/// through to the files, which are unlocked, and the command succeeds.
+#[test]
+fn a_stale_socket_falls_through_to_the_direct_path() {
+    let _serial = serial();
+    let root = board("mbbs-user-stale-socket").canonicalize().expect("scratch dir exists");
+    drop(std::os::unix::net::UnixListener::bind(admin::socket_path(&root)).expect("a listener to abandon"));
+
+    let added = run(&root, &["add", "Dan", "--password", "hunter2"]);
+    assert_eq!(added.status.code(), Some(0), "{}", stderr(&added));
+    assert_eq!(row(&run(&root, &["list"]), "Dan"), "Dan - DEMO NORMAL USER");
 }
 
 #[test]

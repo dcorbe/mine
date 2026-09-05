@@ -129,7 +129,11 @@ characters, no leading space or punctuation.
 The telnet port is not a hardened public login: passwords travel in the
 clear, as MajorBBS stored them, and nothing rate-limits connections.
 
-`mbbs-user` administers the files with the server stopped:
+`mbbs-user` administers the accounts. With the board running it sends each
+command to the server over `mbbs-user.sock` in the board directory and the
+server applies it, so the next login sees the change. With the board stopped
+it edits the files directly. An account somebody is logged in as cannot be
+edited until they log off.
 
 ```sh
 ./target/release/mbbs-user --root /path/to/board-data list
