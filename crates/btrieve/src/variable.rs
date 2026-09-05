@@ -1111,12 +1111,21 @@ pub(crate) fn free_fragment_v6<P: PagesMut>(
 /// ```text
 /// 0x1400  00 00 05 00   PAGE_NUMBER = 5
 /// 0x1404  03 00         modification stamp = 3
-/// 0x1406  ff 00 ff ff   FREE_CHAIN = FreeChain::Last, unchanged by the delete
+/// 0x1406  ff 00 ff ff   FREE_CHAIN = FreeChain::Last  (see the note below)
 /// 0x140a  02 00         FRAGMENT_COUNT = 2
 /// 0x140c  "EMO NORMAL MODERATE MASS_MAIL\0"   fragment 0, 30 bytes, to 0x142a
 /// 0x142a  "EMO\0"                             fragment 1,  4 bytes, to 0x142e
 /// 0x17fa  2e 00 2a 00 0c 00                   entry 2, entry 1, entry 0
 /// ```
+///
+/// The free-chain **value** is measured; that the *delete* did not change
+/// it is **inferred**. This fixture holds only the state after its last
+/// call, so nothing in it shows the field before the delete. What supports
+/// the inference is `v5_variable_insert.fixture`: from the same seed, after
+/// the same kind of first inserts and no delete at all, its page 5 reads
+/// `00 00 05 00 01 00 ff 00 ff ff 02 00` at `0x1400` -- the same
+/// `ff 00 ff ff` in the same field. So the page was already `Last` before
+/// the delete, and the delete left it there.
 ///
 /// and the two surviving records' own pointers read `00 05 00 00` at
 /// `0x1025` (`Testy` -> page 5, fragment **0**) and `00 05 00 01` at
@@ -1129,10 +1138,10 @@ pub(crate) fn free_fragment_v6<P: PagesMut>(
 /// - the surviving record kept fragment index **1**, and the re-inserted one
 ///   took index **0** -- the freed slot was **reused**, not appended past
 ///   the end;
-/// - the free chain at `0x1406` and the control record's own head at
-///   [`super::format::fcr::at::VARIABLE_HIGHEST`] (`0x3a`, still `05 00`)
-///   were untouched: the page was already on the chain and stayed where it
-///   was;
+/// - the free chain at `0x1406` reads `ff 00 ff ff` and the control record's
+///   own head at [`super::format::fcr::at::VARIABLE_HIGHEST`] (`0x3a`) reads
+///   `05 00`. Those two values are measured; that neither was *touched* by
+///   the delete is the inference the note above the dump sets out;
 /// - the modification stamp reads **3** for a page written four times
 ///   (claim+first fragment, second fragment, the delete, the re-insert).
 ///   That settles the reading [`V5Pages`] had to choose from insert-only
@@ -1204,7 +1213,7 @@ pub(crate) fn free_fragment_v6<P: PagesMut>(
 /// ```text
 /// 0x1400  00 00 05 00   PAGE_NUMBER = 5, still page 5 of a six-page file
 /// 0x1404  01 00         modification stamp = 1
-/// 0x1406  ff 00 ff ff   FREE_CHAIN = FreeChain::Last, unchanged by the delete
+/// 0x1406  ff 00 ff ff   FREE_CHAIN = FreeChain::Last  (see the note below)
 /// 0x140a  00 00         FRAGMENT_COUNT = 0
 /// 0x140c  ..0x17fc      every byte zero
 /// 0x17fc  00 00         entry 1, the old boundary, zeroed
@@ -1216,19 +1225,30 @@ pub(crate) fn free_fragment_v6<P: PagesMut>(
 /// ```text
 /// 0x10  00 00 06 10   fcr::FREE = 0x1006, the record slot the delete freed
 /// 0x1c  00 00 00 00   the file holds no records
-/// 0x26  00 00 06 00   fcr::PAGES = 6, unchanged -- the page is still there
+/// 0x26  00 00 06 00   fcr::PAGES = 6 -- the page is still in the file
 /// 0x39  00           no longer virgin
-/// 0x3a  05 00        VARIABLE_HIGHEST = 5, unchanged -- still the chain head
+/// 0x3a  05 00        VARIABLE_HIGHEST = 5 -- still the chain head
 /// ```
 ///
-/// So, **measured**: genuine does not release, truncate, relink or blank the
-/// emptied page. It leaves it exactly where it is, on the free-space chain
-/// where it already was, holding no fragments, with the boundary entry back
-/// at [`FIRST_FRAGMENT`] and the freed body zeroed -- which is byte for byte
-/// what rule 3 above (the trailing collapse) already produces, with the
-/// count reaching zero instead of stopping at one. Neither `fcr::PAGES` nor
-/// `VARIABLE_HIGHEST` is touched. Whatever `FUN_00418dc0` does, it does not
-/// do it to a v5 file's variable page.
+/// The note above the delete fixture's dump applies here too, and to the
+/// last two control-record fields as well: every value quoted is measured,
+/// but *"the delete did not change it"* is an inference, because this
+/// fixture also holds only the state after its last call. The same
+/// corroboration carries it. `v5_variable_insert.fixture`, from the same
+/// seed with no delete anywhere in it, reads `ff 00 ff ff` at `0x1406`,
+/// `00 00 06 00` at `0x26` and `ff 00 05 00` at `0x38` -- the same three
+/// values this file ends with, so the delete moved none of them.
+///
+/// So, **measured**: genuine does not release the emptied page, does not
+/// truncate the file, and does not blank the page's header. It leaves the
+/// page in place, on the free-space chain, holding no fragments, with the
+/// boundary entry back at [`FIRST_FRAGMENT`] and the freed body zeroed --
+/// which is byte for byte what rule 3 above (the trailing collapse) already
+/// produces, with the count reaching zero instead of stopping at one.
+/// **Inferred** from the corroboration above: the delete left the chain
+/// field, `fcr::PAGES` and `VARIABLE_HIGHEST` exactly as it found them.
+/// Whatever `FUN_00418dc0` does, it does not do it to a v5 file's variable
+/// page.
 ///
 /// **`v5_variable_release_reinsert.fixture`** -- the same up to the delete,
 /// then insert `Next` (body `"EMO NORMAL\0"`, 11 bytes), get `next` through
