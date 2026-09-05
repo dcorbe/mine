@@ -830,19 +830,32 @@ fn read_acs_block(bytes: &[u8], page_start: usize, page_size: usize) -> Result<A
 }
 
 /// Whether `page_start`'s own bytes match harvest 5 SS3.3's fragment-page
-/// shape: fragment count (`0x0a`) in `1..=256`, and the first live
+/// shape: fragment count (`0x0a`) in `0..=256`, and the first live
 /// (non-`0xffff`) entry of the array names offset exactly `0x0c` -- the same
 /// two checks `W32MKDE_decompiled.c:19029-19060` performs before treating a
 /// page as this shape at all. Used only as evidence for classifying an
 /// unclaimed, data-bit-clear page of a variable-length file; see
 /// `PageKind::Variable`'s own doc for the corpus measurement backing this as
 /// a real discriminator rather than a guess.
+///
+/// The count's floor is **zero**, and that is measured, not loosened:
+/// `crates/btrieve-oracle/fixtures/v5_variable_release_empty.fixture` is
+/// genuine Pervasive Btrieve 6.15 deleting the only record on a version 5
+/// variable-length file, and it leaves the variable page in the file
+/// holding no fragments at all -- page 5 at `0x1400` reading
+/// `00 00 05 00 | 01 00 | ff 00 ff ff | 00 00`, with the boundary entry at
+/// the end of the page still naming `0x0c` (`variable::free_fragment`'s own
+/// doc comment has the whole page). Refusing that shape here made this
+/// crate's own write verifier reject a file it had just written correctly.
+/// The entry rule is what still keeps an index page out: an index page's
+/// tail is unused entry space, all zero, so its entry 0 reads `0x0000` and
+/// not `0x0c`.
 fn looks_like_fragment_page(bytes: &[u8], page_start: usize, page_size: usize) -> bool {
     if page_start + variable::at::FRAGMENTS > bytes.len() {
         return false;
     }
     let fragment_count = get_u16(bytes, page_start + variable::at::FRAGMENT_COUNT);
-    if fragment_count == 0 || fragment_count > variable::MAX_FRAGMENTS {
+    if fragment_count > variable::MAX_FRAGMENTS {
         return false;
     }
     for i in 0..=usize::from(fragment_count) {

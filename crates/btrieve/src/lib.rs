@@ -14134,6 +14134,98 @@ mod tests {
         assert_eq!(records, wanted, "both records read back with their bodies");
     }
 
+    /// Deleting the **only** record on the file, which empties its variable
+    /// page, and then inserting a longer one, which goes back onto the same
+    /// page. The whole shape `v5_variable_release_empty.fixture` and
+    /// `v5_variable_release_reinsert.fixture` recorded, against a file this
+    /// crate's own `create` wrote -- see `variable::free_fragment`'s doc
+    /// comment for genuine Btrieve's own bytes.
+    ///
+    /// The record `Only` carries the body `"EMO\0"` and `Next` carries
+    /// `"EMO NORMAL\0"`, exactly as the two recordings do, so every offset
+    /// below is a number read off genuine's own page and not one derived
+    /// here.
+    #[test]
+    fn deleting_the_only_v5_variable_record_empties_its_page_and_the_next_insert_reuses_it() {
+        let (path, mut block) = create_v5_variable("block-delete-empties-a-v5-variable-page");
+        let only = block
+            .insert(&variable_record("Only", b"EMO\0"))
+            .expect("the file's only record goes in");
+        let (number, fragment) = body_pointer(&path, only, 31);
+        assert_eq!(fragment, 0, "the only body is fragment 0 of its page");
+
+        const VARIABLE_HEAD: std::ops::Range<usize> = 0x38..0x3c;
+        let before = std::fs::read(&path).expect("read the file before the delete");
+        let pages_before = before[pages::fcr::PAGES..pages::fcr::PAGES + 4].to_vec();
+        let head_before = before[VARIABLE_HEAD].to_vec();
+
+        block.delete(only).expect("the only variable-length record deletes");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(bytes.len(), before.len(), "the emptied page stays in the file");
+        assert_eq!(
+            &bytes[pages::fcr::PAGES..pages::fcr::PAGES + 4],
+            pages_before.as_slice(),
+            "genuine leaves fcr::PAGES alone -- the page is not released"
+        );
+        assert_eq!(
+            &bytes[VARIABLE_HEAD],
+            head_before.as_slice(),
+            "and still offers the page: VARIABLE_HIGHEST does not move either"
+        );
+
+        let page = &bytes[number as usize * 1024..][..1024];
+        assert_eq!(u16::from_le_bytes([page[0x0a], page[0x0b]]), 0, "the page holds nothing");
+        assert_eq!(page_entry(page, 0), 0x0c, "the boundary, back to where bodies start");
+        assert_eq!(page_entry(page, 1), 0x0000, "the entry it used to sit in is zeroed");
+        assert!(page[0x0c..0x10].iter().all(|b| *b == 0), "the freed body is zeroed");
+        assert_eq!(
+            u16::from_le_bytes([page[0x04], page[0x05]]),
+            1,
+            "the second write of this page: the insert and this delete"
+        );
+        assert_eq!(
+            crate::verify::written(&path),
+            Ok(()),
+            "a page holding no fragments is still a file this crate can read and re-emit"
+        );
+        block.records = None;
+        assert_eq!(block.records().expect("a fresh read").len(), 0, "no records left");
+
+        // And the insert that follows goes back onto that same page.
+        let next = block
+            .insert(&variable_record("Next", b"EMO NORMAL\0"))
+            .expect("the emptied page takes a longer body");
+
+        assert_eq!(
+            body_pointer(&path, next, 31),
+            (number, 0),
+            "fragment 0 of the same page -- no page was claimed for it"
+        );
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(bytes.len(), before.len(), "and still no page was added");
+        let page = &bytes[number as usize * 1024..][..1024];
+        assert_eq!(u16::from_le_bytes([page[0x0a], page[0x0b]]), 1, "one fragment again");
+        assert_eq!(page_entry(page, 0), 0x0c, "it starts where the header ends");
+        assert_eq!(page_entry(page, 1), 0x17, "and the boundary is 11 bytes past that");
+        assert_eq!(&page[0x0c..0x17], b"EMO NORMAL\0", "the new body");
+        assert_eq!(
+            u16::from_le_bytes([page[0x04], page[0x05]]),
+            2,
+            "the third write of this page: the insert, the delete and this insert"
+        );
+        assert_eq!(crate::verify::written(&path), Ok(()), "after the re-insert");
+
+        block.records = None;
+        let after = block.records().expect("a fresh read from disk");
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after.physical(0).expect("the record").bytes,
+            variable_record("Next", b"EMO NORMAL\0"),
+            "its fixed part and its body, both whole"
+        );
+    }
+
     /// `position` is a module's word for a file offset, not a slot this layer
     /// chose -- deleting at one the model does not recognise must refuse
     /// rather than clear whatever bytes happen to be there.

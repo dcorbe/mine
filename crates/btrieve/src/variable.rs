@@ -327,6 +327,20 @@ impl Header {
     /// page compares four bytes `[tag_lo][tag_hi][logical_lo][logical_hi]`
     /// against a physical page number and can never hold; that is the
     /// reading this refuses by construction rather than by a runtime check.
+    ///
+    /// # Zero fragments
+    ///
+    /// A **version 5** page may report zero, and this reads it. Measured in
+    /// `crates/btrieve-oracle/fixtures/v5_variable_release_empty.fixture`:
+    /// genuine Btrieve deletes the only record on the file and leaves its
+    /// variable page 5 in the file, at `0x1400`, reading `00 00 05 00` /
+    /// stamp `01 00` / free chain `ff 00 ff ff` / fragment count `00 00`,
+    /// with entry 0 at `0x17fe` still naming `0x0c`. See
+    /// [`free_fragment`]'s own doc comment for the whole page.
+    ///
+    /// A **version 6** page may not. Nothing has recorded what that engine
+    /// leaves behind, and [`free_fragment_v6`] refuses to make one, so the
+    /// shape stays refused rather than guessed at from its v5 sibling.
     fn read(page: &[u8], asked: u32, version: Version) -> Result<Self, String> {
         if page.len() < FIRST_FRAGMENT as usize {
             return Err(format!(
@@ -360,9 +374,16 @@ impl Header {
             return Err(format!("page {asked} says it is page {number}"));
         }
         let fragments = u16::from_le_bytes([page[FRAGMENT_COUNT], page[FRAGMENT_COUNT + 1]]);
-        if fragments == 0 || fragments > MAX_FRAGMENTS {
+        if fragments > MAX_FRAGMENTS {
             return Err(format!(
-                "{fragments} fragments, and a page holds between 1 and {MAX_FRAGMENTS}"
+                "{fragments} fragments, and a page holds at most {MAX_FRAGMENTS}"
+            ));
+        }
+        if fragments == 0 && version == Version::V6 {
+            return Err(format!(
+                "page {asked} reports 0 fragments, and nothing has recorded what a \
+                 version 6 page looks like once its last fragment is freed -- see \
+                 this function's own doc comment"
             ));
         }
         Ok(Self {
@@ -898,15 +919,17 @@ pub(crate) fn rewrite_fragment_in_place_v6<P: PagesMut>(
 ///   standard [`rewrite_fragment_in_place_v6`] already holds itself to.
 /// - **Freeing the only fragment on a page** (`header.fragments == 1`).
 ///   The trailing derivation above decrements the count to zero, and
-///   [`Header::read`] refuses any page reporting zero fragments
-///   (`fragments == 0 || fragments > MAX_FRAGMENTS`) -- so writing this
-///   would leave a page this crate's own reader cannot open again. Whether
-///   genuine Btrieve reclaims the whole page, leaves a zero-fragment marker
-///   this host's reader does not understand, or something else, is not in
-///   the oracle ladder above (every page it measured kept at least one
-///   fragment) -- refused rather than guessed. An oracle rig that empties a
-///   page completely (`varfree.c`'s own delete command, driven past the
-///   point every fragment on one page is gone) would settle it.
+///   [`Header::read`] refuses a **version 6** page reporting zero fragments
+///   -- so writing this would leave a page this crate's own reader cannot
+///   open again. Whether genuine Btrieve reclaims the whole page, leaves a
+///   zero-fragment marker this host's reader does not understand, or
+///   something else, is not in the oracle ladder above (every page it
+///   measured kept at least one fragment) -- refused rather than guessed.
+///   The v5 side of this **is** measured now
+///   (`v5_variable_release_empty.fixture`: the page stays where it is,
+///   holding nothing -- see [`free_fragment`]), and there it is allowed;
+///   nothing has recorded a v6 file doing the same, so this stays refused
+///   rather than borrowing its sibling's answer.
 /// - **An entry between `which` and the boundary that is already `0xffff`.**
 ///   The interior branch rebases every one of those entries by subtracting
 ///   the freed length; doing that to an already-`0xffff` entry corrupts the
@@ -1010,9 +1033,10 @@ pub(crate) fn free_fragment_v6<P: PagesMut>(
             return Err(format!(
                 "logical page {}: fragment {} is the only one on its page, and \
                  freeing it would leave the page reporting 0 fragments -- a shape \
-                 `Header::read` refuses and no oracle recording reaches (every \
-                 delete `docs/2026-08-17-variable-write-oracle.md` measured left \
-                 at least one fragment behind)",
+                 `Header::read` refuses for version 6 and no version 6 recording \
+                 reaches (every delete `docs/2026-08-17-variable-write-oracle.md` \
+                 measured left at least one fragment behind; the v5 answer is \
+                 measured, see `free_fragment`, and is not borrowed here)",
                 pointer.page, pointer.fragment
             ));
         }
@@ -1164,14 +1188,70 @@ pub(crate) fn free_fragment_v6<P: PagesMut>(
 /// - **A chained fragment** ([`Fragment::continued`], the v5 entry's
 ///   `0x8000` bit). Freeing every hop of a chain is a walk this host has not
 ///   measured -- the same standard [`free_fragment_v6`] holds itself to.
-/// - **Emptying the page.** The engine's answer is to release the page
-///   altogether (`FUN_00418dc0`, reached when the count hits zero), and a v5
-///   file has no measured way to release a physical page: nothing in
-///   [`super::pages::fcr`] holds a free *page* list for v5 (`fcr::FREE`
-///   holds record slots -- see [`V5Pages`]), and a page left reporting zero
-///   fragments is one [`Header::read`] refuses to open again. Refused rather
-///   than guessed, which is also why the count that would result is worked
-///   out before a byte is written.
+///
+/// # Emptying the page, which is now measured too
+///
+/// This used to be the second refusal here: freeing a page's only fragment
+/// takes the count to zero, and what genuine Btrieve did with the emptied
+/// page had not been recorded. Two more recordings settle it, both driven
+/// against the same seed file and both carrying six 1,024-byte pages
+/// afterwards.
+///
+/// **`v5_variable_release_empty.fixture`** -- open, insert `Only` (body
+/// `"EMO\0"`, 4 bytes), get it, **delete it**, get it again (status 4),
+/// close. Statuses `0,0,0,0,4,0`. Its page 5 (file offset `0x1400`):
+///
+/// ```text
+/// 0x1400  00 00 05 00   PAGE_NUMBER = 5, still page 5 of a six-page file
+/// 0x1404  01 00         modification stamp = 1
+/// 0x1406  ff 00 ff ff   FREE_CHAIN = FreeChain::Last, unchanged by the delete
+/// 0x140a  00 00         FRAGMENT_COUNT = 0
+/// 0x140c  ..0x17fc      every byte zero
+/// 0x17fc  00 00         entry 1, the old boundary, zeroed
+/// 0x17fe  0c 00         entry 0, the new boundary, back to FIRST_FRAGMENT
+/// ```
+///
+/// and its control record:
+///
+/// ```text
+/// 0x10  00 00 06 10   fcr::FREE = 0x1006, the record slot the delete freed
+/// 0x1c  00 00 00 00   the file holds no records
+/// 0x26  00 00 06 00   fcr::PAGES = 6, unchanged -- the page is still there
+/// 0x39  00           no longer virgin
+/// 0x3a  05 00        VARIABLE_HIGHEST = 5, unchanged -- still the chain head
+/// ```
+///
+/// So, **measured**: genuine does not release, truncate, relink or blank the
+/// emptied page. It leaves it exactly where it is, on the free-space chain
+/// where it already was, holding no fragments, with the boundary entry back
+/// at [`FIRST_FRAGMENT`] and the freed body zeroed -- which is byte for byte
+/// what rule 3 above (the trailing collapse) already produces, with the
+/// count reaching zero instead of stopping at one. Neither `fcr::PAGES` nor
+/// `VARIABLE_HIGHEST` is touched. Whatever `FUN_00418dc0` does, it does not
+/// do it to a v5 file's variable page.
+///
+/// **`v5_variable_release_reinsert.fixture`** -- the same up to the delete,
+/// then insert `Next` (body `"EMO NORMAL\0"`, 11 bytes), get `next` through
+/// the ACS, close. Statuses `0,0,0,0,0,0,0`. Its page 5:
+///
+/// ```text
+/// 0x1400  00 00 05 00   PAGE_NUMBER = 5 -- the SAME page, nothing was claimed
+/// 0x1404  02 00         modification stamp = 2, one more than the delete left
+/// 0x1406  ff 00 ff ff   FREE_CHAIN = FreeChain::Last
+/// 0x140a  01 00         FRAGMENT_COUNT = 1
+/// 0x140c  "EMO NORMAL\0"                  fragment 0, 11 bytes, to 0x1417
+/// 0x17fc  17 00 0c 00                     entry 1 (boundary), entry 0
+/// ```
+///
+/// with the record's own pointer at `0x1025` reading `00 05 00 00` -- page
+/// 5, fragment 0 -- `fcr::PAGES` still 6 and `VARIABLE_HIGHEST` still 5. So
+/// the emptied page is **reused**: the next insert walks the chain, finds
+/// page 5 with room, and appends fragment 0 to it exactly as it would to any
+/// other part-full page. [`Space`] needs no new branch for it, only a
+/// [`Header::read`] that will open a zero-fragment page.
+///
+/// The two stamps are also what pinned [`V5Pages`]'s stamp rule to the write
+/// counter it is: 1 after two writes of the page, 2 after three.
 ///
 /// # What is written
 ///
@@ -1215,7 +1295,9 @@ pub(crate) fn free_fragment<P: PagesMut>(
     // How many entries this free takes out of the array: one for the
     // fragment itself, plus the run of already-freed slots the engine's
     // trailing branch collapses along with it. Zero for an interior free,
-    // whose array keeps every entry it has.
+    // whose array keeps every entry it has. It may take out every entry the
+    // page has, which leaves the page holding nothing -- what genuine does
+    // there is measured, see this function's own doc comment.
     let collapsed = if which + 1 == fragments {
         let mut collapsed = 1;
         while collapsed <= which && entry(&page, which - collapsed)? == UNUSED {
@@ -1225,15 +1307,6 @@ pub(crate) fn free_fragment<P: PagesMut>(
     } else {
         0
     };
-    if fragments == collapsed {
-        return Err(format!(
-            "page {}: freeing fragment {} would leave the page holding no fragments at \
-             all, and releasing a v5 page is not implemented -- see this function's own \
-             doc comment",
-            pointer.page, pointer.fragment
-        ));
-    }
-
     let mut rewritten = page;
     let boundary = entry(&rewritten, fragments)? as usize;
     if boundary == UNUSED as usize {
@@ -1501,9 +1574,20 @@ impl PageSource for V6Pages<'_> {
 ///   genuine variable pages it is one less than the fragment count: 1 with
 ///   2 fragments here, `2b 00` (43) with `2c 00` (44) fragments on the grow
 ///   scenario's page 5 at `0x1400`, `0f 00` (15) with `10 00` (16) on its
-///   page 10 at `0x2800`. Reproduced as a counter incremented by every write
-///   *after* the one that fills a blank page, which is the same number for
-///   an insert-only history and the reading that survives a delete (Task 5).
+///   page 10 at `0x2800`. That equality is a coincidence of an insert-only
+///   history, one write per fragment; the field is a **counter of writes
+///   since the page was created**, starting at zero. Three later recordings
+///   separate the two readings, and all three say counter:
+///   `v5_variable_delete.fixture` reads 3 on a page written four times but
+///   holding two fragments, `v5_variable_release_empty.fixture` reads 1 on a
+///   page written twice and holding **none**, and
+///   `v5_variable_release_reinsert.fixture` reads 2 on a page written three
+///   times and holding one.
+///
+///   [`claim`](PageSource::claim) writing the blank page to disk is this
+///   crate's own step, not the engine's -- genuine builds the page and its
+///   first fragment in one write -- so that write does not count, and
+///   [`V5Pages::claimed`] is what remembers it.
 /// - `0x06..0x0a` [`FREE_CHAIN`]: `ff 00 ff ff`, [`FreeChain::Last`]. What
 ///   [`Space::reoffer`] already writes for a fresh page joining an empty
 ///   chain.
@@ -1548,6 +1632,18 @@ impl PageSource for V6Pages<'_> {
 /// not already have.
 pub(crate) struct V5Pages<'a> {
     file: FilePages<'a>,
+
+    /// The page [`PageSource::claim`] last appended, until something writes
+    /// over it.
+    ///
+    /// `claim` has to put its blank page on disk so [`Space::place`] can
+    /// read it back ([`claim`](PageSource::claim)'s own doc comment says
+    /// why), but genuine Btrieve writes a new variable page **once**, with
+    /// its first fragment already on it. So that blank write is an artefact
+    /// of this crate's own split, and the real write that follows it carries
+    /// stamp 0 rather than 1. This field is what tells the two apart; see
+    /// [`V5Pages::stamped`].
+    claimed: Option<u32>,
 }
 
 impl<'a> V5Pages<'a> {
@@ -1565,6 +1661,7 @@ impl<'a> V5Pages<'a> {
     pub(crate) fn new(path: &'a std::path::Path, page_len: u16, pages: u32) -> Self {
         Self {
             file: FilePages::new(path, page_len, pages),
+            claimed: None,
         }
     }
 
@@ -1577,9 +1674,16 @@ impl<'a> V5Pages<'a> {
     /// The modification stamp a page should carry once `page` is written
     /// over whatever is on disk at `number`.
     ///
-    /// Zero for a page that is still blank (no fragments), one more than
-    /// what is there otherwise. See this type's doc comment for the three
-    /// genuine pages this reproduces.
+    /// Zero for the first real write onto a page [`PageSource::claim`] just
+    /// appended, one more than what is on disk for every write after that.
+    /// See this type's doc comment for the five genuine pages this
+    /// reproduces and for why the claim's own write does not count.
+    ///
+    /// **Not** "zero for a page holding no fragments", which is what this
+    /// said while a blank claim was the only way to reach a fragment count
+    /// of zero. `free_fragment` can leave a page empty now, and
+    /// `v5_variable_release_reinsert.fixture` writes a fragment back onto
+    /// exactly such a page: genuine stamps it 2, not 0.
     ///
     /// # Errors
     ///
@@ -1591,10 +1695,11 @@ impl<'a> V5Pages<'a> {
     /// pins.
     fn stamped(&mut self, number: u32, page: &mut [u8]) -> Result<(), String> {
         const STAMP: usize = 0x04;
-        let on_disk = self.file.page(number)?;
-        let stamp = if fragment_count(on_disk) == 0 {
+        let stamp = if self.claimed == Some(number) {
+            self.claimed = None;
             0
         } else {
+            let on_disk = self.file.page(number)?;
             u16::from_le_bytes([on_disk[STAMP], on_disk[STAMP + 1]]).wrapping_add(1)
         };
         page[STAMP..STAMP + 2].copy_from_slice(&stamp.to_le_bytes());
@@ -1639,6 +1744,9 @@ impl PageSource for V5Pages<'_> {
         // makes `FilePages::page` able to read it back afterwards.
         self.file.pages += 1;
         self.file.write_page(number, &page)?;
+        // This write is not one of the engine's; see the field's own doc
+        // comment and `stamped`.
+        self.claimed = Some(number);
         Ok(number)
     }
 
@@ -1654,11 +1762,12 @@ impl PageSource for V5Pages<'_> {
 /// more entry than the page has fragments, so even an empty page has entry 0,
 /// and it says where fragment 0 will begin.
 ///
-/// [`Header::read`] refuses a page with zero fragments, so this is not
-/// readable as a header until its first fragment lands. That is deliberate:
-/// [`Space::place`] writes the count and the entry together, and a page that
-/// is briefly neither one thing nor the other should not be readable as
-/// either.
+/// [`Header::read`] refuses a v6 page with zero fragments, so a blank v6
+/// page is not readable as a header until its first fragment lands. A blank
+/// v5 page is readable -- it has to be, since genuine leaves an emptied v5
+/// page in exactly this shape but on the free-space chain
+/// ([`free_fragment`]) -- and it is [`FREE_CHAIN`] that tells the two apart:
+/// a page here is off the chain, an emptied one is on it.
 fn blank_page(page_size: u16, version: Version) -> Vec<u8> {
     let len = usize::from(page_size);
     let mut page = vec![0u8; len];
@@ -1683,9 +1792,9 @@ fn set_chain(page: &mut [u8], chain: FreeChain) {
 /// Read entry `which` of a page as a plain offset, without going through
 /// [`Header`].
 ///
-/// [`Header::read`] refuses a page with zero fragments, and a page being built
-/// has zero fragments right up until its first one lands, so the allocator
-/// cannot reach its entries the way a reader does.
+/// A page being built has zero fragments right up until its first one
+/// lands, and for v6 [`Header::read`] refuses it, so the allocator cannot
+/// reach its entries the way a reader does.
 fn entry(page: &[u8], which: u32) -> Result<u32, String> {
     let at = entry_at(page.len() as u32, which)?;
     Ok(Entry::decode(&page[at..at + 2]).offset)
@@ -2393,7 +2502,7 @@ mod tests {
         let mut pages = Held(vec![blank(512), bytes]);
 
         let e = follow(&mut pages, pointer(1, 0)).expect_err("256 is the most");
-        assert!(e.contains("between 1 and 256"), "{e}");
+        assert!(e.contains("at most 256"), "{e}");
     }
 
     /// **Synthetic**, and not a case the engine or MBBSEmu handles: both would
@@ -3410,36 +3519,117 @@ mod tests {
         assert_eq!(&after[0x0c..0x0c + a.len()], a.as_slice(), "the survivor, untouched");
     }
 
-    /// The page would be left holding nothing, and releasing a v5 page is
-    /// not implemented -- refused before a byte is written, not after.
+    /// The page is left holding nothing, and stays exactly where it is.
+    /// `v5_variable_release_empty.fixture`'s own shape, in miniature: the
+    /// count reaches zero, the boundary entry goes back to
+    /// [`FIRST_FRAGMENT`], the entry above it is zeroed, the body is zeroed,
+    /// and the free-space chain field is not touched.
     #[test]
-    fn freeing_the_only_v5_fragment_on_a_page_is_refused() {
+    fn freeing_the_only_v5_fragment_on_a_page_empties_it_and_leaves_it_in_place() {
         let only = vec![0x5au8; 40];
-        let five = page(5, 256, &[(&only, false)]);
-        let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), five.clone()]);
+        let mut five = page(5, 256, &[(&only, false)]);
+        // On the chain and last, the way genuine's page 5 is
+        // (`ff 00 ff ff` at `0x1406`) before the delete that empties it.
+        set_chain(&mut five, FreeChain::Last);
+        let before = five.clone();
+        let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), five]);
 
-        let e = free_fragment(&mut pages, pointer(5, 0), None)
-            .expect_err("the page would report no fragments at all");
-        assert!(e.contains("no fragments at all"), "{e}");
-        assert_eq!(pages.0[5], five, "a refused free writes nothing");
+        let head = free_fragment(&mut pages, pointer(5, 0), Some(3)).expect("the only fragment");
+
+        assert_eq!(head, Some(3), "the page was already on the chain, so the head does not move");
+        let after = &pages.0[5];
+        assert_eq!(fragment_count(after), 0, "the page holds nothing");
+        assert_eq!(entry(after, 0), Ok(FIRST_FRAGMENT), "the boundary, back to where bodies start");
+        assert_eq!(entry(after, 1), Ok(0), "the entry the boundary used to sit in is zeroed");
+        assert!(
+            after[FIRST_FRAGMENT as usize..FIRST_FRAGMENT as usize + only.len()]
+                .iter()
+                .all(|b| *b == 0),
+            "the freed body is zeroed"
+        );
+        assert_eq!(&after[..FREE_CHAIN + 4], &before[..FREE_CHAIN + 4], "number and chain untouched");
+
+        let header = Header::read(after, 5, Version::V5).expect("an emptied v5 page still reads");
+        assert_eq!(header.fragments, 0);
+        assert_eq!(header.free_chain, FreeChain::Last, "still offered for new fragments");
     }
 
-    /// Same refusal when the tombstones before a trailing fragment would
-    /// take the count to zero with it.
+    /// The same, reached the other way: an interior free leaves a hole, and
+    /// the trailing free that follows collapses the hole with it and takes
+    /// the count to zero.
     #[test]
-    fn freeing_a_trailing_v5_fragment_that_would_empty_the_page_is_refused() {
+    fn freeing_a_trailing_v5_fragment_that_empties_the_page_collapses_every_entry() {
         let a = vec![0xa1u8; 20];
         let b = vec![0xb1u8; 10];
         let five = page(5, 256, &[(&a, false), (&b, false)]);
         let mut pages = Held(vec![blank(256), blank(256), blank(256), blank(256), blank(256), five]);
 
         free_fragment(&mut pages, pointer(5, 0), None).expect("interior");
-        let holed = pages.0[5].clone();
+        free_fragment(&mut pages, pointer(5, 1), None).expect("the hole before it collapses too");
 
-        let e = free_fragment(&mut pages, pointer(5, 1), None)
-            .expect_err("the hole before it collapses too, leaving nothing");
-        assert!(e.contains("no fragments at all"), "{e}");
-        assert_eq!(pages.0[5], holed, "a refused free writes nothing");
+        let after = &pages.0[5];
+        assert_eq!(fragment_count(after), 0, "both entries went");
+        assert_eq!(entry(after, 0), Ok(FIRST_FRAGMENT), "the boundary");
+        assert_eq!(entry(after, 1), Ok(0), "zeroed");
+        assert_eq!(entry(after, 2), Ok(0), "zeroed");
+        assert!(
+            after[FIRST_FRAGMENT as usize..FIRST_FRAGMENT as usize + a.len() + b.len()]
+                .iter()
+                .all(|b| *b == 0),
+            "both bodies are zeroed"
+        );
+    }
+
+    /// The insert that follows an emptying delete goes back onto the same
+    /// page rather than claiming a new one --
+    /// `v5_variable_release_reinsert.fixture`'s own answer, and it needs no
+    /// branch of its own in [`Space::place`]: the emptied page is still on
+    /// the free-space chain, so [`Space::room_for`] simply finds it.
+    #[test]
+    fn a_v5_insert_goes_back_onto_a_page_a_delete_emptied() {
+        let only = b"EMO\0".to_vec();
+        let mut five = page(5, 1024, &[(&only, false)]);
+        set_chain(&mut five, FreeChain::Last);
+        let mut source = Scratch::new(1024, Version::V5);
+        for _ in 0..4 {
+            source.claim(&blank_page(1024, Version::V5)).expect("filler");
+        }
+        source.claim(&five).expect("the page under test");
+
+        // Empty it the way a delete does, through the free side.
+        let head = free_fragment(&mut source, pointer(5, 0), Some(5)).expect("the only one");
+        assert_eq!(head, Some(5), "the page was already on the chain; the head does not move");
+
+        let body = b"EMO NORMAL\0".to_vec();
+        let mut space = Space::new(&mut source, Version::V5, head);
+        let placed = space.place(&body).expect("the emptied page takes it");
+
+        assert_eq!(placed, pointer(5, 0), "fragment 0 of the same page; nothing was claimed");
+        assert_eq!(source.claimed(), 5, "still five pages past the control record");
+        let after = source.pages[5].clone();
+        assert_eq!(fragment_count(&after), 1);
+        assert_eq!(entry(&after, 0), Ok(FIRST_FRAGMENT));
+        assert_eq!(entry(&after, 1), Ok(FIRST_FRAGMENT + body.len() as u32));
+        assert_eq!(&after[0x0c..0x0c + body.len()], body.as_slice(), "the new body");
+    }
+
+    /// The v5 allowance is v5's alone: nothing has recorded what a version 6
+    /// engine leaves behind, so [`Header::read`] still refuses the shape
+    /// there.
+    #[test]
+    fn a_v6_page_reporting_no_fragments_is_still_refused() {
+        let mut six = page_v6(7, 256, &[&[0xff, 0xff, 0xff, 0xff, 0x11]]);
+        set_fragment_count(&mut six, 0);
+        set_entry(&mut six, 0, FIRST_FRAGMENT).expect("the boundary");
+
+        let e = Header::read(&six, 7, Version::V6).expect_err("v6 has no measurement for this");
+        assert!(e.contains("0 fragments"), "{e}");
+
+        let mut five = page(7, 256, &[(&[0x11u8][..], false)]);
+        set_fragment_count(&mut five, 0);
+        set_entry(&mut five, 0, FIRST_FRAGMENT).expect("the boundary");
+        let header = Header::read(&five, 7, Version::V5).expect("v5 reads it");
+        assert_eq!(header.fragments, 0);
     }
 
     /// A chained fragment is refused, the same way the v6 free and both

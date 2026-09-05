@@ -76,11 +76,11 @@ use btrieve_oracle::Request;
 /// The fewest fixtures a clean run must find. Pinned at the number
 /// `crates/btrieve-oracle/fixtures/` carries today (`open_close`,
 /// `insert_get_step_stat`, `update_and_delete`,
-/// `status_ten_refusal_and_same_value_rewrite`, and the three
+/// `status_ten_refusal_and_same_value_rewrite`, and the five
 /// `v5_variable_*` recordings) so a run that silently finds zero fixtures --
 /// a moved directory, a build that never copied them, a glob that stopped
 /// matching -- fails loudly instead of reporting a clean sweep of nothing.
-const MIN_SCENARIOS: usize = 7;
+const MIN_SCENARIOS: usize = 9;
 
 /// Decodes a `B_CREATE` request's `databuf` into the [`FileSpec`] shape
 /// [`btrieve::create`] accepts.
@@ -494,7 +494,7 @@ fn diff_bytes(name: &str, at: &str, ours: &[u8], genuine: &[u8]) {
 /// clear (`pages::Header::decode`, so no record page qualifies), the first
 /// four bytes decode -- high word first, `pages::long` -- to the page's own
 /// physical number ([`variable::Header::read`]'s v5 check), the fragment
-/// count at `0x0a` is between 1 and 256, and entry 0, the last two bytes of
+/// count at `0x0a` is **0** to 256, and entry 0, the last two bytes of
 /// the page, names `0x0c` (`W32MKDE_decompiled.c:19035`: fragment 0 starts
 /// where the header ends, or the engine refuses the file with status 54).
 ///
@@ -502,6 +502,18 @@ fn diff_bytes(name: &str, at: &str, ours: &[u8], genuine: &[u8]) {
 /// which also clears the data bit and also opens with its own page number:
 /// an index page's tail is its unused entry space, all zero, so its entry 0
 /// reads `0x0000`.
+///
+/// # Why zero fragments counts
+///
+/// It used to be 1 to 256, and that would have made this comparison skip
+/// the one page `v5_variable_release_empty.fixture` was recorded to pin:
+/// genuine deletes the file's only record and leaves its variable page in
+/// place holding **no** fragments (`variable::free_fragment`'s own doc
+/// comment has the bytes). A skipped page is not a passing comparison -- it
+/// is no comparison -- so the floor is 0 and the entry-0 rule is what keeps
+/// an index page out. Checked rather than assumed: across all nine
+/// committed fixtures the relaxation changes exactly one classification,
+/// that fixture's page 5, and adds nothing anywhere else.
 fn variable_pages(file: &[u8], page: usize) -> Vec<(u32, &[u8])> {
     const DATA_BIT: u16 = 0x8000;
     const FRAGMENT_COUNT: usize = 0x0a;
@@ -519,7 +531,7 @@ fn variable_pages(file: &[u8], page: usize) -> Vec<(u32, &[u8])> {
             let entry_zero = u16le(bytes, page - 2);
             (u16le(bytes, 4) & DATA_BIT == 0
                 && long(bytes) == number as u32
-                && (1..=MAX_FRAGMENTS).contains(&fragments)
+                && fragments <= MAX_FRAGMENTS
                 && entry_zero == FIRST_FRAGMENT)
                 .then_some((number as u32, bytes))
         })
