@@ -1484,4 +1484,42 @@ mod tests {
             "the session's own value reached the file, not the one huprou left behind"
         );
     }
+
+    /// A module that overwrites the slot's `userid` does not get a stranger's
+    /// record written over: key 0 is not modifiable ([`account_spec`]), the
+    /// engine refuses an update that changes it -- status 10 in genuine
+    /// Btrieve 6.15 -- and the logoff stops the machine with the file
+    /// untouched.
+    #[test]
+    fn a_scribbled_userid_in_the_slot_stops_the_machine_at_logoff() {
+        let mut f = opened("login-scribbled-userid");
+        signup(&mut f, "Dan", "hunter2");
+        set_usedat(&mut f, "Dan", 0);
+        register_module(&mut f, &[]);
+        let module = f.minimal_module();
+        let chan = f.host.users().terms().chan(0).unwrap();
+        f.host
+            .login(
+                &mut f.machine,
+                &module,
+                chan,
+                &Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+                term(),
+            )
+            .unwrap()
+            .unwrap();
+
+        // "Ran", where the record says "Dan".
+        write_slot_byte(&mut f, chan, at::USERID, b'R');
+        let out = f.host.hangup(&mut f.machine, &module, chan).expect("hung up");
+        assert!(
+            matches!(out, Some(crate::Outcome::Stopped(_))),
+            "the engine refused the update, so the logoff is a stop: {out:?}"
+        );
+
+        let (_, rec) = find(&mut f, "Dan");
+        assert_eq!(rec.userid(), "Dan", "the account is still the one that logged in");
+        assert_eq!(rec.usedat(), 0, "the refused update wrote nothing at all");
+        assert!(find_opt(&mut f, "Ran").is_none(), "and no account was created under the scribble");
+    }
 }

@@ -6330,10 +6330,24 @@ impl<A: Abi> Host<A> {
     /// to do" as well as "done"; the `Some` is a stop.
     ///
     /// The position was remembered at login rather than looked up again by
-    /// userid, which is what makes this safe against the one thing a module
-    /// can do to the slot that a re-lookup could not survive: overwrite the
-    /// `userid` field. The vendor's `usaptr` is the same promise in pointer
-    /// form.
+    /// userid, and what that buys is one thing exactly: the write lands on
+    /// the record this session loaded, never on some other account a lookup
+    /// by name happened to find. It does **not** make a scribbled `userid`
+    /// survivable. Key 0 is not modifiable ([`accounts::account_spec`]), so
+    /// an update that would change it is refused -- genuine Btrieve 6.15
+    /// answers status 10 and writes nothing, and `Block::update` refuses for
+    /// that reason -- and the logoff becomes a stop with the file's record
+    /// left exactly as it was. See
+    /// `a_scribbled_userid_in_the_slot_stops_the_machine_at_logoff`. The
+    /// vendor's `usaptr` is the same promise in pointer form.
+    ///
+    /// **None of the three error arms below clears the session or resets the
+    /// channel**, and that is deliberate rather than an omission: an
+    /// [`Outcome::Stopped`] poisons the machine, and what follows a stop is
+    /// `mbbs-server`'s `tear_down` (`crates/mbbs-server/src/host.rs:608`),
+    /// which ends the whole life -- every channel torn down, the next life
+    /// started fresh. Per-channel cleanup after a stop is bookkeeping
+    /// nothing ever reads again.
     ///
     /// This host's `curusr` equivalent, [`Host::point_curusr`], is not
     /// needed first: the slot is addressed from `chan` and no global is
