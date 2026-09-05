@@ -6022,11 +6022,128 @@ impl<A: Abi> Host<A> {
         /// `finrou`'s position in `struct module` after `descrp`. See
         /// [`Registration::dispatch`], whose own doc fixes the order.
         const FINROU: usize = 8;
-        self.sweep(machine, module, FINROU, dispatched)
+        self.sweep(machine, module, FINROU, &[], dispatched)
     }
 
-    /// `midnit` -- `MAJORBBS.C:3899-3917`: every module's `mcurou`, in
-    /// registration order, with `clingo` reset to 0 first.
+    /// `accmcu` -- `ACCOUNT.C:1125-1207` -- the deletion half: every account
+    /// the sysop tagged is deleted, every module is told, and the account's
+    /// key ring goes with it. Answers how many accounts were purged.
+    ///
+    /// Two passes over the account file, and they cannot be one:
+    /// [`Accounts::tagged_for_deletion`](accounts::Accounts::tagged_for_deletion)
+    /// collects the whole list before anything is deleted, because a delete
+    /// moves the cursor the walk would be standing on.
+    ///
+    /// Each account is then `lowdel`, `ACCOUNT.C:1330-1356`, in the vendor's
+    /// own order: `dfaDelete` on `accbb`, then the `dlarou` loop, then
+    /// `dlkeys`. The order is the contract. A module's `dlarou` is what
+    /// deletes that module's own per-player rows, and it is entitled to read
+    /// the account file while it does -- so the record must already be gone
+    /// -- while the key ring must still be there for a `dlarou` that asks
+    /// what keys the departing user held.
+    ///
+    /// `dlarou` is handed a pointer to
+    /// [`Accounts::userid_scratch`](accounts::Accounts), 30 bytes of module
+    /// memory reserved once at open, rewritten per account. A fresh
+    /// allocation per call would draw on the same finite descriptor pool the
+    /// module's own heap grows from, once per deleted account per boot.
+    ///
+    /// A module that stops the machine ends the purge where it stands:
+    /// `Ok(Err(poison))`, with that account's record already deleted and its
+    /// ring still in the file. Nothing is rolled back, because a poisoned
+    /// machine cannot be asked to run the rest of the sweep and the next
+    /// boot's purge finds the ring by its own owner name -- see
+    /// [`Host::cleanup`], which does not go on to the `mcurou` sweep.
+    ///
+    /// A host whose account files are not open purges nothing and says so
+    /// with a count of zero. That is every fixture and every board built
+    /// before the account layer existed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the Btrieve engine refused, a registration whose `struct
+    /// module` no longer names memory the module owns, or the scratch no
+    /// longer naming `UIDSIZ` writable bytes of module memory.
+    pub fn purge_accounts(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        dispatched: &mut usize,
+    ) -> io::Result<Result<usize, A::Poison>> {
+        /// `dlarou`'s position in `struct module` after `descrp`. See
+        /// [`Registration::dispatch`], whose own doc fixes the order.
+        const DLAROU: usize = 7;
+
+        // Copied out rather than borrowed: every step below needs `&mut
+        // self`, and `A::Ptr` is `Copy`.
+        let Some((accbb, keysbb, scratch)) = self
+            .accounts
+            .as_ref()
+            .map(|accounts| (accounts.accbb, accounts.keysbb, accounts.userid_scratch))
+        else {
+            return Ok(Ok(0));
+        };
+
+        let tagged = {
+            let Host { btrieve, accounts, .. } = self;
+            let accounts = accounts.as_ref().expect("the accounts this method checked at its top");
+            accounts.tagged_for_deletion(btrieve).map_err(io::Error::other)?
+        };
+
+        for (position, record) in &tagged {
+            let userid = record.userid().to_owned();
+
+            self.btrieve
+                .block_mut(accbb)
+                .map_err(io::Error::other)?
+                .delete(*position)
+                .map_err(|why| io::Error::other(format!("deleting the account {userid}: {why}")))?;
+
+            // NUL-padded to `UIDSIZ`, which is what the scratch was reserved
+            // at and what a `CHAR uid[UIDSIZ]` argument looks like to the
+            // module.
+            scratch
+                .write(A::mem(machine), &accounts::Usracc::key(&userid))
+                .map_err(|e| io::Error::other(format!("handing {userid} to dlarou: {e}")))?;
+
+            if let Some(poison) = self.sweep(
+                machine,
+                module,
+                DLAROU,
+                &[crate::abi::Arg::Ptr(scratch)],
+                dispatched,
+            )? {
+                return Ok(Err(poison));
+            }
+
+            // `dlkeys`. An account with no ring is not a fault: a crash
+            // between `provision`'s two writes leaves exactly that, and the
+            // purge is what finally clears it up.
+            let ring = {
+                let Host { btrieve, accounts, .. } = self;
+                let accounts = accounts.as_ref().expect("the accounts this method checked at its top");
+                accounts.find_ring(btrieve, &userid).map_err(io::Error::other)?
+            };
+            if let Some((at, _)) = ring {
+                self.btrieve
+                    .block_mut(keysbb)
+                    .map_err(io::Error::other)?
+                    .delete(at)
+                    .map_err(|why| {
+                        io::Error::other(format!("deleting the key ring {userid}: {why}"))
+                    })?;
+            }
+
+            // `shocst("USER ACCOUNT DELETED","User-ID: %-29.29s",...)`,
+            // `ACCOUNT.C:1352-1353`.
+            self.note(format!("USER ACCOUNT DELETED User-ID: {userid:<29}"));
+        }
+        Ok(Ok(tagged.len()))
+    }
+
+    /// `midnit` -- `MAJORBBS.C:3899-3917`: the account purge, then every
+    /// module's `mcurou`, in registration order, with `clingo` reset to 0
+    /// first.
     ///
     /// The vendor runs this after `hupall` has hung every user up and before
     /// `mjrfin` runs every `finrou`. A driver must keep that order: `huprou`
@@ -6034,10 +6151,17 @@ impl<A: Abi> Host<A> {
     /// world's. See [`Host::finalize`] for the sweep's own rules, which are
     /// shared.
     ///
+    /// `accmcu` before the `mcurou` sweep, because `MAJORBBS.C:3905-3909`
+    /// has it there: a module's `mcurou` is entitled to see an account file
+    /// the night's deletions have already been taken out of. A purge that
+    /// stopped the machine ([`Host::purge_accounts`]) therefore returns its
+    /// poison from here with the sweep not run at all -- the same rule the
+    /// sweep already keeps between two modules.
+    ///
     /// # Errors
     ///
     /// If a registration's `struct module` no longer names memory the module
-    /// owns, or `clingo` cannot be written.
+    /// owns, `clingo` cannot be written, or the purge hit the Btrieve engine.
     pub fn cleanup(
         &mut self,
         machine: &mut A::Cpu,
@@ -6049,12 +6173,22 @@ impl<A: Abi> Host<A> {
         // LINGO.H:41, and `midnit`'s `clingo=0` before each call.
         let mem = A::mem(machine);
         self.globals().write_int_mem(mem, "clingo", 0)?;
-        self.sweep(machine, module, MCUROU, dispatched)
+        if let Err(poison) = self.purge_accounts(machine, module, dispatched)? {
+            return Ok(Some(poison));
+        }
+        self.sweep(machine, module, MCUROU, &[], dispatched)
     }
 
-    /// Call entry `slot` of every registered module from index 1, skipping a
-    /// null, stopping at the first poison. The body [`Host::finalize`] and
-    /// [`Host::cleanup`] share. Its rules are documented on `finalize`.
+    /// Call entry `slot` of every registered module from index 1 with `args`,
+    /// skipping a null, stopping at the first poison. The body
+    /// [`Host::finalize`], [`Host::cleanup`] and [`Host::purge_accounts`]
+    /// share. Its rules are documented on `finalize`.
+    ///
+    /// `args` is empty for the two shutdown sweeps, whose vectors take none,
+    /// and one pointer for the purge's `dlarou(CHAR *uid)`. One loop rather
+    /// than two: the only thing the argument list changes is what [`Host::run`]
+    /// pushes, and a second copy of the walk would be a second place for the
+    /// null test and the poison rule to drift.
     ///
     /// The vendor's `midnit` and `mjrfin` have no watchdog, so the sweep
     /// lifts the call budget before it starts and puts it back once it is
@@ -6064,11 +6198,12 @@ impl<A: Abi> Host<A> {
         machine: &mut A::Cpu,
         module: &A::Module,
         slot: usize,
+        args: &[crate::abi::Arg<A>],
         dispatched: &mut usize,
     ) -> io::Result<Option<A::Poison>> {
         let budget = A::budget(machine);
         A::set_budget(machine, None);
-        let result = self.sweep_unbounded(machine, module, slot, dispatched);
+        let result = self.sweep_unbounded(machine, module, slot, args, dispatched);
         A::set_budget(machine, budget);
         result
     }
@@ -6081,6 +6216,7 @@ impl<A: Abi> Host<A> {
         machine: &mut A::Cpu,
         module: &A::Module,
         slot: usize,
+        args: &[crate::abi::Arg<A>],
         dispatched: &mut usize,
     ) -> io::Result<Option<A::Poison>> {
         let mut index = 1;
@@ -6092,7 +6228,7 @@ impl<A: Abi> Host<A> {
             // `struct module` to index and `AbsentBbs` is the slot this loop
             // starts past.
             if let Dispatch::Module(Some(vector)) = entry {
-                match self.run(machine, module, vector, &[], None)? {
+                match self.run(machine, module, vector, args, None)? {
                     Outcome::Stopped(poison) => return Ok(Some(poison)),
                     Outcome::Returned { .. } => *dispatched += 1,
                 }

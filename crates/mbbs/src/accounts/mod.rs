@@ -258,9 +258,6 @@ pub struct Accounts<A: Abi> {
     /// it inside a sweep over every deleted account in every module, and a
     /// fresh allocation per call would draw on the same finite descriptor
     /// pool the module's own heap grows from.
-    // Read by the maintenance purge, which does not exist yet. Comes off
-    // with it.
-    #[allow(dead_code)]
     pub(crate) userid_scratch: A::Ptr,
 }
 
@@ -386,6 +383,53 @@ impl<A: Abi> Accounts<A> {
             .block_mut(self.accbb)?
             .insert(&record.bytes)
             .map_err(|why| format!("writing the account {}: {why}", record.userid()))
+    }
+
+    /// Every account the sysop has tagged for deletion, and where each sits.
+    ///
+    /// `accmcu`'s own scan, `ACCOUNT.C:1164-1203`: a walk of the whole
+    /// account file in key order taking each record whose `DELTAG` is set and
+    /// whose `UNDAXS` is clear. `UNDAXS` is the "no deleting this one" flag
+    /// (`USRACC.H:64-68`); the vendor leaves such a record tagged and moves
+    /// on, so a sysop who tagged an account and locked it gets neither the
+    /// deletion nor a surprise.
+    ///
+    /// **The whole walk finishes before the caller deletes anything.** A
+    /// delete moves the cursor this walk is standing on, so a loop that
+    /// deleted as it went would skip records or read a position that no
+    /// longer names one. That is the reason this answers a `Vec` rather than
+    /// taking a callback, and it is why
+    /// [`Host::purge_accounts`](crate::Host::purge_accounts) is two passes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the engine refused. A record the walk found and then could
+    /// not read is an error too, not a skip: the file said it is there.
+    pub(crate) fn tagged_for_deletion(
+        &self,
+        btrieve: &mut Btrieve<AbiMem<A>>,
+    ) -> Result<Vec<(u32, Usracc)>, String> {
+        let block = btrieve.block_mut(self.accbb)?;
+        let mut tagged = Vec::new();
+        let mut op = Op::Lowest;
+        while block
+            .query(0, op, &[0u8; UIDSIZ])
+            .map_err(|why| format!("walking the account file: {why}"))?
+        {
+            let record = block.current().ok_or_else(|| {
+                "the account file walked onto a record it then could not read".to_owned()
+            })?;
+            let position = record.position;
+            let account = Usracc::from_bytes(record.bytes);
+            // Named rather than called twice, and not `flags`: that is the
+            // module the two constants come out of.
+            let word = account.flags();
+            if word & flags::DELTAG != 0 && word & flags::UNDAXS == 0 {
+                tagged.push((position, account));
+            }
+            op = Op::Next;
+        }
+        Ok(tagged)
     }
 
     /// The key ring `owner` owns, and where it sits.

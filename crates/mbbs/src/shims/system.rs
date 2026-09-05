@@ -2845,6 +2845,306 @@ mod tests {
         assert_eq!(clingo, 0, "cleanup must write clingo=0 before sweeping");
     }
 
+    /// A board whose account pair is open, over a scratch directory of its
+    /// own. One channel is enough: nothing here connects a channel, and
+    /// `resolve_login` never touches one.
+    fn purge_board(name: &str) -> Fixture {
+        let mut f = Fixture::rooted(crate::testing::scratch(name));
+        f.host
+            .open_accounts(&mut f.machine, vec!["DEMO".into()])
+            .expect("accounts");
+        f
+    }
+
+    /// Sign `who` up, the way a listener's first claim does.
+    fn signup(f: &mut Fixture, who: &str) {
+        let terminal = crate::accounts::Terminal { ansi: true, width: 80, height: 24 };
+        f.host
+            .resolve_login(
+                &mut f.machine,
+                &crate::accounts::Login::Signup {
+                    userid: who.to_owned(),
+                    password: "x".to_owned(),
+                },
+                terminal,
+            )
+            .expect("no engine fault")
+            .expect("accepted");
+    }
+
+    /// Set one account's flags word in the file, the way the `mbbs-user` CLI
+    /// does: read the record, change it, write it back at the same position.
+    fn set_account_flags(f: &mut Fixture, userid: &str, flags: u16) {
+        let Host { btrieve, accounts, .. } = &mut f.host;
+        let accounts = accounts.as_mut().expect("accounts are open");
+        let (position, mut record) = accounts
+            .find_account(btrieve, userid)
+            .expect("no engine fault")
+            .expect("the account exists");
+        record.set_flags(flags);
+        btrieve
+            .block_mut(accounts.accbb)
+            .expect("the account block")
+            .update(position, &record.bytes)
+            .expect("written back");
+    }
+
+    /// What the account file holds for `userid`, read back through the
+    /// engine rather than from any copy this test kept.
+    fn find_account(f: &mut Fixture, userid: &str) -> Option<(u32, crate::accounts::Usracc)> {
+        let Host { btrieve, accounts, .. } = &mut f.host;
+        let accounts = accounts.as_mut().expect("accounts are open");
+        accounts.find_account(btrieve, userid).expect("no engine fault")
+    }
+
+    /// The mirror of [`find_account`] over the key file.
+    fn find_ring(f: &mut Fixture, owner: &str) -> Option<(u32, crate::accounts::Keyrec)> {
+        let Host { btrieve, accounts, .. } = &mut f.host;
+        let accounts = accounts.as_mut().expect("accounts are open");
+        accounts.find_ring(btrieve, owner).expect("no engine fault")
+    }
+
+    /// 16-bit code for a `dlarou(CHAR *uid)` that records the offset word of
+    /// the far pointer it was handed at `seen`, then returns.
+    ///
+    /// On entry `SP` names the frame [`mbbs_machine::m16::Machine::call`]
+    /// laid down: return offset, return selector, then the argument words.
+    /// So `SS:[SP+4]` is the pointer's offset and `SS:[SP+6]` its selector --
+    /// the same two words a compiled routine reads as `[bp+6]`/`[bp+8]` once
+    /// it has pushed `BP`. This does not bother with `BP`; it never calls
+    /// anything.
+    ///
+    /// The store itself is `lib.rs`'s `marker_stub` encoding widened to a
+    /// word: `ES` through `BX`, then a segment-overridden `mov`.
+    fn dlarou_that_records_its_arg(seen: FarPtr) -> Vec<u8> {
+        let mut code = vec![
+            0x89, 0xe3, // mov bx, sp
+            0x36, 0x8b, 0x47, 0x04, // mov ax, ss:[bx+4]  -- argument zero, low word
+            0xbb, // mov bx, <seen.selector>
+        ];
+        code.extend_from_slice(&seen.selector.to_le_bytes());
+        code.extend_from_slice(&[0x8e, 0xc3]); // mov es, bx
+        code.extend_from_slice(&[0x26, 0x89, 0x06]); // mov es:[seen.offset], ax
+        code.extend_from_slice(&seen.offset.to_le_bytes());
+        code.push(0xcb); // retf
+        code
+    }
+
+    /// 16-bit code for an `mcurou` that stores 1 at `mark` and returns.
+    ///
+    /// `lib.rs`'s `marker_stub`, duplicated for the reason this module's
+    /// other fixtures are. Both purge tests build it, which is what makes
+    /// "the marker still reads 0" a fact about the sweep rather than about
+    /// the encoding: the test that expects the routine to run watches it
+    /// write, and the test that expects it not to run uses the same bytes.
+    fn mcurou_marker(mark: FarPtr) -> Vec<u8> {
+        let mut code = vec![0xbb]; // mov bx, <mark.selector>
+        code.extend_from_slice(&mark.selector.to_le_bytes());
+        code.extend_from_slice(&[0x8e, 0xc3]); // mov es, bx
+        code.extend_from_slice(&[0x26, 0xc6, 0x06]); // mov byte ptr es:[mark], 1
+        code.extend_from_slice(&mark.offset.to_le_bytes());
+        code.extend_from_slice(&[0x01, 0xcb]); // .. , retf
+        code
+    }
+
+    /// A word read back out of module memory.
+    fn read_word(f: &Fixture, at: FarPtr) -> u16 {
+        let bytes = f.machine.read(at, 2).expect("readable");
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    /// One byte read back out of module memory.
+    fn read_byte(f: &Fixture, at: FarPtr) -> u8 {
+        f.machine.read(at, 1).expect("readable")[0]
+    }
+
+    /// The maintenance purge: an account tagged for deletion is deleted,
+    /// every module's `dlarou` is called with its userid, and its key ring
+    /// goes too. `ACCOUNT.C:1164-1203` (`accmcu`) and `1330-1356` (`lowdel`).
+    ///
+    /// Three accounts, so the purge has to discriminate: `Keep` is untagged,
+    /// `Gone` is tagged, and `Locked` is tagged *and* `UNDAXS`, which
+    /// `accmcu` skips. `dlarou` is entry 7 and `mcurou` entry 6; the other
+    /// seven are null, so `dispatched` counting two says the purge called
+    /// entry 7 once -- for the one purged account -- and the cleanup sweep
+    /// called entry 6.
+    #[test]
+    fn cleanup_purges_tagged_accounts_and_calls_dlarou_with_the_userid() {
+        use crate::accounts::record::flags;
+
+        let mut f = purge_board("cleanup-purge");
+        let module = f.minimal_module();
+        for who in ["Keep", "Gone", "Locked"] {
+            signup(&mut f, who);
+        }
+        set_account_flags(&mut f, "Gone", flags::DELTAG);
+        set_account_flags(&mut f, "Locked", flags::DELTAG | flags::UNDAXS);
+
+        let seen = f.buffer(2);
+        let mark = f.buffer(1);
+        let mut code = dlarou_that_records_its_arg(seen);
+        let mcurou_at = u16::try_from(code.len()).expect("the stub is not 64 KiB long");
+        code.extend_from_slice(&mcurou_marker(mark));
+
+        let mut entries = vec![FarPtr { offset: 0, selector: 0 }; 9];
+        entries[7] = f.machine.code_ptr(0);
+        entries[6] = f.machine.code_ptr(mcurou_at);
+        let block = module_block(&mut f, "PURGE", &entries);
+        f.invoke(register_module, &Fixture::far(block)).expect("registered");
+
+        // After the invoke, for the reason `finalize`'s own test spells out:
+        // `Fixture::invoke` builds its trampoline at offset 0 of the scratch
+        // code segment, so a routine written there first is already gone.
+        f.machine.load_code(&code).expect("both stubs fit");
+
+        let mut dispatched = 0;
+        let stopped = f
+            .host
+            .cleanup(&mut f.machine, &module, &mut dispatched)
+            .expect("cleanup ran");
+
+        assert!(stopped.is_none(), "a retf dlarou returns, it does not stop: {stopped:?}");
+        assert_eq!(
+            dispatched, 2,
+            "one dlarou for the one purged account, then the one mcurou"
+        );
+        assert_eq!(read_byte(&f, mark), 1, "the cleanup sweep ran after the purge");
+        let scratch = f.host.accounts().expect("accounts are open").userid_scratch;
+        assert_eq!(
+            read_word(&f, seen),
+            scratch.offset,
+            "dlarou received the account layer's own userid scratch, not some other pointer"
+        );
+        assert_eq!(f.read(scratch), "Gone", "and it holds the purged userid");
+        assert!(find_account(&mut f, "Gone").is_none(), "the tagged account is gone");
+        assert!(find_account(&mut f, "Keep").is_some(), "an untagged account is left alone");
+        assert!(find_account(&mut f, "Locked").is_some(), "UNDAXS is never purged");
+        assert!(find_ring(&mut f, "Gone").is_none(), "its key ring went with it");
+        assert!(find_ring(&mut f, "Keep").is_some());
+        assert!(find_ring(&mut f, "Locked").is_some());
+        let announced: Vec<&String> = f
+            .host
+            .notes()
+            .iter()
+            .filter(|line| line.starts_with("USER ACCOUNT DELETED"))
+            .collect();
+        assert_eq!(announced.len(), 1, "one account was deleted, so one line: {announced:?}");
+        assert_eq!(
+            announced[0].trim_end(),
+            "USER ACCOUNT DELETED User-ID: Gone",
+            "the console hears which account went"
+        );
+    }
+
+    /// Two tagged accounts in one pass, which is the only shape that can
+    /// fail if the purge deleted as it walked.
+    ///
+    /// `tagged_for_deletion` collects the whole list before
+    /// [`Host::purge_accounts`](crate::Host::purge_accounts) deletes
+    /// anything, because a delete moves the cursor the walk is standing on.
+    /// With one tagged account a delete-as-you-go loop behaves identically,
+    /// so nothing else in this file can tell the two designs apart. `Keep`
+    /// sits between the two in `ALLCAPS` key order, so the walk also has to
+    /// carry on past a record it is not taking.
+    #[test]
+    fn every_tagged_account_is_purged_in_one_pass() {
+        use crate::accounts::record::flags;
+
+        let mut f = purge_board("cleanup-purge-two");
+        let module = f.minimal_module();
+        for who in ["Gone1", "Gone2", "Keep"] {
+            signup(&mut f, who);
+        }
+        set_account_flags(&mut f, "Gone1", flags::DELTAG);
+        set_account_flags(&mut f, "Gone2", flags::DELTAG);
+
+        let mut entries = vec![FarPtr { offset: 0, selector: 0 }; 9];
+        entries[7] = f.machine.code_ptr(0);
+        let block = module_block(&mut f, "PURGE", &entries);
+        f.invoke(register_module, &Fixture::far(block)).expect("registered");
+        // After the invoke, for the reason `finalize`'s own test spells out.
+        f.machine.load_code(&[0xcb]).expect("a retf fits");
+
+        let mut dispatched = 0;
+        let stopped = f
+            .host
+            .cleanup(&mut f.machine, &module, &mut dispatched)
+            .expect("cleanup ran");
+
+        assert!(stopped.is_none(), "{stopped:?}");
+        assert_eq!(dispatched, 2, "one dlarou per purged account");
+        assert!(find_account(&mut f, "Gone1").is_none());
+        assert!(find_account(&mut f, "Gone2").is_none(), "the walk did not stop at the first");
+        assert!(find_account(&mut f, "Keep").is_some());
+        assert!(find_ring(&mut f, "Gone1").is_none());
+        assert!(find_ring(&mut f, "Gone2").is_none());
+        let announced: Vec<String> = f
+            .host
+            .notes()
+            .iter()
+            .filter(|line| line.starts_with("USER ACCOUNT DELETED"))
+            .map(|line| line.trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            announced,
+            [
+                "USER ACCOUNT DELETED User-ID: Gone1",
+                "USER ACCOUNT DELETED User-ID: Gone2"
+            ],
+            "one line each, in the order the file holds them"
+        );
+    }
+
+    /// A `dlarou` that stops the machine ends the whole cleanup: `mcurou` is
+    /// not swept afterwards.
+    ///
+    /// `midnit` runs `accmcu` first and every module's `mcurou` only then
+    /// (`MAJORBBS.C:3905-3909`), and a machine that has faulted cannot be
+    /// asked to run the next routine on top of it -- the same rule the sweep
+    /// itself already keeps between modules.
+    ///
+    /// It also pins `lowdel`'s order, which nothing else can observe: the
+    /// account record is deleted *before* `dlarou` and the key ring only
+    /// after it, so a purge stopped inside `dlarou` leaves the account gone
+    /// and the ring standing.
+    #[test]
+    fn a_dlarou_that_stops_the_machine_skips_the_cleanup_sweep() {
+        use crate::accounts::record::flags;
+
+        let mut f = purge_board("cleanup-purge-stops");
+        let module = f.minimal_module();
+        signup(&mut f, "Gone");
+        set_account_flags(&mut f, "Gone", flags::DELTAG);
+
+        let mark = f.buffer(1);
+        // `dlarou` is a far call through a null selector, which faults inside
+        // 16-bit mode. `mcurou` is the same marker stub the test above
+        // watches run, so a marker still reading 0 here is a routine that was
+        // never dispatched rather than one whose encoding is wrong.
+        let mut code = vec![0x9a, 0x00, 0x00, 0x00, 0x00];
+        let mcurou_at = u16::try_from(code.len()).expect("five");
+        code.extend_from_slice(&mcurou_marker(mark));
+
+        let mut entries = vec![FarPtr { offset: 0, selector: 0 }; 9];
+        entries[7] = f.machine.code_ptr(0);
+        entries[6] = f.machine.code_ptr(mcurou_at);
+        let block = module_block(&mut f, "PURGE", &entries);
+        f.invoke(register_module, &Fixture::far(block)).expect("registered");
+        f.machine.load_code(&code).expect("both stubs fit");
+
+        let mut dispatched = 0;
+        let stopped = f
+            .host
+            .cleanup(&mut f.machine, &module, &mut dispatched)
+            .expect("cleanup ran");
+
+        assert!(stopped.is_some(), "a faulting dlarou poisons the machine");
+        assert_eq!(dispatched, 0, "a routine that stopped is not a routine that ran");
+        assert_eq!(read_byte(&f, mark), 0, "mcurou must not be swept after a stop");
+        assert!(find_account(&mut f, "Gone").is_none(), "lowdel deletes the account first");
+        assert!(find_ring(&mut f, "Gone").is_some(), "and the ring only after dlarou");
+    }
+
     /// A `struct agent` in module memory: nine bytes of appid, then four far
     /// vectors.
     fn agent_block(f: &mut Fixture, appid: &str, vectors: &[FarPtr]) -> FarPtr {
