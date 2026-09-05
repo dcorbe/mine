@@ -113,6 +113,13 @@ const AGAIN_PROMPT: &[u8] = b"Enter it again: ";
 const MISMATCH_LINE: &[u8] = b"Passwords do not match.\r\n";
 const TOO_MANY_LINE: &[u8] = b"Too many tries.\r\n";
 
+/// What declining the offer to create an account says: nothing. The caller
+/// answered the question they were asked, so there is no refusal to report
+/// -- but the try is still counted (see [`login_dialogue`]), and going
+/// through [`refuse`] with this is what keeps counting in one place instead
+/// of two.
+const DECLINED_SILENTLY: &[u8] = b"";
+
 /// The one thing a listener says that is not about the caller at all: the
 /// host thread this process is built around is gone, so there is no board
 /// to be let onto.
@@ -356,12 +363,14 @@ async fn handle(
 /// them:
 ///
 /// - **What counts.** `refusals` is the only thing that stops a caller
-///   guessing forever. Every refusal the board answers with counts, a line
-///   the account record cannot hold counts, and a signup whose two
-///   passwords differ counts. Two things do not: an unknown name, which
-///   becomes the offer below rather than a refusal, and declining that
-///   offer, where nothing was refused and the caller simply changed their
-///   mind. The [`MAX_REFUSALS`]th counted try ends the connection.
+///   guessing forever, so every way a try can end without a channel counts:
+///   a refusal the board answers with, a line the account record cannot
+///   hold, a signup whose two passwords differ, and declining the offer to
+///   create the account. The one thing that does not is an unknown name
+///   itself, which becomes that offer rather than a refusal -- but the
+///   answer to the offer is then counted either way, so a name the board
+///   has never heard of still costs exactly one try however the caller
+///   answers. The [`MAX_REFUSALS`]th counted try ends the connection.
 /// - **`Full` and `Maintenance` end it instead of counting.** Neither is
 ///   anything the caller could have typed differently, so a retry would
 ///   only invite them to fail again -- and spending a caller's tries on the
@@ -425,16 +434,24 @@ async fn login_dialogue(
             }
         }
 
-        // Step 4: the offer. Anything but `y` starts over, uncounted -- and
-        // an empty line is an answer here, which is why this is the one
-        // prompt that does not re-ask on one (see `read_line`). Nothing was
-        // refused, so nothing pipelined behind the answer is dropped
-        // either: a caller who typed a whole second login behind their `n`
-        // meant it for the prompt they are about to see.
+        // Step 4: the offer. An empty line is an answer here, which is why
+        // this is the one prompt that does not re-ask on one (see
+        // `read_line`).
+        //
+        // Declining starts over and **counts**. Nothing was refused, so
+        // there is nothing to say -- `refuse` is given an empty line and
+        // writes none -- but the try is spent all the same: a name the
+        // board has never heard of, answered `n`, would otherwise be an
+        // unbounded loop over one socket, since an unknown name does not
+        // count on its own either.
         let Some(answer) = prompt_once(reader, writer, CREATE_PROMPT, true).await? else {
             return Ok(None);
         };
-        if !matches!(answer.as_str(), "y" | "Y") {
+        let answer = answer.trim();
+        if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
+            if refuse(reader, writer, &mut refusals, DECLINED_SILENTLY).await? {
+                return Ok(None);
+            }
             continue;
         }
 
@@ -1845,6 +1862,194 @@ mod tests {
             !String::from_utf8_lossy(&got).contains("hunter2"),
             "a pipelined password is still a password: {:?}",
             String::from_utf8_lossy(&got)
+        );
+    }
+
+    /// Declining the offer to create an account spends a try.
+    ///
+    /// An unknown name does not count on its own -- it becomes the offer --
+    /// so if the answer did not count either, `Dan`, a password, `n` would
+    /// be a dialogue with no ceiling: the same three lines over and over on
+    /// one socket, forever. Three declines here have to reach
+    /// `Too many tries.` exactly as three bad passwords do.
+    #[tokio::test]
+    async fn declining_the_signup_offer_counts_as_a_try() {
+        use tokio::io::AsyncWriteExt;
+
+        let (host_tx, claims, _rest) = fake_host(vec![
+            Err(mbbs::Refusal::Unknown),
+            Err(mbbs::Refusal::Unknown),
+            Err(mbbs::Refusal::Unknown),
+        ]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut got = Vec::new();
+        for try_number in 1..=super::MAX_REFUSALS {
+            read_until_nth(&mut client, &mut got, "Enter your user ID: ", try_number).await;
+            client.write_all(b"Dan\rx\rn\r").await.expect("write one try");
+            read_until_nth(&mut client, &mut got, "Create one? [y/n] n\r\n", try_number).await;
+        }
+        read_to_close(&mut client, &mut got).await;
+
+        let text = String::from_utf8_lossy(&got);
+        assert!(got.ends_with(b"Too many tries.\r\n"), "{text:?}");
+        assert_eq!(
+            text.matches("Enter your user ID: ").count(),
+            super::MAX_REFUSALS,
+            "declining is a spent try, so there is no fourth offer: {text:?}"
+        );
+        for round in 1..=super::MAX_REFUSALS {
+            assert_eq!(
+                next_claim(&claims, &format!("decline {round}")),
+                mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
+            );
+        }
+    }
+
+    /// `yes` is a yes, and so is `Y` with a stray space; anything else
+    /// declines.
+    ///
+    /// The wire is a human typing, not a protocol: a caller who answers the
+    /// question in the obvious longer word should not have their try spent
+    /// on a spelling. Only the accepting side is worth pinning -- the
+    /// declining side is every other string there is, and
+    /// `declining_the_signup_offer_counts_as_a_try` covers what happens to
+    /// it.
+    #[tokio::test]
+    async fn yes_is_accepted_in_the_spellings_a_caller_will_type() {
+        use tokio::io::AsyncWriteExt;
+
+        for answer in ["y", "Y", "yes", "YES", "Yes", " y "] {
+            let terms = mbbs::Terms::new(1);
+            let chan = terms.chan(0).expect("channel 0");
+            let (host_tx, claims, _rest) =
+                fake_host(vec![Err(mbbs::Refusal::Unknown), Ok(chan)]);
+            let addr = bind_dialogue(host_tx).await;
+
+            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            client
+                .write_all(format!("Dan\rx\r{answer}\rhunter2\rhunter2\r").as_bytes())
+                .await
+                .expect("write the dialogue");
+
+            let mut got = Vec::new();
+            read_to_close(&mut client, &mut got).await;
+
+            assert_eq!(
+                next_claim(&claims, &format!("the first login before {answer:?}")),
+                mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
+            );
+            assert_eq!(
+                next_claim(&claims, &format!("the signup after {answer:?}")),
+                mbbs::Login::Signup { userid: "Dan".into(), password: "hunter2".into() },
+                "{answer:?} is a yes"
+            );
+        }
+    }
+
+    /// The two refusals this listener makes on its own count toward the
+    /// limit exactly as the board's do.
+    ///
+    /// Three different kinds in three tries, so the third has to close the
+    /// connection: a user ID the record cannot hold, a chosen signup
+    /// password it cannot hold either, and two signup passwords that
+    /// differ. None of the three reaches the board as a claim of its own,
+    /// which is what makes this a test of *counting* rather than of the
+    /// lines themselves -- turning any one of them into a bare write leaves
+    /// a caller with an extra try nobody granted them.
+    #[tokio::test]
+    async fn local_length_refusals_and_mismatches_count_toward_the_limit() {
+        use tokio::io::AsyncWriteExt;
+
+        let (host_tx, claims, _rest) =
+            fake_host(vec![Err(mbbs::Refusal::Unknown), Err(mbbs::Refusal::Unknown)]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut got = Vec::new();
+
+        // Try 1: a user ID the account record cannot hold.
+        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 1).await;
+        let overlong_id = "x".repeat(mbbs::accounts::UIDSIZ);
+        client
+            .write_all(format!("{overlong_id}\r").as_bytes())
+            .await
+            .expect("write an overlong user ID");
+        read_until_nth(&mut client, &mut got, "a user ID is at most 29 characters\r\n", 1).await;
+
+        // Try 2: a chosen signup password it cannot hold either.
+        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        let overlong_pw = "x".repeat(mbbs::accounts::PSWSIZ);
+        client
+            .write_all(format!("Dan\rx\ry\r{overlong_pw}\r").as_bytes())
+            .await
+            .expect("write an overlong chosen password");
+        read_until_nth(&mut client, &mut got, "a password is at most 9 characters\r\n", 1).await;
+
+        // Try 3: two signup passwords that differ. The third counted
+        // refusal ends it.
+        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 3).await;
+        client
+            .write_all(b"Dan\rx\ry\rone\rtwo\r")
+            .await
+            .expect("write a mismatched pair");
+        read_to_close(&mut client, &mut got).await;
+
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.contains("Passwords do not match.\r\n"),
+            "the third try is the mismatch: {text:?}"
+        );
+        assert!(got.ends_with(b"Too many tries.\r\n"), "{text:?}");
+        assert_eq!(
+            text.matches("Enter your user ID: ").count(),
+            super::MAX_REFUSALS,
+            "three local refusals are three spent tries, no more and no fewer: {text:?}"
+        );
+        // Only the two `Password` claims that opened tries 2 and 3 -- no
+        // signup claim ever went out, and try 1 spoke to nobody at all.
+        for round in 2..=3 {
+            assert_eq!(
+                next_claim(&claims, &format!("try {round}")),
+                mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
+            );
+        }
+        assert!(claims.try_recv().is_err(), "no claim may carry a line this listener refused");
+    }
+
+    /// A password longer than the record's field is refused here, without a
+    /// round trip, and counts -- the password half of `too_long`, which the
+    /// user ID tests cannot reach.
+    #[tokio::test]
+    async fn an_overlong_password_is_refused_without_a_round_trip_and_counts() {
+        use tokio::io::AsyncWriteExt;
+
+        let (host_tx, claims, _rest) = fake_host(Vec::new());
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let overlong = "x".repeat(mbbs::accounts::PSWSIZ);
+        let mut got = Vec::new();
+        for try_number in 1..=super::MAX_REFUSALS {
+            read_until_nth(&mut client, &mut got, "Enter your user ID: ", try_number).await;
+            client
+                .write_all(format!("Dan\r{overlong}\r").as_bytes())
+                .await
+                .expect("write an overlong password");
+            read_until_nth(&mut client, &mut got, "a password is at most 9 characters\r\n", try_number).await;
+        }
+        read_to_close(&mut client, &mut got).await;
+
+        let text = String::from_utf8_lossy(&got);
+        assert!(got.ends_with(b"Too many tries.\r\n"), "{text:?}");
+        assert!(
+            !text.contains(&overlong),
+            "a password is still a password when it is too long: {text:?}"
+        );
+        assert!(
+            claims.try_recv().is_err(),
+            "a password the record cannot hold costs the board nothing"
         );
     }
 
