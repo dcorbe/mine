@@ -17,12 +17,14 @@ successful-Get `databuf`, and post-scenario record contents against what the
 engine under test produced for the same calls. It never compares `posblk`
 (genuine Btrieve's is 128 bytes of engine-private cursor state; this
 project's is a host-side handle — neither shape is scenario data) and never
-compares raw file bytes. Four of the seven fixtures are seeded by a
-`B_CREATE` over the wire, so their files are genuine Btrieve's own v6 layout,
-and nothing this project builds is byte-identical to that in principle. The
-three `v5_variable_*` fixtures are seeded the other way, from a v5 file
-`btrieve::create` wrote, and their transcripts hold that same file after the
-genuine engine wrote into it.
+compares raw file bytes for the `B_CREATE`-seeded fixtures. Four of the nine
+fixtures are seeded that way, over the wire, so their files are genuine
+Btrieve's own v6 layout, and nothing this project builds is byte-identical to
+that in principle. The five `v5_variable_*` fixtures are seeded the other
+way, from a v5 file `btrieve::create` wrote, and their transcripts hold that
+same file after the genuine engine wrote into it -- for those, the replay
+does compare bytes: every variable page, and the two control-record fields a
+variable-length write owns.
 
 ## `open_close.fixture` (3,963 bytes)
 
@@ -166,6 +168,55 @@ the engine under test would be free to invent an allocation policy with
 nothing to check it against. The final Get Equal for the last-inserted key
 answering 0 says the index survived every one of those allocations.
 
+## `v5_variable_release_empty.fixture` (14,319 bytes)
+
+**Scenario:** the same seed file. Open, insert `Only` with the tail `DEMO`
+(35 bytes), Get Equal `Only` to establish currency, Delete, Get Equal `Only`
+again, Close. Statuses: 0, 0, 0, 0, **4**, 0.
+
+**Engine:** genuine Pervasive Btrieve 6.15 under Wine.
+
+**Confirmed by reading the file:** 6,144 bytes, six 1,024-byte pages, still
+v5 (version byte 4, no `"FC"`). Its variable page 5 at `0x1400` reads
+`00 00 05 00 | 01 00 | ff 00 ff ff | 00 00` -- its own page number, a
+modification stamp of 1, still on the free-space chain and last on it, and a
+fragment count of **zero**. Every byte from `0x140c` to the entry array is
+zero, and the array's one remaining member, at `0x17fe`, names `0x0c`. The
+control record still reads `00 00 06 00` at `0x26` (six pages) and
+`ff 00 05 00` at `0x38`, and its record free list at `0x10` now names
+`0x1006`, the slot the deleted record vacated.
+
+**What it proves:** what genuine Btrieve does to a variable page whose last
+fragment is deleted, which no fixture above reaches and which the engine
+under test previously refused outright rather than guess at. The answer is
+that it does nothing beyond emptying it: the page stays in the file, stays
+on the free-space chain, keeps its own number, and neither `fcr::PAGES` nor
+the chain head at `0x3a` moves. An engine that released the page, truncated
+the file, or blanked the header would disagree with this fixture at the
+first byte.
+
+## `v5_variable_release_reinsert.fixture` (14,228 bytes)
+
+**Scenario:** the same seed file and the same first four calls -- open,
+insert `Only` with `DEMO`, Get Equal, Delete -- then insert `Next` with the
+longer tail `DEMO NORMAL` (42 bytes), Get Equal `next` in lower case, Close.
+Seven calls, every one status 0.
+
+**Engine:** genuine Pervasive Btrieve 6.15 under Wine.
+
+**Confirmed by reading the file:** 6,144 bytes, six pages, still v5. Page 5
+at `0x1400` reads `00 00 05 00 | 02 00 | ff 00 ff ff | 01 00` followed by
+`"EMO NORMAL\0"` at `0x140c`, with entries `17 00 0c 00` at `0x17fc`. The
+new record sits at `0x1006` and its own fragment pointer at `0x1025` reads
+`00 05 00 00` -- page 5, fragment 0.
+
+**What it proves:** the emptied page is **reused**, not abandoned. The
+insert that follows the delete goes back onto the same page rather than
+claiming a fresh one, which is why the file is still six pages. It also
+pins the page's modification stamp as a plain counter of writes rather than
+"one less than the fragment count": 1 on a page holding none, 2 on the same
+page holding one again.
+
 ## Why these are kept, and what changed
 
 The design spec that pitches the old census machinery (`census.rs`,
@@ -204,7 +255,7 @@ ground truth for:**
 - **Variable-tail Allocation Tables (VATs).** The four `B_CREATE`-seeded
   fixtures cannot cover this: each creates a fixed-length, single-key file
   (`create_request`'s `record_len` is a plain byte count, and the FileSpec's
-  flags word is always built with no variable-length bit set). The three
+  flags word is always built with no variable-length bit set). The five
   `v5_variable_*` fixtures do hold variable-length records the genuine
   engine wrote, so that path is witnessed here as well as in the corpus.
   Whether their files carry a VAT specifically has **not** been measured,

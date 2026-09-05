@@ -892,6 +892,8 @@ mod generate {
             v5_variable_insert_scenario(),
             v5_variable_delete_scenario(),
             v5_variable_grow_scenario(),
+            v5_variable_release_empty_scenario(),
+            v5_variable_release_reinsert_scenario(),
         ]
     }
 
@@ -1037,6 +1039,44 @@ mod generate {
                 delete_request(),
                 get_keyrec_request(B_GET_EQUAL, "Sysop"), // status 4: gone
                 insert_keyrec_request("Testy", "DEMO NORMAL MODERATE MASS_MAIL"),
+                close_request(),
+            ],
+        }
+    }
+
+    /// The only fragment on a page is deleted and nothing follows: what
+    /// genuine does to an emptied variable page (free chain? PAGES?
+    /// VARIABLE_HIGHEST?).
+    fn v5_variable_release_empty_scenario() -> Scenario {
+        let name = "KEYSREL.DAT";
+        Scenario {
+            name: "v5_variable_release_empty".to_owned(),
+            seed: Seed::File(seed_keyrec_file()),
+            calls: vec![
+                open_request(name),
+                insert_keyrec_request("Only", "DEMO"),
+                get_keyrec_request(B_GET_EQUAL, "Only"),
+                delete_request(),
+                get_keyrec_request(B_GET_EQUAL, "Only"), // status 4
+                close_request(),
+            ],
+        }
+    }
+
+    /// The only fragment on a page is deleted and another record follows:
+    /// whether the emptied page is reused for the new fragment.
+    fn v5_variable_release_reinsert_scenario() -> Scenario {
+        let name = "KEYSREI.DAT";
+        Scenario {
+            name: "v5_variable_release_reinsert".to_owned(),
+            seed: Seed::File(seed_keyrec_file()),
+            calls: vec![
+                open_request(name),
+                insert_keyrec_request("Only", "DEMO"),
+                get_keyrec_request(B_GET_EQUAL, "Only"),
+                delete_request(),
+                insert_keyrec_request("Next", "DEMO NORMAL"),
+                get_keyrec_request(B_GET_EQUAL, "next"), // ACS: found
                 close_request(),
             ],
         }
