@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
@@ -1170,13 +1170,10 @@ async fn the_board_serves_again_after_a_kick_driven_stop_with_no_channel_connect
 ///
 /// Both halves run over the raw `In` channel ([`connect_raw`],
 /// [`wait_for_close`]), so what this proves is the CHANNEL closing, not a
-/// socket receiving FIN. A telnet caller cannot hold a channel on this
-/// board today: `conn::handle` sends a `Password` claim with an empty
-/// password (there is no password prompt until Task 12), so every telnet
-/// login here is refused and the socket closes at once -- which would look
-/// like a close that had nothing to do with the module stopping. The
-/// socket-level half comes back once a telnet login can succeed. The
-/// listener is still bound here, and the prompt read at the end is the
+/// socket receiving FIN. That is deliberately a different test:
+/// `a_logged_in_telnet_socket_is_closed_by_the_stop` below drives a real
+/// telnet login all the way through the dialogue and waits for the FIN.
+/// The listener is still bound here, and the prompt read at the end is the
 /// weaker check of the two: see the comment beside it.
 #[tokio::test]
 async fn a_connected_channel_is_closed_by_the_stop_and_the_board_serves_again_after() {
@@ -1218,6 +1215,86 @@ async fn a_connected_channel_is_closed_by_the_stop_and_the_board_serves_again_af
     let mut after = TcpStream::connect(addr).await.expect("connect after the restart");
     let mut after_buf = Vec::new();
     read_until(&mut after, &mut after_buf, "Enter your user ID: ").await;
+}
+
+/// The same stop, one layer out: a real telnet socket that has *logged in*
+/// receives the FIN when the module stops.
+///
+/// Its sibling above proves the close at the channel level
+/// ([`wait_for_close`] on an `Out` receiver). This proves it where a caller
+/// actually experiences it -- the socket closes and `read_to_end` returns.
+/// That half was impossible until Task 12: `conn::handle` used to send a
+/// `Password` claim with an empty password, so every telnet login was
+/// refused and the socket closed at once, for a reason that had nothing to
+/// do with the module stopping.
+///
+/// The login is a **signup**, because a board built out of a synthetic
+/// module starts with an empty account file: `Dan` does not exist, the
+/// dialogue offers to create the account, and `Login::Signup` provisions
+/// it. The whole dialogue goes out in one write, `look\r` included, which
+/// also carries `conn`'s pipelining rule end to end against a real host.
+///
+/// **The close is not vacuous.** Every way that dialogue can end *without*
+/// a channel writes something first -- a refusal line, `Too many tries.`,
+/// or `Server error, try again later.` -- and none of them is on the wire
+/// here. So the only thing that can have closed this socket is `tear_down`
+/// hanging up a channel that was connected, which is exactly the claim.
+#[tokio::test]
+async fn a_logged_in_telnet_socket_is_closed_by_the_stop() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-telnet-login-fault",
+        &builder::faults_one_second_after_boot(),
+    );
+    let boot = boot(module, "mbbs-server-host-supervisor-telnet-login-fault-root", 2);
+    let serving = boot.serving.clone();
+    let tx = conn::spawn_machine(boot);
+    let addr = conn::serve_on(
+        tx,
+        &[("127.0.0.1:0", mbbs_server::termcompat::Stack::modern)],
+        serving,
+    )
+    .await
+    .expect("bind 127.0.0.1:0")[0];
+
+    let mut sock = TcpStream::connect(addr).await.expect("connect");
+    let mut got = Vec::new();
+    read_until(&mut sock, &mut got, "Enter your user ID: ").await;
+
+    sock.write_all(b"Dan\rhunter2\ry\rhunter2\rhunter2\rlook\r")
+        .await
+        .expect("write the whole signup dialogue");
+    read_until(&mut sock, &mut got, "Enter it again: \r\n").await;
+
+    // The kick fires the module's `HLT` about a second after boot; the
+    // stop hangs every connected channel up and closes its socket.
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), sock.read_to_end(&mut rest))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the module's stop never closed the socket; saw {:?}",
+                String::from_utf8_lossy(&got)
+            )
+        })
+        .expect("read until the server closes the socket");
+    got.extend_from_slice(&rest);
+
+    let text = String::from_utf8_lossy(&got);
+    for refused in [
+        "No account by that name.\r\n",
+        "That user ID is taken.",
+        "That account has no password yet.",
+        "All lines are busy.",
+        "Passwords do not match.",
+        "Too many tries.",
+        "Server error, try again later.",
+    ] {
+        assert!(
+            !text.contains(refused),
+            "the socket closed because the login was refused ({refused:?}), not \
+             because the module stopped: {text:?}"
+        );
+    }
 }
 
 /// A one-term board hands its only channel to the first caller and tells

@@ -1,10 +1,10 @@
 //! The connection task and the listener.
 //!
 //! One `tokio::spawn`ed task per socket, speaking raw bytes. Negotiation
-//! claims `SGA` and `ECHO`; a local, throwaway line editor collects the user
-//! ID because no [`mbbs::Chan`] exists yet to hand that job to GSBL; then the
-//! task becomes a byte pump between the socket and the host thread until
-//! either end goes away.
+//! claims `SGA` and `ECHO`; a local, throwaway line editor collects the
+//! login dialogue's lines because no [`mbbs::Chan`] exists yet to hand that
+//! job to GSBL; then the task becomes a byte pump between the socket and
+//! the host thread until either end goes away.
 //!
 //! **`IAC WILL ECHO` is not a mistake.** GSBL echoes every accepted byte
 //! itself (`crates/mbbs/src/gsbl.rs::Channel::take`, step 11), so the client
@@ -49,7 +49,9 @@
 //! zero -- see `crates/mbbs-server/src/pool.rs`'s own module doc for why.
 //!
 //! **One `serve_on` call serves one machine.** A connection goes from telnet
-//! negotiation straight to the user-ID prompt -- nothing in between.
+//! negotiation straight to the user-ID prompt -- nothing in between. What
+//! follows that prompt is [`login_dialogue`]: a password, and, for a name
+//! the board has never seen, the offer to create the account.
 
 use std::borrow::Cow;
 use std::io;
@@ -92,6 +94,35 @@ const OPT_SGA: u8 = 3;
 /// lethal: see `host::offer`'s own doc comment for the measured
 /// character-creation drop that retired that rule.
 pub(crate) const OUT_CHANNEL_BOUND: usize = 32;
+
+/// How many refusals a caller earns before the connection ends. Spec
+/// section 2.
+pub(crate) const MAX_REFUSALS: usize = 3;
+
+/// The login dialogue, word for word. Spec section 2.
+///
+/// Constants rather than literals at their one call site each, so the whole
+/// script can be read (and diffed) in one place: a caller's screen is a
+/// contract, and a prompt that quietly loses its trailing space is not the
+/// kind of change anybody notices in a diff of `login_dialogue`.
+const USERID_PROMPT: &[u8] = b"Enter your user ID: ";
+const PASSWORD_PROMPT: &[u8] = b"Enter your password: ";
+const CREATE_PROMPT: &[u8] = b"No account by that name. Create one? [y/n] ";
+const CHOOSE_PROMPT: &[u8] = b"Choose a password (1 to 9 characters): ";
+const AGAIN_PROMPT: &[u8] = b"Enter it again: ";
+const MISMATCH_LINE: &[u8] = b"Passwords do not match.\r\n";
+const TOO_MANY_LINE: &[u8] = b"Too many tries.\r\n";
+
+/// The one thing a listener says that is not about the caller at all: the
+/// host thread this process is built around is gone, so there is no board
+/// to be let onto.
+pub(crate) const SERVER_ERROR_LINE: &[u8] = b"Server error, try again later.\r\n";
+
+/// What a telnet caller's terminal is taken to be: what the wire says, not
+/// what the account remembers -- `Host::login` applies these on top of the
+/// record it loads. Nothing in the telnet dialogue negotiates size or
+/// colour, so this is the 80x24 ANSI screen the modules assume.
+const TELNET_TERMINAL: Terminal = Terminal { ansi: true, width: 80, height: 24 };
 
 /// What a caller is told while maintenance is running.
 pub(crate) const MAINTENANCE_LINE: &[u8] = b"The system is down for daily maintenance. Try again in a few minutes.\r\n";
@@ -266,8 +297,8 @@ async fn spawn_listener(
     Ok(local)
 }
 
-/// One connection's whole life: negotiate, prompt for a user ID, connect,
-/// pump bytes until either side hangs up.
+/// One connection's whole life: negotiate, take the caller through the
+/// login dialogue, pump bytes until either side hangs up.
 ///
 /// `stack` is this connection's [`Stack`] constructor -- fixed by which
 /// listener accepted the socket ([`spawn_listener`]'s parameter of the same
@@ -279,7 +310,7 @@ async fn handle(
     stack: fn() -> Stack,
     serving: crate::host::Serving,
 ) -> io::Result<()> {
-    let (mut reader, mut writer) = socket.into_split();
+    let (mut socket_reader, mut writer) = socket.into_split();
 
     // IAC WILL SGA, IAC WILL ECHO -- see the module doc for why WILL ECHO is
     // deliberate.
@@ -291,85 +322,284 @@ async fn handle(
         return Ok(());
     }
 
-    let Some((userid, leftover)) = read_user_id(&mut reader, &mut writer).await? else {
-        return Ok(()); // gone during login
-    };
-
-    // The claim, with no password behind it yet: the password prompt is the
-    // next task's, and this is the one seam it has to change. Until then
-    // every telnet login resolves against the account file and is refused,
-    // which is the honest answer for a listener that has not asked for a
-    // password.
-    let login = Login::Password { userid, password: String::new() };
-    // What the wire says, not what the account remembers: `Host::login`
-    // applies these on top of the record it loads.
-    let terminal = Terminal { ansi: true, width: 80, height: 24 };
-
-    let (out_tx, out_rx) = mpsc::channel::<Out>(OUT_CHANNEL_BOUND);
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if host_tx
-        .send(In::Connect {
-            login,
-            terminal,
-            out: out_tx,
-            reply: reply_tx,
-        })
-        .is_err()
-    {
-        // The host thread is gone. There is no channel this connection could
-        // ever be given, so this is the one place a dead host thread surfaces
-        // to someone who was not already connected.
-        let _ = writer
-            .write_all(b"Server error, try again later.\r\n")
-            .await;
+    let mut reader = Reader::new(&mut socket_reader);
+    let Some((chan, out_rx, leftover)) =
+        login_dialogue(&mut reader, &mut writer, &host_tx).await?
+    else {
+        // Refused, out of tries, or gone. Whoever is still on the other end
+        // has already been told which.
         return Ok(());
-    }
-
-    // This connection's process-wide identity for the rest of its life.
-    let chan = match reply_rx.await {
-        Ok(Ok(chan)) => chan,
-        Ok(Err(refusal)) => {
-            writer.write_all(&refusal_line(refusal)).await?;
-            return Ok(());
-        }
-        Err(_) => {
-            // The host thread died between the send above and answering --
-            // the same "nothing we can do" outcome as the send failing
-            // outright, just discovered one message later.
-            let _ = writer
-                .write_all(b"Server error, try again later.\r\n")
-                .await;
-            return Ok(());
-        }
     };
 
-    // Bytes that arrived pipelined behind the user ID's terminator (the same
-    // TCP segment carried more than one line) must not be dropped just
-    // because they showed up before a channel existed to receive them.
+    // Bytes that arrived pipelined behind the accepted line's terminator
+    // (the same TCP segment carried more than one line) must not be dropped
+    // just because they showed up before a channel existed to receive them.
     if !leftover.is_empty()
         && host_tx.send(In::Input { chan, bytes: leftover }).is_err()
     {
         return Ok(());
     }
 
-    pump(reader, writer, host_tx, chan, out_rx, stack).await
+    pump(socket_reader, writer, host_tx, chan, out_rx, stack).await
 }
 
-/// The tiny line editor behind the user ID prompt.
+/// The whole login dialogue, from the first prompt to a channel. Spec
+/// section 2.
+///
+/// `Ok(None)` means this connection is over: the caller ran out of tries,
+/// hit a refusal there is no point retrying, or went away. Whoever is still
+/// listening has already been told which. `Ok(Some(..))` is a live channel,
+/// the queue the host thread will write to, and whatever bytes arrived
+/// pipelined behind the line that won it.
+///
+/// The steps below are the dialogue in order. Two rules hold across all of
+/// them:
+///
+/// - **What counts.** `refusals` is the only thing that stops a caller
+///   guessing forever. Every refusal the board answers with counts, a line
+///   the account record cannot hold counts, and a signup whose two
+///   passwords differ counts. Two things do not: an unknown name, which
+///   becomes the offer below rather than a refusal, and declining that
+///   offer, where nothing was refused and the caller simply changed their
+///   mind. The [`MAX_REFUSALS`]th counted try ends the connection.
+/// - **`Full` and `Maintenance` end it instead of counting.** Neither is
+///   anything the caller could have typed differently, so a retry would
+///   only invite them to fail again -- and spending a caller's tries on the
+///   board's own state would close the connection on someone who had done
+///   nothing wrong.
+async fn login_dialogue(
+    reader: &mut Reader<'_>,
+    writer: &mut OwnedWriteHalf,
+    host_tx: &std_mpsc::Sender<In>,
+) -> io::Result<Option<(Chan, mpsc::Receiver<Out>, Vec<u8>)>> {
+    use mbbs::Refusal as R;
+    use mbbs::accounts::{PSWSIZ, UIDSIZ, validate_password, validate_userid};
+
+    let mut refusals = 0usize;
+
+    loop {
+        // Step 1: who is this?
+        let Some(userid) = read_line(reader, writer, USERID_PROMPT, true).await? else {
+            return Ok(None);
+        };
+        if let Some(refusal) = too_long(&userid, UIDSIZ - 1, validate_userid) {
+            if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
+                return Ok(None);
+            }
+            continue;
+        }
+
+        // Step 2: prove it. Not echoed -- see `read_line`'s `echo`.
+        let Some(password) = read_line(reader, writer, PASSWORD_PROMPT, false).await? else {
+            return Ok(None);
+        };
+        if let Some(refusal) = too_long(&password, PSWSIZ - 1, validate_password) {
+            if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
+                return Ok(None);
+            }
+            continue;
+        }
+
+        // Step 3: ask the board. It owns the account file, so it -- not
+        // this listener -- decides whether this is anybody.
+        let claim = Login::Password { userid: userid.clone(), password };
+        match claim_channel(host_tx, claim, TELNET_TERMINAL, writer).await? {
+            None => return Ok(None),
+            Some(Ok((chan, out_rx))) => {
+                return Ok(Some((chan, out_rx, std::mem::take(&mut reader.pending))));
+            }
+            // Not a refusal on the wire: an unknown name is the one answer
+            // this listener turns into an offer, so the caller sees the
+            // create prompt below instead of a goodbye.
+            Some(Err(R::Unknown)) => {}
+            Some(Err(refusal @ (R::Full | R::Maintenance))) => {
+                writer.write_all(&refusal_line(refusal)).await?;
+                writer.flush().await?;
+                return Ok(None);
+            }
+            Some(Err(refusal)) => {
+                if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
+                    return Ok(None);
+                }
+                continue;
+            }
+        }
+
+        // Step 4: the offer. Anything but `y` starts over, uncounted -- and
+        // an empty line is an answer here, which is why this is the one
+        // prompt that does not re-ask on one (see `read_line`). Nothing was
+        // refused, so nothing pipelined behind the answer is dropped
+        // either: a caller who typed a whole second login behind their `n`
+        // meant it for the prompt they are about to see.
+        let Some(answer) = prompt_once(reader, writer, CREATE_PROMPT, true).await? else {
+            return Ok(None);
+        };
+        if !matches!(answer.as_str(), "y" | "Y") {
+            continue;
+        }
+
+        // Step 5: a new password, twice, neither echoed.
+        let Some(chosen) = read_line(reader, writer, CHOOSE_PROMPT, false).await? else {
+            return Ok(None);
+        };
+        if let Some(refusal) = too_long(&chosen, PSWSIZ - 1, validate_password) {
+            if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
+                return Ok(None);
+            }
+            continue;
+        }
+        let Some(again) = read_line(reader, writer, AGAIN_PROMPT, false).await? else {
+            return Ok(None);
+        };
+        if again != chosen {
+            if refuse(reader, writer, &mut refusals, MISMATCH_LINE).await? {
+                return Ok(None);
+            }
+            continue;
+        }
+
+        // Step 6: claim the new account. The board still has the last word
+        // -- the name may be reserved, or somebody may have taken it
+        // between step 3 and here.
+        let claim = Login::Signup { userid, password: chosen };
+        match claim_channel(host_tx, claim, TELNET_TERMINAL, writer).await? {
+            None => return Ok(None),
+            Some(Ok((chan, out_rx))) => {
+                return Ok(Some((chan, out_rx, std::mem::take(&mut reader.pending))));
+            }
+            Some(Err(refusal @ (R::Full | R::Maintenance))) => {
+                writer.write_all(&refusal_line(refusal)).await?;
+                writer.flush().await?;
+                return Ok(None);
+            }
+            Some(Err(refusal)) => {
+                if refuse(reader, writer, &mut refusals, &refusal_line(refusal)).await? {
+                    return Ok(None);
+                }
+                continue;
+            }
+        }
+    }
+}
+
+/// One counted refusal: say which one it was, drop anything pipelined
+/// behind the line that earned it, and answer whether that was the last
+/// try.
+///
+/// **The pipelined bytes go.** A caller who typed ahead was typing ahead of
+/// a dialogue that has just restarted; feeding those bytes to the fresh
+/// user ID prompt would spend their remaining tries on lines they meant for
+/// prompts that are no longer on screen. This is the same rule an empty
+/// line has always had (see [`read_line`]).
+///
+/// `line` rather than a [`mbbs::Refusal`] because not every counted
+/// refusal has one: two signup passwords that differ are refused here, in
+/// this listener's own words, and never reach the board at all.
+async fn refuse(
+    reader: &mut Reader<'_>,
+    writer: &mut OwnedWriteHalf,
+    refusals: &mut usize,
+    line: &[u8],
+) -> io::Result<bool> {
+    writer.write_all(line).await?;
+    writer.flush().await?;
+    reader.pending.clear();
+
+    *refusals += 1;
+    if *refusals >= MAX_REFUSALS {
+        writer.write_all(TOO_MANY_LINE).await?;
+        writer.flush().await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The one refusal a listener makes on its own: a line longer than the
+/// field the account record keeps it in.
+///
+/// There is nothing to ask the board about -- the record cannot hold it,
+/// whoever it names -- and asking would spend a channel (`Pool::take`, then
+/// `give_back`) to be told so. The *words*, though, are the account
+/// layer's: `validate` is called for them rather than a string being
+/// spelled out here, so this listener can never tell a caller something
+/// different from what the same line would have been refused with one layer
+/// down.
+fn too_long(
+    line: &str,
+    limit: usize,
+    validate: fn(&str) -> Result<(), mbbs::Refusal>,
+) -> Option<mbbs::Refusal> {
+    if line.len() <= limit {
+        return None;
+    }
+    validate(line).err()
+}
+
+/// Send one claim to the host thread and wait for the board's answer.
+///
+/// Every listener -- telnet, the door, and Task 13's rlogin -- makes this
+/// same round trip, and the two ways it can end badly are the same for all
+/// of them, which is why they are here rather than at each call site:
+///
+/// - `Ok(None)`: the host thread is gone, either before the message was
+///   taken or between that and the answer. The caller cannot tell those two
+///   apart and there is nothing either of them could do differently, so
+///   both write `Server error, try again later.` and end the connection.
+/// - `Ok(Some(Err(refusal)))`: the board said no. **The wire line is not
+///   written here.** Telnet turns [`mbbs::Refusal::Unknown`] into a signup
+///   offer rather than a goodbye, and counts some refusals and not others,
+///   so which refusals become a line -- and which become a prompt -- is the
+///   listener's decision. [`refusal_line`] is the shared vocabulary it
+///   makes that decision with.
+///
+/// The `Sender<Out>` half of the queue goes to the host with the claim; the
+/// `Receiver` comes back beside the channel, for [`pump`].
+pub(crate) async fn claim_channel<W: AsyncWrite + Unpin>(
+    host_tx: &std_mpsc::Sender<In>,
+    login: Login,
+    terminal: Terminal,
+    writer: &mut W,
+) -> io::Result<Option<Result<(Chan, mpsc::Receiver<Out>), mbbs::Refusal>>> {
+    let (out_tx, out_rx) = mpsc::channel::<Out>(OUT_CHANNEL_BOUND);
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    if host_tx
+        .send(In::Connect { login, terminal, out: out_tx, reply: reply_tx })
+        .is_err()
+    {
+        let _ = writer.write_all(SERVER_ERROR_LINE).await;
+        return Ok(None);
+    }
+
+    match reply_rx.await {
+        Ok(Ok(chan)) => Ok(Some(Ok((chan, out_rx)))),
+        Ok(Err(refusal)) => Ok(Some(Err(refusal))),
+        Err(_) => {
+            // The host thread died between the send above and answering --
+            // the same "nothing we can do" outcome as the send failing
+            // outright, just discovered one message later.
+            let _ = writer.write_all(SERVER_ERROR_LINE).await;
+            Ok(None)
+        }
+    }
+}
+
+/// The tiny line editor behind every prompt in the login dialogue.
 ///
 /// A miniature, deliberate duplicate of one fragment of
 /// `gsbl::Channel::take`: backspace/DEL erase, CR or LF terminates, printable
 /// ASCII is kept, everything else is dropped. **This must not be unified with
 /// `gsbl::Channel::take.`** The duplication exists only because no
 /// [`mbbs::Chan`] exists yet at this point in a connection's life -- GSBL is
-/// unreachable before `Host::connect` -- and it ends the instant one does:
-/// [`pump`] below hands every later byte straight to the host and never edits
-/// a line again.
+/// unreachable before a channel is claimed -- and it ends the instant one
+/// exists: [`pump`] below hands every later byte straight to the host and
+/// never edits a line again.
 ///
 /// Bytes above `0x7e` are dropped rather than reproducing GSBL's high-bit
-/// strip (`gsbl.rs::translate`) byte-for-byte; a user ID is not a place a
-/// stray high-bit character needs to survive, and this code is deleted the
-/// moment a channel exists to do the job properly.
+/// strip (`gsbl.rs::translate`) byte-for-byte; neither a user ID nor a
+/// password is a place a stray high-bit character needs to survive (the
+/// account layer's own `validate_password` refuses one anyway), and this
+/// code is deleted the moment a channel exists to do the job properly.
 #[derive(Default)]
 struct LineEditor {
     line: Vec<u8>,
@@ -412,63 +642,127 @@ impl LineEditor {
     }
 }
 
-/// Prompt for a user ID and read one line, editing it locally (see
-/// [`LineEditor`]).
+/// The reading half of the login dialogue.
 ///
-/// An empty line re-prompts rather than closing the connection: a bare Enter
-/// is far more likely to be a stray keystroke or leftover negotiation noise
-/// than a deliberate refusal to log in, and hanging up on it would refuse
-/// service to someone who has not actually done anything yet.
+/// Three things have to live longer than one prompt, which is why they are
+/// a struct rather than three locals inside a read:
+///
+/// - the socket, obviously;
+/// - the telnet [`Filter`], because an `IAC` sequence can straddle the byte
+///   that ends a line, and a filter rebuilt per prompt would forget the
+///   half it was holding;
+/// - `pending`, the bytes that arrived in the same `read()` as the last
+///   line's terminator. A caller who sends `Dan\rhunter2\r` in one write
+///   has already answered the password prompt before it was printed, and
+///   those bytes have to feed it rather than be dropped or waited on.
+struct Reader<'a> {
+    socket: &'a mut OwnedReadHalf,
+    filter: Filter,
+    /// Filtered bytes left over from the last line. Consumed by the next
+    /// prompt, cleared by anything that refuses a line (see [`refuse`]).
+    pending: Vec<u8>,
+}
+
+impl<'a> Reader<'a> {
+    fn new(socket: &'a mut OwnedReadHalf) -> Self {
+        Self { socket, filter: Filter::default(), pending: Vec::new() }
+    }
+}
+
+/// Print `prompt` and read one line, editing it locally (see
+/// [`LineEditor`]), re-asking until the line is not empty.
+///
+/// An empty line re-prompts rather than closing the connection: a bare
+/// Enter is far more likely to be a stray keystroke or leftover negotiation
+/// noise than a deliberate refusal to log in, and hanging up on it would
+/// refuse service to someone who has not actually done anything yet. Any
+/// bytes pipelined behind a bare Enter are discarded along with it -- this
+/// is the one corner this task does not chase, since it requires a user to
+/// type nothing and something in the same breath.
+///
+/// The one prompt that must not re-ask is the offer to create an account,
+/// where an empty line is an answer ("no"); it calls [`prompt_once`]
+/// directly.
+///
+/// `echo` is what makes a password prompt a password prompt: with it off,
+/// nothing typed is written back -- not the characters ([`Edit::Echo`]) and
+/// not a backspace's visual erase ([`Edit::Erase`]), since there is nothing
+/// on screen to erase. The line's own `\r\n` is still written either way,
+/// so the next prompt starts on a fresh line.
 ///
 /// Returns `Ok(None)` on EOF or a read error -- there is nothing left to
-/// prompt. On success, also returns whatever bytes were filtered but arrived
-/// after the line's terminator in the same read, so pipelined input is not
-/// silently dropped.
-async fn read_user_id(
-    reader: &mut OwnedReadHalf,
+/// prompt.
+async fn read_line(
+    reader: &mut Reader<'_>,
     writer: &mut OwnedWriteHalf,
-) -> io::Result<Option<(String, Vec<u8>)>> {
+    prompt: &[u8],
+    echo: bool,
+) -> io::Result<Option<String>> {
     loop {
-        writer.write_all(b"Enter your user ID: ").await?;
-        writer.flush().await?;
+        match prompt_once(reader, writer, prompt, echo).await? {
+            None => return Ok(None),
+            Some(line) if line.is_empty() => reader.pending.clear(),
+            Some(line) => return Ok(Some(line)),
+        }
+    }
+}
 
-        let mut filter = Filter::default();
-        let mut editor = LineEditor::default();
-        let mut buf = [0u8; 512];
+/// [`read_line`] without the re-ask: print `prompt`, read exactly one line,
+/// and answer it even if it is empty.
+///
+/// Whatever arrived pipelined behind the previous line is consumed first
+/// and edited exactly as freshly read bytes are, echo and all -- a client
+/// that types ahead sees the same screen as one that waits.
+async fn prompt_once(
+    reader: &mut Reader<'_>,
+    writer: &mut OwnedWriteHalf,
+    prompt: &[u8],
+    echo: bool,
+) -> io::Result<Option<String>> {
+    writer.write_all(prompt).await?;
+    writer.flush().await?;
 
-        let (userid, leftover) = loop {
-            let n = reader.read(&mut buf).await?;
+    let mut editor = LineEditor::default();
+    let mut buf = [0u8; 512];
+
+    loop {
+        let bytes = if reader.pending.is_empty() {
+            let n = reader.socket.read(&mut buf).await?;
             if n == 0 {
                 return Ok(None);
             }
-
-            let bytes = filter.feed(&buf[..n]);
-            let mut done = None;
-            for (i, &byte) in bytes.iter().enumerate() {
-                match editor.feed(byte) {
-                    Edit::None => {}
-                    Edit::Echo(b) => writer.write_all(&[b]).await?,
-                    Edit::Erase => writer.write_all(b"\x08 \x08").await?,
-                    Edit::Done(line) => {
-                        writer.write_all(b"\r\n").await?;
-                        done = Some((line, bytes[i + 1..].to_vec()));
-                        break;
-                    }
-                }
-            }
-            writer.flush().await?;
-            if let Some(result) = done {
-                break result;
-            }
+            reader.filter.feed(&buf[..n])
+        } else {
+            std::mem::take(&mut reader.pending)
         };
 
-        if !userid.is_empty() {
-            return Ok(Some((userid, leftover)));
+        let mut done = None;
+        for (i, &byte) in bytes.iter().enumerate() {
+            match editor.feed(byte) {
+                Edit::None => {}
+                Edit::Echo(b) => {
+                    if echo {
+                        writer.write_all(&[b]).await?;
+                    }
+                }
+                Edit::Erase => {
+                    if echo {
+                        writer.write_all(b"\x08 \x08").await?;
+                    }
+                }
+                Edit::Done(line) => {
+                    writer.write_all(b"\r\n").await?;
+                    done = Some((line, bytes[i + 1..].to_vec()));
+                    break;
+                }
+            }
         }
-        // Empty: loop back and prompt again. Any bytes that were pipelined
-        // behind a bare Enter are discarded along with it -- this is the one
-        // corner this task does not chase, since it requires a user to type
-        // nothing and something in the same breath.
+        writer.flush().await?;
+
+        if let Some((line, leftover)) = done {
+            reader.pending = leftover;
+            return Ok(Some(line));
+        }
     }
 }
 
@@ -586,7 +880,9 @@ mod tests {
         let addr = bound[0];
 
         let mut sock = TcpStream::connect(addr).await.expect("connect");
-        sock.write_all(b"nobody\r").await.expect("write userid");
+        // A whole login, not just the user ID: nothing reaches the host
+        // thread until the password prompt has been answered too.
+        sock.write_all(b"nobody\rpw\r").await.expect("write the login");
 
         let mut received = Vec::new();
         sock.read_to_end(&mut received)
@@ -634,49 +930,33 @@ mod tests {
         );
     }
 
-    /// A refused claim reaches the caller as its own line and closes the
-    /// socket -- the whole of what a telnet caller is told, since there is
-    /// no channel to hand them.
+    /// A refused claim reaches the caller as its own line, and the
+    /// dialogue starts over.
     ///
     /// The refusal is chosen for what only this path can prove: a fake host
     /// answers `Err(Refusal::Suspended)`, so the bytes on the wire can only
-    /// have come from `handle` mapping the reply through
-    /// [`refusal_line`]. `Full` would not discriminate -- the old code
-    /// wrote that same line from a hardcoded string.
+    /// have come from `login_dialogue` mapping the reply through
+    /// [`refusal_line`]. `Full` would not discriminate -- it is the one
+    /// refusal the old code wrote from a hardcoded string, and it is now
+    /// also the one that ends the dialogue instead of counting
+    /// (`a_full_board_ends_the_dialogue_without_counting`).
     #[tokio::test]
-    async fn a_refused_login_prints_the_line_and_closes() {
-        use crate::msg::In;
-        use crate::termcompat::Stack;
-        use std::sync::mpsc as std_mpsc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
+    async fn a_refused_login_prints_the_line_and_prompts_again() {
+        use tokio::io::AsyncWriteExt;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-        let (host_tx, host_rx) = std_mpsc::channel::<In>();
+        let (host_tx, _claims, _rest) = fake_host(vec![Err(mbbs::Refusal::Suspended)]);
+        let addr = bind_dialogue(host_tx).await;
 
-        std::thread::spawn(move || {
-            for msg in host_rx {
-                if let In::Connect { reply, .. } = msg {
-                    let _ = reply.send(Err(mbbs::Refusal::Suspended));
-                }
-            }
-        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"tester\rpw\r").await.expect("write the login");
 
-        tokio::spawn(async move {
-            let (server, _peer) = listener.accept().await.expect("accept");
-            let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let _ = handle(server, host_tx, Stack::modern, serving).await;
-        });
-
-        let mut client = TcpStream::connect(addr).await.expect("connect");
-        client.write_all(b"tester\r").await.expect("write userid");
         let mut got = Vec::new();
-        client.read_to_end(&mut got).await.expect("read until the server closes");
+        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
 
         assert!(
-            got.ends_with(b"That account is suspended.\r\n"),
-            "a refused caller is told which refusal it was, then closed: {:?}",
+            String::from_utf8_lossy(&got)
+                .contains("That account is suspended.\r\nEnter your user ID: "),
+            "a refused caller is told which refusal it was, then asked again: {:?}",
             String::from_utf8_lossy(&got)
         );
     }
@@ -973,96 +1253,6 @@ mod tests {
         }
     }
 
-    /// `handle`'s `leftover` forwarding, pinned at the unit level.
-    ///
-    /// The real proof of this is `crates/mbbs-server/tests/two_players.rs`'s
-    /// `two_real_sockets_and_one_sees_the_other`, which drives it end to end
-    /// through a real module -- but on this checkout that test is blocked
-    /// before it ever reaches this behaviour, by a pre-existing licence-limit
-    /// fault the module reports unrelated to `leftover` at all (see that
-    /// test's own history). This is the same forwarding, isolated from the
-    /// module entirely: a fake host thread stands in, so what this proves is
-    /// exactly `handle`'s own contract -- a byte that arrives pipelined
-    /// behind the user ID's terminator, in the same `read()` `read_user_id`
-    /// makes, reaches the host thread as `In::Input { chan, .. }` tagged with
-    /// the same bare `Chan` `In::Connect`'s reply carried, not dropped just
-    /// because no `Chan` existed yet when it arrived.
-    #[tokio::test]
-    async fn handle_forwards_a_pipelined_leftover_as_input() {
-        use crate::msg::In;
-        use std::sync::mpsc as std_mpsc;
-        use std::time::Duration;
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
-        let (host_tx, host_rx) = std_mpsc::channel::<In>();
-        let terms = mbbs::Terms::new(1);
-
-        tokio::spawn(async move {
-            let (server, _peer) = listener.accept().await.expect("accept");
-            let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let _ = handle(server, host_tx, super::Stack::modern, serving).await;
-        });
-
-        let mut client = TcpStream::connect(addr).await.expect("connect");
-        // The user ID and a second line in ONE write, so both land in the
-        // same TCP segment and the same `read()` inside `read_user_id` --
-        // exactly the pipelining `leftover` exists to carry forward. This is
-        // the whole test: it only discriminates `handle`'s `leftover`
-        // forwarding from `pump`'s own read loop if both lines arrive in
-        // that one `read()`. A write split across two `read()`s would let
-        // `pump` deliver the second line on its own, and the test would
-        // still pass without proving `leftover` forwarding at all.
-        client
-            .write_all(b"tester\rHELLO\r")
-            .await
-            .expect("write userid and leftover together");
-
-        let (chan, input) = tokio::task::spawn_blocking(move || {
-            let connect = host_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("In::Connect never arrived");
-            let In::Connect { login, terminal, reply, .. } = connect else {
-                panic!("expected In::Connect first, got a different In variant");
-            };
-            // The claim this listener sends today: the user ID it read, and
-            // an empty password because it has not asked for one yet. Task
-            // 12's password prompt is a change to this one line of `handle`
-            // and to this assertion.
-            assert_eq!(
-                login,
-                mbbs::Login::Password { userid: "tester".into(), password: String::new() },
-                "a telnet caller is a Password claim, never a trusted one"
-            );
-            assert_eq!(terminal, mbbs::Terminal { ansi: true, width: 80, height: 24 });
-            let chan = terms.chan(0).expect("channel 0");
-            let _ = reply.send(Ok(chan));
-            let input = host_rx.recv_timeout(Duration::from_secs(5)).expect(
-                "In::Input for the pipelined leftover never arrived -- it was dropped",
-            );
-            (chan, input)
-        })
-        .await
-        .expect("spawn_blocking did not panic");
-
-        match input {
-            In::Input { chan: got_chan, bytes } => {
-                assert_eq!(
-                    got_chan, chan,
-                    "the leftover must be tagged with the same Chan Connect was answered with"
-                );
-                assert_eq!(
-                    bytes, b"HELLO\r",
-                    "the pipelined bytes behind the user ID's terminator must survive intact"
-                );
-            }
-            _ => panic!("expected In::Input carrying the pipelined leftover"),
-        }
-    }
-
     /// The wiring risk Task 5 adds: a listener started with `Stack::raw`
     /// must hand its connections `Stack::raw`, and one started with
     /// `Stack::modern` must hand its connections `Stack::modern` -- not,
@@ -1141,7 +1331,7 @@ mod tests {
 
         async fn login_and_drain(addr: std::net::SocketAddr) -> Vec<u8> {
             let mut sock = TcpStream::connect(addr).await.expect("connect");
-            sock.write_all(b"tester\r").await.expect("write userid");
+            sock.write_all(b"tester\rpw\r").await.expect("write the login");
             let mut received = Vec::new();
             sock.read_to_end(&mut received).await.expect("read until pump closes the socket");
             received
@@ -1277,6 +1467,491 @@ mod tests {
         assert_eq!(
             got,
             [IAC, WILL, OPT_SGA, IAC, WILL, OPT_ECHO].iter().copied().chain(b"Enter your user ID: ".iter().copied()).collect::<Vec<u8>>()
+        );
+    }
+
+    // ---- the login dialogue ------------------------------------------
+
+    /// How long one read in a dialogue test may block before the test calls
+    /// it a hang. Every one of these runs over loopback against a fake host
+    /// with no module behind it, so a wait this long is never legitimate.
+    const DIALOGUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Read from `client` into `acc` until `acc` holds at least `count`
+    /// occurrences of `needle`. Panics on EOF or on the timeout rather than
+    /// hanging the run.
+    ///
+    /// The count is what makes a retry loop testable: `Enter your user ID: `
+    /// appears once per try, so "the second prompt" is `count == 2` and
+    /// nothing weaker.
+    async fn read_until_nth(
+        client: &mut tokio::net::TcpStream,
+        acc: &mut Vec<u8>,
+        needle: &str,
+        count: usize,
+    ) {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if String::from_utf8_lossy(acc).matches(needle).count() >= count {
+                return;
+            }
+            let mut buf = [0u8; 512];
+            let n = match tokio::time::timeout(DIALOGUE_TIMEOUT, client.read(&mut buf)).await {
+                Ok(Ok(0)) => panic!(
+                    "the socket closed before {needle:?} appeared {count} time(s); saw {:?}",
+                    String::from_utf8_lossy(acc)
+                ),
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => panic!("read error waiting for {needle:?}: {e}"),
+                Err(_) => panic!(
+                    "timed out waiting for {needle:?} x{count}; saw {:?}",
+                    String::from_utf8_lossy(acc)
+                ),
+            };
+            acc.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Read to EOF, appending to `acc`, with a timeout instead of a hang.
+    async fn read_to_close(client: &mut tokio::net::TcpStream, acc: &mut Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(DIALOGUE_TIMEOUT, client.read_to_end(acc))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the server never closed the socket; saw {:?}",
+                    String::from_utf8_lossy(acc)
+                )
+            })
+            .expect("read until the server closes the socket");
+    }
+
+    /// A fake host thread for the dialogue tests: it answers each
+    /// `In::Connect` from `replies`, in order, and hands the test the claim
+    /// it saw on one channel and every other message on another.
+    ///
+    /// The `Sender<Out>` is dropped as soon as a claim is answered, which
+    /// [`pump`] reads as a closed output channel and turns into a socket
+    /// shutdown. That is what lets a test that expects a *successful* login
+    /// read to EOF rather than waiting on a board that will never say
+    /// anything on its own.
+    ///
+    /// A claim beyond the end of `replies` is answered `Err(Full)`: a
+    /// dialogue that sends more claims than the test set up should end
+    /// loudly, on a line the test never asked for, rather than block.
+    fn fake_host(
+        replies: Vec<Result<mbbs::Chan, mbbs::Refusal>>,
+    ) -> (
+        std::sync::mpsc::Sender<crate::msg::In>,
+        std::sync::mpsc::Receiver<mbbs::Login>,
+        std::sync::mpsc::Receiver<crate::msg::In>,
+    ) {
+        use crate::msg::In;
+        let (tx, rx) = std::sync::mpsc::channel::<In>();
+        let (claims_tx, claims_rx) = std::sync::mpsc::channel();
+        let (rest_tx, rest_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            for msg in rx {
+                match msg {
+                    In::Connect { login, out, reply, .. } => {
+                        let _ = claims_tx.send(login);
+                        let _ = reply.send(replies.next().unwrap_or(Err(mbbs::Refusal::Full)));
+                        drop(out);
+                    }
+                    other => {
+                        let _ = rest_tx.send(other);
+                    }
+                }
+            }
+        });
+        (tx, claims_rx, rest_rx)
+    }
+
+    /// Bind one telnet listener in front of a [`fake_host`] sender.
+    async fn bind_dialogue(host_tx: std::sync::mpsc::Sender<crate::msg::In>) -> std::net::SocketAddr {
+        use crate::termcompat::Stack;
+        super::serve_on(
+            host_tx,
+            &[("127.0.0.1:0", Stack::modern as fn() -> Stack)],
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await
+        .expect("bind the telnet listener")[0]
+    }
+
+    /// The next claim the fake host saw, or a panic naming what was waited
+    /// for.
+    fn next_claim(claims: &std::sync::mpsc::Receiver<mbbs::Login>, what: &str) -> mbbs::Login {
+        claims
+            .recv_timeout(DIALOGUE_TIMEOUT)
+            .unwrap_or_else(|e| panic!("no claim reached the host for {what}: {e}"))
+    }
+
+    /// A telnet caller is asked for a password, and not one byte of it is
+    /// echoed back.
+    ///
+    /// The two halves are one test on purpose: a listener that never echoed
+    /// anything would pass the second assertion and fail the first, and one
+    /// that echoed the whole line would pass the first and fail the second.
+    /// What must hold is that the user ID comes back and the password does
+    /// not, with both prompts in that order.
+    #[tokio::test]
+    async fn a_password_is_asked_for_and_not_echoed() {
+        use tokio::io::AsyncWriteExt;
+
+        let terms = mbbs::Terms::new(1);
+        let chan = terms.chan(0).expect("channel 0");
+        let (host_tx, claims, _rest) = fake_host(vec![Ok(chan)]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"Dan\rhunter2\r").await.expect("write the login");
+
+        let mut got = Vec::new();
+        read_to_close(&mut client, &mut got).await;
+        let text = String::from_utf8_lossy(&got);
+
+        assert!(
+            text.contains("Enter your user ID: Dan\r\nEnter your password: \r\n"),
+            "both prompts, in order, with the user ID echoed and the password not: {text:?}"
+        );
+        assert!(
+            !text.contains("hunter2"),
+            "the password must never reach the wire: {text:?}"
+        );
+        assert_eq!(
+            next_claim(&claims, "the password login"),
+            mbbs::Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+            "the claim carries the password the caller typed, not an empty one"
+        );
+    }
+
+    /// An unknown user ID becomes an offer, not a goodbye: the caller is
+    /// asked whether to create the account, and answering `y` sends a
+    /// `Signup` claim with the password they chose twice.
+    ///
+    /// The whole dialogue is written in one `write_all`, which also pins
+    /// the pipelining rule through four prompts: every line after the user
+    /// ID arrives in the same `read()` the user ID did, and the last one
+    /// (`look\r`) has to survive as `In::Input` once a channel exists.
+    #[tokio::test]
+    async fn an_unknown_name_offers_signup_and_sends_the_signup_claim() {
+        use crate::msg::In;
+        use tokio::io::AsyncWriteExt;
+
+        let terms = mbbs::Terms::new(1);
+        let chan = terms.chan(0).expect("channel 0");
+        let (host_tx, claims, rest) = fake_host(vec![Err(mbbs::Refusal::Unknown), Ok(chan)]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"Dan\rx\ry\rhunter2\rhunter2\rlook\r")
+            .await
+            .expect("write the whole dialogue at once");
+
+        let mut got = Vec::new();
+        read_to_close(&mut client, &mut got).await;
+        let text = String::from_utf8_lossy(&got);
+
+        assert!(
+            text.contains(
+                "Enter your password: \r\n\
+                 No account by that name. Create one? [y/n] y\r\n\
+                 Choose a password (1 to 9 characters): \r\n\
+                 Enter it again: \r\n"
+            ),
+            "the offer replaces the refusal line rather than following it, and \
+             neither chosen password is echoed: {text:?}"
+        );
+
+        assert_eq!(
+            next_claim(&claims, "the first, unknown login"),
+            mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
+        );
+        assert_eq!(
+            next_claim(&claims, "the signup"),
+            mbbs::Login::Signup { userid: "Dan".into(), password: "hunter2".into() }
+        );
+
+        match rest.recv_timeout(DIALOGUE_TIMEOUT).expect("the pipelined line reached the host") {
+            In::Input { chan: got_chan, bytes } => {
+                assert_eq!(got_chan, chan);
+                assert_eq!(
+                    bytes, b"look\r",
+                    "the bytes behind the accepted line survive the whole dialogue"
+                );
+            }
+            _ => panic!("expected In::Input carrying the pipelined line"),
+        }
+    }
+
+    /// Two different passwords at signup are refused on the spot, with no
+    /// claim sent, and the dialogue starts over at the user ID prompt.
+    #[tokio::test]
+    async fn mismatched_signup_passwords_return_to_the_user_id_prompt() {
+        use tokio::io::AsyncWriteExt;
+
+        let (host_tx, claims, _rest) = fake_host(vec![Err(mbbs::Refusal::Unknown)]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"Dan\rx\ry\rone\rtwo\r")
+            .await
+            .expect("write the whole dialogue at once");
+
+        let mut got = Vec::new();
+        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        let text = String::from_utf8_lossy(&got);
+
+        assert!(
+            text.contains("Enter it again: \r\nPasswords do not match.\r\nEnter your user ID: "),
+            "a mismatch says so and starts over: {text:?}"
+        );
+        assert_eq!(
+            next_claim(&claims, "the first, unknown login"),
+            mbbs::Login::Password { userid: "Dan".into(), password: "x".into() }
+        );
+        assert!(
+            claims.try_recv().is_err(),
+            "a mismatch is refused here -- no Signup claim may reach the host"
+        );
+    }
+
+    /// Three counted refusals end the connection. The board answers
+    /// `BadPassword` every time, so nothing but the count can stop the
+    /// caller trying again.
+    ///
+    /// Each try is written only after its prompt has been read: bytes
+    /// pipelined behind a refused line are deliberately dropped, so three
+    /// tries in one `write_all` would be one try and two discarded lines.
+    #[tokio::test]
+    async fn three_refusals_close_the_connection() {
+        use tokio::io::AsyncWriteExt;
+
+        let (host_tx, claims, _rest) =
+            fake_host(vec![Err(mbbs::Refusal::BadPassword), Err(mbbs::Refusal::BadPassword), Err(mbbs::Refusal::BadPassword)]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut got = Vec::new();
+        for try_number in 1..=super::MAX_REFUSALS {
+            read_until_nth(&mut client, &mut got, "Enter your user ID: ", try_number).await;
+            client.write_all(b"Dan\rbad\r").await.expect("write one try");
+            read_until_nth(&mut client, &mut got, "Invalid password.\r\n", try_number).await;
+        }
+        read_to_close(&mut client, &mut got).await;
+
+        let text = String::from_utf8_lossy(&got);
+        assert!(got.ends_with(b"Too many tries.\r\n"), "{text:?}");
+        assert_eq!(
+            text.matches("Enter your user ID: ").count(),
+            super::MAX_REFUSALS,
+            "there is no fourth try: {text:?}"
+        );
+        for round in 1..=super::MAX_REFUSALS {
+            assert_eq!(
+                next_claim(&claims, &format!("try {round}")),
+                mbbs::Login::Password { userid: "Dan".into(), password: "bad".into() }
+            );
+        }
+        assert!(claims.try_recv().is_err(), "exactly {} claims", super::MAX_REFUSALS);
+    }
+
+    /// A user ID that cannot fit the account file's field is refused here,
+    /// in the account layer's own words, without asking the board.
+    ///
+    /// The "without a round trip" half is the point: a 30-byte user ID is
+    /// one the record cannot hold, and sending it would spend a channel
+    /// (`Pool::take`, then `give_back`) to be told what this listener
+    /// already knows.
+    #[tokio::test]
+    async fn an_overlong_user_id_is_refused_without_a_round_trip() {
+        use tokio::io::AsyncWriteExt;
+
+        let (host_tx, claims, _rest) = fake_host(Vec::new());
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let overlong = "x".repeat(mbbs::accounts::UIDSIZ);
+        client
+            .write_all(format!("{overlong}\r").as_bytes())
+            .await
+            .expect("write an overlong user ID");
+
+        let mut got = Vec::new();
+        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+        let text = String::from_utf8_lossy(&got);
+
+        assert!(
+            text.contains("a user ID is at most 29 characters\r\n"),
+            "the wire text is the account layer's own: {text:?}"
+        );
+        assert!(
+            !text.contains("Enter your password: "),
+            "a user ID the record cannot hold is refused before the password prompt: {text:?}"
+        );
+        assert!(
+            claims.try_recv().is_err(),
+            "nothing may reach the host: this refusal costs no channel"
+        );
+    }
+
+    /// The user ID and the password in one `write_all`, and the line behind
+    /// them delivered as input once the channel exists.
+    ///
+    /// Both lines have to land in the same `read()` for this to prove
+    /// anything: bytes left over from the user ID's line have to feed the
+    /// password prompt rather than being dropped or waited on, and what is
+    /// left after *that* is what `In::Input` carries. Split across two
+    /// reads, the socket would drive each prompt on its own and the test
+    /// would pass without exercising either hand-off.
+    #[tokio::test]
+    async fn userid_and_password_pipelined_in_one_read_both_land() {
+        use crate::msg::In;
+        use tokio::io::AsyncWriteExt;
+
+        let terms = mbbs::Terms::new(1);
+        let chan = terms.chan(0).expect("channel 0");
+        let (host_tx, claims, rest) = fake_host(vec![Ok(chan)]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"Dan\rhunter2\rlook\r")
+            .await
+            .expect("write both lines and the leftover together");
+
+        let mut got = Vec::new();
+        read_to_close(&mut client, &mut got).await;
+
+        assert_eq!(
+            next_claim(&claims, "the pipelined login"),
+            mbbs::Login::Password { userid: "Dan".into(), password: "hunter2".into() }
+        );
+        match rest.recv_timeout(DIALOGUE_TIMEOUT).expect("the pipelined line reached the host") {
+            In::Input { chan: got_chan, bytes } => {
+                assert_eq!(
+                    got_chan, chan,
+                    "the leftover is tagged with the Chan the reply carried"
+                );
+                assert_eq!(bytes, b"look\r");
+            }
+            _ => panic!("expected In::Input carrying the pipelined line"),
+        }
+        assert!(
+            !String::from_utf8_lossy(&got).contains("hunter2"),
+            "a pipelined password is still a password: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    /// A backspace at a password prompt erases the byte and writes nothing
+    /// back -- not even the `\x08 \x08` an echoing prompt uses.
+    ///
+    /// With echo off there is nothing on screen to erase, so the visual
+    /// erase would be three stray bytes walking the client's cursor back
+    /// over the prompt itself. This is the half of `read_line`'s `echo`
+    /// rule that `a_password_is_asked_for_and_not_echoed` cannot see: a
+    /// listener that suppressed `Edit::Echo` and forgot `Edit::Erase`
+    /// passes that test and fails this one.
+    #[tokio::test]
+    async fn a_backspace_in_a_password_erases_nothing_on_the_wire() {
+        use tokio::io::AsyncWriteExt;
+
+        let terms = mbbs::Terms::new(1);
+        let chan = terms.chan(0).expect("channel 0");
+        let (host_tx, claims, _rest) = fake_host(vec![Ok(chan)]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        // "hunterX", backspace, "2" -- the editor still has to build
+        // "hunter2" out of it.
+        client.write_all(b"Dan\rhunterX\x082\r").await.expect("write the login");
+
+        let mut got = Vec::new();
+        read_to_close(&mut client, &mut got).await;
+
+        assert_eq!(
+            next_claim(&claims, "the edited password"),
+            mbbs::Login::Password { userid: "Dan".into(), password: "hunter2".into() },
+            "the backspace must still edit the line it is not echoing"
+        );
+        assert!(
+            !got.contains(&0x08u8),
+            "a password prompt has nothing on screen to erase: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    /// Bytes pipelined behind a line that was refused are dropped, not fed
+    /// to the prompt the dialogue restarts at.
+    ///
+    /// A caller who typed a whole second login behind the first was typing
+    /// ahead of a dialogue that has just gone back to its start; replaying
+    /// those bytes into the fresh prompts would spend their remaining tries
+    /// on lines meant for prompts that are no longer on screen. The fake
+    /// host would happily serve the second login here -- the only reason it
+    /// never sees it is that `refuse` cleared the buffer.
+    #[tokio::test]
+    async fn bytes_pipelined_behind_a_refused_line_are_dropped() {
+        use tokio::io::AsyncWriteExt;
+
+        let terms = mbbs::Terms::new(1);
+        let chan = terms.chan(0).expect("channel 0");
+        let (host_tx, claims, _rest) = fake_host(vec![Err(mbbs::Refusal::BadPassword), Ok(chan)]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"Dan\rbad\rBob\rgood\r")
+            .await
+            .expect("write two logins at once");
+
+        let mut got = Vec::new();
+        read_until_nth(&mut client, &mut got, "Enter your user ID: ", 2).await;
+
+        assert_eq!(
+            next_claim(&claims, "the first, refused login"),
+            mbbs::Login::Password { userid: "Dan".into(), password: "bad".into() }
+        );
+        assert!(
+            claims.try_recv().is_err(),
+            "the second login was typed behind a refused line and must not reach \
+             the host: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert!(
+            !String::from_utf8_lossy(&got).contains("Bob"),
+            "nothing behind the refused line is echoed either: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    /// A full board ends the dialogue rather than counting a try: there is
+    /// nothing the caller could type differently, so there is nothing to
+    /// retry.
+    #[tokio::test]
+    async fn a_full_board_ends_the_dialogue_without_counting() {
+        use tokio::io::AsyncWriteExt;
+
+        let (host_tx, _claims, _rest) = fake_host(vec![Err(mbbs::Refusal::Full)]);
+        let addr = bind_dialogue(host_tx).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"Dan\rhunter2\r").await.expect("write the login");
+
+        let mut got = Vec::new();
+        read_to_close(&mut client, &mut got).await;
+        let text = String::from_utf8_lossy(&got);
+
+        assert!(got.ends_with(b"All lines are busy.\r\n"), "{text:?}");
+        assert_eq!(
+            text.matches("Enter your user ID: ").count(),
+            1,
+            "a full board is not the caller's mistake: there is no second prompt: {text:?}"
         );
     }
 }

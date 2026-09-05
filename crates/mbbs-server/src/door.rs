@@ -19,10 +19,9 @@ use std::sync::mpsc as std_mpsc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
 
-use crate::conn::{self, OUT_CHANNEL_BOUND};
-use crate::msg::{In, Out};
+use crate::conn;
+use crate::msg::In;
 use crate::termcompat::Stack;
 
 /// The header's first line. The `1` is the protocol version; a relay that
@@ -272,26 +271,19 @@ async fn session(stream: UnixStream, tx: std_mpsc::Sender<In>, serving: crate::h
         return Ok(());
     }
 
-    let (out_tx, out_rx) = mpsc::channel::<Out>(OUT_CHANNEL_BOUND);
-    let (reply_tx, reply_rx) = oneshot::channel();
     let (claim, terminal) = login(&handshake);
-    if tx
-        .send(In::Connect { login: claim, terminal, out: out_tx, reply: reply_tx })
-        .is_err()
-    {
-        writer.write_all(b"Server error, try again later.\r\n").await?;
-        return Ok(());
-    }
-    let chan = match reply_rx.await {
-        Ok(Ok(chan)) => chan,
-        Ok(Err(refusal)) => {
+    // The round trip and both of its "the host thread is gone" endings are
+    // `conn`'s, shared with the telnet and rlogin listeners. What is left
+    // here is the one decision that is the door's own: a refused relay is
+    // told which refusal it was and closed, with no retry -- there is
+    // nobody at this end of the socket to type anything different.
+    let (chan, out_rx) = match conn::claim_channel(&tx, claim, terminal, &mut writer).await? {
+        Some(Ok(pair)) => pair,
+        Some(Err(refusal)) => {
             writer.write_all(&conn::refusal_line(refusal)).await?;
             return Ok(());
         }
-        Err(_) => {
-            writer.write_all(b"Server error, try again later.\r\n").await?;
-            return Ok(());
-        }
+        None => return Ok(()),
     };
 
     if !leftover.is_empty() && tx.send(In::Input { chan, bytes: leftover }).is_err() {
