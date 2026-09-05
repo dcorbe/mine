@@ -7,36 +7,16 @@ use std::time::Duration;
 
 use clap::Parser;
 use mbbs::Terms;
-use mbbs::abi::{Wg16, Wg32, Wg32Cpu};
+use mbbs::abi::{Wg16, Wg32};
 use mbbs_machine::Format;
 use mbbs_server::conn::{self, Listener, default_keys};
-use mbbs_server::host::{Boot, ExtensionBuilder};
+use mbbs_server::host::{Boot, ExtensionBuilder, build_wg32_cpu};
 use mbbs_server::msg::In;
 use mbbs_server::rlogin::{self, NameField};
 use mbbs_server::termcompat::Stack;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:2323";
 const DEFAULT_TERMS: u16 = 2;
-
-/// The arena [`Wg32Cpu::new`]'s placeholder `Memory` reserves for a `Wg32`
-/// module's host-allocated regions (`ModuleMem::alloc_region`, design doc
-/// Part 3) -- everything a `Wg32` module asks the host to allocate at
-/// runtime, on top of its own loaded images.
-///
-/// **Provisional, the same way `DEFAULT_POLLS_PER_SECOND` is provisional.** No
-/// real 32-bit module has ever run against this host long enough to measure
-/// what it actually needs (`crates/mbbs/tests/wg32_round_trip.rs`'s own
-/// fixture gets by on `0x0002_0000`, but that is a synthetic one-import
-/// module built to prove the border works, not LunatiX). 16 MiB is a
-/// generous guess, not a measurement: undershoot fails loudly
-/// (`Memory::alloc`'s `OutOfMemory`, not silent corruption -- `flatptr.rs`
-/// bounds-checks every access against the arena's real mapped range), so the
-/// honest failure mode of guessing too small is a board that refuses to
-/// serve rather than one that corrupts state, and overshoot only costs
-/// address space `MAP_32BIT` has to spare, not RSS (anonymous pages are not
-/// resident until touched). Retune from a real session's high-water mark,
-/// not from this comment.
-const DEFAULT_WG32_ARENA_BYTES: usize = 0x0100_0000;
 
 /// Poll firings granted per elapsed second -- `--polls-per-second`'s default.
 ///
@@ -325,18 +305,6 @@ fn format_name(format: Format) -> &'static str {
     match format {
         Format::Ne => "NE",
         Format::Pe => "PE",
-    }
-}
-
-/// Build [`Boot::build`]'s closure for a `Wg32` machine: an empty
-/// [`mbbs_machine::m32::Memory`] with the host arena, and a fresh
-/// [`mbbs_machine::m32::Machine`]. Every module's image arrives through
-/// `Host::load` (`host::life`'s per-module loop), in `--module` order.
-fn build_wg32_cpu() -> impl Fn() -> io::Result<Wg32Cpu> + Send {
-    || {
-        let mem = mbbs_machine::m32::Memory::new(DEFAULT_WG32_ARENA_BYTES)?;
-        let machine = mbbs_machine::m32::Machine::new()?;
-        Ok(Wg32Cpu::new(machine, mem))
     }
 }
 

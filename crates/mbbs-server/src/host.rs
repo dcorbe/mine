@@ -59,7 +59,7 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mbbs::abi::Abi;
+use mbbs::abi::{Abi, Wg32Cpu};
 use mbbs::{Chan, Ended, Host, Outcome, Terms, Wait};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
@@ -82,6 +82,46 @@ use crate::pool::Pool;
 /// entry's own [`Boot::modules`] path stem, lowercased -- see that field's
 /// own doc for the exact derivation `life` uses.
 pub type ExtensionBuilder<A> = Box<dyn Fn(&[(String, <A as Abi>::Module)]) -> io::Result<Box<dyn mbbs::extension::Extension<A>>> + Send>;
+
+/// The arena [`Wg32Cpu::new`]'s placeholder `Memory` reserves for a `Wg32`
+/// module's host-allocated regions (`ModuleMem::alloc_region`, design doc
+/// Part 3) -- everything a `Wg32` module asks the host to allocate at
+/// runtime, on top of its own loaded images.
+///
+/// **Provisional, the same way `DEFAULT_POLLS_PER_SECOND` is provisional.** No
+/// real 32-bit module has ever run against this host long enough to measure
+/// what it actually needs (`crates/mbbs/tests/wg32_round_trip.rs`'s own
+/// fixture gets by on `0x0002_0000`, but that is a synthetic one-import
+/// module built to prove the border works, not LunatiX). 16 MiB is a
+/// generous guess, not a measurement: undershoot fails loudly
+/// (`Memory::alloc`'s `OutOfMemory`, not silent corruption -- `flatptr.rs`
+/// bounds-checks every access against the arena's real mapped range), so the
+/// honest failure mode of guessing too small is a board that refuses to
+/// serve rather than one that corrupts state, and overshoot only costs
+/// address space `MAP_32BIT` has to spare, not RSS (anonymous pages are not
+/// resident until touched). Retune from a real session's high-water mark,
+/// not from this comment.
+pub const DEFAULT_WG32_ARENA_BYTES: usize = 0x0100_0000;
+
+/// Build [`Boot::build`]'s closure for a `Wg32` machine: an empty
+/// [`mbbs_machine::m32::Memory`] with the host arena, and a fresh
+/// [`mbbs_machine::m32::Machine`]. Every module's image arrives through
+/// `Host::load` ([`life`]'s per-module loop), in `--module` order.
+///
+/// Here rather than in `main.rs` because `main` is not the only program
+/// that builds a `Wg32` machine over a board: `mbbs-user` builds one to
+/// read the same board's account files, and a second copy of these four
+/// lines is a second arena size to keep in step.
+///
+/// Building the closure cannot fail. Calling it can, if the arena cannot be
+/// mapped or the machine cannot be built.
+pub fn build_wg32_cpu() -> impl Fn() -> io::Result<Wg32Cpu> + Send {
+    || {
+        let mem = mbbs_machine::m32::Memory::new(DEFAULT_WG32_ARENA_BYTES)?;
+        let machine = mbbs_machine::m32::Machine::new()?;
+        Ok(Wg32Cpu::new(machine, mem))
+    }
+}
 
 /// Whether the board is taking callers. False from the start of maintenance
 /// until the next life has booted. Read by every accept path, set by the
