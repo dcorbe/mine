@@ -666,12 +666,12 @@ pub(crate) async fn claim_channel<W: AsyncWrite + Unpin>(
 ///
 /// A miniature, deliberate duplicate of one fragment of
 /// `gsbl::Channel::take`: backspace/DEL erase, CR or LF terminates, printable
-/// ASCII is kept, everything else is dropped. **This must not be unified with
-/// `gsbl::Channel::take.`** The duplication exists only because no
-/// [`mbbs::Chan`] exists yet at this point in a connection's life -- GSBL is
-/// unreachable before a channel is claimed -- and it ends the instant one
-/// exists: [`pump`] below hands every later byte straight to the host and
-/// never edits a line again.
+/// ASCII is kept, Ctrl-D ends the connection ([`Edit::Abort`]), everything else is
+/// dropped. **This must not be unified with `gsbl::Channel::take.`** The
+/// duplication exists only because no [`mbbs::Chan`] exists yet at this point in a
+/// connection's life -- GSBL is unreachable before a channel is claimed -- and it
+/// ends the instant one exists: [`pump`] below hands every later byte straight to
+/// the host and never edits a line again.
 ///
 /// Bytes above `0x7e` are dropped rather than reproducing GSBL's high-bit
 /// strip (`gsbl.rs::translate`) byte-for-byte; neither a user ID nor a
@@ -696,6 +696,9 @@ enum Edit {
     /// prompt is not the place to introduce a `Vec<u8>` identity that the
     /// rest of this host does not have.
     Done(String),
+    /// Ctrl-D: the caller asked to leave. The line in progress is dropped
+    /// and the connection ends with nothing further written.
+    Abort,
 }
 
 impl LineEditor {
@@ -711,6 +714,7 @@ impl LineEditor {
                     Edit::None
                 }
             }
+            0x04 => Edit::Abort,
             // At the cap the byte is dropped and not echoed: echoing a
             // character the line did not keep would put it on the caller's
             // screen and not in the line, which is the one outcome worse
@@ -794,6 +798,9 @@ async fn read_line(
 /// Whatever arrived pipelined behind the previous line is consumed first
 /// and edited exactly as freshly read bytes are, echo and all -- a client
 /// that types ahead sees the same screen as one that waits.
+///
+/// Returns `Ok(None)` on EOF, a read error, or Ctrl-D -- there is nothing
+/// left to prompt.
 async fn prompt_once(
     reader: &mut Reader<'_>,
     writer: &mut OwnedWriteHalf,
@@ -836,6 +843,7 @@ async fn prompt_once(
                     done = Some((line, bytes[i + 1..].to_vec()));
                     break;
                 }
+                Edit::Abort => return Ok(None),
             }
         }
         writer.flush().await?;
@@ -1127,6 +1135,19 @@ mod tests {
             Edit::Done(line) => assert_eq!(line, "rangerdan"),
             _ => panic!("CR must terminate the line"),
         }
+    }
+
+    /// Ctrl-D is the one control byte that means something: leave. It is
+    /// answered on its own, whatever is already on the line.
+    #[test]
+    fn ctrl_d_aborts_whatever_is_on_the_line() {
+        let mut editor = LineEditor::default();
+        for &b in b"Da" {
+            editor.feed(b);
+        }
+        assert!(matches!(editor.feed(0x04), Edit::Abort));
+        let mut empty = LineEditor::default();
+        assert!(matches!(empty.feed(0x04), Edit::Abort), "on an empty line too");
     }
 
     /// At [`LINE_CAP`] the editor stops accumulating and stops echoing, and
@@ -1787,6 +1808,39 @@ mod tests {
             "nothing reached the host"
         );
         assert!(matches!(rest.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    }
+
+    /// Ctrl-D at any of the five prompts closes the connection with nothing
+    /// further written, and nothing reaches the board. The last case has it
+    /// pipelined behind an accepted line: the password prompt reads it out
+    /// of `pending` and closes just the same.
+    #[tokio::test]
+    async fn ctrl_d_at_any_prompt_closes_the_connection() {
+        use tokio::io::AsyncWriteExt;
+
+        let cases: [(&[u8], &str); 6] = [
+            (b"\x04", "Enter your user ID, or NEW to sign up: "),
+            (b"Dan\r\x04", "Enter your password: "),
+            (b"new\r\x04", "Choose a user ID: "),
+            (b"new\rDan\r\x04", "Choose a password (1 to 9 characters): "),
+            (b"new\rDan\rpw\r\x04", "Enter it again: "),
+            (b"Dan\r\x04ignored\r", "Enter your password: "),
+        ];
+        for (typed, last_prompt) in cases {
+            let (host_tx, claims, rest) = fake_host(vec![]);
+            let addr = bind_dialogue(host_tx).await;
+            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            client.write_all(typed).await.expect("write");
+            let mut got = Vec::new();
+            read_to_close(&mut client, &mut got).await;
+            let text = String::from_utf8_lossy(&got);
+            assert!(
+                text.ends_with(last_prompt),
+                "{typed:?}: the socket closes at the prompt, with nothing after it: {text:?}"
+            );
+            assert!(claims.try_recv().is_err(), "{typed:?}: no claim reached the board");
+            assert!(rest.try_recv().is_err(), "{typed:?}: nothing else reached the board");
+        }
     }
 
     /// A telnet caller is asked for a password, and not one byte of it is
